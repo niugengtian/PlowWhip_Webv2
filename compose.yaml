@@ -1,0 +1,36 @@
+name: plow-whip-web-v2
+
+services:
+  control-plane:
+    build:
+      context: .
+    image: plow-whip-web-v2:local
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:8742:8742"
+    environment:
+      PLOW_WHIP_EMBEDDED_CRON: "1"
+      PLOW_WHIP_CONTAINER_LOOPBACK: "1"
+      PLOW_WHIP_BRIDGE_URL: "${PLOW_WHIP_BRIDGE_URL:-http://host.docker.internal:8765}"
+      PLOW_WHIP_BRIDGE_TOKEN: "${PLOW_WHIP_BRIDGE_TOKEN:-}"
+      TZ: "${TZ:-Asia/Shanghai}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - plow-whip-data:/data
+      - plow-whip-projects:/projects
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+
+volumes:
+  plow-whip-data:
+    name: plow-whip-web-v2-data
+  plow-whip-projects:
+    name: plow-whip-web-v2-projects

@@ -6,7 +6,7 @@ dist/
 web/*.tsbuildinfo
 web/vite.config.js
 web/vite.config.d.ts
-runtime/
+/runtime/
 .pytest_cache/
 __pycache__/
 *.py[cod]

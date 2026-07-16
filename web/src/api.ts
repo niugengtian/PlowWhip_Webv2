@@ -43,15 +43,19 @@ export type Worker = {
   role: string
   provider: string
   session_id: string
+  external_session_id: string | null
   session_generation: number
   status: string
   active_task_id: string | null
+  last_seen_at: string | null
+  last_error: string | null
   released_at: string | null
 }
 export type Project = {
   id: string
   name: string
   path: string
+  host_path: string | null
   status: string
   created_at: string
   roles: Role[]
@@ -61,9 +65,12 @@ export type Project = {
 export type RuntimeSettingsValues = {
   scheduler_interval_seconds: number
   scheduler_lease_seconds: number
+  cron_enabled: boolean
+  cron_expression: string
+  cron_timezone: string
+  cron_misfire_policy: 'catch_up_once' | 'skip'
   max_parallel_workers: number
   auto_dispatch: boolean
-  system_scheduler_authorized: boolean
   task_default_token_budget: number
   global_daily_token_budget: number
   max_same_failure: number
@@ -73,8 +80,21 @@ export type RuntimeSettingsValues = {
 }
 export type RuntimeSettings = { revision: number; values: RuntimeSettingsValues; updated_at: string | null }
 export type SchedulerStatus = {
-  runtime: { fencing_token: number; last_tick_at: string | null; last_result: Record<string, unknown> | null; last_error: string | null }
-  system: { os: string; backend: string; supported: boolean; target: string | null; reason: string | null }
+  runtime: {
+    fencing_token: number
+    last_tick_at: string | null
+    last_result: Record<string, unknown> | null
+    last_error: string | null
+    runner_id: string | null
+    runner_started_at: string | null
+    runner_heartbeat_at: string | null
+    runner_stopped_at: string | null
+    runner_error: string | null
+    runner_active: boolean
+    last_cron_slot: string | null
+  }
+  engine: { backend: string; active: boolean; managed_by: string; data_dir: string }
+  schedule: { enabled: boolean; expression: string; timezone: string; misfire_policy: 'catch_up_once' | 'skip'; next_run_at: string | null }
   authorization_required: boolean
   model_invoked: boolean
 }
@@ -109,7 +129,16 @@ export type OutboxEvent = {
   created_at: string
   delivered_at: string | null
 }
-export type Provider = { name: string; status: string; model_invoked: boolean; capabilities: string[]; reason: string | null }
+export type Provider = {
+  name: string; display_name: string; status: string; model_invoked: boolean;
+  capabilities: string[]; reason: string | null; adapter: 'codex' | 'cursor' | 'json-worker' | 'generic-command';
+  transport: 'host-bridge' | 'container'; executable: string | null; enabled: boolean;
+  credential_env: string | null; revision: number; last_probed_at: string | null
+}
+export type ConventionSuggestion = {
+  id: string; scope: Convention['scope']; scope_id: string; source_revision: number;
+  provider: string; suggestion: string; input_tokens: number; output_tokens: number; applied: boolean
+}
 export type AuditEntry = { sequence: number; actor: string; method: string; path: string; status_code: number; created_at: string }
 export type PermissionGrant = {
   id: string; project_id: string | null; capability: string; resource: string;
@@ -140,6 +169,16 @@ async function request<T>(path: string, options: FetchOptions = {}): Promise<T> 
 
 export const api = {
   providers: () => request<Provider[]>('/api/providers'),
+  updateProvider: (provider: Provider) => request<Provider>(`/api/providers/${provider.name}`, {
+    method: 'PUT',
+    body: JSON.stringify({
+      name: provider.name, display_name: provider.display_name, adapter: provider.adapter,
+      transport: provider.transport, executable: provider.executable, enabled: provider.enabled,
+      credential_env: provider.credential_env, capabilities: provider.capabilities,
+      expected_revision: provider.revision,
+    }),
+  }),
+  probeProvider: (name: string) => request<Provider>(`/api/providers/${name}/probe`, { method: 'POST' }),
   audit: () => request<AuditEntry[]>('/api/audit'),
   permissions: () => request<PermissionGrant[]>('/api/permissions'),
   createPermission: (payload: Record<string, unknown>) => request<PermissionGrant>('/api/permissions', { method: 'POST', body: JSON.stringify(payload) }),
@@ -154,6 +193,11 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify({ ...convention, expected_revision: convention.revision }),
     }),
+  refineConvention: (convention: Convention, provider: string, projectId: string | null) =>
+    request<ConventionSuggestion>(`/api/conventions/${convention.scope}/${convention.scope_id}/refine`, {
+      method: 'POST',
+      body: JSON.stringify({ provider, project_id: projectId }),
+    }),
   usage: () => request<Usage>('/api/usage'),
   settings: () => request<RuntimeSettings>('/api/settings'),
   updateSettings: (settings: RuntimeSettings) =>
@@ -163,12 +207,15 @@ export const api = {
     }),
   schedulerStatus: () => request<SchedulerStatus>('/api/scheduler/status'),
   schedulerTick: () => request<Record<string, unknown>>('/api/scheduler/tick', { method: 'POST' }),
-  schedulerInstall: () => request<Record<string, unknown>>('/api/scheduler/install', { method: 'POST' }),
   projects: () => request<Project[]>('/api/projects'),
-  createProject: (payload: { name: string; path: string }) =>
+  createProject: (payload: { name: string; path: string; host_path?: string | null }) =>
     request<Project>('/api/projects', { method: 'POST', body: JSON.stringify(payload) }),
   releaseProject: (projectId: string) =>
     request<Project>(`/api/projects/${projectId}/release`, { method: 'POST' }),
+  rebindWorker: (workerId: string, provider: string) =>
+    request<Worker>(`/api/workers/${workerId}/rebind`, {
+      method: 'POST', body: JSON.stringify({ provider, reason: 'operator_rebind' }),
+    }),
   tasks: () => request<Task[]>('/api/tasks'),
   taskEvents: (taskId: string) => request<TaskEvent[]>(`/api/tasks/${taskId}/events`),
   createTask: (payload: Record<string, unknown>) =>

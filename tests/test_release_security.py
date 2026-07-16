@@ -120,7 +120,7 @@ def test_permissions_and_mutations_are_audited_without_secret_payloads() -> None
         app = create_app(Settings(data_dir=Path(directory) / "runtime"))
         with TestClient(app) as client:
             created = client.post("/api/permissions", json={
-                "project_id": None, "capability": "system_scheduler", "resource": "current-user",
+                "project_id": None, "capability": "secret_reference", "resource": "*",
                 "decision": "deny", "reason": "not approved",
             })
             assert created.status_code == 200
@@ -226,4 +226,5 @@ def test_openapi_and_provider_capabilities_are_complete() -> None:
         generic = next(item for item in providers if item["name"] == "generic-command")
         codex = next(item for item in providers if item["name"] == "codex")
         assert generic["status"] == "available" and generic["model_invoked"] is False
-        assert codex["status"] == "unavailable" and codex["reason"]
+        assert codex["status"] == "unknown" and codex["reason"]
+        assert codex["transport"] == "host-bridge"

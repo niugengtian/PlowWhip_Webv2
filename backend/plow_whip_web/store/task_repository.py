@@ -8,6 +8,7 @@ from typing import Any
 from plow_whip_web.domain.model import (
     InvalidTransitionError,
     NotFoundError,
+    ProviderUnavailableError,
     RevisionConflictError,
     ResourceBusyError,
     TaskRecord,
@@ -122,6 +123,37 @@ class TaskRepository:
             return [_task_from_row(row) for row in rows]
         finally:
             connection.close()
+
+    def worker_execution_context(self, worker_id: str) -> dict[str, Any]:
+        connection = self.database.connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT w.external_session_id, w.provider, p.path project_path,
+                       COALESCE(p.host_path, p.path) host_path
+                FROM workers w JOIN projects p ON p.id = w.project_id
+                WHERE w.id = ?
+                """,
+                (worker_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"worker not found: {worker_id}")
+            return dict(row)
+        finally:
+            connection.close()
+
+    def record_worker_result(
+        self, worker_id: str, *, external_session_id: str | None, error: str | None
+    ) -> None:
+        with self.database.transaction(immediate=True) as connection:
+            connection.execute(
+                """
+                UPDATE workers SET external_session_id = COALESCE(?, external_session_id),
+                    last_seen_at = CURRENT_TIMESTAMP, last_error = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (external_session_id, error, worker_id),
+            )
 
     def events(self, task_id: str, *, after: int = 0) -> list[dict[str, Any]]:
         connection = self.database.connect()
@@ -398,12 +430,16 @@ class TaskRepository:
             connection.execute(
                 """
                 INSERT INTO workers(id, project_id, role_id, provider, session_id)
-                VALUES (?, ?, ?, 'generic-command', ?)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (worker_id, task.project_id, task.role_id, str(uuid.uuid4())),
+                (worker_id, task.project_id, task.role_id, task.provider, str(uuid.uuid4())),
             )
         else:
             worker_id = worker["id"]
+            if worker["provider"] != task.provider:
+                raise ProviderUnavailableError(
+                    f"角色已绑定 {worker['provider']}，请轮转会话后再切换到 {task.provider}"
+                )
             if worker["status"] != "idle":
                 raise ResourceBusyError(f"role worker is busy: {worker_id}")
         resource_key = task.resource_key or f"project:{task.project_id}"

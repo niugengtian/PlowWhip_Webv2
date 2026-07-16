@@ -6,6 +6,8 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from plow_whip_web.runtime.cron import CronExpression, validate_timezone
+
 from plow_whip_web.domain.model import TaskRecord, TaskStatus
 
 
@@ -46,7 +48,7 @@ class TaskCreate(BaseModel):
     role: Literal["coordination", "fullstack", "web3", "devops_sre", "verification"] = "fullstack"
     resource_key: Annotated[str | None, Field(max_length=300)] = None
     network_requirement: Literal["none", "any", "domestic", "overseas"] = "none"
-    provider: Literal["generic-command", "codex", "cursor", "claude"] = "generic-command"
+    provider: Annotated[str, Field(pattern=r"^[a-z][a-z0-9-]{1,63}$")] = "generic-command"
     quality_profile: Literal["fast", "balanced", "strict"] = "balanced"
     command: CommandSpec
     verification: Annotated[list[VerificationSpec], Field(min_length=1, max_length=32)]
@@ -119,6 +121,7 @@ class TaskEventView(BaseModel):
 class ProjectCreate(BaseModel):
     name: Annotated[str, Field(min_length=1, max_length=120)]
     path: str
+    host_path: str | None = None
 
     @field_validator("path")
     @classmethod
@@ -128,11 +131,22 @@ class ProjectCreate(BaseModel):
             raise ValueError("path must be an existing directory")
         return str(path)
 
+    @field_validator("host_path")
+    @classmethod
+    def host_path_must_be_absolute(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        path = Path(value).expanduser()
+        if not path.is_absolute() or ".." in path.parts:
+            raise ValueError("host_path must be an absolute path")
+        return str(path)
+
 
 class ProjectView(BaseModel):
     id: str
     name: str
     path: str
+    host_path: str | None
     status: str
     created_at: str
     roles: list[dict[str, Any]]
@@ -142,9 +156,12 @@ class ProjectView(BaseModel):
 class RuntimeSettingsValues(BaseModel):
     scheduler_interval_seconds: Annotated[int, Field(ge=10, le=3600)] = 30
     scheduler_lease_seconds: Annotated[int, Field(ge=30, le=7200)] = 90
+    cron_enabled: bool = True
+    cron_expression: Annotated[str, Field(min_length=9, max_length=100)] = "*/1 * * * *"
+    cron_timezone: Annotated[str, Field(min_length=1, max_length=100)] = "Asia/Shanghai"
+    cron_misfire_policy: Literal["catch_up_once", "skip"] = "catch_up_once"
     max_parallel_workers: Annotated[int, Field(ge=1, le=64)] = 4
     auto_dispatch: bool = True
-    system_scheduler_authorized: bool = False
     task_default_token_budget: Annotated[int, Field(ge=0, le=100_000_000)] = 50_000
     global_daily_token_budget: Annotated[int, Field(ge=0, le=1_000_000_000)] = 500_000
     max_same_failure: Annotated[int, Field(ge=1, le=20)] = 3
@@ -157,6 +174,16 @@ class RuntimeSettingsValues(BaseModel):
         if self.scheduler_lease_seconds < self.scheduler_interval_seconds * 2:
             raise ValueError("scheduler lease must be at least twice the interval")
         return self
+
+    @field_validator("cron_expression")
+    @classmethod
+    def cron_expression_must_be_valid(cls, value: str) -> str:
+        return CronExpression.parse(value).source
+
+    @field_validator("cron_timezone")
+    @classmethod
+    def timezone_must_be_valid(cls, value: str) -> str:
+        return validate_timezone(value)
 
 
 class RuntimeSettingsView(BaseModel):
@@ -183,8 +210,33 @@ class ConventionPut(BaseModel):
         return self
 
 
+class ConventionRefineRequest(BaseModel):
+    provider: Annotated[str, Field(min_length=1, max_length=80)] = "simple-worker"
+    project_id: Annotated[str | None, Field(max_length=100)] = None
+    instruction: Annotated[str, Field(min_length=1, max_length=2000)] = (
+        "在不改变原意和权限边界的前提下，删除重复内容，改写成清晰、可执行、可验证的中文约束。"
+    )
+
+
+class ProviderPut(BaseModel):
+    name: Annotated[str, Field(pattern=r"^[a-z][a-z0-9-]{1,63}$")]
+    display_name: Annotated[str, Field(min_length=1, max_length=100)]
+    adapter: Literal["codex", "cursor", "json-worker", "generic-command"]
+    transport: Literal["host-bridge", "container"]
+    executable: Annotated[str | None, Field(max_length=500)] = None
+    enabled: bool = True
+    credential_env: Annotated[str | None, Field(pattern=r"^[A-Z][A-Z0-9_]{1,99}$")] = None
+    capabilities: Annotated[list[str], Field(min_length=1, max_length=16)]
+    expected_revision: Annotated[int, Field(ge=0)] = 0
+
+
 class RotateWorkerRequest(BaseModel):
     reason: Annotated[str, Field(min_length=1, max_length=200)] = "context_rotation"
+
+
+class RebindWorkerRequest(BaseModel):
+    provider: Annotated[str, Field(min_length=1, max_length=80)]
+    reason: Annotated[str, Field(min_length=1, max_length=200)] = "provider_rebind"
 
 
 class TaskControl(BaseModel):
@@ -195,7 +247,7 @@ class TaskControl(BaseModel):
 
 class PermissionGrantCreate(BaseModel):
     project_id: str | None = None
-    capability: Literal["project_read", "project_write", "network_domestic", "network_overseas", "system_scheduler", "secret_reference"]
+    capability: Literal["project_read", "project_write", "network_domestic", "network_overseas", "secret_reference"]
     resource: Annotated[str, Field(min_length=1, max_length=500)]
     decision: Literal["allow", "deny"]
     reason: Annotated[str, Field(min_length=1, max_length=500)]

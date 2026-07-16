@@ -1,5 +1,7 @@
 # plow-whip Web v2 Sprint 执行计划
 
+> 状态更新（2026-07-17）：S0–S6 已完成；新增 S7 Docker-first Runtime 与容器内 Crontab，替代 S3 的宿主 OS scheduler 安装方案。验收证据见 `SPRINT_7_EVIDENCE.md`。
+
 > 状态：待用户审阅
 > 日期：2026-07-16
 > 产品目标：保障质量的前提下实现无人值守完成，尽量减少 Token 消费。
@@ -70,6 +72,7 @@ S0 基线隔离与工程骨架
         → S4 Context、Convention、Token 与轮转
           → S5 人工控制与故障恢复
             → S6 安全、完整 UI 与发布验收
+              → S7 Docker-first Runtime、named volumes 与容器内 Crontab
 ```
 
 每个 Sprint 内，Backend、Frontend、测试可以并行推进；领域状态机和数据库 Schema 是共同契约，必须先冻结再并行。

@@ -15,13 +15,13 @@ class ProjectRepository:
     def __init__(self, database: Database) -> None:
         self.database = database
 
-    def create(self, *, name: str, path: str) -> dict[str, Any]:
+    def create(self, *, name: str, path: str, host_path: str | None = None) -> dict[str, Any]:
         project_id = str(uuid.uuid4())
         resolved = str(Path(path).expanduser().resolve())
         with self.database.transaction(immediate=True) as connection:
             connection.execute(
-                "INSERT INTO projects(id, name, path) VALUES (?, ?, ?)",
-                (project_id, name, resolved),
+                "INSERT INTO projects(id, name, path, host_path) VALUES (?, ?, ?, ?)",
+                (project_id, name, resolved, host_path),
             )
             for kind in DEFAULT_ROLES:
                 connection.execute(
@@ -43,7 +43,8 @@ class ProjectRepository:
             workers = connection.execute(
                 """
                 SELECT w.id, w.role_id, r.kind role, w.provider, w.session_id,
-                       w.session_generation, w.status, w.active_task_id, w.released_at
+                       w.external_session_id, w.session_generation, w.status,
+                       w.active_task_id, w.last_seen_at, w.last_error, w.released_at
                 FROM workers w JOIN roles r ON r.id = w.role_id
                 WHERE w.project_id = ? ORDER BY r.kind
                 """,
@@ -51,6 +52,7 @@ class ProjectRepository:
             ).fetchall()
             return {
                 "id": row["id"], "name": row["name"], "path": row["path"],
+                "host_path": row["host_path"],
                 "status": row["status"], "created_at": row["created_at"],
                 "roles": [dict(item) for item in roles],
                 "workers": [dict(item) for item in workers],
@@ -73,7 +75,7 @@ class ProjectRepository:
         try:
             row = connection.execute(
                 """
-                SELECT p.path project_path, p.status project_status, r.id role_id
+                SELECT p.path project_path, p.host_path, p.status project_status, r.id role_id
                 FROM projects p JOIN roles r ON r.project_id = p.id
                 WHERE p.id = ? AND r.kind = ?
                 """,
@@ -150,7 +152,8 @@ class ProjectRepository:
             session_id = str(uuid.uuid4())
             connection.execute(
                 """
-                UPDATE workers SET session_id = ?, session_generation = session_generation + 1,
+                UPDATE workers SET session_id = ?, external_session_id = NULL,
+                    last_error = NULL, session_generation = session_generation + 1,
                     updated_at = CURRENT_TIMESTAMP WHERE id = ?
                 """,
                 (session_id, worker_id),
@@ -158,9 +161,46 @@ class ProjectRepository:
             updated = connection.execute(
                 """
                 SELECT w.id, w.role_id, r.kind role, w.provider, w.session_id,
-                       w.session_generation, w.status, w.active_task_id, w.released_at
+                       w.external_session_id, w.session_generation, w.status,
+                       w.active_task_id, w.last_seen_at, w.last_error, w.released_at
                 FROM workers w JOIN roles r ON r.id = w.role_id WHERE w.id = ?
                 """,
                 (worker_id,),
             ).fetchone()
             return dict(updated)
+
+    def rebind_worker(self, worker_id: str, *, provider: str, reason: str) -> dict[str, Any]:
+        with self.database.transaction(immediate=True) as connection:
+            worker = connection.execute(
+                "SELECT * FROM workers WHERE id = ?", (worker_id,)
+            ).fetchone()
+            if worker is None:
+                raise NotFoundError(f"worker not found: {worker_id}")
+            if worker["status"] != "idle":
+                raise InvalidTransitionError("only an idle worker can be rebound")
+            configured = connection.execute(
+                "SELECT enabled FROM provider_configs WHERE name = ?", (provider,)
+            ).fetchone()
+            if configured is None or not configured["enabled"]:
+                raise InvalidTransitionError("target provider is not enabled")
+            connection.execute(
+                """
+                INSERT INTO worker_session_archives(
+                    worker_id, project_id, role_id, session_id, session_generation, reason
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    worker_id, worker["project_id"], worker["role_id"], worker["session_id"],
+                    worker["session_generation"], reason,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE workers SET provider = ?, session_id = ?, external_session_id = NULL,
+                    last_error = NULL, session_generation = session_generation + 1,
+                    updated_at = CURRENT_TIMESTAMP WHERE id = ?
+                """,
+                (provider, str(uuid.uuid4()), worker_id),
+            )
+        project = self.get(worker["project_id"])
+        return next(item for item in project["workers"] if item["id"] == worker_id)

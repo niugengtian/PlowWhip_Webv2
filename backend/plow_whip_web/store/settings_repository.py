@@ -10,9 +10,12 @@ from plow_whip_web.store.database import Database
 DEFAULT_SETTINGS: dict[str, Any] = {
     "scheduler_interval_seconds": 30,
     "scheduler_lease_seconds": 90,
+    "cron_enabled": True,
+    "cron_expression": "*/1 * * * *",
+    "cron_timezone": "Asia/Shanghai",
+    "cron_misfire_policy": "catch_up_once",
     "max_parallel_workers": 4,
     "auto_dispatch": True,
-    "system_scheduler_authorized": False,
     "task_default_token_budget": 50_000,
     "global_daily_token_budget": 500_000,
     "max_same_failure": 3,

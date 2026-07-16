@@ -11,6 +11,10 @@ class Settings:
     database_name: str = "plow-whip-web.sqlite3"
     bind_host: str = "127.0.0.1"
     api_token: str | None = None
+    embedded_cron: bool = False
+    container_loopback: bool = False
+    host_bridge_url: str = "http://host.docker.internal:8765"
+    host_bridge_token: str | None = None
 
     @property
     def database_path(self) -> Path:
@@ -23,6 +27,8 @@ class Settings:
 
     @property
     def is_loopback(self) -> bool:
+        if self.container_loopback:
+            return True
         if self.bind_host == "localhost":
             return True
         try:

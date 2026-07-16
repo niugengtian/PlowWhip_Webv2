@@ -1,5 +1,7 @@
 # plow-whip Web v2 产品与架构设计
 
+> Sprint 7 架构修订（2026-07-17）：运行基线改为 Docker-first。Python、Web、SQLite 和单一全局 Cron engine 均位于容器；SQLite/日志使用 `/data` named volume，项目使用 `/projects` named volume。本文中宿主 OS scheduler、系统权限申请与 launchd/systemd/Task Scheduler 安装设计已废止，以 `ARCHITECTURE.md`、`RUNBOOK.md` 和 `SPRINT_7_EVIDENCE.md` 为准。
+
 > 状态：重写基线草案
 > 日期：2026-07-16
 > 核心方向：不依赖 Codex、Cursor、OpenClaw 或任何现成 Agent Runtime。plow-whip 自己提供 Web 控制面、状态机、上下文编译、模型调用、工具执行、验证和停止条件。

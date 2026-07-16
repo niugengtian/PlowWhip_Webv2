@@ -19,6 +19,7 @@ class ExecutionResult:
     failure_class: str | None = None
     input_tokens: int = 0
     output_tokens: int = 0
+    external_session_id: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -29,6 +30,7 @@ class ExecutionResult:
             "failure_class": self.failure_class,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
+            "external_session_id": self.external_session_id,
         }
 
 

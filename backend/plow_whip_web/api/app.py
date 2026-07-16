@@ -14,13 +14,16 @@ from plow_whip_web import __version__
 from plow_whip_web.api.schemas import (
     ExpectedRevision,
     ConventionPut,
+    ConventionRefineRequest,
     ProjectCreate,
     ProjectView,
+    ProviderPut,
     PermissionGrantCreate,
     RestoreRequest,
     RuntimeSettingsUpdate,
     RuntimeSettingsView,
     RotateWorkerRequest,
+    RebindWorkerRequest,
     TaskCreate,
     TaskControl,
     TaskEventView,
@@ -38,6 +41,7 @@ from plow_whip_web.domain.model import (
 )
 from plow_whip_web.runtime.task_service import TaskService
 from plow_whip_web.runtime.scheduler import SchedulerService
+from plow_whip_web.runtime.cron import EmbeddedCronRunner, schedule_view
 from plow_whip_web.runtime.budget import BudgetManager
 from plow_whip_web.runtime.context import ContextCompiler
 from plow_whip_web.runtime.journal import SessionJournal
@@ -54,7 +58,8 @@ from plow_whip_web.store.audit_repository import AuditRepository
 from plow_whip_web.store.permission_repository import PermissionRepository
 from plow_whip_web.store.provider_repository import ProviderRepository
 from plow_whip_web.store.task_repository import TaskRepository
-from plow_whip_web.system_scheduler import SystemScheduler
+from plow_whip_web.providers.host_bridge import HostBridgeClient
+from plow_whip_web.providers.pool import ProviderPool
 from plow_whip_web.roles import ROLE_PROMPTS
 from plow_whip_web.maintenance import MaintenanceService
 
@@ -76,18 +81,26 @@ def create_app(settings: Settings) -> FastAPI:
     audit = AuditRepository(database)
     permissions = PermissionRepository(database)
     providers = ProviderRepository(database)
+    provider_pool = ProviderPool(
+        database, providers, task_repository,
+        HostBridgeClient(settings.host_bridge_url, settings.host_bridge_token),
+    )
     maintenance = MaintenanceService(
         settings.data_dir, database, runtime_settings, health_repository, providers
     )
     task_service = TaskService(
-        task_repository, budget=budget, context_compiler=context_compiler, journal=journal
+        task_repository, budget=budget, context_compiler=context_compiler, journal=journal,
+        provider_pool=provider_pool,
     )
     scheduler_repository = SchedulerRepository(database)
     scheduler_service = SchedulerService(
         scheduler_repository, runtime_settings, task_repository, task_service,
         connectivity=ConnectivityProbe(), health=health_repository, recovery=recovery,
+        provider_pool=provider_pool,
     )
-    system_scheduler = SystemScheduler(settings.data_dir)
+    embedded_cron_runner = EmbeddedCronRunner(
+        scheduler_service, scheduler_repository, runtime_settings
+    )
 
     app = FastAPI(
         title="plow-whip Web v2",
@@ -102,7 +115,7 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.runtime_settings = runtime_settings
     app.state.scheduler_repository = scheduler_repository
     app.state.scheduler_service = scheduler_service
-    app.state.system_scheduler = system_scheduler
+    app.state.embedded_cron_runner = embedded_cron_runner
     app.state.conventions = conventions
     app.state.budget = budget
     app.state.context_compiler = context_compiler
@@ -113,6 +126,7 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.audit = audit
     app.state.permissions = permissions
     app.state.providers = providers
+    app.state.provider_pool = provider_pool
     app.state.maintenance = maintenance
 
     @app.middleware("http")
@@ -188,14 +202,33 @@ def create_app(settings: Settings) -> FastAPI:
             "anti_loop_guards": True,
             "audited_permissions": True,
             "loopback_default": settings.is_loopback,
-            "system_scheduler": system_scheduler.plan().as_dict(),
-            "sprint": 6,
+            "container_runtime": True,
+            "host_scheduler_required": False,
+            "embedded_cron": True,
+            "docker_managed_sqlite": True,
+            "worker_provider_pool": True,
+            "restricted_host_bridge": True,
+            "convention_refinement": True,
+            "platform_api_key_required": False,
+            "sprint": 8,
         }
 
     @app.get("/api/providers", tags=["providers"])
     def list_providers(request: Request) -> list[dict[str, object]]:
         repository: ProviderRepository = request.app.state.providers
         return repository.list()
+
+    @app.put("/api/providers/{provider_name}", tags=["providers"])
+    def put_provider(request: Request, provider_name: str, payload: ProviderPut) -> dict[str, object]:
+        if provider_name != payload.name:
+            raise DomainError("provider path and payload name differ")
+        repository: ProviderRepository = request.app.state.providers
+        return repository.put(**payload.model_dump())
+
+    @app.post("/api/providers/{provider_name}/probe", tags=["providers"])
+    def probe_provider(request: Request, provider_name: str) -> dict[str, object]:
+        pool: ProviderPool = request.app.state.provider_pool
+        return pool.probe(provider_name)
 
     @app.get("/api/audit", tags=["audit"])
     def audit_log(request: Request, limit: int = 200) -> list[dict[str, object]]:
@@ -254,6 +287,30 @@ def create_app(settings: Settings) -> FastAPI:
             expected_revision=payload.expected_revision,
         )
 
+    @app.post("/api/conventions/{scope}/{scope_id}/refine", tags=["context"])
+    def refine_convention(
+        request: Request, scope: str, scope_id: str, payload: ConventionRefineRequest
+    ) -> dict[str, object]:
+        repository: ConventionRepository = request.app.state.conventions
+        current = repository.get(scope=scope, scope_id=scope_id)
+        projects: ProjectRepository = request.app.state.project_repository
+        project_id = payload.project_id
+        if scope == "project":
+            project_id = scope_id
+        elif scope == "task":
+            task = request.app.state.task_repository.get(scope_id)
+            project_id = task.project_id
+        if not project_id:
+            raise DomainError("全局 Convention 精炼需要指定一个可供 Worker 运行的项目")
+        project = projects.get(project_id)
+        project_path = project["host_path"] or project["path"]
+        pool: ProviderPool = request.app.state.provider_pool
+        return pool.refine_convention(
+            scope=scope, scope_id=scope_id, content=current["content"],
+            source_revision=current["revision"], provider_name=payload.provider,
+            project_path=project_path, instruction=payload.instruction,
+        )
+
     @app.get("/api/tasks/{task_id}/context", tags=["context"])
     def compile_context(request: Request, task_id: str) -> dict[str, object]:
         compiler: ContextCompiler = request.app.state.context_compiler
@@ -309,6 +366,13 @@ def create_app(settings: Settings) -> FastAPI:
         repository: ProjectRepository = request.app.state.project_repository
         return repository.rotate_worker(worker_id, reason=payload.reason)
 
+    @app.post("/api/workers/{worker_id}/rebind", tags=["workforce"])
+    def rebind_worker(request: Request, worker_id: str, payload: RebindWorkerRequest) -> dict[str, object]:
+        repository: ProjectRepository = request.app.state.project_repository
+        return repository.rebind_worker(
+            worker_id, provider=payload.provider, reason=payload.reason
+        )
+
     @app.get("/api/settings", response_model=RuntimeSettingsView, tags=["settings"])
     def get_settings(request: Request) -> RuntimeSettingsView:
         repository: SettingsRepository = request.app.state.runtime_settings
@@ -318,32 +382,24 @@ def create_app(settings: Settings) -> FastAPI:
     def update_settings(request: Request, payload: RuntimeSettingsUpdate) -> RuntimeSettingsView:
         repository: SettingsRepository = request.app.state.runtime_settings
         updated = repository.update(payload.values.model_dump(), expected_revision=payload.expected_revision)
-        if updated["values"]["system_scheduler_authorized"]:
-            permissions_repository: PermissionRepository = request.app.state.permissions
-            target = request.app.state.system_scheduler.plan().target or "unsupported"
-            if not permissions_repository.is_allowed(
-                project_id=None, capability="system_scheduler", resource=target
-            ):
-                permissions_repository.grant(
-                    project_id=None, capability="system_scheduler", resource=target,
-                    decision="allow", reason="authorized from Settings",
-                )
         return RuntimeSettingsView(**updated)
 
     @app.get("/api/scheduler/status", tags=["scheduler"])
     def scheduler_status(request: Request) -> dict[str, object]:
         repository: SchedulerRepository = request.app.state.scheduler_repository
-        manager: SystemScheduler = request.app.state.system_scheduler
         runtime: SettingsRepository = request.app.state.runtime_settings
         values = runtime.get()["values"]
-        target = manager.plan().target or "unsupported"
-        permissions_repository: PermissionRepository = request.app.state.permissions
-        authorized = values["system_scheduler_authorized"] and permissions_repository.is_allowed(
-            project_id=None, capability="system_scheduler", resource=target
-        )
+        runtime_status = repository.status()
         return {
-            "runtime": repository.status(), "system": manager.plan().as_dict(),
-            "authorization_required": not authorized,
+            "runtime": runtime_status,
+            "engine": {
+                "backend": "embedded-cron",
+                "active": request.app.state.settings.embedded_cron and runtime_status["runner_active"],
+                "managed_by": "docker" if request.app.state.settings.container_loopback else "process",
+                "data_dir": str(request.app.state.settings.data_dir),
+            },
+            "schedule": schedule_view(values),
+            "authorization_required": False,
             "model_invoked": False,
         }
 
@@ -352,25 +408,12 @@ def create_app(settings: Settings) -> FastAPI:
         service: SchedulerService = request.app.state.scheduler_service
         return service.tick(owner="web-api")
 
-    @app.post("/api/scheduler/install", tags=["scheduler"])
-    def scheduler_install(request: Request) -> dict[str, object]:
-        manager: SystemScheduler = request.app.state.system_scheduler
-        runtime: SettingsRepository = request.app.state.runtime_settings
-        values = runtime.get()["values"]
-        target = manager.plan().target or "unsupported"
-        permissions_repository: PermissionRepository = request.app.state.permissions
-        authorized = values["system_scheduler_authorized"] and permissions_repository.is_allowed(
-            project_id=None, capability="system_scheduler", resource=target
-        )
-        return manager.install(
-            interval_seconds=values["scheduler_interval_seconds"],
-            authorized=authorized,
-        )
-
     @app.post("/api/projects", response_model=ProjectView, status_code=201, tags=["projects"])
     def create_project(request: Request, payload: ProjectCreate) -> ProjectView:
         repository: ProjectRepository = request.app.state.project_repository
-        return ProjectView(**repository.create(name=payload.name, path=payload.path))
+        return ProjectView(**repository.create(
+            name=payload.name, path=payload.path, host_path=payload.host_path
+        ))
 
     @app.get("/api/projects", response_model=list[ProjectView], tags=["projects"])
     def list_projects(request: Request) -> list[ProjectView]:
