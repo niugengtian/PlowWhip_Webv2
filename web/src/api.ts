@@ -70,6 +70,21 @@ export type SchedulerStatus = {
   authorization_required: boolean
   model_invoked: boolean
 }
+export type Convention = {
+  scope: 'global' | 'project' | 'task'
+  scope_id: string
+  content: string
+  revision: number
+  updated_at: string | null
+}
+export type Usage = {
+  input_tokens: number
+  output_tokens: number
+  total_tokens: number
+  control_tokens: number
+  projects: { project_id: string | null; tokens: number }[]
+  tasks: { task_id: string; tokens: number }[]
+}
 
 export type TaskEvent = {
   sequence: number
@@ -94,6 +109,13 @@ async function request<T>(path: string, options: FetchOptions = {}): Promise<T> 
 }
 
 export const api = {
+  convention: (scope: string, scopeId: string) => request<Convention>(`/api/conventions/${scope}/${scopeId}`),
+  updateConvention: (convention: Convention) =>
+    request<Convention>('/api/conventions', {
+      method: 'PUT',
+      body: JSON.stringify({ ...convention, expected_revision: convention.revision }),
+    }),
+  usage: () => request<Usage>('/api/usage'),
   settings: () => request<RuntimeSettings>('/api/settings'),
   updateSettings: (settings: RuntimeSettings) =>
     request<RuntimeSettings>('/api/settings', {

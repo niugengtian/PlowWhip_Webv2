@@ -1,5 +1,5 @@
 import { FormEvent, useCallback, useEffect, useState } from 'react'
-import { api, Project, RuntimeSettings, SchedulerStatus, Task, TaskEvent } from './api'
+import { api, Convention, Project, RuntimeSettings, SchedulerStatus, Task, TaskEvent, Usage } from './api'
 
 type Health = {
   status: string
@@ -7,7 +7,7 @@ type Health = {
   database: { status: string; journal_mode: string; migration_count: number }
 }
 
-type View = 'today' | 'tasks' | 'projects' | 'workforce' | 'settings'
+type View = 'today' | 'tasks' | 'projects' | 'workforce' | 'usage' | 'settings'
 
 const initialForm = {
   title: 'Create verified result',
@@ -28,6 +28,8 @@ export function App() {
   const [projects, setProjects] = useState<Project[]>([])
   const [runtimeSettings, setRuntimeSettings] = useState<RuntimeSettings | null>(null)
   const [schedulerStatus, setSchedulerStatus] = useState<SchedulerStatus | null>(null)
+  const [usage, setUsage] = useState<Usage | null>(null)
+  const [convention, setConvention] = useState<Convention | null>(null)
   const [selected, setSelected] = useState<Task | null>(null)
   const [events, setEvents] = useState<TaskEvent[]>([])
   const [form, setForm] = useState(initialForm)
@@ -59,6 +61,8 @@ export function App() {
       .catch((reason: unknown) => setError(messageOf(reason)))
     api.settings().then(setRuntimeSettings).catch((reason: unknown) => setError(messageOf(reason)))
     api.schedulerStatus().then(setSchedulerStatus).catch((reason: unknown) => setError(messageOf(reason)))
+    api.usage().then(setUsage).catch((reason: unknown) => setError(messageOf(reason)))
+    api.convention('global', 'global').then(setConvention).catch((reason: unknown) => setError(messageOf(reason)))
   }, [])
 
   useEffect(() => {
@@ -159,6 +163,30 @@ export function App() {
     }
   }
 
+  async function loadConvention(scope: Convention['scope'], scopeId: string) {
+    if (!scopeId) return
+    setError(null)
+    try {
+      setConvention(await api.convention(scope, scopeId))
+    } catch (reason) {
+      setError(messageOf(reason))
+    }
+  }
+
+  async function saveConvention(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!convention) return
+    setBusy(true)
+    setError(null)
+    try {
+      setConvention(await api.updateConvention(convention))
+    } catch (reason) {
+      setError(messageOf(reason))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   async function drive(task: Task) {
     setBusy(true)
     setError(null)
@@ -194,7 +222,7 @@ export function App() {
         <button className={view === 'tasks' ? 'active' : ''} onClick={() => setView('tasks')}>Tasks</button>
         <button className={view === 'projects' ? 'active' : ''} onClick={() => setView('projects')}>Projects</button>
         <button className={view === 'workforce' ? 'active' : ''} onClick={() => setView('workforce')}>Workforce</button>
-        <button disabled>Usage</button><button className={view === 'settings' ? 'active' : ''} onClick={() => setView('settings')}>Settings</button>
+        <button className={view === 'usage' ? 'active' : ''} onClick={() => { setView('usage'); api.usage().then(setUsage) }}>Usage</button><button className={view === 'settings' ? 'active' : ''} onClick={() => setView('settings')}>Settings</button>
       </nav>
 
       <main>
@@ -288,6 +316,12 @@ export function App() {
               }))}
             </div>
           </section>
+        ) : view === 'usage' ? (
+          <section className="task-detail">
+            <div className="section-heading"><div><span className="step">TOKEN LEDGER</span><h2>消费与节省证据</h2></div><button onClick={() => api.usage().then(setUsage)}>刷新</button></div>
+            <section className="metrics usage-metrics"><article><span>Control Token</span><strong>{usage?.control_tokens ?? 0}</strong></article><article><span>Work Token</span><strong>{usage?.total_tokens ?? 0}</strong></article><article><span>Input</span><strong>{usage?.input_tokens ?? 0}</strong></article><article><span>Output</span><strong>{usage?.output_tokens ?? 0}</strong></article></section>
+            <div className="detail-grid"><section><h3>按项目</h3>{usage?.projects.length ? usage.projects.map((item) => <div className="usage-row" key={item.project_id ?? 'unbound'}><span>{projects.find((project) => project.id === item.project_id)?.name ?? item.project_id ?? 'unbound'}</span><strong>{item.tokens}</strong></div>) : <p className="muted">尚无模型 Token 消费。</p>}</section><section><h3>按 Task</h3>{usage?.tasks.length ? usage.tasks.map((item) => <div className="usage-row" key={item.task_id}><span>{tasks.find((task) => task.id === item.task_id)?.title ?? item.task_id}</span><strong>{item.tokens}</strong></div>) : <p className="muted">0 Token 控制链不会制造账单。</p>}</section></div>
+          </section>
         ) : (
           <section className="settings-layout">
             <section className="task-detail scheduler-card">
@@ -315,6 +349,17 @@ export function App() {
               <label className="check"><input type="checkbox" checked={runtimeSettings.values.auto_dispatch} onChange={(event) => setRuntimeSettings({ ...runtimeSettings, values: { ...runtimeSettings.values, auto_dispatch: event.target.checked } })} />无人值守自动派发 Ready Task</label>
               <label className="check"><input type="checkbox" checked={runtimeSettings.values.system_scheduler_authorized} onChange={(event) => setRuntimeSettings({ ...runtimeSettings, values: { ...runtimeSettings.values, system_scheduler_authorized: event.target.checked } })} />授权写入当前用户的系统定时任务</label>
               <button className="primary" disabled={busy}>保存设置</button>
+            </form>}
+            {convention && <form className="task-form" onSubmit={saveConvention}>
+              <span className="step">THREE-SCOPE CONVENTION · REV {convention.revision}</span><h2>约束编辑器</h2>
+              <div className="field-row"><label>作用域<select value={convention.scope} onChange={(event) => {
+                const scope = event.target.value as Convention['scope']
+                const scopeId = scope === 'global' ? 'global' : scope === 'project' ? projects[0]?.id ?? '' : tasks[0]?.id ?? ''
+                loadConvention(scope, scopeId)
+              }}><option value="global">Global</option><option value="project">Project</option><option value="task">Task</option></select></label>
+              <label>目标<select value={convention.scope_id} disabled={convention.scope === 'global'} onChange={(event) => loadConvention(convention.scope, event.target.value)}>{convention.scope === 'global' ? <option value="global">global</option> : convention.scope === 'project' ? projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>) : tasks.map((task) => <option key={task.id} value={task.id}>{task.title}</option>)}</select></label></div>
+              <label>Convention<textarea className="convention-editor" placeholder="质量门、权限边界、项目规范或 Task 特殊约束" value={convention.content} onChange={(event) => setConvention({ ...convention, content: event.target.value })} /></label>
+              <button className="primary" disabled={busy}>保存 Convention</button>
             </form>}
           </section>
         )}

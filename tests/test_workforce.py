@@ -73,6 +73,13 @@ def test_role_worker_session_is_reused_then_released() -> None:
             assert workforce_after_second[0]["session_id"] == first_session
             assert workforce_after_second[0]["status"] == "idle"
 
+            rotated = client.post(
+                f"/api/workers/{first_worker}/rotate", json={"reason": "context_limit"}
+            )
+            assert rotated.status_code == 200
+            assert rotated.json()["session_generation"] == 2
+            assert rotated.json()["session_id"] != first_session
+
             released = client.post(f"/api/projects/{project['id']}/release")
             assert released.status_code == 200
             assert released.json()["status"] == "completed"
@@ -80,7 +87,7 @@ def test_role_worker_session_is_reused_then_released() -> None:
 
         connection = app.state.database.connect()
         try:
-            assert connection.execute("SELECT COUNT(*) FROM worker_session_archives").fetchone()[0] == 1
+            assert connection.execute("SELECT COUNT(*) FROM worker_session_archives").fetchone()[0] == 2
             assert connection.execute("SELECT COUNT(*) FROM task_leases").fetchone()[0] == 0
             assert connection.execute("SELECT COUNT(*) FROM resource_locks").fetchone()[0] == 0
         finally:

@@ -125,3 +125,42 @@ class ProjectRepository:
                 (project_id,),
             )
         return self.get(project_id)
+
+    def rotate_worker(self, worker_id: str, *, reason: str) -> dict[str, Any]:
+        with self.database.transaction(immediate=True) as connection:
+            worker = connection.execute(
+                """
+                SELECT w.*, r.kind role FROM workers w JOIN roles r ON r.id = w.role_id
+                WHERE w.id = ?
+                """,
+                (worker_id,),
+            ).fetchone()
+            if worker is None:
+                raise NotFoundError(f"worker not found: {worker_id}")
+            if worker["status"] != "idle":
+                raise InvalidTransitionError("only an idle worker session can rotate")
+            connection.execute(
+                """
+                INSERT INTO worker_session_archives(
+                    worker_id, project_id, role_id, session_id, session_generation, reason
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (worker_id, worker["project_id"], worker["role_id"], worker["session_id"], worker["session_generation"], reason),
+            )
+            session_id = str(uuid.uuid4())
+            connection.execute(
+                """
+                UPDATE workers SET session_id = ?, session_generation = session_generation + 1,
+                    updated_at = CURRENT_TIMESTAMP WHERE id = ?
+                """,
+                (session_id, worker_id),
+            )
+            updated = connection.execute(
+                """
+                SELECT w.id, w.role_id, r.kind role, w.provider, w.session_id,
+                       w.session_generation, w.status, w.active_task_id, w.released_at
+                FROM workers w JOIN roles r ON r.id = w.role_id WHERE w.id = ?
+                """,
+                (worker_id,),
+            ).fetchone()
+            return dict(updated)

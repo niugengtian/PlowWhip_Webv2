@@ -48,7 +48,7 @@ class TaskCreate(BaseModel):
     command: CommandSpec
     verification: Annotated[list[VerificationSpec], Field(min_length=1, max_length=32)]
     max_attempts: Annotated[int, Field(ge=1, le=10)] = 1
-    token_budget: Annotated[int, Field(ge=0)] = 0
+    token_budget: Annotated[int | None, Field(ge=0)] = None
 
     @field_validator("project_path")
     @classmethod
@@ -158,3 +158,20 @@ class RuntimeSettingsView(BaseModel):
 class RuntimeSettingsUpdate(BaseModel):
     expected_revision: Annotated[int, Field(ge=0)]
     values: RuntimeSettingsValues
+
+
+class ConventionPut(BaseModel):
+    scope: Literal["global", "project", "task"]
+    scope_id: Annotated[str, Field(min_length=1, max_length=100)]
+    content: Annotated[str, Field(max_length=100_000)]
+    expected_revision: Annotated[int, Field(ge=0)]
+
+    @model_validator(mode="after")
+    def global_scope_id_is_fixed(self) -> "ConventionPut":
+        if self.scope == "global" and self.scope_id != "global":
+            raise ValueError("global convention scope_id must be global")
+        return self
+
+
+class RotateWorkerRequest(BaseModel):
+    reason: Annotated[str, Field(min_length=1, max_length=200)] = "context_rotation"

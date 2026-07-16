@@ -10,10 +10,10 @@ beforeEach(() => {
       const path = String(input)
       return {
         ok: true,
-        json: async () => ['/api/tasks', '/api/projects'].includes(path) ? [] : ({
+        json: async () => ['/api/tasks', '/api/projects'].includes(path) ? [] : path === '/api/usage' ? ({ input_tokens: 0, output_tokens: 0, total_tokens: 0, control_tokens: 0, projects: [], tasks: [] }) : path === '/api/conventions/global/global' ? ({ scope: 'global', scope_id: 'global', content: '', revision: 0, updated_at: null }) : ({
           status: 'ok',
           version: '0.1.0',
-          database: { status: 'ok', journal_mode: 'wal', migration_count: 4 },
+          database: { status: 'ok', journal_mode: 'wal', migration_count: 5 },
         }),
       }
     }),

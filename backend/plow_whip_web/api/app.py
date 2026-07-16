@@ -6,10 +6,12 @@ from fastapi.responses import JSONResponse
 from plow_whip_web import __version__
 from plow_whip_web.api.schemas import (
     ExpectedRevision,
+    ConventionPut,
     ProjectCreate,
     ProjectView,
     RuntimeSettingsUpdate,
     RuntimeSettingsView,
+    RotateWorkerRequest,
     TaskCreate,
     TaskEventView,
     TaskView,
@@ -24,12 +26,17 @@ from plow_whip_web.domain.model import (
 )
 from plow_whip_web.runtime.task_service import TaskService
 from plow_whip_web.runtime.scheduler import SchedulerService
+from plow_whip_web.runtime.budget import BudgetManager
+from plow_whip_web.runtime.context import ContextCompiler
+from plow_whip_web.runtime.journal import SessionJournal
 from plow_whip_web.store.database import Database
+from plow_whip_web.store.convention_repository import ConventionRepository
 from plow_whip_web.store.project_repository import ProjectRepository
 from plow_whip_web.store.scheduler_repository import SchedulerRepository
 from plow_whip_web.store.settings_repository import SettingsRepository
 from plow_whip_web.store.task_repository import TaskRepository
 from plow_whip_web.system_scheduler import SystemScheduler
+from plow_whip_web.roles import ROLE_PROMPTS
 
 
 def create_app(settings: Settings) -> FastAPI:
@@ -38,8 +45,14 @@ def create_app(settings: Settings) -> FastAPI:
     database.migrate()
     task_repository = TaskRepository(database)
     project_repository = ProjectRepository(database)
-    task_service = TaskService(task_repository)
     runtime_settings = SettingsRepository(database)
+    conventions = ConventionRepository(database)
+    budget = BudgetManager(database, runtime_settings)
+    context_compiler = ContextCompiler(settings.data_dir, database, task_repository, conventions, runtime_settings)
+    journal = SessionJournal(settings.data_dir, runtime_settings)
+    task_service = TaskService(
+        task_repository, budget=budget, context_compiler=context_compiler, journal=journal
+    )
     scheduler_repository = SchedulerRepository(database)
     scheduler_service = SchedulerService(scheduler_repository, runtime_settings, task_repository, task_service)
     system_scheduler = SystemScheduler(settings.data_dir)
@@ -58,6 +71,10 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.scheduler_repository = scheduler_repository
     app.state.scheduler_service = scheduler_service
     app.state.system_scheduler = system_scheduler
+    app.state.conventions = conventions
+    app.state.budget = budget
+    app.state.context_compiler = context_compiler
+    app.state.journal = journal
 
     @app.exception_handler(NotFoundError)
     async def not_found_handler(_request: Request, error: NotFoundError) -> JSONResponse:
@@ -97,9 +114,43 @@ def create_app(settings: Settings) -> FastAPI:
             "multi_project": True,
             "durable_worker_sessions": True,
             "zero_token_scheduler": True,
+            "compiled_context": True,
+            "three_scope_conventions": True,
             "system_scheduler": system_scheduler.plan().as_dict(),
-            "sprint": 3,
+            "sprint": 4,
         }
+
+    @app.get("/api/roles", tags=["context"])
+    def role_templates() -> dict[str, str]:
+        return ROLE_PROMPTS
+
+    @app.get("/api/conventions/{scope}/{scope_id}", tags=["context"])
+    def get_convention(request: Request, scope: str, scope_id: str) -> dict[str, object]:
+        repository: ConventionRepository = request.app.state.conventions
+        return repository.get(scope=scope, scope_id=scope_id)
+
+    @app.put("/api/conventions", tags=["context"])
+    def put_convention(request: Request, payload: ConventionPut) -> dict[str, object]:
+        repository: ConventionRepository = request.app.state.conventions
+        return repository.put(
+            scope=payload.scope, scope_id=payload.scope_id, content=payload.content,
+            expected_revision=payload.expected_revision,
+        )
+
+    @app.get("/api/tasks/{task_id}/context", tags=["context"])
+    def compile_context(request: Request, task_id: str) -> dict[str, object]:
+        compiler: ContextCompiler = request.app.state.context_compiler
+        return compiler.compile(task_id)
+
+    @app.get("/api/usage", tags=["usage"])
+    def usage(request: Request) -> dict[str, object]:
+        manager: BudgetManager = request.app.state.budget
+        return manager.summary()
+
+    @app.post("/api/workers/{worker_id}/rotate", tags=["workforce"])
+    def rotate_worker(request: Request, worker_id: str, payload: RotateWorkerRequest) -> dict[str, object]:
+        repository: ProjectRepository = request.app.state.project_repository
+        return repository.rotate_worker(worker_id, reason=payload.reason)
 
     @app.get("/api/settings", response_model=RuntimeSettingsView, tags=["settings"])
     def get_settings(request: Request) -> RuntimeSettingsView:
@@ -173,6 +224,7 @@ def create_app(settings: Settings) -> FastAPI:
             project_path = binding["project_path"]
             role_id = binding["role_id"]
         assert project_path is not None
+        default_budget = runtime_settings.get()["values"]["task_default_token_budget"]
         record = repository.create(
             title=payload.title,
             objective=payload.objective,
@@ -180,7 +232,7 @@ def create_app(settings: Settings) -> FastAPI:
             command=payload.command.model_dump(),
             verification=[item.model_dump(exclude_none=True) for item in payload.verification],
             max_attempts=payload.max_attempts,
-            token_budget=payload.token_budget,
+            token_budget=payload.token_budget if payload.token_budget is not None else default_budget,
             idempotency_key=idempotency_key,
             project_id=payload.project_id,
             role_id=role_id,

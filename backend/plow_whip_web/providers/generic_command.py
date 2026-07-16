@@ -34,6 +34,10 @@ class GenericCommandProvider:
     name = "generic-command"
     model_invoked = False
 
+    @staticmethod
+    def estimate_tokens(_command: dict[str, Any]) -> int:
+        return 0
+
     def execute(self, project_path: Path, command: dict[str, Any]) -> ExecutionResult:
         argv = command["argv"]
         timeout_seconds = int(command.get("timeout_seconds", 60))
