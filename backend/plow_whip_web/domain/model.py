@@ -28,6 +28,10 @@ class TaskRecord:
     title: str
     objective: str
     project_path: str
+    project_id: str | None
+    role_id: str | None
+    worker_id: str | None
+    resource_key: str | None
     status: TaskStatus
     revision: int
     command: dict[str, Any]
@@ -55,4 +59,8 @@ class RevisionConflictError(DomainError):
 
 
 class InvalidTransitionError(DomainError):
+    pass
+
+
+class ResourceBusyError(DomainError):
     pass

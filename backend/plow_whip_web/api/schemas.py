@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -41,7 +41,10 @@ class VerificationSpec(BaseModel):
 class TaskCreate(BaseModel):
     title: Annotated[str, Field(min_length=1, max_length=200)]
     objective: Annotated[str, Field(min_length=1, max_length=4000)]
-    project_path: str
+    project_path: str | None = None
+    project_id: str | None = None
+    role: Literal["coordination", "fullstack", "web3", "devops_sre", "verification"] = "fullstack"
+    resource_key: Annotated[str | None, Field(max_length=300)] = None
     command: CommandSpec
     verification: Annotated[list[VerificationSpec], Field(min_length=1, max_length=32)]
     max_attempts: Annotated[int, Field(ge=1, le=10)] = 1
@@ -49,11 +52,19 @@ class TaskCreate(BaseModel):
 
     @field_validator("project_path")
     @classmethod
-    def project_path_must_exist(cls, value: str) -> str:
+    def project_path_must_exist(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         path = Path(value).expanduser().resolve()
         if not path.is_dir():
             raise ValueError("project_path must be an existing directory")
         return str(path)
+
+    @model_validator(mode="after")
+    def project_reference_required(self) -> "TaskCreate":
+        if self.project_id is None and self.project_path is None:
+            raise ValueError("project_id or project_path is required")
+        return self
 
 
 class ExpectedRevision(BaseModel):
@@ -65,6 +76,10 @@ class TaskView(BaseModel):
     title: str
     objective: str
     project_path: str
+    project_id: str | None
+    role_id: str | None
+    worker_id: str | None
+    resource_key: str | None
     status: TaskStatus
     revision: int
     command: dict[str, object]
@@ -89,3 +104,26 @@ class TaskEventView(BaseModel):
     payload: dict[str, object]
     state_revision: int
     created_at: str
+
+
+class ProjectCreate(BaseModel):
+    name: Annotated[str, Field(min_length=1, max_length=120)]
+    path: str
+
+    @field_validator("path")
+    @classmethod
+    def path_must_exist(cls, value: str) -> str:
+        path = Path(value).expanduser().resolve()
+        if not path.is_dir():
+            raise ValueError("path must be an existing directory")
+        return str(path)
+
+
+class ProjectView(BaseModel):
+    id: str
+    name: str
+    path: str
+    status: str
+    created_at: str
+    roles: list[dict[str, Any]]
+    workers: list[dict[str, Any]]

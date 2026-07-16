@@ -10,10 +10,10 @@ beforeEach(() => {
       const path = String(input)
       return {
         ok: true,
-        json: async () => path === '/api/tasks' ? [] : ({
+        json: async () => ['/api/tasks', '/api/projects'].includes(path) ? [] : ({
           status: 'ok',
           version: '0.1.0',
-          database: { status: 'ok', journal_mode: 'wal', migration_count: 2 },
+          database: { status: 'ok', journal_mode: 'wal', migration_count: 3 },
         }),
       }
     }),

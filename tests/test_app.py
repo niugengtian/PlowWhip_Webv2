@@ -19,7 +19,7 @@ def test_health_reports_wal_and_migration() -> None:
     payload = response.json()
     assert payload["status"] == "ok"
     assert payload["database"]["journal_mode"] == "wal"
-    assert payload["database"]["migration_count"] == 2
+    assert payload["database"]["migration_count"] == 3
 
 
 def test_capabilities_are_zero_token_and_desktop_free() -> None:
@@ -29,9 +29,10 @@ def test_capabilities_are_zero_token_and_desktop_free() -> None:
             response = client.get("/api/system/capabilities")
 
     assert response.status_code == 200
-    assert response.json() == {
-        "web_control_plane": True,
-        "desktop_required": False,
-        "model_invoked": False,
-        "sprint": 1,
-    }
+    payload = response.json()
+    assert payload["web_control_plane"] is True
+    assert payload["desktop_required"] is False
+    assert payload["model_invoked"] is False
+    assert payload["multi_project"] is True
+    assert payload["durable_worker_sessions"] is True
+    assert payload["sprint"] == 2

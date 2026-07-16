@@ -9,6 +9,7 @@ from plow_whip_web.domain.model import (
     InvalidTransitionError,
     NotFoundError,
     RevisionConflictError,
+    ResourceBusyError,
     TaskRecord,
     TaskStatus,
     TERMINAL_TASK_STATUSES,
@@ -39,6 +40,9 @@ class TaskRepository:
         max_attempts: int,
         token_budget: int,
         idempotency_key: str,
+        project_id: str | None = None,
+        role_id: str | None = None,
+        resource_key: str | None = None,
     ) -> TaskRecord:
         with self.database.transaction(immediate=True) as connection:
             duplicate = connection.execute(
@@ -52,8 +56,9 @@ class TaskRepository:
                 """
                 INSERT INTO tasks(
                     id, title, objective, project_path, status, revision,
-                    command_json, verification_json, max_attempts, token_budget
-                ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+                    command_json, verification_json, max_attempts, token_budget,
+                    project_id, role_id, resource_key
+                ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -65,6 +70,9 @@ class TaskRepository:
                     _dump(verification),
                     max_attempts,
                     token_budget,
+                    project_id,
+                    role_id,
+                    resource_key,
                 ),
             )
             self._event(
@@ -137,19 +145,21 @@ class TaskRepository:
                 raise InvalidTransitionError(f"task is not ready: {task.status}")
             if task.attempts_used >= task.max_attempts:
                 raise InvalidTransitionError("task attempt budget exhausted")
+            worker_id, lease_token, fencing_token = self._acquire_worker_and_lock(connection, task)
             attempt_id = str(uuid.uuid4())
             run_id = str(uuid.uuid4())
             next_revision = task.revision + 1
             attempt_number = task.attempts_used + 1
             cursor = connection.execute(
                 """
-                UPDATE tasks SET status = ?, revision = ?, attempts_used = ?, updated_at = CURRENT_TIMESTAMP
+                UPDATE tasks SET status = ?, revision = ?, attempts_used = ?, worker_id = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE id = ? AND revision = ? AND status = ?
                 """,
                 (
                     TaskStatus.RUNNING.value,
                     next_revision,
                     attempt_number,
+                    worker_id,
                     task.id,
                     task.revision,
                     TaskStatus.READY.value,
@@ -172,7 +182,10 @@ class TaskRepository:
                 connection,
                 task_id=task.id,
                 event_type="attempt.started",
-                payload={"attempt_id": attempt_id, "run_id": run_id, "attempt_number": attempt_number},
+                payload={
+                    "attempt_id": attempt_id, "run_id": run_id, "attempt_number": attempt_number,
+                    "worker_id": worker_id, "lease_token": lease_token, "fencing_token": fencing_token,
+                },
                 revision=next_revision,
                 idempotency_key=idempotency_key,
             )
@@ -240,6 +253,7 @@ class TaskRepository:
                     task.revision,
                 ),
             )
+            self._release_worker_and_lock(connection, task.id, task.worker_id)
             connection.execute(
                 "UPDATE task_attempts SET status = ?, finished_at = CURRENT_TIMESTAMP WHERE id = ?",
                 ("completed" if passed else "failed", attempt_id),
@@ -266,6 +280,73 @@ class TaskRepository:
                 idempotency_key=idempotency_key,
             )
             return self._get_with_connection(connection, task.id)
+
+    def _acquire_worker_and_lock(self, connection: Any, task: TaskRecord) -> tuple[str | None, str | None, int | None]:
+        if task.project_id is None or task.role_id is None:
+            return None, None, None
+        connection.execute("DELETE FROM resource_locks WHERE expires_at <= CURRENT_TIMESTAMP")
+        connection.execute("DELETE FROM task_leases WHERE expires_at <= CURRENT_TIMESTAMP")
+        worker = connection.execute(
+            "SELECT * FROM workers WHERE project_id = ? AND role_id = ?",
+            (task.project_id, task.role_id),
+        ).fetchone()
+        if worker is None:
+            worker_id = str(uuid.uuid4())
+            connection.execute(
+                """
+                INSERT INTO workers(id, project_id, role_id, provider, session_id)
+                VALUES (?, ?, ?, 'generic-command', ?)
+                """,
+                (worker_id, task.project_id, task.role_id, str(uuid.uuid4())),
+            )
+        else:
+            worker_id = worker["id"]
+            if worker["status"] != "idle":
+                raise ResourceBusyError(f"role worker is busy: {worker_id}")
+        resource_key = task.resource_key or f"project:{task.project_id}"
+        collision = connection.execute(
+            "SELECT task_id FROM resource_locks WHERE resource_key = ?",
+            (resource_key,),
+        ).fetchone()
+        if collision:
+            raise ResourceBusyError(f"resource is busy: {resource_key}")
+        connection.execute(
+            "UPDATE projects SET next_fencing_token = next_fencing_token + 1 WHERE id = ?",
+            (task.project_id,),
+        )
+        fencing_token = connection.execute(
+            "SELECT next_fencing_token FROM projects WHERE id = ?", (task.project_id,)
+        ).fetchone()[0]
+        lease_token = str(uuid.uuid4())
+        connection.execute(
+            """
+            INSERT INTO task_leases(task_id, worker_id, lease_token, fencing_token, expires_at)
+            VALUES (?, ?, ?, ?, datetime('now', '+5 minutes'))
+            """,
+            (task.id, worker_id, lease_token, fencing_token),
+        )
+        connection.execute(
+            """
+            INSERT INTO resource_locks(resource_key, project_id, task_id, worker_id, lease_token, expires_at)
+            VALUES (?, ?, ?, ?, ?, datetime('now', '+5 minutes'))
+            """,
+            (resource_key, task.project_id, task.id, worker_id, lease_token),
+        )
+        connection.execute(
+            "UPDATE workers SET status = 'busy', active_task_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (task.id, worker_id),
+        )
+        return worker_id, lease_token, fencing_token
+
+    @staticmethod
+    def _release_worker_and_lock(connection: Any, task_id: str, worker_id: str | None) -> None:
+        connection.execute("DELETE FROM resource_locks WHERE task_id = ?", (task_id,))
+        connection.execute("DELETE FROM task_leases WHERE task_id = ?", (task_id,))
+        if worker_id:
+            connection.execute(
+                "UPDATE workers SET status = 'idle', active_task_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND active_task_id = ?",
+                (worker_id, task_id),
+            )
 
     def _transition(
         self,
@@ -338,6 +419,10 @@ def _task_from_row(row: Any) -> TaskRecord:
         title=row["title"],
         objective=row["objective"],
         project_path=row["project_path"],
+        project_id=row["project_id"],
+        role_id=row["role_id"],
+        worker_id=row["worker_id"],
+        resource_key=row["resource_key"],
         status=TaskStatus(row["status"]),
         revision=row["revision"],
         command=json.loads(row["command_json"]),
