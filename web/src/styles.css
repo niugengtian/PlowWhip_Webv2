@@ -82,11 +82,22 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .worker-grid dl div { display: grid; grid-template-columns: 70px minmax(0, 1fr); gap: 8px; padding: 8px 0; border-top: 1px solid #e2e7e3; }
 .worker-grid dt { color: #6a756d; }
 .worker-grid dd { margin: 0; overflow-wrap: anywhere; }
+.settings-layout { display: grid; gap: 24px; }
+.scheduler-card dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 28px; }
+.scheduler-card dl div { display: grid; grid-template-columns: 130px minmax(0, 1fr); padding: 12px 0; border-bottom: 1px solid #e2e7e3; }
+.scheduler-card dt { color: #6a756d; }
+.scheduler-card dd { margin: 0; overflow-wrap: anywhere; }
+.action-row { display: flex; gap: 10px; margin-top: 20px; }
+.action-row button { border: 1px solid #b9c6bc; border-radius: 8px; background: transparent; padding: 10px 14px; cursor: pointer; }
+.action-row .primary { border: 0; background: #1d4d2e; }
+.settings-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0 14px; }
+.settings-form .check { display: flex; grid-template-columns: auto 1fr; align-items: center; }
+.settings-form .check input { width: auto; }
 
 @media (max-width: 760px) {
   .topbar { align-items: flex-start; flex-direction: column; }
   .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .empty, .workspace-grid, .detail-grid, .worker-grid { grid-template-columns: 1fr; }
+  .empty, .workspace-grid, .detail-grid, .worker-grid, .settings-grid, .scheduler-card dl { grid-template-columns: 1fr; }
   .field-row { grid-template-columns: 1fr; }
 }
 

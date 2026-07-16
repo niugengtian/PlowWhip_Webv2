@@ -127,3 +127,34 @@ class ProjectView(BaseModel):
     created_at: str
     roles: list[dict[str, Any]]
     workers: list[dict[str, Any]]
+
+
+class RuntimeSettingsValues(BaseModel):
+    scheduler_interval_seconds: Annotated[int, Field(ge=10, le=3600)] = 30
+    scheduler_lease_seconds: Annotated[int, Field(ge=30, le=7200)] = 90
+    max_parallel_workers: Annotated[int, Field(ge=1, le=64)] = 4
+    auto_dispatch: bool = True
+    system_scheduler_authorized: bool = False
+    task_default_token_budget: Annotated[int, Field(ge=0, le=100_000_000)] = 50_000
+    global_daily_token_budget: Annotated[int, Field(ge=0, le=1_000_000_000)] = 500_000
+    max_same_failure: Annotated[int, Field(ge=1, le=20)] = 3
+    max_no_progress: Annotated[int, Field(ge=1, le=20)] = 3
+    context_max_bytes: Annotated[int, Field(ge=4096, le=1_048_576)] = 32_768
+    rotation_max_bytes: Annotated[int, Field(ge=16_384, le=16_777_216)] = 262_144
+
+    @model_validator(mode="after")
+    def lease_must_exceed_interval(self) -> "RuntimeSettingsValues":
+        if self.scheduler_lease_seconds < self.scheduler_interval_seconds * 2:
+            raise ValueError("scheduler lease must be at least twice the interval")
+        return self
+
+
+class RuntimeSettingsView(BaseModel):
+    revision: int
+    values: RuntimeSettingsValues
+    updated_at: str | None
+
+
+class RuntimeSettingsUpdate(BaseModel):
+    expected_revision: Annotated[int, Field(ge=0)]
+    values: RuntimeSettingsValues

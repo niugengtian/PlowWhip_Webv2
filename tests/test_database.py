@@ -9,6 +9,8 @@ from plow_whip_web.store.database import Database
 def test_migrations_are_idempotent() -> None:
     with TemporaryDirectory() as directory:
         database = Database(Path(directory) / "test.sqlite3")
-        assert database.migrate() == ["0001_initial.sql", "0002_tasks.sql", "0003_workforce.sql"]
+        assert database.migrate() == [
+            "0001_initial.sql", "0002_tasks.sql", "0003_workforce.sql", "0004_scheduler.sql"
+        ]
         assert database.migrate() == []
-        assert database.health()["migration_count"] == 3
+        assert database.health()["migration_count"] == 4

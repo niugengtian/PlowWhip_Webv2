@@ -19,7 +19,7 @@ def test_health_reports_wal_and_migration() -> None:
     payload = response.json()
     assert payload["status"] == "ok"
     assert payload["database"]["journal_mode"] == "wal"
-    assert payload["database"]["migration_count"] == 3
+    assert payload["database"]["migration_count"] == 4
 
 
 def test_capabilities_are_zero_token_and_desktop_free() -> None:
@@ -35,4 +35,5 @@ def test_capabilities_are_zero_token_and_desktop_free() -> None:
     assert payload["model_invoked"] is False
     assert payload["multi_project"] is True
     assert payload["durable_worker_sessions"] is True
-    assert payload["sprint"] == 2
+    assert payload["zero_token_scheduler"] is True
+    assert payload["sprint"] == 3

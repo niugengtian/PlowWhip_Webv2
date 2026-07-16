@@ -13,7 +13,7 @@ beforeEach(() => {
         json: async () => ['/api/tasks', '/api/projects'].includes(path) ? [] : ({
           status: 'ok',
           version: '0.1.0',
-          database: { status: 'ok', journal_mode: 'wal', migration_count: 3 },
+          database: { status: 'ok', journal_mode: 'wal', migration_count: 4 },
         }),
       }
     }),

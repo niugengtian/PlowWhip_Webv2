@@ -8,6 +8,8 @@ from plow_whip_web.api.schemas import (
     ExpectedRevision,
     ProjectCreate,
     ProjectView,
+    RuntimeSettingsUpdate,
+    RuntimeSettingsView,
     TaskCreate,
     TaskEventView,
     TaskView,
@@ -21,9 +23,13 @@ from plow_whip_web.domain.model import (
     ResourceBusyError,
 )
 from plow_whip_web.runtime.task_service import TaskService
+from plow_whip_web.runtime.scheduler import SchedulerService
 from plow_whip_web.store.database import Database
 from plow_whip_web.store.project_repository import ProjectRepository
+from plow_whip_web.store.scheduler_repository import SchedulerRepository
+from plow_whip_web.store.settings_repository import SettingsRepository
 from plow_whip_web.store.task_repository import TaskRepository
+from plow_whip_web.system_scheduler import SystemScheduler
 
 
 def create_app(settings: Settings) -> FastAPI:
@@ -33,6 +39,10 @@ def create_app(settings: Settings) -> FastAPI:
     task_repository = TaskRepository(database)
     project_repository = ProjectRepository(database)
     task_service = TaskService(task_repository)
+    runtime_settings = SettingsRepository(database)
+    scheduler_repository = SchedulerRepository(database)
+    scheduler_service = SchedulerService(scheduler_repository, runtime_settings, task_repository, task_service)
+    system_scheduler = SystemScheduler(settings.data_dir)
 
     app = FastAPI(
         title="plow-whip Web v2",
@@ -44,6 +54,10 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.task_repository = task_repository
     app.state.project_repository = project_repository
     app.state.task_service = task_service
+    app.state.runtime_settings = runtime_settings
+    app.state.scheduler_repository = scheduler_repository
+    app.state.scheduler_service = scheduler_service
+    app.state.system_scheduler = system_scheduler
 
     @app.exception_handler(NotFoundError)
     async def not_found_handler(_request: Request, error: NotFoundError) -> JSONResponse:
@@ -82,8 +96,47 @@ def create_app(settings: Settings) -> FastAPI:
             "model_invoked": False,
             "multi_project": True,
             "durable_worker_sessions": True,
-            "sprint": 2,
+            "zero_token_scheduler": True,
+            "system_scheduler": system_scheduler.plan().as_dict(),
+            "sprint": 3,
         }
+
+    @app.get("/api/settings", response_model=RuntimeSettingsView, tags=["settings"])
+    def get_settings(request: Request) -> RuntimeSettingsView:
+        repository: SettingsRepository = request.app.state.runtime_settings
+        return RuntimeSettingsView(**repository.get())
+
+    @app.put("/api/settings", response_model=RuntimeSettingsView, tags=["settings"])
+    def update_settings(request: Request, payload: RuntimeSettingsUpdate) -> RuntimeSettingsView:
+        repository: SettingsRepository = request.app.state.runtime_settings
+        return RuntimeSettingsView(**repository.update(payload.values.model_dump(), expected_revision=payload.expected_revision))
+
+    @app.get("/api/scheduler/status", tags=["scheduler"])
+    def scheduler_status(request: Request) -> dict[str, object]:
+        repository: SchedulerRepository = request.app.state.scheduler_repository
+        manager: SystemScheduler = request.app.state.system_scheduler
+        runtime: SettingsRepository = request.app.state.runtime_settings
+        values = runtime.get()["values"]
+        return {
+            "runtime": repository.status(), "system": manager.plan().as_dict(),
+            "authorization_required": not values["system_scheduler_authorized"],
+            "model_invoked": False,
+        }
+
+    @app.post("/api/scheduler/tick", tags=["scheduler"])
+    def scheduler_tick(request: Request) -> dict[str, object]:
+        service: SchedulerService = request.app.state.scheduler_service
+        return service.tick(owner="web-api")
+
+    @app.post("/api/scheduler/install", tags=["scheduler"])
+    def scheduler_install(request: Request) -> dict[str, object]:
+        manager: SystemScheduler = request.app.state.system_scheduler
+        runtime: SettingsRepository = request.app.state.runtime_settings
+        values = runtime.get()["values"]
+        return manager.install(
+            interval_seconds=values["scheduler_interval_seconds"],
+            authorized=values["system_scheduler_authorized"],
+        )
 
     @app.post("/api/projects", response_model=ProjectView, status_code=201, tags=["projects"])
     def create_project(request: Request, payload: ProjectCreate) -> ProjectView:

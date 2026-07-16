@@ -1,5 +1,5 @@
 import { FormEvent, useCallback, useEffect, useState } from 'react'
-import { api, Project, Task, TaskEvent } from './api'
+import { api, Project, RuntimeSettings, SchedulerStatus, Task, TaskEvent } from './api'
 
 type Health = {
   status: string
@@ -7,7 +7,7 @@ type Health = {
   database: { status: string; journal_mode: string; migration_count: number }
 }
 
-type View = 'today' | 'tasks' | 'projects' | 'workforce'
+type View = 'today' | 'tasks' | 'projects' | 'workforce' | 'settings'
 
 const initialForm = {
   title: 'Create verified result',
@@ -26,6 +26,8 @@ export function App() {
   const [health, setHealth] = useState<Health | null>(null)
   const [tasks, setTasks] = useState<Task[]>([])
   const [projects, setProjects] = useState<Project[]>([])
+  const [runtimeSettings, setRuntimeSettings] = useState<RuntimeSettings | null>(null)
+  const [schedulerStatus, setSchedulerStatus] = useState<SchedulerStatus | null>(null)
   const [selected, setSelected] = useState<Task | null>(null)
   const [events, setEvents] = useState<TaskEvent[]>([])
   const [form, setForm] = useState(initialForm)
@@ -55,6 +57,8 @@ export function App() {
     api.projects()
       .then(setProjects)
       .catch((reason: unknown) => setError(messageOf(reason)))
+    api.settings().then(setRuntimeSettings).catch((reason: unknown) => setError(messageOf(reason)))
+    api.schedulerStatus().then(setSchedulerStatus).catch((reason: unknown) => setError(messageOf(reason)))
   }, [])
 
   useEffect(() => {
@@ -125,6 +129,36 @@ export function App() {
     }
   }
 
+  async function saveSettings(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!runtimeSettings) return
+    setBusy(true)
+    setError(null)
+    try {
+      setRuntimeSettings(await api.updateSettings(runtimeSettings))
+      setSchedulerStatus(await api.schedulerStatus())
+    } catch (reason) {
+      setError(messageOf(reason))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function schedulerAction(action: 'tick' | 'install') {
+    setBusy(true)
+    setError(null)
+    try {
+      if (action === 'tick') await api.schedulerTick()
+      else await api.schedulerInstall()
+      setSchedulerStatus(await api.schedulerStatus())
+      await refreshTasks()
+    } catch (reason) {
+      setError(messageOf(reason))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   async function drive(task: Task) {
     setBusy(true)
     setError(null)
@@ -160,7 +194,7 @@ export function App() {
         <button className={view === 'tasks' ? 'active' : ''} onClick={() => setView('tasks')}>Tasks</button>
         <button className={view === 'projects' ? 'active' : ''} onClick={() => setView('projects')}>Projects</button>
         <button className={view === 'workforce' ? 'active' : ''} onClick={() => setView('workforce')}>Workforce</button>
-        <button disabled>Usage</button><button disabled>Settings</button>
+        <button disabled>Usage</button><button className={view === 'settings' ? 'active' : ''} onClick={() => setView('settings')}>Settings</button>
       </nav>
 
       <main>
@@ -244,7 +278,7 @@ export function App() {
               </article>)}
             </section>
           </section>
-        ) : (
+        ) : view === 'workforce' ? (
           <section className="task-detail">
             <div className="section-heading"><div><span className="step">PROJECT · ROLE · CLI SESSION</span><h2>Worker 状态</h2></div><button onClick={refreshProjects}>刷新</button></div>
             <div className="worker-grid">
@@ -253,6 +287,35 @@ export function App() {
                 return <article key={role.id}><small>{project.name}</small><h3>{role.kind}</h3><span className={`task-status status-${worker?.status ?? 'not_hired'}`}>{worker?.status ?? 'not hired'}</span><dl><div><dt>Provider</dt><dd>{worker?.provider ?? '—'}</dd></div><div><dt>Session</dt><dd className="hash">{worker?.session_id ?? '按需创建'}</dd></div><div><dt>Task</dt><dd className="hash">{worker?.active_task_id ?? '—'}</dd></div></dl></article>
               }))}
             </div>
+          </section>
+        ) : (
+          <section className="settings-layout">
+            <section className="task-detail scheduler-card">
+              <div className="section-heading"><div><span className="step">ZERO TOKEN CONTROL PATH</span><h2>系统调度器</h2></div><span className={`task-status ${schedulerStatus?.authorization_required ? 'status-terminal_failed' : 'status-completed'}`}>{schedulerStatus?.authorization_required ? '等待授权安装' : '已授权'}</span></div>
+              <dl>
+                <div><dt>OS / Backend</dt><dd>{schedulerStatus ? `${schedulerStatus.system.os} · ${schedulerStatus.system.backend}` : '检测中'}</dd></div>
+                <div><dt>Target</dt><dd className="hash">{schedulerStatus?.system.target ?? '—'}</dd></div>
+                <div><dt>Fencing</dt><dd>{schedulerStatus?.runtime.fencing_token ?? 0}</dd></div>
+                <div><dt>Last tick</dt><dd>{schedulerStatus?.runtime.last_tick_at ?? '尚未运行'}</dd></div>
+                <div><dt>Control model</dt><dd>{schedulerStatus?.model_invoked ? 'invoked' : '0 Token / never invoked'}</dd></div>
+              </dl>
+              <div className="action-row"><button disabled={busy} onClick={() => schedulerAction('tick')}>立即运行 Tick</button><button className="primary" disabled={busy || schedulerStatus?.authorization_required} onClick={() => schedulerAction('install')}>安装单一系统定时任务</button></div>
+            </section>
+            {runtimeSettings && <form className="task-form settings-form" onSubmit={saveSettings}>
+              <span className="step">CONTROL PLANE SETTINGS · REV {runtimeSettings.revision}</span><h2>运行参数</h2>
+              <div className="settings-grid">
+                {([
+                  ['scheduler_interval_seconds', 'Tick 间隔（秒）'], ['scheduler_lease_seconds', '调度租约（秒）'],
+                  ['max_parallel_workers', '最大并行 Worker'], ['task_default_token_budget', 'Task 默认 Token 预算'],
+                  ['global_daily_token_budget', '全局每日 Token 预算'], ['max_same_failure', '同类失败熔断次数'],
+                  ['max_no_progress', '无进展熔断次数'], ['context_max_bytes', 'Context 最大字节'],
+                  ['rotation_max_bytes', '文件轮转字节'],
+                ] as const).map(([key, label]) => <label key={key}>{label}<input type="number" value={runtimeSettings.values[key]} onChange={(event) => setRuntimeSettings({ ...runtimeSettings, values: { ...runtimeSettings.values, [key]: Number(event.target.value) } })} /></label>)}
+              </div>
+              <label className="check"><input type="checkbox" checked={runtimeSettings.values.auto_dispatch} onChange={(event) => setRuntimeSettings({ ...runtimeSettings, values: { ...runtimeSettings.values, auto_dispatch: event.target.checked } })} />无人值守自动派发 Ready Task</label>
+              <label className="check"><input type="checkbox" checked={runtimeSettings.values.system_scheduler_authorized} onChange={(event) => setRuntimeSettings({ ...runtimeSettings, values: { ...runtimeSettings.values, system_scheduler_authorized: event.target.checked } })} />授权写入当前用户的系统定时任务</label>
+              <button className="primary" disabled={busy}>保存设置</button>
+            </form>}
           </section>
         )}
       </main>
