@@ -6,6 +6,7 @@ export type TaskStatus =
   | 'terminal_failed'
   | 'needs_human'
   | 'cancelled'
+  | 'paused'
 
 export type Task = {
   id: string
@@ -16,6 +17,11 @@ export type Task = {
   role_id: string | null
   worker_id: string | null
   resource_key: string | null
+  network_requirement: 'none' | 'any' | 'domestic' | 'overseas'
+  same_failure_count: number
+  no_progress_count: number
+  last_failure_fingerprint: string | null
+  next_eligible_at: string | null
   status: TaskStatus
   revision: number
   max_attempts: number
@@ -85,6 +91,22 @@ export type Usage = {
   projects: { project_id: string | null; tokens: number }[]
   tasks: { task_id: string; tokens: number }[]
 }
+export type RuntimeHealth = {
+  connectivity: string
+  domestic_ok: number | null
+  overseas_ok: number | null
+  last_tick_at: string | null
+  last_resume_at: string | null
+  consecutive_failures: number
+}
+export type OutboxEvent = {
+  sequence: number
+  event_type: string
+  aggregate_id: string
+  payload: Record<string, unknown>
+  created_at: string
+  delivered_at: string | null
+}
 
 export type TaskEvent = {
   sequence: number
@@ -109,6 +131,9 @@ async function request<T>(path: string, options: FetchOptions = {}): Promise<T> 
 }
 
 export const api = {
+  runtimeHealth: () => request<RuntimeHealth>('/api/system/health'),
+  recover: () => request<Record<string, unknown>>('/api/system/recover', { method: 'POST' }),
+  outbox: () => request<OutboxEvent[]>('/api/outbox'),
   convention: (scope: string, scopeId: string) => request<Convention>(`/api/conventions/${scope}/${scopeId}`),
   updateConvention: (convention: Convention) =>
     request<Convention>('/api/conventions', {
@@ -143,5 +168,11 @@ export const api = {
       method: 'POST',
       idempotencyKey: crypto.randomUUID(),
       body: JSON.stringify({ expected_revision: task.revision }),
+    }),
+  controlTask: (task: Task, action: 'pause' | 'resume' | 'cancel' | 'needs_human', reason: string) =>
+    request<Task>(`/api/tasks/${task.id}/control`, {
+      method: 'POST',
+      idempotencyKey: crypto.randomUUID(),
+      body: JSON.stringify({ action, reason, expected_revision: task.revision }),
     }),
 }

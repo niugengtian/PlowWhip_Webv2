@@ -30,4 +30,4 @@ pnpm run build
 
 Backend 默认监听 `127.0.0.1:8742`，Frontend 开发服务器默认监听 `127.0.0.1:5173`。
 
-当前已完成 Sprint 0–4：独立基础设施、可验证任务闭环、多项目与 Worker 会话、单一 0 Token 系统调度器、三层 Convention、压缩 Context Pack、Token 预算账本和日志切割轮转。
+当前已完成 Sprint 0–5：前述能力之外，已加入人工控制、断网/飞行模式、休眠与崩溃恢复、持久 Outbox/SSE、数据库锁退避，以及基于证据指纹的防死循环机制。

@@ -13,6 +13,7 @@ class TaskStatus(StrEnum):
     TERMINAL_FAILED = "terminal_failed"
     NEEDS_HUMAN = "needs_human"
     CANCELLED = "cancelled"
+    PAUSED = "paused"
 
 
 TERMINAL_TASK_STATUSES = {
@@ -32,6 +33,11 @@ class TaskRecord:
     role_id: str | None
     worker_id: str | None
     resource_key: str | None
+    network_requirement: str
+    same_failure_count: int
+    no_progress_count: int
+    last_failure_fingerprint: str | None
+    next_eligible_at: str | None
     status: TaskStatus
     revision: int
     command: dict[str, Any]

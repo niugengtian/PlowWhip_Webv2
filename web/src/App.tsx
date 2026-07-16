@@ -1,5 +1,5 @@
 import { FormEvent, useCallback, useEffect, useState } from 'react'
-import { api, Convention, Project, RuntimeSettings, SchedulerStatus, Task, TaskEvent, Usage } from './api'
+import { api, Convention, OutboxEvent, Project, RuntimeHealth, RuntimeSettings, SchedulerStatus, Task, TaskEvent, Usage } from './api'
 
 type Health = {
   status: string
@@ -15,6 +15,7 @@ const initialForm = {
   projectPath: '',
   projectId: '',
   role: 'fullstack',
+  networkRequirement: 'none',
   executable: 'python3',
   argumentsJson: '["-c", "from pathlib import Path; Path(\'result.txt\').write_text(\'quality-pass\', encoding=\'utf-8\')"]',
   verifyPath: 'result.txt',
@@ -30,6 +31,8 @@ export function App() {
   const [schedulerStatus, setSchedulerStatus] = useState<SchedulerStatus | null>(null)
   const [usage, setUsage] = useState<Usage | null>(null)
   const [convention, setConvention] = useState<Convention | null>(null)
+  const [runtimeHealth, setRuntimeHealth] = useState<RuntimeHealth | null>(null)
+  const [outbox, setOutbox] = useState<OutboxEvent[]>([])
   const [selected, setSelected] = useState<Task | null>(null)
   const [events, setEvents] = useState<TaskEvent[]>([])
   const [form, setForm] = useState(initialForm)
@@ -63,6 +66,8 @@ export function App() {
     api.schedulerStatus().then(setSchedulerStatus).catch((reason: unknown) => setError(messageOf(reason)))
     api.usage().then(setUsage).catch((reason: unknown) => setError(messageOf(reason)))
     api.convention('global', 'global').then(setConvention).catch((reason: unknown) => setError(messageOf(reason)))
+    api.runtimeHealth().then(setRuntimeHealth).catch((reason: unknown) => setError(messageOf(reason)))
+    api.outbox().then(setOutbox).catch((reason: unknown) => setError(messageOf(reason)))
   }, [])
 
   useEffect(() => {
@@ -87,6 +92,7 @@ export function App() {
         title: form.title,
         objective: form.objective,
         ...(form.projectId ? { project_id: form.projectId, role: form.role } : { project_path: form.projectPath }),
+        network_requirement: form.networkRequirement,
         command: { argv: [form.executable, ...args] },
         verification: [
           { kind: 'exit_code', expected: 0 },
@@ -202,6 +208,21 @@ export function App() {
     }
   }
 
+  async function control(task: Task, action: 'pause' | 'resume' | 'cancel' | 'needs_human') {
+    setBusy(true)
+    setError(null)
+    try {
+      const updated = await api.controlTask(task, action, `operator_${action}`)
+      setSelected(updated)
+      await refreshTasks()
+      setOutbox(await api.outbox())
+    } catch (reason) {
+      setError(messageOf(reason))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const active = tasks.filter((task) => !['completed', 'terminal_failed', 'cancelled'].includes(task.status))
   const modelRuns = tasks.reduce((total, task) => total + task.attempts_used, 0)
 
@@ -213,7 +234,7 @@ export function App() {
           <h1>无人值守工作控制台</h1>
         </div>
         <span className={`status ${health ? 'healthy' : ''}`}>
-          {health ? 'Runtime healthy' : error ? 'Runtime offline' : 'Connecting'}
+          {health ? `Runtime healthy · ${runtimeHealth?.connectivity ?? 'probing'}` : error ? 'Runtime offline' : 'Connecting'}
         </span>
       </header>
 
@@ -227,6 +248,7 @@ export function App() {
 
       <main>
         {error && <div className="error" role="alert">{error}</div>}
+        {outbox.filter((item) => !item.delivered_at).map((item) => <div className="human-alert" key={item.sequence}><strong>Needs you</strong><span>{String(item.payload.reason ?? item.event_type)}</span></div>)}
         {view === 'today' ? (
           <>
             <section className="hero">
@@ -253,6 +275,7 @@ export function App() {
                   <label>Executable<input required value={form.executable} onChange={(event) => setForm({ ...form, executable: event.target.value })} /></label>
                   <label>验证文件<input required value={form.verifyPath} onChange={(event) => setForm({ ...form, verifyPath: event.target.value })} /></label>
                 </div>
+                <label>网络要求<select value={form.networkRequirement} onChange={(event) => setForm({ ...form, networkRequirement: event.target.value })}><option value="none">无需网络（离线可运行）</option><option value="any">任意网络</option><option value="domestic">国内网络</option><option value="overseas">海外网络</option></select></label>
                 <label>Arguments JSON<textarea required value={form.argumentsJson} onChange={(event) => setForm({ ...form, argumentsJson: event.target.value })} /></label>
                 <label>文件必须包含<input required value={form.verifyText} onChange={(event) => setForm({ ...form, verifyText: event.target.value })} /></label>
                 <button className="primary" disabled={busy}>{busy ? '处理中…' : '创建 Task'}</button>
@@ -270,7 +293,7 @@ export function App() {
           </>
         ) : view === 'tasks' ? (
           <section className="task-detail">
-            <div className="section-heading"><div><span className="step">TASK DETAIL</span><h2>{selected?.title ?? '选择一个 Task'}</h2></div>{selected?.status === 'ready' && <button className="primary" disabled={busy} onClick={() => drive(selected)}>Drive + Verify</button>}</div>
+            <div className="section-heading"><div><span className="step">TASK DETAIL</span><h2>{selected?.title ?? '选择一个 Task'}</h2></div>{selected && <div className="compact-actions">{selected.status === 'ready' && <><button className="primary" disabled={busy} onClick={() => drive(selected)}>Drive + Verify</button><button disabled={busy} onClick={() => control(selected, 'pause')}>暂停</button><button disabled={busy} onClick={() => control(selected, 'needs_human')}>转人工</button></>}{['paused', 'needs_human'].includes(selected.status) && <button className="primary" disabled={busy} onClick={() => control(selected, 'resume')}>恢复</button>}{['ready', 'paused', 'needs_human'].includes(selected.status) && <button className="danger" disabled={busy} onClick={() => control(selected, 'cancel')}>取消</button>}</div>}</div>
             {selected ? (
               <div className="detail-grid">
                 <dl>
@@ -280,6 +303,8 @@ export function App() {
                   <div><dt>Task Token</dt><dd>{selected.tokens_used}</dd></div>
                   <div><dt>Project</dt><dd>{selected.project_path}</dd></div>
                   <div><dt>Worker</dt><dd className="hash">{selected.worker_id ?? 'unbound'}</dd></div>
+                  <div><dt>Network</dt><dd>{selected.network_requirement}</dd></div>
+                  <div><dt>Loop guard</dt><dd>{selected.same_failure_count} same / {selected.no_progress_count} no progress</dd></div>
                   <div><dt>Evidence</dt><dd className="hash">{selected.last_evidence_hash ?? '—'}</dd></div>
                 </dl>
                 <div className="timeline">

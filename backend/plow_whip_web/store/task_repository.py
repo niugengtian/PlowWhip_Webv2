@@ -43,6 +43,7 @@ class TaskRepository:
         project_id: str | None = None,
         role_id: str | None = None,
         resource_key: str | None = None,
+        network_requirement: str = "none",
     ) -> TaskRecord:
         with self.database.transaction(immediate=True) as connection:
             duplicate = connection.execute(
@@ -57,8 +58,8 @@ class TaskRepository:
                 INSERT INTO tasks(
                     id, title, objective, project_path, status, revision,
                     command_json, verification_json, max_attempts, token_budget,
-                    project_id, role_id, resource_key
-                ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
+                    project_id, role_id, resource_key, network_requirement
+                ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -73,6 +74,7 @@ class TaskRepository:
                     project_id,
                     role_id,
                     resource_key,
+                    network_requirement,
                 ),
             )
             self._event(
@@ -97,6 +99,21 @@ class TaskRepository:
         try:
             rows = connection.execute(
                 "SELECT * FROM tasks ORDER BY created_at DESC, id DESC LIMIT ?", (limit,)
+            ).fetchall()
+            return [_task_from_row(row) for row in rows]
+        finally:
+            connection.close()
+
+    def list_ready(self, *, limit: int = 100) -> list[TaskRecord]:
+        connection = self.database.connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT * FROM tasks WHERE status = 'ready'
+                AND (next_eligible_at IS NULL OR next_eligible_at <= CURRENT_TIMESTAMP)
+                ORDER BY created_at, id LIMIT ?
+                """,
+                (limit,),
             ).fetchall()
             return [_task_from_row(row) for row in rows]
         finally:
@@ -218,9 +235,10 @@ class TaskRepository:
         execution: dict[str, Any],
         verification: dict[str, Any],
         idempotency_key: str,
+        max_same_failure: int = 3,
+        max_no_progress: int = 3,
     ) -> TaskRecord:
         passed = bool(verification["passed"])
-        target = TaskStatus.COMPLETED if passed else TaskStatus.TERMINAL_FAILED
         with self.database.transaction(immediate=True) as connection:
             duplicate = connection.execute(
                 "SELECT task_id FROM task_events WHERE idempotency_key = ?",
@@ -235,12 +253,25 @@ class TaskRepository:
                 )
             if task.status is not TaskStatus.VERIFYING:
                 raise InvalidTransitionError(f"task is not verifying: {task.status}")
+            fingerprint = verification["evidence_hash"]
+            same_failure_count = 0 if passed else (
+                task.same_failure_count + 1 if task.last_failure_fingerprint == fingerprint else 1
+            )
+            no_progress_count = 0 if passed else same_failure_count
+            can_retry = (
+                not passed and task.attempts_used < task.max_attempts
+                and same_failure_count < max_same_failure and no_progress_count < max_no_progress
+            )
+            target = TaskStatus.COMPLETED if passed else (TaskStatus.READY if can_retry else TaskStatus.TERMINAL_FAILED)
             next_revision = task.revision + 1
             token_delta = int(execution.get("input_tokens", 0)) + int(execution.get("output_tokens", 0))
             connection.execute(
                 """
                 UPDATE tasks SET status = ?, revision = ?, tokens_used = tokens_used + ?,
-                    last_evidence_hash = ?, last_error = ?, updated_at = CURRENT_TIMESTAMP
+                    last_evidence_hash = ?, last_error = ?, same_failure_count = ?,
+                    no_progress_count = ?, last_failure_fingerprint = ?,
+                    next_eligible_at = CASE WHEN ? THEN datetime('now', ?) ELSE NULL END,
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE id = ? AND revision = ?
                 """,
                 (
@@ -249,6 +280,11 @@ class TaskRepository:
                     token_delta,
                     verification["evidence_hash"],
                     None if passed else verification["summary"],
+                    same_failure_count,
+                    no_progress_count,
+                    None if passed else fingerprint,
+                    1 if can_retry else 0,
+                    f"+{min(300, 2 ** task.attempts_used)} seconds",
                     task.id,
                     task.revision,
                 ),
@@ -274,11 +310,62 @@ class TaskRepository:
             self._event(
                 connection,
                 task_id=task.id,
-                event_type="task.completed" if passed else "task.terminal_failed",
+                event_type="task.completed" if passed else ("task.retry_scheduled" if can_retry else "task.terminal_failed"),
                 payload={"attempt_id": attempt_id, "run_id": run_id, "verification": verification},
                 revision=next_revision,
                 idempotency_key=idempotency_key,
             )
+            return self._get_with_connection(connection, task.id)
+
+    def control(
+        self, task_id: str, *, action: str, reason: str, expected_revision: int,
+        idempotency_key: str,
+    ) -> TaskRecord:
+        with self.database.transaction(immediate=True) as connection:
+            duplicate = connection.execute(
+                "SELECT task_id FROM task_events WHERE idempotency_key = ?", (idempotency_key,)
+            ).fetchone()
+            if duplicate:
+                return self._get_with_connection(connection, duplicate["task_id"])
+            task = self._get_with_connection(connection, task_id)
+            if task.revision != expected_revision:
+                raise RevisionConflictError(
+                    f"expected revision {expected_revision}, current revision {task.revision}"
+                )
+            if task.status in TERMINAL_TASK_STATUSES:
+                raise InvalidTransitionError(f"terminal task cannot be controlled: {task.status}")
+            transitions = {
+                "pause": ({TaskStatus.READY, TaskStatus.NEEDS_HUMAN}, TaskStatus.PAUSED),
+                "resume": ({TaskStatus.PAUSED, TaskStatus.NEEDS_HUMAN}, TaskStatus.READY),
+                "needs_human": ({TaskStatus.READY, TaskStatus.PAUSED}, TaskStatus.NEEDS_HUMAN),
+                "cancel": ({TaskStatus.READY, TaskStatus.PAUSED, TaskStatus.NEEDS_HUMAN}, TaskStatus.CANCELLED),
+            }
+            if action not in transitions:
+                raise InvalidTransitionError(f"unsupported control action: {action}")
+            allowed, target = transitions[action]
+            if task.status not in allowed:
+                raise InvalidTransitionError(f"cannot {action} task in state {task.status}")
+            revision = task.revision + 1
+            connection.execute(
+                "UPDATE tasks SET status = ?, revision = ?, next_eligible_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (target.value, revision, task.id),
+            )
+            connection.execute(
+                "INSERT INTO task_controls(task_id, action, reason) VALUES (?, ?, ?)",
+                (task.id, action, reason),
+            )
+            self._event(
+                connection, task_id=task.id, event_type=f"task.{action}", payload={"reason": reason},
+                revision=revision, idempotency_key=idempotency_key,
+            )
+            if target is TaskStatus.NEEDS_HUMAN:
+                connection.execute(
+                    """
+                    INSERT INTO outbox_events(topic, aggregate_id, event_type, payload_json)
+                    VALUES ('task', ?, 'task.needs_human', ?)
+                    """,
+                    (task.id, _dump({"task_id": task.id, "reason": reason})),
+                )
             return self._get_with_connection(connection, task.id)
 
     def _acquire_worker_and_lock(self, connection: Any, task: TaskRecord) -> tuple[str | None, str | None, int | None]:
@@ -318,19 +405,21 @@ class TaskRepository:
             "SELECT next_fencing_token FROM projects WHERE id = ?", (task.project_id,)
         ).fetchone()[0]
         lease_token = str(uuid.uuid4())
+        lease_seconds = max(300, int(task.command.get("timeout_seconds", 60)) + 60)
+        lease_modifier = f"+{lease_seconds} seconds"
         connection.execute(
             """
             INSERT INTO task_leases(task_id, worker_id, lease_token, fencing_token, expires_at)
-            VALUES (?, ?, ?, ?, datetime('now', '+5 minutes'))
+            VALUES (?, ?, ?, ?, datetime('now', ?))
             """,
-            (task.id, worker_id, lease_token, fencing_token),
+            (task.id, worker_id, lease_token, fencing_token, lease_modifier),
         )
         connection.execute(
             """
             INSERT INTO resource_locks(resource_key, project_id, task_id, worker_id, lease_token, expires_at)
-            VALUES (?, ?, ?, ?, ?, datetime('now', '+5 minutes'))
+            VALUES (?, ?, ?, ?, ?, datetime('now', ?))
             """,
-            (resource_key, task.project_id, task.id, worker_id, lease_token),
+            (resource_key, task.project_id, task.id, worker_id, lease_token, lease_modifier),
         )
         connection.execute(
             "UPDATE workers SET status = 'busy', active_task_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -423,6 +512,11 @@ def _task_from_row(row: Any) -> TaskRecord:
         role_id=row["role_id"],
         worker_id=row["worker_id"],
         resource_key=row["resource_key"],
+        network_requirement=row["network_requirement"],
+        same_failure_count=row["same_failure_count"],
+        no_progress_count=row["no_progress_count"],
+        last_failure_fingerprint=row["last_failure_fingerprint"],
+        next_eligible_at=row["next_eligible_at"],
         status=TaskStatus(row["status"]),
         revision=row["revision"],
         command=json.loads(row["command_json"]),
