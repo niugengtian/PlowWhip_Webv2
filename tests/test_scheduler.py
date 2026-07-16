@@ -113,3 +113,22 @@ def test_scheduler_api_exposes_capability_without_installing() -> None:
         assert install.status_code == 200
         assert install.json()["installed"] is False
         assert install.json()["authorization_required"] is True
+
+
+def test_scheduler_authorization_creates_durable_permission_record() -> None:
+    with TemporaryDirectory() as directory:
+        app = create_app(Settings(data_dir=Path(directory) / "runtime"))
+        with TestClient(app) as client:
+            settings = client.get("/api/settings").json()
+            settings["values"]["system_scheduler_authorized"] = True
+            updated = client.put(
+                "/api/settings",
+                json={"expected_revision": settings["revision"], "values": settings["values"]},
+            )
+            status = client.get("/api/scheduler/status")
+            permissions = client.get("/api/permissions").json()
+        assert updated.status_code == 200
+        assert status.json()["authorization_required"] is False
+        grant = next(item for item in permissions if item["capability"] == "system_scheduler")
+        assert grant["decision"] == "allow"
+        assert grant["reason"] == "authorized from Settings"

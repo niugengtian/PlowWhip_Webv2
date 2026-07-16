@@ -7,6 +7,8 @@ from pathlib import Path
 from time import monotonic
 from typing import Any
 
+from plow_whip_web.security import Redactor
+
 
 @dataclass(frozen=True, slots=True)
 class ExecutionResult:
@@ -43,11 +45,8 @@ class GenericCommandProvider:
         timeout_seconds = int(command.get("timeout_seconds", 60))
         output_limit = int(command.get("output_limit_bytes", 131_072))
         started = monotonic()
-        child_env = {
-            key: value
-            for key, value in os.environ.items()
-            if not key.startswith("COV_CORE_") and not key.startswith("COVERAGE_")
-        }
+        allowed_environment = {"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "TERM", "SYSTEMROOT", "WINDIR"}
+        child_env = {key: value for key, value in os.environ.items() if key in allowed_environment}
         try:
             completed = subprocess.run(
                 argv,
@@ -62,8 +61,8 @@ class GenericCommandProvider:
         except subprocess.TimeoutExpired as error:
             return ExecutionResult(
                 returncode=124,
-                stdout=_bounded_text(error.stdout, output_limit),
-                stderr=_bounded_text(error.stderr, output_limit),
+                stdout=Redactor.redact(_bounded_text(error.stdout, output_limit)),
+                stderr=Redactor.redact(_bounded_text(error.stderr, output_limit)),
                 duration_ms=int((monotonic() - started) * 1000),
                 failure_class="timeout",
             )
@@ -71,14 +70,14 @@ class GenericCommandProvider:
             return ExecutionResult(
                 returncode=126,
                 stdout="",
-                stderr=str(error)[:output_limit],
+                stderr=Redactor.redact(str(error)[:output_limit]),
                 duration_ms=int((monotonic() - started) * 1000),
                 failure_class="command_unavailable",
             )
         return ExecutionResult(
             returncode=completed.returncode,
-            stdout=completed.stdout[:output_limit],
-            stderr=completed.stderr[:output_limit],
+            stdout=Redactor.redact(completed.stdout[:output_limit]),
+            stderr=Redactor.redact(completed.stderr[:output_limit]),
             duration_ms=int((monotonic() - started) * 1000),
             failure_class=None if completed.returncode == 0 else "command_failed",
         )

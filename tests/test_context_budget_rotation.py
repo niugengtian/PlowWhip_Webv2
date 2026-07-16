@@ -110,7 +110,7 @@ def test_budget_rejects_before_claim_or_provider_invocation() -> None:
         task = app.state.task_repository.create(
             title="budget", objective="must stop before spend", project_path=str(project),
             command={"argv": ["unused"]}, verification=[{"kind": "exit_code", "expected": 0}],
-            max_attempts=1, token_budget=50, idempotency_key="budget-stop",
+            max_attempts=1, token_budget=50, idempotency_key="budget-stop", provider="token-test",
         )
         provider = TokenProvider(estimate=60)
         service = TaskService(
@@ -133,7 +133,7 @@ def test_usage_ledger_tracks_work_tokens_but_control_tokens_stay_zero() -> None:
         task = app.state.task_repository.create(
             title="usage", objective="record tokens", project_path=str(project),
             command={"argv": ["unused"]}, verification=[{"kind": "exit_code", "expected": 0}],
-            max_attempts=1, token_budget=100, idempotency_key="usage-task",
+            max_attempts=1, token_budget=100, idempotency_key="usage-task", provider="token-test",
         )
         service = TaskService(
             app.state.task_repository, provider=TokenProvider(estimate=9, actual=9),

@@ -38,6 +38,8 @@ class TaskRecord:
     no_progress_count: int
     last_failure_fingerprint: str | None
     next_eligible_at: str | None
+    provider: str
+    quality_profile: str
     status: TaskStatus
     revision: int
     command: dict[str, Any]
@@ -69,4 +71,12 @@ class InvalidTransitionError(DomainError):
 
 
 class ResourceBusyError(DomainError):
+    pass
+
+
+class ProviderUnavailableError(DomainError):
+    pass
+
+
+class PolicyViolationError(DomainError):
     pass

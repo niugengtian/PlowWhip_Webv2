@@ -46,6 +46,8 @@ class TaskCreate(BaseModel):
     role: Literal["coordination", "fullstack", "web3", "devops_sre", "verification"] = "fullstack"
     resource_key: Annotated[str | None, Field(max_length=300)] = None
     network_requirement: Literal["none", "any", "domestic", "overseas"] = "none"
+    provider: Literal["generic-command", "codex", "cursor", "claude"] = "generic-command"
+    quality_profile: Literal["fast", "balanced", "strict"] = "balanced"
     command: CommandSpec
     verification: Annotated[list[VerificationSpec], Field(min_length=1, max_length=32)]
     max_attempts: Annotated[int, Field(ge=1, le=10)] = 1
@@ -86,6 +88,8 @@ class TaskView(BaseModel):
     no_progress_count: int
     last_failure_fingerprint: str | None
     next_eligible_at: str | None
+    provider: str
+    quality_profile: str
     status: TaskStatus
     revision: int
     command: dict[str, object]
@@ -187,3 +191,16 @@ class TaskControl(BaseModel):
     action: Literal["pause", "resume", "cancel", "needs_human"]
     reason: Annotated[str, Field(min_length=1, max_length=500)]
     expected_revision: Annotated[int, Field(ge=0)]
+
+
+class PermissionGrantCreate(BaseModel):
+    project_id: str | None = None
+    capability: Literal["project_read", "project_write", "network_domestic", "network_overseas", "system_scheduler", "secret_reference"]
+    resource: Annotated[str, Field(min_length=1, max_length=500)]
+    decision: Literal["allow", "deny"]
+    reason: Annotated[str, Field(min_length=1, max_length=500)]
+
+
+class RestoreRequest(BaseModel):
+    filename: Annotated[str, Field(min_length=1, max_length=200)]
+    confirm: Literal["RESTORE"]

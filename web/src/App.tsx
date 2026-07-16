@@ -1,5 +1,5 @@
 import { FormEvent, useCallback, useEffect, useState } from 'react'
-import { api, Convention, OutboxEvent, Project, RuntimeHealth, RuntimeSettings, SchedulerStatus, Task, TaskEvent, Usage } from './api'
+import { api, AuditEntry, Convention, OutboxEvent, PermissionGrant, Project, Provider, RuntimeHealth, RuntimeSettings, SchedulerStatus, Task, TaskEvent, Usage } from './api'
 
 type Health = {
   status: string
@@ -7,7 +7,7 @@ type Health = {
   database: { status: string; journal_mode: string; migration_count: number }
 }
 
-type View = 'today' | 'tasks' | 'projects' | 'workforce' | 'usage' | 'settings'
+type View = 'today' | 'tasks' | 'projects' | 'workforce' | 'usage' | 'providers' | 'audit' | 'health' | 'settings'
 
 const initialForm = {
   title: 'Create verified result',
@@ -16,6 +16,8 @@ const initialForm = {
   projectId: '',
   role: 'fullstack',
   networkRequirement: 'none',
+  provider: 'generic-command',
+  qualityProfile: 'balanced',
   executable: 'python3',
   argumentsJson: '["-c", "from pathlib import Path; Path(\'result.txt\').write_text(\'quality-pass\', encoding=\'utf-8\')"]',
   verifyPath: 'result.txt',
@@ -33,6 +35,10 @@ export function App() {
   const [convention, setConvention] = useState<Convention | null>(null)
   const [runtimeHealth, setRuntimeHealth] = useState<RuntimeHealth | null>(null)
   const [outbox, setOutbox] = useState<OutboxEvent[]>([])
+  const [providers, setProviders] = useState<Provider[]>([])
+  const [audit, setAudit] = useState<AuditEntry[]>([])
+  const [permissions, setPermissions] = useState<PermissionGrant[]>([])
+  const [maintenanceResult, setMaintenanceResult] = useState<Record<string, unknown> | null>(null)
   const [selected, setSelected] = useState<Task | null>(null)
   const [events, setEvents] = useState<TaskEvent[]>([])
   const [form, setForm] = useState(initialForm)
@@ -68,6 +74,9 @@ export function App() {
     api.convention('global', 'global').then(setConvention).catch((reason: unknown) => setError(messageOf(reason)))
     api.runtimeHealth().then(setRuntimeHealth).catch((reason: unknown) => setError(messageOf(reason)))
     api.outbox().then(setOutbox).catch((reason: unknown) => setError(messageOf(reason)))
+    api.providers().then(setProviders).catch((reason: unknown) => setError(messageOf(reason)))
+    api.audit().then(setAudit).catch((reason: unknown) => setError(messageOf(reason)))
+    api.permissions().then(setPermissions).catch((reason: unknown) => setError(messageOf(reason)))
   }, [])
 
   useEffect(() => {
@@ -93,6 +102,8 @@ export function App() {
         objective: form.objective,
         ...(form.projectId ? { project_id: form.projectId, role: form.role } : { project_path: form.projectPath }),
         network_requirement: form.networkRequirement,
+        provider: form.provider,
+        quality_profile: form.qualityProfile,
         command: { argv: [form.executable, ...args] },
         verification: [
           { kind: 'exit_code', expected: 0 },
@@ -193,6 +204,20 @@ export function App() {
     }
   }
 
+  async function maintenance(action: 'backup' | 'diagnostics' | 'recover') {
+    setBusy(true)
+    setError(null)
+    try {
+      const result = action === 'backup' ? await api.backup() : action === 'diagnostics' ? await api.diagnostics() : await api.recover()
+      setMaintenanceResult(result)
+      setRuntimeHealth(await api.runtimeHealth())
+    } catch (reason) {
+      setError(messageOf(reason))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   async function drive(task: Task) {
     setBusy(true)
     setError(null)
@@ -243,7 +268,11 @@ export function App() {
         <button className={view === 'tasks' ? 'active' : ''} onClick={() => setView('tasks')}>Tasks</button>
         <button className={view === 'projects' ? 'active' : ''} onClick={() => setView('projects')}>Projects</button>
         <button className={view === 'workforce' ? 'active' : ''} onClick={() => setView('workforce')}>Workforce</button>
-        <button className={view === 'usage' ? 'active' : ''} onClick={() => { setView('usage'); api.usage().then(setUsage) }}>Usage</button><button className={view === 'settings' ? 'active' : ''} onClick={() => setView('settings')}>Settings</button>
+        <button className={view === 'usage' ? 'active' : ''} onClick={() => { setView('usage'); api.usage().then(setUsage) }}>Usage</button>
+        <button className={view === 'providers' ? 'active' : ''} onClick={() => setView('providers')}>Providers</button>
+        <button className={view === 'audit' ? 'active' : ''} onClick={() => { setView('audit'); api.audit().then(setAudit) }}>Audit</button>
+        <button className={view === 'health' ? 'active' : ''} onClick={() => { setView('health'); api.runtimeHealth().then(setRuntimeHealth) }}>Health</button>
+        <button className={view === 'settings' ? 'active' : ''} onClick={() => setView('settings')}>Settings</button>
       </nav>
 
       <main>
@@ -276,6 +305,7 @@ export function App() {
                   <label>验证文件<input required value={form.verifyPath} onChange={(event) => setForm({ ...form, verifyPath: event.target.value })} /></label>
                 </div>
                 <label>网络要求<select value={form.networkRequirement} onChange={(event) => setForm({ ...form, networkRequirement: event.target.value })}><option value="none">无需网络（离线可运行）</option><option value="any">任意网络</option><option value="domestic">国内网络</option><option value="overseas">海外网络</option></select></label>
+                <div className="field-row"><label>Provider<select value={form.provider} onChange={(event) => setForm({ ...form, provider: event.target.value })}>{providers.map((provider) => <option key={provider.name} value={provider.name}>{provider.name} · {provider.status}</option>)}</select></label><label>质量档位<select value={form.qualityProfile} onChange={(event) => setForm({ ...form, qualityProfile: event.target.value })}><option value="fast">Fast</option><option value="balanced">Balanced</option><option value="strict">Strict + 独立复核</option></select></label></div>
                 <label>Arguments JSON<textarea required value={form.argumentsJson} onChange={(event) => setForm({ ...form, argumentsJson: event.target.value })} /></label>
                 <label>文件必须包含<input required value={form.verifyText} onChange={(event) => setForm({ ...form, verifyText: event.target.value })} /></label>
                 <button className="primary" disabled={busy}>{busy ? '处理中…' : '创建 Task'}</button>
@@ -305,6 +335,7 @@ export function App() {
                   <div><dt>Worker</dt><dd className="hash">{selected.worker_id ?? 'unbound'}</dd></div>
                   <div><dt>Network</dt><dd>{selected.network_requirement}</dd></div>
                   <div><dt>Loop guard</dt><dd>{selected.same_failure_count} same / {selected.no_progress_count} no progress</dd></div>
+                  <div><dt>Provider</dt><dd>{selected.provider} · {selected.quality_profile}</dd></div>
                   <div><dt>Evidence</dt><dd className="hash">{selected.last_evidence_hash ?? '—'}</dd></div>
                 </dl>
                 <div className="timeline">
@@ -347,6 +378,12 @@ export function App() {
             <section className="metrics usage-metrics"><article><span>Control Token</span><strong>{usage?.control_tokens ?? 0}</strong></article><article><span>Work Token</span><strong>{usage?.total_tokens ?? 0}</strong></article><article><span>Input</span><strong>{usage?.input_tokens ?? 0}</strong></article><article><span>Output</span><strong>{usage?.output_tokens ?? 0}</strong></article></section>
             <div className="detail-grid"><section><h3>按项目</h3>{usage?.projects.length ? usage.projects.map((item) => <div className="usage-row" key={item.project_id ?? 'unbound'}><span>{projects.find((project) => project.id === item.project_id)?.name ?? item.project_id ?? 'unbound'}</span><strong>{item.tokens}</strong></div>) : <p className="muted">尚无模型 Token 消费。</p>}</section><section><h3>按 Task</h3>{usage?.tasks.length ? usage.tasks.map((item) => <div className="usage-row" key={item.task_id}><span>{tasks.find((task) => task.id === item.task_id)?.title ?? item.task_id}</span><strong>{item.tokens}</strong></div>) : <p className="muted">0 Token 控制链不会制造账单。</p>}</section></div>
           </section>
+        ) : view === 'providers' ? (
+          <section className="task-detail"><div className="section-heading"><div><span className="step">CLI WORKER PROVIDERS</span><h2>Provider 能力</h2></div></div><div className="worker-grid">{providers.map((provider) => <article key={provider.name}><small>{provider.model_invoked ? 'Model provider' : '0 Token tool provider'}</small><h3>{provider.name}</h3><span className={`task-status ${provider.status === 'available' ? 'status-completed' : 'status-terminal_failed'}`}>{provider.status}</span><p>{provider.capabilities.join(' · ')}</p><p className="muted">{provider.reason ?? 'ready'}</p></article>)}</div></section>
+        ) : view === 'audit' ? (
+          <section className="task-detail"><div className="section-heading"><div><span className="step">IMMUTABLE LOCAL AUDIT</span><h2>变更审计</h2></div><button onClick={() => api.audit().then(setAudit)}>刷新</button></div><div className="audit-table">{audit.map((entry) => <div key={entry.sequence}><span>{entry.sequence}</span><strong>{entry.method}</strong><code>{entry.path}</code><span>{entry.status_code}</span><small>{entry.created_at}</small></div>)}</div></section>
+        ) : view === 'health' ? (
+          <section className="settings-layout"><section className="task-detail"><div className="section-heading"><div><span className="step">RUNTIME HEALTH</span><h2>{runtimeHealth?.connectivity ?? 'unknown'}</h2></div><span className={`task-status ${runtimeHealth?.connectivity === 'online' ? 'status-completed' : 'status-terminal_failed'}`}>{runtimeHealth?.consecutive_failures ?? 0} failures</span></div><div className="detail-grid"><dl><div><dt>Domestic</dt><dd>{String(runtimeHealth?.domestic_ok ?? 'unknown')}</dd></div><div><dt>Overseas</dt><dd>{String(runtimeHealth?.overseas_ok ?? 'unknown')}</dd></div><div><dt>Last tick</dt><dd>{runtimeHealth?.last_tick_at ?? '—'}</dd></div><div><dt>Last resume</dt><dd>{runtimeHealth?.last_resume_at ?? '—'}</dd></div></dl><div><h3>维护动作</h3><div className="action-row"><button disabled={busy} onClick={() => maintenance('recover')}>运行恢复</button><button disabled={busy} onClick={() => maintenance('backup')}>创建备份</button><button disabled={busy} onClick={() => maintenance('diagnostics')}>诊断包</button></div>{maintenanceResult && <pre className="result-box">{JSON.stringify(maintenanceResult, null, 2)}</pre>}</div></div></section></section>
         ) : (
           <section className="settings-layout">
             <section className="task-detail scheduler-card">
@@ -386,6 +423,7 @@ export function App() {
               <label>Convention<textarea className="convention-editor" placeholder="质量门、权限边界、项目规范或 Task 特殊约束" value={convention.content} onChange={(event) => setConvention({ ...convention, content: event.target.value })} /></label>
               <button className="primary" disabled={busy}>保存 Convention</button>
             </form>}
+            <section className="task-detail"><div className="section-heading"><div><span className="step">PERMISSION RECORDS</span><h2>权限决策</h2></div><button disabled={busy} onClick={async () => { const grant = await api.createPermission({ project_id: null, capability: 'system_scheduler', resource: 'current-user', decision: 'deny', reason: 'explicit default deny' }); setPermissions([grant, ...permissions]) }}>新增默认拒绝记录</button></div>{permissions.map((grant) => <div className="usage-row" key={grant.id}><span>{grant.capability} · {grant.resource}</span><strong>{grant.decision}{grant.revoked_at ? ' · revoked' : ''}</strong></div>)}</section>
           </section>
         )}
       </main>

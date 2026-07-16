@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
+from pathlib import Path
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, Header, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 from plow_whip_web import __version__
 from plow_whip_web.api.schemas import (
@@ -12,6 +16,8 @@ from plow_whip_web.api.schemas import (
     ConventionPut,
     ProjectCreate,
     ProjectView,
+    PermissionGrantCreate,
+    RestoreRequest,
     RuntimeSettingsUpdate,
     RuntimeSettingsView,
     RotateWorkerRequest,
@@ -27,6 +33,8 @@ from plow_whip_web.domain.model import (
     NotFoundError,
     RevisionConflictError,
     ResourceBusyError,
+    ProviderUnavailableError,
+    PolicyViolationError,
 )
 from plow_whip_web.runtime.task_service import TaskService
 from plow_whip_web.runtime.scheduler import SchedulerService
@@ -42,9 +50,13 @@ from plow_whip_web.store.scheduler_repository import SchedulerRepository
 from plow_whip_web.store.settings_repository import SettingsRepository
 from plow_whip_web.store.health_repository import HealthRepository
 from plow_whip_web.store.outbox_repository import OutboxRepository
+from plow_whip_web.store.audit_repository import AuditRepository
+from plow_whip_web.store.permission_repository import PermissionRepository
+from plow_whip_web.store.provider_repository import ProviderRepository
 from plow_whip_web.store.task_repository import TaskRepository
 from plow_whip_web.system_scheduler import SystemScheduler
 from plow_whip_web.roles import ROLE_PROMPTS
+from plow_whip_web.maintenance import MaintenanceService
 
 
 def create_app(settings: Settings) -> FastAPI:
@@ -61,6 +73,12 @@ def create_app(settings: Settings) -> FastAPI:
     health_repository = HealthRepository(database)
     outbox = OutboxRepository(database)
     recovery = RecoveryService(database)
+    audit = AuditRepository(database)
+    permissions = PermissionRepository(database)
+    providers = ProviderRepository(database)
+    maintenance = MaintenanceService(
+        settings.data_dir, database, runtime_settings, health_repository, providers
+    )
     task_service = TaskService(
         task_repository, budget=budget, context_compiler=context_compiler, journal=journal
     )
@@ -92,6 +110,31 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.health_repository = health_repository
     app.state.outbox = outbox
     app.state.recovery = recovery
+    app.state.audit = audit
+    app.state.permissions = permissions
+    app.state.providers = providers
+    app.state.maintenance = maintenance
+
+    @app.middleware("http")
+    async def security_and_audit(request: Request, call_next):
+        actor = "loopback-local"
+        if not settings.is_loopback:
+            expected = f"Bearer {settings.api_token}"
+            supplied = request.headers.get("Authorization", "")
+            if not hmac.compare_digest(supplied, expected):
+                return JSONResponse(status_code=401, content={"detail": "local API authentication required"})
+            origin = request.headers.get("Origin")
+            if origin and urlparse(origin).hostname != request.url.hostname:
+                return JSONResponse(status_code=403, content={"detail": "origin rejected"})
+            actor = "authenticated-local-client"
+        response = await call_next(request)
+        if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+            audit.record(
+                actor=actor, method=request.method, path=request.url.path,
+                status_code=response.status_code,
+                detail={"client": request.client.host if request.client else None},
+            )
+        return response
 
     @app.exception_handler(NotFoundError)
     async def not_found_handler(_request: Request, error: NotFoundError) -> JSONResponse:
@@ -108,6 +151,14 @@ def create_app(settings: Settings) -> FastAPI:
     @app.exception_handler(ResourceBusyError)
     async def resource_busy_handler(_request: Request, error: ResourceBusyError) -> JSONResponse:
         return JSONResponse(status_code=409, content={"detail": str(error), "code": "resource_busy"})
+
+    @app.exception_handler(ProviderUnavailableError)
+    async def provider_unavailable_handler(_request: Request, error: ProviderUnavailableError) -> JSONResponse:
+        return JSONResponse(status_code=409, content={"detail": str(error), "code": "provider_unavailable"})
+
+    @app.exception_handler(PolicyViolationError)
+    async def policy_violation_handler(_request: Request, error: PolicyViolationError) -> JSONResponse:
+        return JSONResponse(status_code=403, content={"detail": str(error), "code": "policy_violation"})
 
     @app.exception_handler(DomainError)
     async def domain_handler(_request: Request, error: DomainError) -> JSONResponse:
@@ -135,9 +186,56 @@ def create_app(settings: Settings) -> FastAPI:
             "three_scope_conventions": True,
             "fault_recovery": True,
             "anti_loop_guards": True,
+            "audited_permissions": True,
+            "loopback_default": settings.is_loopback,
             "system_scheduler": system_scheduler.plan().as_dict(),
-            "sprint": 5,
+            "sprint": 6,
         }
+
+    @app.get("/api/providers", tags=["providers"])
+    def list_providers(request: Request) -> list[dict[str, object]]:
+        repository: ProviderRepository = request.app.state.providers
+        return repository.list()
+
+    @app.get("/api/audit", tags=["audit"])
+    def audit_log(request: Request, limit: int = 200) -> list[dict[str, object]]:
+        repository: AuditRepository = request.app.state.audit
+        return repository.list(limit=min(max(limit, 1), 1000))
+
+    @app.get("/api/permissions", tags=["permissions"])
+    def list_permissions(request: Request) -> list[dict[str, object]]:
+        repository: PermissionRepository = request.app.state.permissions
+        return repository.list()
+
+    @app.post("/api/permissions", tags=["permissions"])
+    def create_permission(request: Request, payload: PermissionGrantCreate) -> dict[str, object]:
+        repository: PermissionRepository = request.app.state.permissions
+        return repository.grant(**payload.model_dump())
+
+    @app.post("/api/permissions/{grant_id}/revoke", tags=["permissions"])
+    def revoke_permission(request: Request, grant_id: str) -> dict[str, bool]:
+        repository: PermissionRepository = request.app.state.permissions
+        return {"revoked": repository.revoke(grant_id)}
+
+    @app.post("/api/maintenance/backup", tags=["maintenance"])
+    def create_backup(request: Request) -> dict[str, object]:
+        service: MaintenanceService = request.app.state.maintenance
+        return service.backup()
+
+    @app.get("/api/maintenance/export", tags=["maintenance"])
+    def export_metadata(request: Request) -> dict[str, object]:
+        service: MaintenanceService = request.app.state.maintenance
+        return service.export_metadata()
+
+    @app.post("/api/maintenance/diagnostics", tags=["maintenance"])
+    def create_diagnostics(request: Request) -> dict[str, object]:
+        service: MaintenanceService = request.app.state.maintenance
+        return service.diagnostics()
+
+    @app.post("/api/maintenance/restore", tags=["maintenance"])
+    def restore_backup(request: Request, payload: RestoreRequest) -> dict[str, object]:
+        service: MaintenanceService = request.app.state.maintenance
+        return service.restore_backup(payload.filename)
 
     @app.get("/api/roles", tags=["context"])
     def role_templates() -> dict[str, str]:
@@ -219,7 +317,18 @@ def create_app(settings: Settings) -> FastAPI:
     @app.put("/api/settings", response_model=RuntimeSettingsView, tags=["settings"])
     def update_settings(request: Request, payload: RuntimeSettingsUpdate) -> RuntimeSettingsView:
         repository: SettingsRepository = request.app.state.runtime_settings
-        return RuntimeSettingsView(**repository.update(payload.values.model_dump(), expected_revision=payload.expected_revision))
+        updated = repository.update(payload.values.model_dump(), expected_revision=payload.expected_revision)
+        if updated["values"]["system_scheduler_authorized"]:
+            permissions_repository: PermissionRepository = request.app.state.permissions
+            target = request.app.state.system_scheduler.plan().target or "unsupported"
+            if not permissions_repository.is_allowed(
+                project_id=None, capability="system_scheduler", resource=target
+            ):
+                permissions_repository.grant(
+                    project_id=None, capability="system_scheduler", resource=target,
+                    decision="allow", reason="authorized from Settings",
+                )
+        return RuntimeSettingsView(**updated)
 
     @app.get("/api/scheduler/status", tags=["scheduler"])
     def scheduler_status(request: Request) -> dict[str, object]:
@@ -227,9 +336,14 @@ def create_app(settings: Settings) -> FastAPI:
         manager: SystemScheduler = request.app.state.system_scheduler
         runtime: SettingsRepository = request.app.state.runtime_settings
         values = runtime.get()["values"]
+        target = manager.plan().target or "unsupported"
+        permissions_repository: PermissionRepository = request.app.state.permissions
+        authorized = values["system_scheduler_authorized"] and permissions_repository.is_allowed(
+            project_id=None, capability="system_scheduler", resource=target
+        )
         return {
             "runtime": repository.status(), "system": manager.plan().as_dict(),
-            "authorization_required": not values["system_scheduler_authorized"],
+            "authorization_required": not authorized,
             "model_invoked": False,
         }
 
@@ -243,9 +357,14 @@ def create_app(settings: Settings) -> FastAPI:
         manager: SystemScheduler = request.app.state.system_scheduler
         runtime: SettingsRepository = request.app.state.runtime_settings
         values = runtime.get()["values"]
+        target = manager.plan().target or "unsupported"
+        permissions_repository: PermissionRepository = request.app.state.permissions
+        authorized = values["system_scheduler_authorized"] and permissions_repository.is_allowed(
+            project_id=None, capability="system_scheduler", resource=target
+        )
         return manager.install(
             interval_seconds=values["scheduler_interval_seconds"],
-            authorized=values["system_scheduler_authorized"],
+            authorized=authorized,
         )
 
     @app.post("/api/projects", response_model=ProjectView, status_code=201, tags=["projects"])
@@ -297,6 +416,8 @@ def create_app(settings: Settings) -> FastAPI:
             role_id=role_id,
             resource_key=payload.resource_key,
             network_requirement=payload.network_requirement,
+            provider=payload.provider,
+            quality_profile=payload.quality_profile,
         )
         return TaskView.from_record(record)
 
@@ -343,5 +464,11 @@ def create_app(settings: Settings) -> FastAPI:
             task_id, action=payload.action, reason=payload.reason,
             expected_revision=payload.expected_revision, idempotency_key=idempotency_key,
         ))
+
+    package_static = Path(__file__).resolve().parents[1] / "static"
+    source_static = Path(__file__).resolve().parents[3] / "web" / "dist"
+    web_dist = package_static if package_static.is_dir() else source_static
+    if web_dist.is_dir():
+        app.mount("/", StaticFiles(directory=web_dist, html=True), name="web")
 
     return app

@@ -44,6 +44,8 @@ class TaskRepository:
         role_id: str | None = None,
         resource_key: str | None = None,
         network_requirement: str = "none",
+        provider: str = "generic-command",
+        quality_profile: str = "balanced",
     ) -> TaskRecord:
         with self.database.transaction(immediate=True) as connection:
             duplicate = connection.execute(
@@ -58,8 +60,8 @@ class TaskRepository:
                 INSERT INTO tasks(
                     id, title, objective, project_path, status, revision,
                     command_json, verification_json, max_attempts, token_budget,
-                    project_id, role_id, resource_key, network_requirement
-                ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
+                    project_id, role_id, resource_key, network_requirement, provider, quality_profile
+                ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -75,6 +77,8 @@ class TaskRepository:
                     role_id,
                     resource_key,
                     network_requirement,
+                    provider,
+                    quality_profile,
                 ),
             )
             self._event(
@@ -191,9 +195,9 @@ class TaskRepository:
             connection.execute(
                 """
                 INSERT INTO task_runs(id, task_id, attempt_id, run_type, provider, status)
-                VALUES (?, ?, ?, 'execute', 'generic-command', 'running')
+                VALUES (?, ?, ?, 'execute', ?, 'running')
                 """,
-                (run_id, task.id, attempt_id),
+                (run_id, task.id, attempt_id, task.provider),
             )
             self._event(
                 connection,
@@ -207,6 +211,18 @@ class TaskRepository:
                 idempotency_key=idempotency_key,
             )
             return ClaimResult(self._get_with_connection(connection, task.id), attempt_id, run_id, True)
+
+    def record_quality_run(
+        self, *, task_id: str, attempt_id: str, run_type: str, result: dict[str, Any]
+    ) -> None:
+        with self.database.transaction(immediate=True) as connection:
+            connection.execute(
+                """
+                INSERT INTO task_runs(id, task_id, attempt_id, run_type, provider, status, result_json, finished_at)
+                VALUES (?, ?, ?, ?, 'deterministic-quality-gate', 'completed', ?, CURRENT_TIMESTAMP)
+                """,
+                (str(uuid.uuid4()), task_id, attempt_id, run_type, _dump(result)),
+            )
 
     def mark_verifying(
         self,
@@ -517,6 +533,8 @@ def _task_from_row(row: Any) -> TaskRecord:
         no_progress_count=row["no_progress_count"],
         last_failure_fingerprint=row["last_failure_fingerprint"],
         next_eligible_at=row["next_eligible_at"],
+        provider=row["provider"],
+        quality_profile=row["quality_profile"],
         status=TaskStatus(row["status"]),
         revision=row["revision"],
         command=json.loads(row["command_json"]),

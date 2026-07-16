@@ -1,6 +1,8 @@
 .venv/
 node_modules/
 web/dist/
+backend/plow_whip_web/static/
+dist/
 web/*.tsbuildinfo
 web/vite.config.js
 web/vite.config.d.ts

@@ -22,6 +22,8 @@ export type Task = {
   no_progress_count: number
   last_failure_fingerprint: string | null
   next_eligible_at: string | null
+  provider: string
+  quality_profile: string
   status: TaskStatus
   revision: number
   max_attempts: number
@@ -107,6 +109,12 @@ export type OutboxEvent = {
   created_at: string
   delivered_at: string | null
 }
+export type Provider = { name: string; status: string; model_invoked: boolean; capabilities: string[]; reason: string | null }
+export type AuditEntry = { sequence: number; actor: string; method: string; path: string; status_code: number; created_at: string }
+export type PermissionGrant = {
+  id: string; project_id: string | null; capability: string; resource: string;
+  decision: string; reason: string; created_at: string; revoked_at: string | null
+}
 
 export type TaskEvent = {
   sequence: number
@@ -131,6 +139,12 @@ async function request<T>(path: string, options: FetchOptions = {}): Promise<T> 
 }
 
 export const api = {
+  providers: () => request<Provider[]>('/api/providers'),
+  audit: () => request<AuditEntry[]>('/api/audit'),
+  permissions: () => request<PermissionGrant[]>('/api/permissions'),
+  createPermission: (payload: Record<string, unknown>) => request<PermissionGrant>('/api/permissions', { method: 'POST', body: JSON.stringify(payload) }),
+  backup: () => request<Record<string, unknown>>('/api/maintenance/backup', { method: 'POST' }),
+  diagnostics: () => request<Record<string, unknown>>('/api/maintenance/diagnostics', { method: 'POST' }),
   runtimeHealth: () => request<RuntimeHealth>('/api/system/health'),
   recover: () => request<Record<string, unknown>>('/api/system/recover', { method: 'POST' }),
   outbox: () => request<OutboxEvent[]>('/api/outbox'),

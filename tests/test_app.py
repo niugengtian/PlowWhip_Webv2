@@ -19,7 +19,7 @@ def test_health_reports_wal_and_migration() -> None:
     payload = response.json()
     assert payload["status"] == "ok"
     assert payload["database"]["journal_mode"] == "wal"
-    assert payload["database"]["migration_count"] == 6
+    assert payload["database"]["migration_count"] == 7
 
 
 def test_capabilities_are_zero_token_and_desktop_free() -> None:
@@ -40,4 +40,6 @@ def test_capabilities_are_zero_token_and_desktop_free() -> None:
     assert payload["three_scope_conventions"] is True
     assert payload["fault_recovery"] is True
     assert payload["anti_loop_guards"] is True
-    assert payload["sprint"] == 5
+    assert payload["audited_permissions"] is True
+    assert payload["loopback_default"] is True
+    assert payload["sprint"] == 6

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import uvicorn
@@ -21,7 +22,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-    settings = Settings(data_dir=args.data_dir.resolve())
+    settings = Settings(
+        data_dir=args.data_dir.resolve(), bind_host=args.host,
+        api_token=os.environ.get("PLOW_WHIP_API_TOKEN"),
+    )
     app = create_app(settings)
     if args.command == "scheduler-tick":
         result = app.state.scheduler_service.tick()

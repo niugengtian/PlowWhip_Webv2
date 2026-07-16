@@ -102,12 +102,17 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .usage-row { display: flex; justify-content: space-between; gap: 18px; padding: 11px 0; border-bottom: 1px solid #e2e7e3; }
 .usage-row span { overflow-wrap: anywhere; }
 .convention-editor { min-height: 220px !important; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; line-height: 1.55; }
+.audit-table > div { display: grid; grid-template-columns: 50px 70px minmax(180px, 1fr) 60px 150px; gap: 12px; align-items: center; padding: 11px 0; border-bottom: 1px solid #e2e7e3; }
+.audit-table code { overflow-wrap: anywhere; }
+.result-box { max-height: 240px; overflow: auto; padding: 14px; background: #111a14; color: #dce9df; border-radius: 8px; font-size: .76rem; }
 
 @media (max-width: 760px) {
   .topbar { align-items: flex-start; flex-direction: column; }
   .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .empty, .workspace-grid, .detail-grid, .worker-grid, .settings-grid, .scheduler-card dl { grid-template-columns: 1fr; }
   .field-row { grid-template-columns: 1fr; }
+  .audit-table > div { grid-template-columns: 36px 60px minmax(120px, 1fr); }
+  .audit-table > div span:nth-last-child(-n+2), .audit-table small { display: none; }
 }
 
 @media (prefers-color-scheme: dark) {
