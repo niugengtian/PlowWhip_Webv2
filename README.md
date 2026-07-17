@@ -39,7 +39,8 @@ Backend 默认监听 `127.0.0.1:8742`，Frontend 开发服务器默认监听 `12
 cp .env.local.example .env.local
 chmod 600 .env.local
 # 编辑 .env.local：填写 PLOW_WHIP_BRIDGE_TOKEN；需要 DeepSeek 时再填写 DEEPSEEK_API_KEY
-docker compose --env-file .env.local up --build -d
+SHA="$(git rev-parse HEAD)"
+python3 scripts/release_local.py deploy --expected-sha "$SHA"
 ```
 
 ```powershell
@@ -47,7 +48,8 @@ docker compose --env-file .env.local up --build -d
 Copy-Item .env.local.example .env.local
 icacls .env.local /inheritance:r /grant:r "$($env:USERNAME):(R,W)"
 # 编辑 .env.local 后启动
-docker compose --env-file .env.local up --build -d
+$sha = git rev-parse HEAD
+py scripts\release_local.py deploy --expected-sha $sha
 ```
 
 浏览器打开 `http://127.0.0.1:8742`。
@@ -69,11 +71,13 @@ Docker 容器不能直接复用宿主机 CLI、认证和项目目录。Codex CLI
 macOS：
 
 ```bash
-.venv/bin/python -m plow_whip_web.host_bridge \
-  --env-file .env.local \
-  --project-root /Users/you/work \
-  --state-dir "$HOME/.plow-whip-web/host-bridge"
+.venv/bin/python scripts/release_local.py install-bridge-macos \
+  --project-root /Users/you/work
 ```
+
+该命令安装用户级 `com.plow-whip-web.host-bridge` LaunchAgent，显式保存可找到
+Codex 与 simple-worker 的 `PATH`，登录后自动启动，并拒绝在仍有活跃 Host Job
+时替换 Bridge。plist 只保存 `.env.local` 路径，不保存 Token 或 API Key。
 
 Linux：
 
@@ -104,6 +108,11 @@ docker compose ps
 docker compose logs -f control-plane
 docker compose exec control-plane python -m plow_whip_web --data-dir /data scheduler-tick
 ```
+
+发布或升级必须只通过 `scripts/release_local.py deploy`。它用本机文件锁保证同一时刻
+只有一个 Compose 写事务，并要求工作树干净、HEAD 与 GitHub 分支精确一致；镜像记录
+同一发布 SHA。监控和状态检查只能使用只读 API、`docker ps/inspect/logs` 或
+`scripts/release_local.py verify`，不得在观察循环中调用 Compose。
 
 不要把 SQLite 写进镜像层。数据使用 named volume，因此重建/升级镜像不会丢失；只有明确执行 `docker compose down -v` 才会删除数据卷。
 

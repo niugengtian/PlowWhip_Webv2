@@ -3,9 +3,14 @@
 ## First start
 
 ```bash
-docker compose up --build -d
-docker compose ps
+SHA="$(git rev-parse HEAD)"
+python3 scripts/release_local.py deploy --expected-sha "$SHA"
 ```
+
+This is the only supported local release writer. It holds a process lock, requires
+a clean worktree and exact local/remote branch SHA, passes that SHA into the image
+revision label, preserves named volumes, and rejects a non-unique or unhealthy
+control-plane. Read-only monitors must never run Compose.
 
 Open `http://127.0.0.1:8742`. Register projects, save Convention and Settings, then **submit a goal**. The control plane PM-splits it into ordered role work items and the scheduler advances them. Manual single-task create remains available under “诊断任务” for debugging only. The built frontend is served by FastAPI.
 
@@ -39,7 +44,34 @@ Treat the task hard cap as a turn-end settlement gate, not a provider-side gener
 
 ## Upgrade and migration
 
-Create a backup from Health, build the new image, then run `docker compose up -d`. Migrations are ordered and idempotent. Migration `0020_provider_context_pressure.sql` adds zero-valued legacy usage/pressure defaults and no body backfill; it preserves 0017/0018/0019 behavior. Check `/health` and the migration count. Never use `down -v` during an upgrade.
+Create a backup from Health, push the intended clean commit, then run:
+
+```bash
+SHA="$(git rev-parse HEAD)"
+python3 scripts/release_local.py deploy --expected-sha "$SHA"
+python3 scripts/release_local.py verify --expected-sha "$SHA"
+```
+
+Do not run a second `docker compose up`, build, restart, or down while this transaction
+is active. Migrations are ordered and idempotent. Migration
+`0020_provider_context_pressure.sql` adds zero-valued legacy usage/pressure defaults
+and no body backfill; it preserves 0017/0018/0019 behavior. Check `/health` and the
+migration count. Never use `down -v` during an upgrade.
+
+## macOS Host Bridge
+
+The Bridge remains a host process. Install its persistent user LaunchAgent once:
+
+```bash
+.venv/bin/python scripts/release_local.py install-bridge-macos \
+  --project-root /Users/you/work
+```
+
+The installer refuses replacement while a Host Job is active, keeps one listener on
+8765, uses the repository venv by absolute path, and persists an explicit PATH that
+contains Codex and simple-worker. It reads secrets only from the mode-600
+`.env.local`; no secret value is copied into the plist. All Host Providers share this
+one Bridge. Generic Command remains container-local.
 
 ## Backup, diagnostics and restore
 
@@ -47,4 +79,7 @@ Health creates integrity-checked SQLite backups and secret-free diagnostic ZIPs.
 
 ## Uninstall
 
-Run `docker compose down` to remove the container while preserving data. Only run `docker compose down -v` after an explicit decision to destroy SQLite, archives and managed projects. No launchd, systemd or Task Scheduler entry is installed.
+Run `docker compose down` to remove the container while preserving data. Only run
+`docker compose down -v` after an explicit decision to destroy SQLite, archives and
+managed projects. On macOS, remove the Host Bridge LaunchAgent separately only when
+the host worker pool is intentionally being uninstalled.

@@ -4,6 +4,8 @@ services:
   control-plane:
     build:
       context: .
+      args:
+        PLOW_WHIP_RELEASE_SHA: "${PLOW_WHIP_RELEASE_SHA:-unknown}"
     image: plow-whip-web-v2:local
     restart: unless-stopped
     init: true

@@ -9,6 +9,9 @@ RUN pnpm run build
 
 FROM python:3.13-slim AS runtime
 
+ARG PLOW_WHIP_RELEASE_SHA=unknown
+LABEL org.opencontainers.image.revision="${PLOW_WHIP_RELEASE_SHA}"
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PLOW_WHIP_EMBEDDED_CRON=1 \
