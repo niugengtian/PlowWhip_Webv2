@@ -19,6 +19,7 @@ def test_migrations_are_idempotent() -> None:
             "0010_cli_capabilities.sql",
             "0011_host_jobs.sql",
             "0012_token_usage_idempotency.sql",
+            "0013_simple_worker.sql",
         ]
         assert database.migrate() == []
-        assert database.health()["migration_count"] == 12
+        assert database.health()["migration_count"] == 13

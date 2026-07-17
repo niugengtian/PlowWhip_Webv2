@@ -73,7 +73,10 @@ button.full { width: 100%; }
 .muted { color: var(--muted); font-size: .72rem; }
 
 .metrics-strip { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 9px; margin-bottom: 12px; }
-.metrics-strip article { display: grid; grid-template-columns: 38px 1fr auto; align-items: center; gap: 10px; min-height: 74px; border: 1px solid var(--line); border-radius: 6px; padding: 12px; background: var(--panel); }
+.metrics-strip .metric-card { display: grid; grid-template-columns: 38px 1fr auto; align-items: center; gap: 10px; width: 100%; min-height: 74px; border: 1px solid var(--line); border-radius: 6px; padding: 12px; color: inherit; text-align: left; background: var(--panel); }
+.metrics-strip button.metric-card { cursor: pointer; transition: border-color .16s ease, background .16s ease, transform .16s ease; }
+.metrics-strip button.metric-card:hover { border-color: #36558e; background: #111827; transform: translateY(-1px); }
+.metrics-strip button.metric-card:focus-visible { outline: 2px solid var(--acc); outline-offset: 2px; }
 .metric-icon { width: 36px; height: 36px; }
 .metrics-strip span { display: block; color: #7b8caf; font-size: .69rem; }
 .metrics-strip strong { display: block; margin-top: 2px; color: #eff3ff; font-size: 1.32rem; }
@@ -210,7 +213,7 @@ textarea { min-height: 84px; resize: vertical; line-height: 1.5; }
   .context-actions { width: 100%; }
   .context-actions button { flex: 1; }
   .metrics-strip, .facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .metrics-strip article { grid-template-columns: 34px 1fr; }
+  .metrics-strip .metric-card { grid-template-columns: 34px 1fr; }
   .metrics-strip small { display: none; }
   .split-layout { grid-template-columns: 1fr; }
   .list-panel, .detail-panel { min-height: auto; }

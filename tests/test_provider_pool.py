@@ -8,7 +8,13 @@ from fastapi.testclient import TestClient
 
 from plow_whip_web.api.app import create_app
 from plow_whip_web.config import Settings
-from plow_whip_web.host_bridge import _execution_argv, _parse_stream
+from plow_whip_web.host_bridge import (
+    _execution_argv,
+    _parse_stream,
+    _resolve_executable,
+    _safe_environment,
+    _version_argv,
+)
 from plow_whip_web.providers.generic_command import ExecutionResult
 from plow_whip_web.providers.pool import _last_text
 
@@ -39,6 +45,7 @@ def test_provider_presets_and_revision_guarded_registration() -> None:
             simple = next(item for item in providers if item["name"] == "simple-worker")
             assert simple["adapter"] == "json-worker"
             assert "refine_convention" in simple["capabilities"]
+            assert simple["credential_env"] == "DEEPSEEK_API_KEY"
 
             created = client.put("/api/providers/local-runner", json={
                 "name": "local-runner",
@@ -141,6 +148,30 @@ def test_host_bridge_argv_is_fixed_and_stream_parser_keeps_session_and_usage() -
         '{"usage":{"input_tokens":17,"output_tokens":9}}\n'
     )
     assert parsed == {"session_id": "session-1", "input_tokens": 17, "output_tokens": 9}
+    assert _version_argv("json-worker", "/bin/simple-worker") == [
+        "/bin/simple-worker", "--probe",
+    ]
+
+
+def test_host_bridge_passes_only_declared_deepseek_credentials(monkeypatch) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret-one")
+    monkeypatch.setenv("DEEPSEEK_API_KEY_02", "secret-two")
+    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
+    monkeypatch.setenv("UNRELATED_SECRET", "must-not-pass")
+    environment = _safe_environment()
+    assert environment["DEEPSEEK_API_KEY"] == "secret-one"
+    assert environment["DEEPSEEK_API_KEY_02"] == "secret-two"
+    assert environment["DEEPSEEK_MODEL"] == "deepseek-v4-flash"
+    assert "UNRELATED_SECRET" not in environment
+
+
+def test_host_bridge_finds_worker_next_to_its_python(monkeypatch, tmp_path: Path) -> None:
+    worker = tmp_path / "simple-worker"
+    worker.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    worker.chmod(0o700)
+    monkeypatch.setattr("plow_whip_web.host_bridge.sys.executable", str(tmp_path / "python"))
+    monkeypatch.setenv("PATH", "")
+    assert _resolve_executable("simple-worker", "json-worker") == str(worker)
 
 
 def test_convention_output_extracts_nested_cli_agent_message() -> None:

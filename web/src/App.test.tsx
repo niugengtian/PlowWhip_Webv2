@@ -1,6 +1,6 @@
 import '@testing-library/jest-dom/vitest'
-import { render, screen } from '@testing-library/react'
-import { beforeEach, expect, test, vi } from 'vitest'
+import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import { App } from './App'
 
 beforeEach(() => {
@@ -47,9 +47,22 @@ beforeEach(() => {
   )
 })
 
+afterEach(cleanup)
+
 test('shows the approved product priority', () => {
   render(<App />)
   expect(
     screen.getByText('保障质量的前提下实现无人值守完成，尽量减少 Token 消费。'),
   ).toBeInTheDocument()
+})
+
+test.each([
+  ['活跃项目', '项目注册表'],
+  ['在线 Worker', 'Worker 状态'],
+  ['可用 Provider', 'Worker Provider'],
+  ['今日 Token', '消费明细'],
+])('opens the %s detail page from the dashboard metric', (metric, heading) => {
+  render(<App />)
+  fireEvent.click(screen.getByRole('button', { name: `查看${metric}详情` }))
+  expect(screen.getByRole('heading', { name: heading })).toBeInTheDocument()
 })

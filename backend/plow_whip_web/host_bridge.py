@@ -4,9 +4,11 @@ import argparse
 import hmac
 import json
 import os
+import re
 import signal
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -581,18 +583,33 @@ def _resolve_executable(configured: str, adapter: str) -> str | None:
     if Path(candidate).is_absolute():
         path = Path(candidate)
         return str(path) if path.is_file() and os.access(path, os.X_OK) else None
-    return shutil.which(candidate)
+    resolved = shutil.which(candidate)
+    if resolved:
+        return resolved
+    sibling = Path(sys.executable).parent / candidate
+    return str(sibling) if sibling.is_file() and os.access(sibling, os.X_OK) else None
 
 
 def _version_argv(adapter: str, executable: str) -> list[str]:
     if adapter == "cursor":
         return [executable, "agent", "--version"]
+    if adapter == "json-worker":
+        return [executable, "--probe"]
     return [executable, "--version"]
 
 
 def _safe_environment() -> dict[str, str]:
     allowed = {"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "TERM", "CODEX_HOME", "CURSOR_API_KEY"}
-    return {key: value for key, value in os.environ.items() if key in allowed}
+    deepseek_key = re.compile(r"^DEEPSEEK_API_KEY(?:_\d+)?$")
+    return {
+        key: value for key, value in os.environ.items()
+        if key in allowed
+        or key in {
+            "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL",
+            "PLOW_WHIP_SIMPLE_WORKER_STATE_DIR",
+        }
+        or deepseek_key.fullmatch(key)
+    }
 
 
 def _is_within(path: Path, root: Path) -> bool:

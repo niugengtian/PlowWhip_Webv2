@@ -54,6 +54,9 @@ Docker 容器不能直接执行 macOS 二进制。Codex CLI、Cursor CLI 和 sim
 
 ```bash
 export PLOW_WHIP_BRIDGE_TOKEN="$(openssl rand -hex 24)"
+# 可选：启用内置 DeepSeek simple-worker；不配置时系统仍可正常启动。
+export DEEPSEEK_API_KEY="..."
+export DEEPSEEK_MODEL="deepseek-v4-flash"
 PLOW_WHIP_BRIDGE_TOKEN="$PLOW_WHIP_BRIDGE_TOKEN" docker compose up --build -d
 .venv/bin/python -m plow_whip_web.host_bridge \
   --project-root /Users/your-name/work \
@@ -62,7 +65,7 @@ PLOW_WHIP_BRIDGE_TOKEN="$PLOW_WHIP_BRIDGE_TOKEN" docker compose up --build -d
 
 先启动容器，再让 Host Bridge 在当前终端持续运行；两者必须使用同一个令牌。Host Bridge 会把不含 Prompt 和 argv 的 Host Job 状态写入 `--state-dir`。Bridge 暂时不可达时，容器保留任务租约并进入 `recovery_hold`，不会把仍可能存活的 CLI 进程重复派发；Bridge 恢复后由零 Token 调度自动对账。
 
-项目注册时分别填写容器路径和本机路径。容器 Worker 使用 `/projects/...`；Codex/Cursor/simple-worker 使用 `/Users/...`。控制台 Provider 页可执行 0 Token 探测。平台 API Key 不是启动前提；未来凭据只通过环境变量引用接入，不保存在页面、SQLite、日志或镜像里。
+项目注册时分别填写容器路径和本机路径。容器 Worker 使用 `/projects/...`；Codex/Cursor/simple-worker 使用 `/Users/...`。控制台 Provider 页可执行 0 Token 探测。平台 API Key 不是启动前提；凭据只通过环境变量引用接入，不保存在页面、SQLite、日志或镜像里。simple-worker 在缺少 `DEEPSEEK_API_KEY` 时会明确显示不可用，不会伪装就绪。
 
 查看状态和日志：
 

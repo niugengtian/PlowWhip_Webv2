@@ -25,6 +25,7 @@ dev = [
 
 [project.scripts]
 plow-whip-web = "plow_whip_web.__main__:main"
+simple-worker = "plow_whip_web.simple_worker:main"
 
 [tool.setuptools]
 package-dir = {"" = "backend"}

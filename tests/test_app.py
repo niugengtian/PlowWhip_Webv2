@@ -19,7 +19,7 @@ def test_health_reports_wal_and_migration() -> None:
     payload = response.json()
     assert payload["status"] == "ok"
     assert payload["database"]["journal_mode"] == "wal"
-    assert payload["database"]["migration_count"] == 12
+    assert payload["database"]["migration_count"] == 13
 
 
 def test_capabilities_are_zero_token_and_desktop_free() -> None:
