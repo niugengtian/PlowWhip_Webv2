@@ -50,6 +50,39 @@ class HostBridgeClient:
             external_session_id=payload.get("session_id"),
         )
 
+    def start_job(
+        self, *, job_id: str, provider: dict[str, object], project_path: str,
+        prompt: str, session_id: str | None, timeout_seconds: int,
+    ) -> dict[str, object]:
+        return self._post("/v1/jobs/start", {
+            "job_id": job_id,
+            "adapter": provider["adapter"],
+            "executable": provider.get("executable"),
+            "project_path": project_path,
+            "prompt": prompt,
+            "session_id": session_id,
+            "timeout_seconds": timeout_seconds,
+        }, timeout=20)
+
+    def job_status(self, job_id: str) -> dict[str, object]:
+        return self._post("/v1/jobs/status", {"job_id": job_id}, timeout=10)
+
+    def cancel_job(self, job_id: str) -> dict[str, object]:
+        return self._post("/v1/jobs/cancel", {"job_id": job_id}, timeout=10)
+
+    @staticmethod
+    def result(snapshot: dict[str, object]) -> ExecutionResult:
+        return ExecutionResult(
+            returncode=int(snapshot.get("returncode") or 0),
+            stdout=str(snapshot.get("stdout") or ""),
+            stderr=str(snapshot.get("stderr") or ""),
+            duration_ms=int(snapshot.get("duration_ms") or 0),
+            failure_class=snapshot.get("failure_class"),
+            input_tokens=int(snapshot.get("input_tokens") or 0),
+            output_tokens=int(snapshot.get("output_tokens") or 0),
+            external_session_id=snapshot.get("session_id"),
+        )
+
     def _post(self, path: str, payload: dict[str, object], *, timeout: int) -> dict[str, object]:
         if not self.token:
             raise ProviderUnavailableError("Host Bridge 未配置：缺少 PLOW_WHIP_BRIDGE_TOKEN")

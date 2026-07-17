@@ -1,6 +1,7 @@
 export type TaskStatus =
   | 'ready'
   | 'running'
+  | 'stopping'
   | 'verifying'
   | 'completed'
   | 'terminal_failed'

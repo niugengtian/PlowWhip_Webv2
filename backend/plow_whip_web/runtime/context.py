@@ -36,6 +36,12 @@ class ContextCompiler:
             "## Objective\n" + task.objective,
             "## Role\n" + ROLE_PROMPTS.get(role, ROLE_PROMPTS["fullstack"]),
         ]
+        if task.last_error == "external_execution_interrupted":
+            sections.append(
+                "## Continuation\nThe previous host process was externally interrupted. "
+                "Inspect the existing workspace first, preserve completed work, and continue "
+                "the same objective from the retained CLI session without repeating finished steps."
+            )
         for convention in self.conventions.resolve(project_id=task.project_id, task_id=task.id):
             if convention["content"]:
                 sections.append(f"## Convention: {convention['scope']}\n{convention['content']}")

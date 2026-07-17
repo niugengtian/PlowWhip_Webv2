@@ -19,7 +19,7 @@ def test_health_reports_wal_and_migration() -> None:
     payload = response.json()
     assert payload["status"] == "ok"
     assert payload["database"]["journal_mode"] == "wal"
-    assert payload["database"]["migration_count"] == 10
+    assert payload["database"]["migration_count"] == 12
 
 
 def test_capabilities_are_zero_token_and_desktop_free() -> None:
@@ -48,5 +48,8 @@ def test_capabilities_are_zero_token_and_desktop_free() -> None:
     assert payload["docker_managed_sqlite"] is True
     assert payload["worker_provider_pool"] is True
     assert payload["restricted_host_bridge"] is True
+    assert payload["durable_host_jobs"] is True
+    assert payload["early_cli_session_persistence"] is True
+    assert payload["safe_running_cancel"] is True
     assert payload["platform_api_key_required"] is False
-    assert payload["sprint"] == 8
+    assert payload["sprint"] == 9

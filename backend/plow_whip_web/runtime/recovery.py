@@ -19,8 +19,12 @@ class RecoveryService:
             stale = connection.execute(
                 """
                 SELECT t.* FROM tasks t LEFT JOIN task_leases l ON l.task_id = t.id
-                WHERE t.status IN ('running', 'verifying')
+                WHERE t.status IN ('running', 'stopping', 'verifying')
                 AND (l.task_id IS NULL OR l.expires_at <= CURRENT_TIMESTAMP)
+                AND NOT EXISTS (
+                    SELECT 1 FROM host_jobs h
+                    WHERE h.task_id = t.id AND h.consumed_at IS NULL
+                )
                 """
             ).fetchall()
             for task in stale:
@@ -67,7 +71,7 @@ class RecoveryService:
                 """
                 UPDATE workers SET status = 'idle', active_task_id = NULL
                 WHERE status = 'busy' AND active_task_id NOT IN (
-                    SELECT id FROM tasks WHERE status IN ('running', 'verifying')
+                    SELECT id FROM tasks WHERE status IN ('running', 'stopping', 'verifying')
                 )
                 """
             ).rowcount

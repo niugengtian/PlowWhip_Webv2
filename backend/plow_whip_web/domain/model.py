@@ -8,6 +8,7 @@ from typing import Any
 class TaskStatus(StrEnum):
     READY = "ready"
     RUNNING = "running"
+    STOPPING = "stopping"
     VERIFYING = "verifying"
     COMPLETED = "completed"
     TERMINAL_FAILED = "terminal_failed"

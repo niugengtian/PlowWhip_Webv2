@@ -58,6 +58,7 @@ from plow_whip_web.store.audit_repository import AuditRepository
 from plow_whip_web.store.permission_repository import PermissionRepository
 from plow_whip_web.store.provider_repository import ProviderRepository
 from plow_whip_web.store.task_repository import TaskRepository
+from plow_whip_web.store.host_job_repository import HostJobRepository
 from plow_whip_web.providers.host_bridge import HostBridgeClient
 from plow_whip_web.providers.pool import ProviderPool
 from plow_whip_web.roles import ROLE_PROMPTS
@@ -69,6 +70,7 @@ def create_app(settings: Settings) -> FastAPI:
     database = Database(settings.database_path)
     database.migrate()
     task_repository = TaskRepository(database)
+    host_jobs = HostJobRepository(database)
     project_repository = ProjectRepository(database)
     runtime_settings = SettingsRepository(database)
     conventions = ConventionRepository(database)
@@ -90,7 +92,7 @@ def create_app(settings: Settings) -> FastAPI:
     )
     task_service = TaskService(
         task_repository, budget=budget, context_compiler=context_compiler, journal=journal,
-        provider_pool=provider_pool,
+        provider_pool=provider_pool, host_jobs=host_jobs,
     )
     scheduler_repository = SchedulerRepository(database)
     scheduler_service = SchedulerService(
@@ -110,6 +112,7 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.settings = settings
     app.state.database = database
     app.state.task_repository = task_repository
+    app.state.host_jobs = host_jobs
     app.state.project_repository = project_repository
     app.state.task_service = task_service
     app.state.runtime_settings = runtime_settings
@@ -208,9 +211,12 @@ def create_app(settings: Settings) -> FastAPI:
             "docker_managed_sqlite": True,
             "worker_provider_pool": True,
             "restricted_host_bridge": True,
+            "durable_host_jobs": True,
+            "early_cli_session_persistence": True,
+            "safe_running_cancel": True,
             "convention_refinement": True,
             "platform_api_key_required": False,
-            "sprint": 8,
+            "sprint": 9,
         }
 
     @app.get("/api/providers", tags=["providers"])
@@ -502,8 +508,8 @@ def create_app(settings: Settings) -> FastAPI:
         payload: TaskControl,
         idempotency_key: str = Header(alias="Idempotency-Key", min_length=8, max_length=200),
     ) -> TaskView:
-        repository: TaskRepository = request.app.state.task_repository
-        return TaskView.from_record(repository.control(
+        service: TaskService = request.app.state.task_service
+        return TaskView.from_record(service.control(
             task_id, action=payload.action, reason=payload.reason,
             expected_revision=payload.expected_revision, idempotency_key=idempotency_key,
         ))

@@ -1,0 +1,167 @@
+from __future__ import annotations
+
+import json
+import uuid
+from typing import Any
+
+from plow_whip_web.store.database import Database
+
+
+class HostJobRepository:
+    """Container-side source of truth for durable Host Bridge execution."""
+
+    def __init__(self, database: Database) -> None:
+        self.database = database
+
+    def prepare(
+        self, *, task_id: str, attempt_id: str, run_id: str, provider: str
+    ) -> dict[str, Any]:
+        with self.database.transaction(immediate=True) as connection:
+            existing = connection.execute(
+                "SELECT * FROM host_jobs WHERE task_id = ? AND attempt_id = ?",
+                (task_id, attempt_id),
+            ).fetchone()
+            if existing:
+                return dict(existing)
+            context = connection.execute(
+                """
+                SELECT t.worker_id, l.fencing_token, w.session_generation
+                FROM tasks t
+                LEFT JOIN task_leases l ON l.task_id = t.id
+                LEFT JOIN workers w ON w.id = t.worker_id
+                WHERE t.id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if context is None:
+                raise ValueError(f"task not found: {task_id}")
+            job_id = str(uuid.uuid4())
+            connection.execute(
+                """
+                INSERT INTO host_jobs(
+                    job_id, task_id, attempt_id, run_id, worker_id, provider,
+                    fencing_token, session_generation
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id, task_id, attempt_id, run_id, context["worker_id"], provider,
+                    context["fencing_token"], context["session_generation"],
+                ),
+            )
+            return dict(connection.execute(
+                "SELECT * FROM host_jobs WHERE job_id = ?", (job_id,)
+            ).fetchone())
+
+    def record(self, job_id: str, snapshot: dict[str, Any]) -> dict[str, Any]:
+        result_json = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
+        session_id = snapshot.get("session_id") or snapshot.get("external_session_id")
+        with self.database.transaction(immediate=True) as connection:
+            connection.execute(
+                """
+                UPDATE host_jobs SET status = ?, host_pid = COALESCE(?, host_pid),
+                    external_session_id = COALESCE(?, external_session_id),
+                    heartbeat_at = COALESCE(?, CURRENT_TIMESTAMP),
+                    finished_at = ?, result_json = ?, last_error = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE job_id = ?
+                """,
+                (
+                    str(snapshot.get("status") or "unknown"), snapshot.get("pid"), session_id,
+                    snapshot.get("heartbeat_at"), snapshot.get("finished_at"), result_json,
+                    snapshot.get("failure_class"), job_id,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM host_jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"host job not found: {job_id}")
+            if row["worker_id"]:
+                connection.execute(
+                    """
+                    UPDATE workers SET external_session_id = COALESCE(?, external_session_id),
+                        last_seen_at = CURRENT_TIMESTAMP, last_error = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (session_id, snapshot.get("failure_class"), row["worker_id"]),
+                )
+            return dict(row)
+
+    def active(self) -> list[dict[str, Any]]:
+        connection = self.database.connect()
+        try:
+            return [dict(row) for row in connection.execute(
+                "SELECT * FROM host_jobs WHERE consumed_at IS NULL ORDER BY created_at"
+            ).fetchall()]
+        finally:
+            connection.close()
+
+    def renew(self, job_id: str, *, seconds: int = 300) -> None:
+        modifier = f"+{max(60, seconds)} seconds"
+        with self.database.transaction(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT task_id, worker_id FROM host_jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                return
+            connection.execute(
+                "UPDATE task_leases SET expires_at = datetime('now', ?) WHERE task_id = ?",
+                (modifier, row["task_id"]),
+            )
+            connection.execute(
+                "UPDATE resource_locks SET expires_at = datetime('now', ?) WHERE task_id = ?",
+                (modifier, row["task_id"]),
+            )
+            if row["worker_id"]:
+                connection.execute(
+                    "UPDATE workers SET last_seen_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (row["worker_id"],),
+                )
+
+    def hold(self, job_id: str, error: str) -> None:
+        with self.database.transaction(immediate=True) as connection:
+            connection.execute(
+                """
+                UPDATE host_jobs SET status = 'recovery_hold', last_error = ?,
+                    updated_at = CURRENT_TIMESTAMP WHERE job_id = ? AND consumed_at IS NULL
+                """,
+                (error[:1000], job_id),
+            )
+            row = connection.execute(
+                "SELECT task_id, worker_id FROM host_jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                return
+            if row["worker_id"]:
+                connection.execute(
+                    """
+                    UPDATE workers SET last_error = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (f"host_job_recovery_hold: {error}"[:1000], row["worker_id"]),
+                )
+            task = connection.execute(
+                "SELECT revision FROM tasks WHERE id = ?", (row["task_id"],)
+            ).fetchone()
+            if task:
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO task_events(
+                        task_id, event_type, payload_json, state_revision, idempotency_key
+                    ) VALUES (?, 'host_job.recovery_hold', ?, ?, ?)
+                    """,
+                    (
+                        row["task_id"],
+                        json.dumps(
+                            {"host_job_id": job_id, "reason": error[:1000]},
+                            ensure_ascii=False, sort_keys=True,
+                        ),
+                        task["revision"], f"host-job:{job_id}:recovery-hold",
+                    ),
+                )
+
+    def consume(self, job_id: str) -> None:
+        with self.database.transaction(immediate=True) as connection:
+            connection.execute(
+                "UPDATE host_jobs SET consumed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE job_id = ?",
+                (job_id,),
+            )

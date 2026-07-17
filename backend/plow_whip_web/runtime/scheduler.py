@@ -55,6 +55,7 @@ class SchedulerService:
         lease = self.scheduler.acquire(owner, lease_seconds=values["scheduler_lease_seconds"])
         if not lease.acquired:
             return {"status": "skipped_lease_busy", "model_tokens": 0, "fencing_token": lease.fencing_token}
+        host_jobs_result = self.task_service.reconcile_host_jobs()
         recovery_result = self.recovery.reconcile() if self.recovery else {"recovered_tasks": [], "model_invoked": False}
         provider_status = self.provider_pool.probe_all() if self.provider_pool else []
         connectivity = self.connectivity.check()
@@ -72,6 +73,7 @@ class SchedulerService:
             "completed": [],
             "deferred": [{"task_id": task.id, "reason": f"network:{connectivity.state}"} for task in blocked],
             "model_tokens": 0, "health": health_result, "recovery": recovery_result,
+            "host_jobs": host_jobs_result,
             "providers": [
                 {"name": item["name"], "status": item["status"], "model_invoked": False}
                 for item in provider_status

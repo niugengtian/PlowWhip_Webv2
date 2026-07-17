@@ -202,7 +202,10 @@ class TaskRepository:
             attempt_id = str(uuid.uuid4())
             run_id = str(uuid.uuid4())
             next_revision = task.revision + 1
-            attempt_number = task.attempts_used + 1
+            attempt_number = int(connection.execute(
+                "SELECT COALESCE(MAX(attempt_number), 0) + 1 FROM task_attempts WHERE task_id = ?",
+                (task.id,),
+            ).fetchone()[0])
             cursor = connection.execute(
                 """
                 UPDATE tasks SET status = ?, revision = ?, attempts_used = ?, worker_id = ?, updated_at = CURRENT_TIMESTAMP
@@ -414,6 +417,132 @@ class TaskRepository:
                     """,
                     (task.id, _dump({"task_id": task.id, "reason": reason})),
                 )
+            return self._get_with_connection(connection, task.id)
+
+    def request_running_cancel(
+        self, task_id: str, *, reason: str, expected_revision: int, idempotency_key: str
+    ) -> TaskRecord:
+        with self.database.transaction(immediate=True) as connection:
+            duplicate = connection.execute(
+                "SELECT task_id FROM task_events WHERE idempotency_key = ?", (idempotency_key,)
+            ).fetchone()
+            if duplicate:
+                return self._get_with_connection(connection, task_id)
+            task = self._get_with_connection(connection, task_id)
+            if task.revision != expected_revision:
+                raise RevisionConflictError(
+                    f"expected revision {expected_revision}, current revision {task.revision}"
+                )
+            if task.status not in {TaskStatus.RUNNING, TaskStatus.VERIFYING}:
+                raise InvalidTransitionError(f"cannot cancel task in state {task.status}")
+            revision = task.revision + 1
+            connection.execute(
+                "UPDATE tasks SET status = ?, revision = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (TaskStatus.STOPPING.value, revision, task.id),
+            )
+            connection.execute(
+                "INSERT INTO task_controls(task_id, action, reason) VALUES (?, 'cancel', ?)",
+                (task.id, reason),
+            )
+            self._event(
+                connection, task_id=task.id, event_type="task.cancel_requested",
+                payload={"reason": reason}, revision=revision, idempotency_key=idempotency_key,
+            )
+            return self._get_with_connection(connection, task.id)
+
+    def finalize_running_cancel(self, task_id: str, *, job_id: str) -> TaskRecord:
+        with self.database.transaction(immediate=True) as connection:
+            task = self._get_with_connection(connection, task_id)
+            if task.status is TaskStatus.CANCELLED:
+                return task
+            if task.status is not TaskStatus.STOPPING:
+                raise InvalidTransitionError(f"task is not stopping: {task.status}")
+            revision = task.revision + 1
+            connection.execute(
+                """
+                UPDATE tasks SET status = ?, revision = ?, last_error = 'cancelled',
+                    updated_at = CURRENT_TIMESTAMP WHERE id = ?
+                """,
+                (TaskStatus.CANCELLED.value, revision, task.id),
+            )
+            self._release_worker_and_lock(connection, task.id, task.worker_id)
+            connection.execute(
+                """
+                UPDATE task_attempts SET status = 'cancelled', finished_at = CURRENT_TIMESTAMP
+                WHERE task_id = ? AND status = 'running'
+                """,
+                (task.id,),
+            )
+            connection.execute(
+                """
+                UPDATE task_runs SET status = 'cancelled', finished_at = CURRENT_TIMESTAMP
+                WHERE task_id = ? AND status = 'running'
+                """,
+                (task.id,),
+            )
+            self._event(
+                connection, task_id=task.id, event_type="task.cancelled",
+                payload={"host_job_id": job_id}, revision=revision,
+                idempotency_key=f"host-job:{job_id}:cancelled",
+            )
+            return self._get_with_connection(connection, task.id)
+
+    def resume_after_external_interruption(
+        self, task_id: str, *, job_id: str, external_session_id: str | None
+    ) -> TaskRecord:
+        """Release only after the Host Bridge has confirmed the old PID is gone."""
+        with self.database.transaction(immediate=True) as connection:
+            task = self._get_with_connection(connection, task_id)
+            if task.status not in {TaskStatus.RUNNING, TaskStatus.STOPPING}:
+                return task
+            target = (
+                TaskStatus.READY
+                if task.attempts_used <= task.max_attempts
+                else TaskStatus.NEEDS_HUMAN
+            )
+            revision = task.revision + 1
+            connection.execute(
+                """
+                UPDATE tasks SET status = ?, revision = ?,
+                    attempts_used = MAX(0, attempts_used - 1), worker_id = NULL,
+                    last_error = 'external_execution_interrupted',
+                    next_eligible_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (target.value, revision, task.id),
+            )
+            if task.worker_id:
+                connection.execute(
+                    """
+                    UPDATE workers SET external_session_id = COALESCE(?, external_session_id),
+                        status = 'idle', active_task_id = NULL, last_error = ?,
+                        updated_at = CURRENT_TIMESTAMP WHERE id = ?
+                    """,
+                    (external_session_id, "external_execution_interrupted", task.worker_id),
+                )
+            self._release_worker_and_lock(connection, task.id, task.worker_id)
+            connection.execute(
+                """
+                UPDATE task_attempts SET status = 'interrupted', finished_at = CURRENT_TIMESTAMP
+                WHERE task_id = ? AND status = 'running'
+                """,
+                (task.id,),
+            )
+            connection.execute(
+                """
+                UPDATE task_runs SET status = 'interrupted', finished_at = CURRENT_TIMESTAMP
+                WHERE task_id = ? AND status = 'running'
+                """,
+                (task.id,),
+            )
+            self._event(
+                connection, task_id=task.id, event_type="task.execution_interrupted",
+                payload={
+                    "host_job_id": job_id, "target": target.value,
+                    "session_retained": bool(external_session_id),
+                },
+                revision=revision, idempotency_key=f"host-job:{job_id}:interrupted",
+            )
             return self._get_with_connection(connection, task.id)
 
     def _acquire_worker_and_lock(self, connection: Any, task: TaskRecord) -> tuple[str | None, str | None, int | None]:

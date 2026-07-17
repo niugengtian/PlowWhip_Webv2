@@ -16,3 +16,14 @@ Probe, wake, lease, recovery and scheduling are deterministic 0 Token actions. A
 SQLite, WAL, logs and archives live in `/data`; managed repositories live in `/projects`. Host and container paths are stored separately because a Docker named volume cannot be treated as a macOS CLI workspace. Container workers use `projects.path`; Host Bridge workers use `projects.host_path`. Both must refer to the same logical checkout through an explicit mount or operator-managed sync.
 
 Completion is impossible without deterministic verification. Balanced adds one bounded planning record. Strict adds exactly one independent deterministic review; there is no review recursion.
+
+## Execution continuity
+
+Host CLI execution is a two-ledger protocol:
+
+1. SQLite creates a stable Host Job id with task attempt, worker generation and fencing token.
+2. Host Bridge writes `dispatching` before process creation, then persists PID, process identity and CLI session as soon as they exist.
+3. The scheduler polls Host Job state and renews task/resource leases without invoking a model.
+4. `completed` enters deterministic verification; `interrupted` releases the dead process lease and requeues with the retained CLI session; `cancelled` releases only after host confirmation.
+
+An unconsumed Host Job excludes its task from generic stale-lease recovery. This is the brain-split boundary: inability to prove that the old process is dead causes `recovery_hold`, never speculative duplicate dispatch. A Bridge restart can identify and cancel a live orphan process, but cannot reattach its stdout pipe; after that orphan exits, the task resumes from the persisted CLI session and compact context on a new attempt.

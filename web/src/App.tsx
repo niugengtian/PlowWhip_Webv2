@@ -23,7 +23,7 @@ const roleNames: Record<string, string> = {
 }
 
 const statusNames: Record<TaskStatus, string> = {
-  ready: '待执行', running: '执行中', verifying: '验证中', completed: '已完成',
+  ready: '待执行', running: '执行中', stopping: '停止中', verifying: '验证中', completed: '已完成',
   terminal_failed: '已熔断', needs_human: '需要处理', cancelled: '已取消', paused: '已暂停',
 }
 
@@ -234,7 +234,7 @@ export function App() {
 function Board({ tasks, projects, workers, providers, usage, onSelect }: { tasks: Task[]; projects: Project[]; workers: Worker[]; providers: Provider[]; usage: Usage | null; onSelect: (task: Task) => void }) {
   const columns: { title: string; statuses: TaskStatus[]; tone: string }[] = [
     { title: '待执行', statuses: ['ready', 'paused'], tone: 'blue' },
-    { title: '执行中', statuses: ['running'], tone: 'violet' },
+    { title: '执行中', statuses: ['running', 'stopping'], tone: 'violet' },
     { title: '质量验证', statuses: ['verifying'], tone: 'yellow' },
     { title: '已终态', statuses: ['completed', 'terminal_failed', 'cancelled', 'needs_human'], tone: 'green' },
   ]

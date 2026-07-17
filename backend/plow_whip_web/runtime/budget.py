@@ -32,16 +32,23 @@ class BudgetManager:
         if spent + estimated_tokens > daily_limit:
             raise BudgetExceededError("global daily token budget would be exceeded")
 
-    def record(self, task: TaskRecord, execution: dict[str, Any], *, provider: str) -> None:
+    def record(
+        self, task: TaskRecord, execution: dict[str, Any], *,
+        provider: str, run_id: str | None = None,
+    ) -> None:
         input_tokens = int(execution.get("input_tokens", 0))
         output_tokens = int(execution.get("output_tokens", 0))
         with self.database.transaction(immediate=True) as connection:
             connection.execute(
                 """
-                INSERT INTO token_usage(task_id, project_id, worker_id, input_tokens, output_tokens, provider)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT OR IGNORE INTO token_usage(
+                    task_id, project_id, worker_id, input_tokens, output_tokens, provider, run_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (task.id, task.project_id, task.worker_id, input_tokens, output_tokens, provider),
+                (
+                    task.id, task.project_id, task.worker_id, input_tokens, output_tokens,
+                    provider, run_id,
+                ),
             )
 
     def summary(self) -> dict[str, Any]:

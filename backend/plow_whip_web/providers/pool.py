@@ -82,6 +82,33 @@ class ProviderPool:
         )
         return result
 
+    def uses_host_job(self, provider_name: str) -> bool:
+        return self.require_available(provider_name)["transport"] == "host-bridge"
+
+    def start_task_job(
+        self, task: TaskRecord, *, job_id: str, prompt: str
+    ) -> dict[str, object]:
+        provider = self.require_available(task.provider)
+        if provider["transport"] != "host-bridge":
+            raise ProviderUnavailableError(f"provider 不使用 Host Job: {task.provider}")
+        if not task.worker_id:
+            raise ProviderUnavailableError("CLI Worker 尚未绑定")
+        worker = self.tasks.worker_execution_context(task.worker_id)
+        return self.bridge.start_job(
+            job_id=job_id,
+            provider=provider,
+            project_path=worker["host_path"],
+            prompt=prompt,
+            session_id=worker["external_session_id"],
+            timeout_seconds=int(task.command.get("timeout_seconds", 600)),
+        )
+
+    def poll_task_job(self, job_id: str) -> dict[str, object]:
+        return self.bridge.job_status(job_id)
+
+    def cancel_task_job(self, job_id: str) -> dict[str, object]:
+        return self.bridge.cancel_job(job_id)
+
     def refine_convention(
         self,
         *,
