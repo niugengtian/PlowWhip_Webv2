@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 
 from plow_whip_web import __version__
 from plow_whip_web.api.schemas import (
+    ArtifactOpenRequest,
     ExpectedRevision,
     ConventionPut,
     ConventionRefineRequest,
@@ -27,6 +28,7 @@ from plow_whip_web.api.schemas import (
     TaskCreate,
     TaskControl,
     TaskEventView,
+    TaskArtifactView,
     TaskView,
 )
 from plow_whip_web.config import Settings
@@ -501,6 +503,49 @@ def create_app(settings: Settings) -> FastAPI:
         repository: TaskRepository = request.app.state.task_repository
         return [TaskEventView(**event) for event in repository.events(task_id, after=after)]
 
+    @app.get(
+        "/api/tasks/{task_id}/artifacts",
+        response_model=list[TaskArtifactView],
+        tags=["artifacts"],
+    )
+    def task_artifacts(request: Request, task_id: str) -> list[TaskArtifactView]:
+        repository: TaskRepository = request.app.state.task_repository
+        task = repository.get(task_id)
+        paths = list(dict.fromkeys(
+            str(spec["path"])
+            for spec in task.verification
+            if spec.get("kind") in {"file_exists", "file_contains"} and spec.get("path")
+        ))
+        if not paths:
+            return []
+        project_path = _task_host_path(request, task.project_id, task.project_path)
+        pool: ProviderPool = request.app.state.provider_pool
+        return [
+            TaskArtifactView(**artifact)
+            for artifact in pool.inspect_artifacts(project_path=project_path, paths=paths)
+        ]
+
+    @app.post("/api/tasks/{task_id}/artifacts/open", tags=["artifacts"])
+    def open_task_artifact(
+        request: Request, task_id: str, payload: ArtifactOpenRequest
+    ) -> dict[str, object]:
+        repository: TaskRepository = request.app.state.task_repository
+        task = repository.get(task_id)
+        declared = {
+            str(spec["path"])
+            for spec in task.verification
+            if spec.get("kind") in {"file_exists", "file_contains"} and spec.get("path")
+        }
+        if payload.relative_path not in declared:
+            raise PolicyViolationError("只能打开任务已声明验证的产物")
+        project_path = _task_host_path(request, task.project_id, task.project_path)
+        pool: ProviderPool = request.app.state.provider_pool
+        return pool.open_artifact(
+            project_path=project_path,
+            relative_path=payload.relative_path,
+            action=payload.action,
+        )
+
     @app.post("/api/tasks/{task_id}/control", response_model=TaskView, tags=["tasks"])
     def control_task(
         request: Request,
@@ -521,3 +566,13 @@ def create_app(settings: Settings) -> FastAPI:
         app.mount("/", StaticFiles(directory=web_dist, html=True), name="web")
 
     return app
+
+
+def _task_host_path(
+    request: Request, project_id: str | None, fallback_path: str
+) -> str:
+    if not project_id:
+        return fallback_path
+    project: ProjectRepository = request.app.state.project_repository
+    record = project.get(project_id)
+    return str(record["host_path"] or record["path"])

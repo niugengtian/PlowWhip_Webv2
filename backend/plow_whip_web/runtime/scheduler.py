@@ -67,9 +67,12 @@ class SchedulerService:
         ready = self.tasks.list_ready(limit=1000)
         runnable = [task for task in ready if network_available(task.network_requirement, connectivity.state)]
         blocked = [task for task in ready if task not in runnable]
-        selected = runnable[: values["max_parallel_workers"]]
+        active = self.tasks.in_flight_count()
+        available_slots = max(0, values["max_parallel_workers"] - active)
+        selected = runnable[:available_slots]
         result: dict[str, Any] = {
             "status": "completed", "scanned": len(ready), "selected": len(selected),
+            "active": active, "available_slots": available_slots,
             "completed": [],
             "deferred": [{"task_id": task.id, "reason": f"network:{connectivity.state}"} for task in blocked],
             "model_tokens": 0, "health": health_result, "recovery": recovery_result,

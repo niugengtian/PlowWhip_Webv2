@@ -7,6 +7,7 @@ from urllib.request import Request, urlopen
 
 from plow_whip_web.domain.model import ProviderUnavailableError
 from plow_whip_web.providers.generic_command import ExecutionResult
+from plow_whip_web.runtime.verification import VerificationResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +70,53 @@ class HostBridgeClient:
 
     def cancel_job(self, job_id: str) -> dict[str, object]:
         return self._post("/v1/jobs/cancel", {"job_id": job_id}, timeout=10)
+
+    def verify(
+        self, *, project_path: str, execution: ExecutionResult,
+        verification: list[dict[str, object]],
+    ) -> VerificationResult:
+        payload = self._post("/v1/verify", {
+            "project_path": project_path,
+            "execution": {
+                "returncode": execution.returncode,
+                "duration_ms": execution.duration_ms,
+                "failure_class": execution.failure_class,
+                "input_tokens": execution.input_tokens,
+                "output_tokens": execution.output_tokens,
+                "external_session_id": execution.external_session_id,
+            },
+            "verification": verification,
+        }, timeout=20)
+        checks = payload.get("checks")
+        if not isinstance(checks, list):
+            raise ProviderUnavailableError("Host Bridge 返回了无效的验证结果")
+        return VerificationResult(
+            passed=bool(payload.get("passed")),
+            checks=checks,
+            evidence_hash=str(payload.get("evidence_hash") or ""),
+            summary=str(payload.get("summary") or ""),
+        )
+
+    def inspect_artifacts(
+        self, *, project_path: str, paths: list[str]
+    ) -> list[dict[str, object]]:
+        payload = self._post("/v1/artifacts/inspect", {
+            "project_path": project_path,
+            "paths": paths,
+        }, timeout=30)
+        artifacts = payload.get("artifacts")
+        if not isinstance(artifacts, list):
+            raise ProviderUnavailableError("Host Bridge 返回了无效的产物索引")
+        return artifacts
+
+    def open_artifact(
+        self, *, project_path: str, relative_path: str, action: str
+    ) -> dict[str, object]:
+        return self._post("/v1/artifacts/open", {
+            "project_path": project_path,
+            "relative_path": relative_path,
+            "action": action,
+        }, timeout=10)
 
     @staticmethod
     def result(snapshot: dict[str, object]) -> ExecutionResult:

@@ -71,7 +71,43 @@ def test_context_is_deterministically_bounded() -> None:
         )
         compiled = app.state.context_compiler.compile(task.id)
         assert compiled["byte_size"] <= 4096
-        assert compiled["content"].endswith("[context truncated deterministically]\n")
+        assert "context sections truncated deterministically by scope priority" in compiled["content"]
+        assert "## Convention: project" in compiled["content"]
+        assert "## Boundaries" in compiled["content"]
+        assert compiled["content"].endswith(
+            "Only verification evidence can move this task to completed.\n"
+        )
+
+
+def test_context_truncation_prefers_task_and_project_rules_over_global_rules() -> None:
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        app = create_app(Settings(data_dir=root / "runtime"))
+        project, task = _bound_task(app, root)
+        current = app.state.runtime_settings.get()
+        values = dict(current["values"])
+        values["context_max_bytes"] = 4096
+        app.state.runtime_settings.update(values, expected_revision=0)
+        app.state.conventions.put(
+            scope="global", scope_id="global",
+            content="GLOBAL-LOW-PRIORITY " * 1000, expected_revision=0,
+        )
+        app.state.conventions.put(
+            scope="project", scope_id=project["id"],
+            content="PROJECT-SAFETY-RULE " * 1000, expected_revision=0,
+        )
+        app.state.conventions.put(
+            scope="task", scope_id=task.id,
+            content="TASK-COMPLETION-RULE " * 1000, expected_revision=0,
+        )
+
+        content = app.state.context_compiler.compile(task.id)["content"]
+
+        assert "TASK-COMPLETION-RULE" in content
+        assert "PROJECT-SAFETY-RULE" in content
+        assert "GLOBAL-LOW-PRIORITY" not in content
+        assert f"Task id: {task.id}" in content
+        assert "Only verification evidence can move this task to completed." in content
 
 
 def test_only_five_practical_role_prompts_are_exposed() -> None:

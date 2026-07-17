@@ -10,6 +10,30 @@ from plow_whip_web.api.app import create_app
 from plow_whip_web.config import Settings
 
 
+class ArtifactBridge:
+    def __init__(self) -> None:
+        self.opened: tuple[str, str, str] | None = None
+
+    def inspect_artifacts(
+        self, *, project_path: str, paths: list[str]
+    ) -> list[dict[str, object]]:
+        return [{
+            "relative_path": path,
+            "host_path": str(Path(project_path) / path),
+            "exists": (Path(project_path) / path).is_file(),
+            "bytes": (Path(project_path) / path).stat().st_size,
+            "sha256": "a" * 64,
+            "modified_at": "2026-07-17T00:00:00+00:00",
+            "actions": ["finder", "cursor"],
+        } for path in paths]
+
+    def open_artifact(
+        self, *, project_path: str, relative_path: str, action: str
+    ) -> dict[str, object]:
+        self.opened = (project_path, relative_path, action)
+        return {"status": "opened"}
+
+
 def _task_payload(project: Path, *, content: str = "quality-pass") -> dict[str, object]:
     code = f"from pathlib import Path; Path('result.txt').write_text({content!r}, encoding='utf-8')"
     return {
@@ -71,6 +95,58 @@ def test_create_drive_verify_and_absorb_terminal_state() -> None:
                 "verification.started",
                 "task.completed",
             ]
+
+
+def test_task_artifacts_point_to_host_project_and_open_only_declared_files() -> None:
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        container_project = root / "container"
+        host_project = root / "host"
+        container_project.mkdir()
+        host_project.mkdir()
+        (host_project / "报告.md").write_text("ready", encoding="utf-8")
+        app = create_app(Settings(
+            data_dir=root / "runtime",
+            host_bridge_token="test-token-is-long-enough-123",
+        ))
+        bridge = ArtifactBridge()
+        app.state.provider_pool.bridge = bridge
+        project = app.state.project_repository.create(
+            name="artifact-project",
+            path=str(container_project),
+            host_path=str(host_project),
+        )
+        role = app.state.project_repository.resolve_role(project["id"], "verification")
+        task = app.state.task_repository.create(
+            title="artifact-index",
+            objective="index report",
+            project_path=str(container_project),
+            project_id=project["id"],
+            role_id=role["role_id"],
+            provider="cursor",
+            command={"argv": ["cursor"], "timeout_seconds": 60},
+            verification=[{"kind": "file_exists", "path": "报告.md"}],
+            max_attempts=1,
+            token_budget=100,
+            idempotency_key="artifact-index-create",
+        )
+
+        with TestClient(app) as client:
+            artifacts = client.get(f"/api/tasks/{task.id}/artifacts")
+            opened = client.post(
+                f"/api/tasks/{task.id}/artifacts/open",
+                json={"relative_path": "报告.md", "action": "cursor"},
+            )
+            rejected = client.post(
+                f"/api/tasks/{task.id}/artifacts/open",
+                json={"relative_path": "secrets.env", "action": "cursor"},
+            )
+
+        assert artifacts.status_code == 200
+        assert artifacts.json()[0]["host_path"] == str(host_project / "报告.md")
+        assert opened.status_code == 200
+        assert bridge.opened == (str(host_project), "报告.md", "cursor")
+        assert rejected.status_code == 403
 
 
 def test_verification_failure_cannot_complete() -> None:

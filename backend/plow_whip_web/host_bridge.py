@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import hmac
 import json
 import os
@@ -18,11 +19,14 @@ from pathlib import Path
 from time import monotonic
 from typing import Any
 
+from plow_whip_web.providers.generic_command import ExecutionResult
+from plow_whip_web.runtime.verification import VerificationEngine
 from plow_whip_web.security import Redactor
 
 
 MAX_BODY_BYTES = 1_048_576
 MAX_OUTPUT_BYTES = 262_144
+MAX_ARTIFACT_HASH_BYTES = 67_108_864
 SUPPORTED_ADAPTERS = {"codex", "cursor", "json-worker"}
 
 
@@ -75,6 +79,12 @@ def _handler(
                     self._send(200, probe(payload))
                 elif self.path == "/v1/execute":
                     self._send(200, execute(payload, roots))
+                elif self.path == "/v1/verify":
+                    self._send(200, verify(payload, roots))
+                elif self.path == "/v1/artifacts/inspect":
+                    self._send(200, inspect_artifacts(payload, roots))
+                elif self.path == "/v1/artifacts/open":
+                    self._send(200, open_artifact(payload, roots))
                 elif self.path == "/v1/jobs/start":
                     self._send(202, jobs.start(payload))
                 elif self.path == "/v1/jobs/status":
@@ -493,6 +503,125 @@ def execute(payload: dict[str, Any], roots: tuple[Path, ...]) -> dict[str, objec
             "output_tokens": 0,
             "session_id": session_id,
         }
+
+
+def verify(payload: dict[str, Any], roots: tuple[Path, ...]) -> dict[str, object]:
+    project_path = Path(str(payload["project_path"])).expanduser().resolve()
+    if not project_path.is_dir() or not any(_is_within(project_path, root) for root in roots):
+        raise ValueError("project_path is outside the configured project roots")
+    execution_payload = payload.get("execution")
+    specs = payload.get("verification")
+    if not isinstance(execution_payload, dict):
+        raise ValueError("execution must be an object")
+    if not isinstance(specs, list) or not 1 <= len(specs) <= 32:
+        raise ValueError("verification must contain 1-32 checks")
+    execution = ExecutionResult(
+        returncode=int(execution_payload.get("returncode", 1)),
+        stdout="",
+        stderr="",
+        duration_ms=int(execution_payload.get("duration_ms", 0)),
+        failure_class=execution_payload.get("failure_class"),
+        input_tokens=int(execution_payload.get("input_tokens", 0)),
+        output_tokens=int(execution_payload.get("output_tokens", 0)),
+        external_session_id=execution_payload.get("external_session_id"),
+    )
+    result = VerificationEngine().verify(project_path, execution, specs)
+    return {
+        "passed": result.passed,
+        "checks": result.checks,
+        "evidence_hash": result.evidence_hash,
+        "summary": result.summary,
+    }
+
+
+def inspect_artifacts(
+    payload: dict[str, Any], roots: tuple[Path, ...]
+) -> dict[str, object]:
+    project_path = _project_path(payload, roots)
+    paths = payload.get("paths")
+    if not isinstance(paths, list) or not 1 <= len(paths) <= 32:
+        raise ValueError("paths must contain 1-32 relative artifact paths")
+    cursor = _resolve_executable("", "cursor")
+    artifacts: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for raw_path in paths:
+        relative_path = str(raw_path)
+        if relative_path in seen:
+            continue
+        seen.add(relative_path)
+        target = _artifact_path(project_path, relative_path)
+        exists = target.is_file()
+        stat = target.stat() if exists else None
+        sha256 = None
+        if stat is not None and stat.st_size <= MAX_ARTIFACT_HASH_BYTES:
+            digest = hashlib.sha256()
+            with target.open("rb") as artifact:
+                for chunk in iter(lambda: artifact.read(1_048_576), b""):
+                    digest.update(chunk)
+            sha256 = digest.hexdigest()
+        artifacts.append({
+            "relative_path": relative_path,
+            "host_path": str(target),
+            "exists": exists,
+            "bytes": stat.st_size if stat is not None else None,
+            "sha256": sha256,
+            "modified_at": (
+                datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(timespec="seconds")
+                if stat is not None else None
+            ),
+            "actions": ["finder", *(["cursor"] if cursor else [])] if exists else [],
+        })
+    return {"project_path": str(project_path), "artifacts": artifacts}
+
+
+def open_artifact(
+    payload: dict[str, Any], roots: tuple[Path, ...]
+) -> dict[str, object]:
+    project_path = _project_path(payload, roots)
+    relative_path = str(payload["relative_path"])
+    target = _artifact_path(project_path, relative_path)
+    if not target.is_file():
+        raise ValueError("artifact does not exist")
+    action = str(payload.get("action") or "")
+    if action == "finder":
+        argv = ["/usr/bin/open", "-R", str(target)]
+    elif action == "cursor":
+        cursor = _resolve_executable("", "cursor")
+        if cursor is None:
+            raise ValueError("Cursor CLI is not available")
+        argv = [cursor, str(target)]
+    else:
+        raise ValueError("unsupported artifact action")
+    process = subprocess.Popen(
+        argv, cwd=project_path, stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        env=_safe_environment(), start_new_session=True,
+    )
+    return {
+        "status": "opened",
+        "action": action,
+        "relative_path": relative_path,
+        "host_path": str(target),
+        "pid": process.pid,
+    }
+
+
+def _project_path(payload: dict[str, Any], roots: tuple[Path, ...]) -> Path:
+    project_path = Path(str(payload["project_path"])).expanduser().resolve()
+    if not project_path.is_dir() or not any(
+        _is_within(project_path, root) for root in roots
+    ):
+        raise ValueError("project_path is outside the configured project roots")
+    return project_path
+
+
+def _artifact_path(project_path: Path, relative_path: str) -> Path:
+    if not relative_path or Path(relative_path).is_absolute():
+        raise ValueError("artifact path must be relative")
+    target = (project_path / relative_path).resolve()
+    if not _is_within(target, project_path):
+        raise ValueError("artifact path escapes project root")
+    return target
 
 
 def _execution_argv(

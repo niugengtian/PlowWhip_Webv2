@@ -125,6 +125,23 @@ button.full { width: 100%; }
 .timeline h2, .usage-columns h2 { margin: 0 0 10px; font-size: .79rem; }
 .timeline > div { display: grid; grid-template-columns: 38px 1fr auto; gap: 9px; padding: 9px 0; border-bottom: 1px solid var(--line); color: #7788ab; font-size: .67rem; }
 .timeline strong { color: #b9c4df; }
+.artifacts { border-bottom: 1px solid var(--line); padding: 17px 18px; }
+.section-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+.section-heading h2 { margin: 3px 0 0; color: #d9e2f7; font-size: .86rem; }
+.section-heading > span { color: #64769b; font-size: .64rem; }
+.artifacts article { display: grid; grid-template-columns: 34px minmax(0, 1fr) auto; align-items: center; gap: 10px; border: 1px solid #26324d; border-radius: 5px; padding: 10px; background: #111725; }
+.artifacts article + article { margin-top: 8px; }
+.artifacts article.missing { opacity: .6; }
+.artifact-icon { display: grid; place-items: center; width: 32px; height: 32px; border: 1px solid #2b3b5d; border-radius: 5px; color: #79a3f5; }
+.artifact-main { min-width: 0; }
+.artifact-main strong, .artifact-main code, .artifact-main small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.artifact-main strong { color: #dae3f8; font-size: .74rem; }
+.artifact-main code { margin-top: 4px; color: #788bae; font-size: .62rem; }
+.artifact-main small { margin-top: 4px; color: #536687; font-size: .6rem; }
+.artifact-actions { display: flex; gap: 6px; }
+.artifact-actions button { padding: 6px 8px; font-size: .66rem; }
+.artifact-error, .artifact-empty { margin: 0; border: 1px dashed #2a3753; border-radius: 5px; padding: 12px; color: #7283a6; font-size: .68rem; }
+.artifact-error { border-color: rgba(255,82,112,.35); color: #ff8ba0; }
 
 .settings-layout { display: grid; gap: 12px; }
 .project-grid, .provider-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; padding: 14px; }
@@ -222,5 +239,8 @@ textarea { min-height: 84px; resize: vertical; line-height: 1.5; }
   .kanban-column:last-child { border-bottom: 0; }
   .facts > div, .facts > div:nth-child(3n) { border-right: 1px solid var(--line); }
   .facts > div:nth-child(2n) { border-right: 0; }
+  .artifacts article { grid-template-columns: 34px minmax(0, 1fr); }
+  .artifact-actions { grid-column: 1 / -1; }
+  .artifact-actions button { flex: 1; }
   .editor-grid textarea { min-height: 190px; }
 }

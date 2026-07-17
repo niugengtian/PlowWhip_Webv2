@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +16,7 @@ from plow_whip_web.providers.pool import ProviderPool
 from plow_whip_web.runtime.budget import BudgetManager
 from plow_whip_web.runtime.context import ContextCompiler
 from plow_whip_web.runtime.journal import SessionJournal
-from plow_whip_web.runtime.verification import VerificationEngine
+from plow_whip_web.runtime.verification import VerificationEngine, VerificationResult
 from plow_whip_web.security import CommandPolicy
 from plow_whip_web.store.host_job_repository import HostJobRepository
 from plow_whip_web.store.task_repository import TaskRepository
@@ -57,15 +59,22 @@ class TaskService:
             )
         if pending.provider == self.provider.name:
             self.command_policy.validate(Path(pending.project_path), pending.command)
+        host_model = bool(
+            provider_config and provider_config["transport"] == "host-bridge"
+        )
         estimate = (
             self.provider.estimate_tokens(pending.command)
             if pending.provider == self.provider.name else 0
         )
+        reserved_tokens = 0
         if self.budget:
             self.budget.ensure(pending, estimate)
+            if host_model:
+                reserved_tokens = self.budget.host_reservation(pending)
         claim = self.repository.claim(
             task_id, expected_revision=expected_revision,
             idempotency_key=f"{idempotency_key}:claim",
+            reserved_tokens=reserved_tokens,
         )
         if not claim.claimed:
             return claim.task
@@ -142,11 +151,25 @@ class TaskService:
             if status == "completed":
                 if task.status is TaskStatus.STOPPING:
                     result = self.repository.finalize_running_cancel(task_id, job_id=job_id)
+                    self._settle_host_reservation(task, job, snapshot)
                 elif task.status in {TaskStatus.RUNNING, TaskStatus.VERIFYING}:
                     execution = self.provider_pool.bridge.result(snapshot)
+                    try:
+                        verification = self.provider_pool.verify_host_task(task, execution)
+                        independent = (
+                            self.provider_pool.verify_host_task(task, execution)
+                            if task.quality_profile == "strict" else None
+                        )
+                    except ProviderUnavailableError as error:
+                        self.host_jobs.hold(job_id, str(error))
+                        self.host_jobs.renew(job_id)
+                        active += 1
+                        continue
                     result = self._finish_execution(
                         task, job["attempt_id"], job["run_id"], execution,
                         idempotency_prefix=f"host-job:{job_id}",
+                        verification=verification,
+                        independent_verification=independent,
                     )
                 else:
                     result = task
@@ -169,6 +192,7 @@ class TaskService:
                         external_session_id=snapshot.get("session_id"),
                     )
                 )
+                self._settle_host_reservation(task, job, snapshot)
                 self.host_jobs.consume(job_id)
                 settled.append({"task_id": task_id, "status": result.status.value})
                 continue
@@ -177,6 +201,7 @@ class TaskService:
                     task_id, job_id=job_id,
                     external_session_id=snapshot.get("session_id"),
                 )
+                self._settle_host_reservation(task, job, snapshot)
                 self.host_jobs.consume(job_id)
                 settled.append({"task_id": task_id, "status": result.status.value})
                 continue
@@ -187,6 +212,20 @@ class TaskService:
             "checked": len(jobs), "active": active, "settled": settled,
             "model_invoked": False,
         }
+
+    def _settle_host_reservation(
+        self, task: TaskRecord, job: dict[str, Any], snapshot: dict[str, Any]
+    ) -> None:
+        if not self.budget or not self.provider_pool:
+            return
+        execution = self.provider_pool.bridge.result(snapshot).as_dict()
+        if int(execution["input_tokens"]) + int(execution["output_tokens"]) > 0:
+            self.budget.record(
+                task, execution, provider=task.provider, run_id=job["run_id"],
+                add_to_task=True,
+            )
+        else:
+            self.budget.release(job["run_id"])
 
     def control(
         self, task_id: str, *, action: str, reason: str,
@@ -225,15 +264,19 @@ class TaskService:
     def _finish_execution(
         self, task: TaskRecord, attempt_id: str, run_id: str,
         execution: ExecutionResult, *, idempotency_prefix: str,
+        verification: VerificationResult | None = None,
+        independent_verification: VerificationResult | None = None,
     ) -> TaskRecord:
         project_path = Path(task.project_path).resolve()
         verifying = self.repository.mark_verifying(
             task.id, expected_revision=task.revision,
             idempotency_key=f"{idempotency_prefix}:verify",
         )
-        verification = self.verifier.verify(project_path, execution, task.verification)
+        verification = verification or self.verifier.verify(
+            project_path, execution, task.verification
+        )
         if task.quality_profile == "strict":
-            independent = VerificationEngine().verify(
+            independent = independent_verification or VerificationEngine().verify(
                 project_path, execution, task.verification
             )
             self.repository.record_quality_run(
@@ -251,6 +294,9 @@ class TaskService:
         verification_payload: dict[str, Any] = {
             "passed": verification.passed, "checks": verification.checks,
             "evidence_hash": verification.evidence_hash,
+            "failure_fingerprint": _failure_fingerprint(
+                execution, verification.checks
+            ),
             "summary": verification.summary,
         }
         limits = self.budget.settings.get()["values"] if self.budget else {}
@@ -276,3 +322,32 @@ class TaskService:
                 "output_tokens": execution_payload["output_tokens"],
             })
         return completed
+
+
+def _failure_fingerprint(
+    execution: ExecutionResult, checks: list[dict[str, Any]]
+) -> str:
+    def stable(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: stable(item)
+                for key, item in value.items()
+                if key != "modified_at_ns"
+            }
+        if isinstance(value, list):
+            return [stable(item) for item in value]
+        return value
+
+    canonical = json.dumps(
+        {
+            "execution": {
+                "returncode": execution.returncode,
+                "failure_class": execution.failure_class,
+            },
+            "checks": stable(checks),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

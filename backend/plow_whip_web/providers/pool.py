@@ -8,6 +8,7 @@ from typing import Any
 from plow_whip_web.domain.model import ProviderUnavailableError, TaskRecord
 from plow_whip_web.providers.generic_command import ExecutionResult, GenericCommandProvider
 from plow_whip_web.providers.host_bridge import HostBridgeClient
+from plow_whip_web.runtime.verification import VerificationResult
 from plow_whip_web.store.database import Database
 from plow_whip_web.store.provider_repository import ProviderRepository
 from plow_whip_web.store.task_repository import TaskRepository
@@ -108,6 +109,30 @@ class ProviderPool:
 
     def cancel_task_job(self, job_id: str) -> dict[str, object]:
         return self.bridge.cancel_job(job_id)
+
+    def verify_host_task(
+        self, task: TaskRecord, execution: ExecutionResult
+    ) -> VerificationResult:
+        if not task.worker_id:
+            raise ProviderUnavailableError("CLI Worker 尚未绑定")
+        worker = self.tasks.worker_execution_context(task.worker_id)
+        return self.bridge.verify(
+            project_path=worker["host_path"],
+            execution=execution,
+            verification=task.verification,
+        )
+
+    def inspect_artifacts(
+        self, *, project_path: str, paths: list[str]
+    ) -> list[dict[str, object]]:
+        return self.bridge.inspect_artifacts(project_path=project_path, paths=paths)
+
+    def open_artifact(
+        self, *, project_path: str, relative_path: str, action: str
+    ) -> dict[str, object]:
+        return self.bridge.open_artifact(
+            project_path=project_path, relative_path=relative_path, action=action
+        )
 
     def refine_convention(
         self,

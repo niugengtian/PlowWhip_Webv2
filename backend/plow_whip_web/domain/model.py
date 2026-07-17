@@ -81,3 +81,7 @@ class ProviderUnavailableError(DomainError):
 
 class PolicyViolationError(DomainError):
     pass
+
+
+class BudgetExceededError(DomainError):
+    pass

@@ -7,6 +7,7 @@ from typing import Any
 
 from plow_whip_web.domain.model import (
     InvalidTransitionError,
+    BudgetExceededError,
     NotFoundError,
     ProviderUnavailableError,
     RevisionConflictError,
@@ -16,6 +17,7 @@ from plow_whip_web.domain.model import (
     TERMINAL_TASK_STATUSES,
 )
 from plow_whip_web.store.database import Database
+from plow_whip_web.store.settings_repository import DEFAULT_SETTINGS
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,7 +181,10 @@ class TaskRepository:
         finally:
             connection.close()
 
-    def claim(self, task_id: str, *, expected_revision: int, idempotency_key: str) -> ClaimResult:
+    def claim(
+        self, task_id: str, *, expected_revision: int, idempotency_key: str,
+        reserved_tokens: int = 0,
+    ) -> ClaimResult:
         with self.database.transaction(immediate=True) as connection:
             duplicate = connection.execute(
                 "SELECT task_id FROM task_events WHERE idempotency_key = ?",
@@ -198,6 +203,39 @@ class TaskRepository:
                 raise InvalidTransitionError(f"task is not ready: {task.status}")
             if task.attempts_used >= task.max_attempts:
                 raise InvalidTransitionError("task attempt budget exhausted")
+            limits = dict(DEFAULT_SETTINGS)
+            settings = connection.execute(
+                "SELECT settings_json FROM system_settings WHERE id = 1"
+            ).fetchone()
+            if settings:
+                limits.update(json.loads(settings["settings_json"]))
+            if self._in_flight_count(connection) >= int(limits["max_parallel_workers"]):
+                raise ResourceBusyError("global parallel worker limit reached")
+            if reserved_tokens:
+                task_reserved = connection.execute(
+                    """
+                    SELECT COALESCE(SUM(reserved_tokens), 0)
+                    FROM token_reservations
+                    WHERE task_id = ? AND status = 'active'
+                    """,
+                    (task.id,),
+                ).fetchone()[0]
+                if task.tokens_used + task_reserved + reserved_tokens > task.token_budget:
+                    raise BudgetExceededError("task token budget would be exceeded")
+                daily_allocated = connection.execute(
+                    """
+                    SELECT
+                        (SELECT COALESCE(SUM(input_tokens + output_tokens), 0)
+                         FROM token_usage WHERE date(created_at) = date('now'))
+                      + (SELECT COALESCE(SUM(reserved_tokens), 0)
+                         FROM token_reservations
+                         WHERE status = 'active' AND date(created_at) = date('now'))
+                    """
+                ).fetchone()[0]
+                if daily_allocated + reserved_tokens > int(
+                    limits["global_daily_token_budget"]
+                ):
+                    raise BudgetExceededError("global daily token budget would be exceeded")
             worker_id, lease_token, fencing_token = self._acquire_worker_and_lock(connection, task)
             attempt_id = str(uuid.uuid4())
             run_id = str(uuid.uuid4())
@@ -234,6 +272,18 @@ class TaskRepository:
                 """,
                 (run_id, task.id, attempt_id, task.provider),
             )
+            if reserved_tokens:
+                connection.execute(
+                    """
+                    INSERT INTO token_reservations(
+                        run_id, task_id, project_id, worker_id, provider, reserved_tokens
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id, task.id, task.project_id, worker_id, task.provider,
+                        reserved_tokens,
+                    ),
+                )
             self._event(
                 connection,
                 task_id=task.id,
@@ -246,6 +296,26 @@ class TaskRepository:
                 idempotency_key=idempotency_key,
             )
             return ClaimResult(self._get_with_connection(connection, task.id), attempt_id, run_id, True)
+
+    def in_flight_count(self) -> int:
+        connection = self.database.connect()
+        try:
+            return self._in_flight_count(connection)
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _in_flight_count(connection: Any) -> int:
+        return int(connection.execute(
+            """
+            SELECT COUNT(*) FROM (
+                SELECT id AS task_id FROM tasks
+                WHERE status IN ('running', 'verifying', 'stopping')
+                UNION
+                SELECT task_id FROM host_jobs WHERE consumed_at IS NULL
+            )
+            """
+        ).fetchone()[0])
 
     def record_quality_run(
         self, *, task_id: str, attempt_id: str, run_type: str, result: dict[str, Any]
@@ -304,7 +374,9 @@ class TaskRepository:
                 )
             if task.status is not TaskStatus.VERIFYING:
                 raise InvalidTransitionError(f"task is not verifying: {task.status}")
-            fingerprint = verification["evidence_hash"]
+            fingerprint = verification.get(
+                "failure_fingerprint", verification["evidence_hash"]
+            )
             same_failure_count = 0 if passed else (
                 task.same_failure_count + 1 if task.last_failure_fingerprint == fingerprint else 1
             )

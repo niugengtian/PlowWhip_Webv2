@@ -118,6 +118,21 @@ class TaskEventView(BaseModel):
     created_at: str
 
 
+class TaskArtifactView(BaseModel):
+    relative_path: str
+    host_path: str
+    exists: bool
+    bytes: int | None
+    sha256: str | None
+    modified_at: str | None
+    actions: list[Literal["finder", "cursor"]]
+
+
+class ArtifactOpenRequest(BaseModel):
+    relative_path: str
+    action: Literal["finder", "cursor"]
+
+
 class ProjectCreate(BaseModel):
     name: Annotated[str, Field(min_length=1, max_length=120)]
     path: str

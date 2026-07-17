@@ -35,6 +35,18 @@ export type Task = {
   last_error: string | null
   created_at: string
   updated_at: string
+  command: Record<string, unknown>
+  verification: { kind: string; path?: string; contains?: string; expected?: number }[]
+}
+
+export type TaskArtifact = {
+  relative_path: string
+  host_path: string
+  exists: boolean
+  bytes: number | null
+  sha256: string | null
+  modified_at: string | null
+  actions: ('finder' | 'cursor')[]
 }
 
 export type Role = { id: string; kind: string; status: string }
@@ -219,6 +231,14 @@ export const api = {
     }),
   tasks: () => request<Task[]>('/api/tasks'),
   taskEvents: (taskId: string) => request<TaskEvent[]>(`/api/tasks/${taskId}/events`),
+  taskArtifacts: (taskId: string) =>
+    request<TaskArtifact[]>(`/api/tasks/${taskId}/artifacts`),
+  openTaskArtifact: (
+    taskId: string, relativePath: string, action: 'finder' | 'cursor',
+  ) => request<Record<string, unknown>>(`/api/tasks/${taskId}/artifacts/open`, {
+    method: 'POST',
+    body: JSON.stringify({ relative_path: relativePath, action }),
+  }),
   createTask: (payload: Record<string, unknown>) =>
     request<Task>('/api/tasks', {
       method: 'POST',

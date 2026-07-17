@@ -19,6 +19,10 @@ Settings shows the embedded runner heartbeat, five-field Cron expression, timezo
 docker compose exec control-plane python -m plow_whip_web --data-dir /data scheduler-tick
 ```
 
+`max_parallel_workers` includes work already running from prior ticks and manual drives. A Tick result reports `active` and `available_slots`; `selected: 0` with no error is expected when existing Host Jobs occupy every slot.
+
+Host model tasks require positive task and global Token budgets. The control plane reserves the task's remaining budget before dispatch and exposes active reservation totals from `/api/usage`. Reported actual usage releases unused capacity after settlement. Treat this as an allocation gate, not a provider-side generation cutoff: stop or cancel a CLI job if its provider does not honor an external spending limit.
+
 ## Upgrade and migration
 
 Create a backup from Health, build the new image, then run `docker compose up -d`. Migrations are ordered and idempotent. Check `/health` and the migration count. Never use `down -v` during an upgrade.

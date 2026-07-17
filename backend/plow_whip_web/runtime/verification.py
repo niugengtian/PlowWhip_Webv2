@@ -35,18 +35,25 @@ class VerificationEngine:
                 )
                 continue
             target = _safe_project_path(project_path, spec["path"])
+            artifact = _artifact_evidence(target)
             if kind == "file_exists":
-                results.append({"kind": kind, "path": spec["path"], "passed": target.is_file()})
+                results.append({
+                    "kind": kind, "path": spec["path"],
+                    "passed": artifact is not None, "artifact": artifact,
+                })
                 continue
             if kind == "file_contains":
                 expected_text = str(spec["contains"])
-                actual_text = target.read_text(encoding="utf-8") if target.is_file() else ""
+                actual_text = (
+                    target.read_text(encoding="utf-8") if artifact is not None else ""
+                )
                 results.append(
                     {
                         "kind": kind,
                         "path": spec["path"],
                         "passed": expected_text in actual_text,
                         "contains": expected_text,
+                        "artifact": artifact,
                     }
                 )
                 continue
@@ -75,3 +82,15 @@ def _safe_project_path(root: Path, relative: str) -> Path:
     if not target.is_relative_to(root):
         raise ValueError("verification path escapes project root")
     return target
+
+
+def _artifact_evidence(target: Path) -> dict[str, Any] | None:
+    if not target.is_file():
+        return None
+    content = target.read_bytes()
+    stat = target.stat()
+    return {
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "bytes": len(content),
+        "modified_at_ns": stat.st_mtime_ns,
+    }
