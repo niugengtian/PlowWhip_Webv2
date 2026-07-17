@@ -1,4 +1,8 @@
 .venv/
+.env
+.env.local
+.env.*.local
+!.env.local.example
 node_modules/
 web/dist/
 backend/plow_whip_web/static/

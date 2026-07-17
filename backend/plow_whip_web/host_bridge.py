@@ -19,6 +19,7 @@ from pathlib import Path
 from time import monotonic
 from typing import Any
 
+from plow_whip_web.config import load_private_env
 from plow_whip_web.providers.generic_command import ExecutionResult
 from plow_whip_web.runtime.verification import VerificationEngine
 from plow_whip_web.security import Redactor
@@ -26,6 +27,7 @@ from plow_whip_web.security import Redactor
 
 MAX_BODY_BYTES = 1_048_576
 MAX_OUTPUT_BYTES = 262_144
+MAX_OUTPUT_TAIL_BYTES = 16_384
 MAX_ARTIFACT_HASH_BYTES = 67_108_864
 SUPPORTED_ADAPTERS = {"codex", "cursor", "json-worker"}
 
@@ -35,6 +37,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bind", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--project-root", action="append", type=Path, required=True)
+    parser.add_argument(
+        "--env-file",
+        type=Path,
+        help="Private local environment file (must not be accessible by group or others)",
+    )
     parser.add_argument(
         "--state-dir",
         type=Path,
@@ -46,6 +53,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.env_file is not None:
+        try:
+            if not load_private_env(args.env_file):
+                raise SystemExit(f"private environment file not found: {args.env_file}")
+        except ValueError as error:
+            raise SystemExit(str(error)) from error
     token = os.environ.get("PLOW_WHIP_BRIDGE_TOKEN", "")
     if len(token) < 24:
         raise SystemExit("PLOW_WHIP_BRIDGE_TOKEN must contain at least 24 characters")
@@ -169,6 +182,9 @@ class HostJobManager:
             "returncode": None,
             "stdout": "",
             "stderr": "",
+            "output_ref": f"{job_id}/",
+            "output_segments": [],
+            "output_bytes": {"stdout": 0, "stderr": 0, "total": 0},
             "duration_ms": 0,
             "failure_class": None,
             "input_tokens": 0,
@@ -195,10 +211,12 @@ class HostJobManager:
             )
         except OSError as error:
             with self._lock:
+                sanitized_error = Redactor.redact(str(error))[:1000]
+                self._append_output(record, "stderr", sanitized_error)
                 record.update({
                     "status": "completed", "returncode": 126,
                     "failure_class": "command_unavailable",
-                    "stderr": Redactor.redact(str(error))[:1000],
+                    "error_summary": sanitized_error,
                     "finished_at": _utc_now(), "heartbeat_at": _utc_now(),
                 })
                 self._write(record)
@@ -293,6 +311,7 @@ class HostJobManager:
                 "status": status,
                 "returncode": returncode,
                 "failure_class": failure,
+                "error_summary": failure,
                 "duration_ms": int((monotonic() - started) * 1000),
                 "heartbeat_at": _utc_now(),
                 "finished_at": _utc_now(),
@@ -306,10 +325,11 @@ class HostJobManager:
         for line in iter(stream.readline, ""):
             with self._lock:
                 record = self._read(job_id)
-                record[field] = _append_bounded(str(record.get(field) or ""), Redactor.redact(line))
+                sanitized = Redactor.redact(line)
+                self._append_output(record, field, sanitized)
                 record["heartbeat_at"] = _utc_now()
                 if field == "stdout":
-                    parsed = _parse_stream(line)
+                    parsed = _parse_stream(sanitized)
                     record["session_id"] = record.get("session_id") or parsed["session_id"]
                     record["input_tokens"] = max(
                         int(record.get("input_tokens") or 0), int(parsed["input_tokens"])
@@ -342,6 +362,7 @@ class HostJobManager:
                     "status": "cancelled" if not _same_process(record) else "recovery_hold",
                     "returncode": 130 if not _process_alive(pid) else None,
                     "failure_class": "cancelled" if not _process_alive(pid) else "process_unconfirmed",
+                    "error_summary": "cancelled" if not _process_alive(pid) else "process_unconfirmed",
                     "heartbeat_at": _utc_now(),
                     "finished_at": _utc_now() if not _process_alive(pid) else None,
                 })
@@ -354,11 +375,19 @@ class HostJobManager:
                 job_id = _job_id(record.get("job_id"))
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
                 continue
+            output_directory = self._output_directory(job_id)
+            if not any(output_directory.glob("*.log")):
+                for stream in ("stdout", "stderr"):
+                    legacy_tail = str(record.get(stream) or "")
+                    if legacy_tail:
+                        self._append_output(record, stream, Redactor.redact(legacy_tail))
+            self._sync_output_index(record)
             if record.get("status") in {"dispatching", "running", "orphan_running", "recovery_hold"}:
                 if record.get("status") == "dispatching" and not record.get("pid"):
                     record.update({
                         "status": "recovery_hold",
                         "failure_class": "dispatch_outcome_unknown",
+                        "error_summary": "dispatch_outcome_unknown",
                         "heartbeat_at": _utc_now(),
                     })
                     self._write(record)
@@ -371,6 +400,7 @@ class HostJobManager:
                     record.update({
                         "returncode": 125,
                         "failure_class": "external_interruption",
+                        "error_summary": "external_interruption",
                         "finished_at": _utc_now(),
                     })
                 record["heartbeat_at"] = _utc_now()
@@ -378,8 +408,11 @@ class HostJobManager:
             elif record.get("status") == "cancelling" and not _same_process(record):
                 record.update({
                     "status": "cancelled", "returncode": 130,
-                    "failure_class": "cancelled", "finished_at": _utc_now(),
+                    "failure_class": "cancelled", "error_summary": "cancelled",
+                    "finished_at": _utc_now(),
                 })
+                self._write(record)
+            else:
                 self._write(record)
             if path.name != f"{job_id}.json":
                 try:
@@ -407,6 +440,7 @@ class HostJobManager:
                     "status": "cancelled" if record.get("cancel_requested") else "interrupted",
                     "returncode": 130 if record.get("cancel_requested") else 125,
                     "failure_class": "cancelled" if record.get("cancel_requested") else "external_interruption",
+                    "error_summary": "cancelled" if record.get("cancel_requested") else "external_interruption",
                     "heartbeat_at": _utc_now(),
                     "finished_at": _utc_now(),
                 })
@@ -424,12 +458,130 @@ class HostJobManager:
 
     def _write(self, record: dict[str, Any]) -> None:
         job_id = _job_id(record.get("job_id"))
+        record.setdefault("stdout", "")
+        record.setdefault("stderr", "")
+        record.setdefault("output_ref", f"{job_id}/")
+        record.setdefault("output_segments", [])
+        record.setdefault("output_bytes", {"stdout": 0, "stderr": 0, "total": 0})
+        if record.get("status") in {"completed", "cancelled", "interrupted"}:
+            record["carry_forward_ref"] = f"{job_id}/carry-forward.json"
         target = self.root / f"{job_id}.json"
-        temporary = self.root / f".{job_id}.{uuid.uuid4().hex}.tmp"
-        temporary.write_text(
-            json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-            encoding="utf-8",
+        self._write_json(target, record)
+        if record.get("status") in {"completed", "cancelled", "interrupted"}:
+            self._write_carry_forward(record)
+
+    def _append_output(self, record: dict[str, Any], stream: str, value: str) -> None:
+        job_id = _job_id(record.get("job_id"))
+        self._output_directory(job_id)
+        chunks = _utf8_chunks(value, MAX_OUTPUT_BYTES)
+        segments = list(record.get("output_segments") or [])
+        stream_segments = [item for item in segments if item.get("stream") == stream]
+        for chunk in chunks:
+            encoded = chunk.encode("utf-8")
+            current = stream_segments[-1] if stream_segments else None
+            if current is None or int(current["bytes"]) + len(encoded) > MAX_OUTPUT_BYTES:
+                index = len(stream_segments)
+                relative = f"{job_id}/{stream}.{index:06d}.log"
+                current = {
+                    "stream": stream, "index": index, "ref": relative,
+                    "bytes": 0, "sha256": hashlib.sha256(b"").hexdigest(),
+                }
+                segments.append(current)
+                stream_segments.append(current)
+            target = self.root / str(current["ref"])
+            descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            try:
+                with os.fdopen(descriptor, "ab", closefd=True) as output:
+                    output.write(encoded)
+                    output.flush()
+                    os.fsync(output.fileno())
+            except Exception:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+                raise
+            current["bytes"] = target.stat().st_size
+            current["sha256"] = _sha256_file(target)
+        record["output_ref"] = f"{job_id}/"
+        record["output_segments"] = sorted(
+            segments,
+            key=lambda item: (
+                0 if item["stream"] == "stdout" else 1, int(item["index"])
+            ),
         )
+        totals = {
+            name: sum(
+                int(item["bytes"]) for item in segments if item.get("stream") == name
+            )
+            for name in ("stdout", "stderr")
+        }
+        record["output_bytes"] = {**totals, "total": totals["stdout"] + totals["stderr"]}
+        record[stream] = _append_bounded(
+            str(record.get(stream) or ""), value, MAX_OUTPUT_TAIL_BYTES
+        )
+
+    def _sync_output_index(self, record: dict[str, Any]) -> None:
+        job_id = _job_id(record.get("job_id"))
+        directory = self._output_directory(job_id)
+        segments: list[dict[str, object]] = []
+        totals = {"stdout": 0, "stderr": 0}
+        for stream in ("stdout", "stderr"):
+            paths = sorted(directory.glob(f"{stream}.[0-9][0-9][0-9][0-9][0-9][0-9].log"))
+            for index, path in enumerate(paths):
+                size = path.stat().st_size
+                segments.append({
+                    "stream": stream, "index": index,
+                    "ref": f"{job_id}/{path.name}", "bytes": size,
+                    "sha256": _sha256_file(path),
+                })
+                totals[stream] += size
+            record[stream] = _tail_from_files(paths, MAX_OUTPUT_TAIL_BYTES)
+        record["output_ref"] = f"{job_id}/"
+        record["output_segments"] = segments
+        record["output_bytes"] = {**totals, "total": totals["stdout"] + totals["stderr"]}
+
+    def _output_directory(self, job_id: str) -> Path:
+        directory = self.root / job_id
+        directory.mkdir(parents=True, exist_ok=True)
+        try:
+            directory.chmod(0o700)
+        except OSError:
+            pass
+        return directory
+
+    def _write_carry_forward(self, record: dict[str, Any]) -> None:
+        job_id = _job_id(record.get("job_id"))
+        input_tokens = int(record.get("input_tokens") or 0)
+        output_tokens = int(record.get("output_tokens") or 0)
+        carry = {
+            "status": record.get("status"),
+            "failure_class": record.get("failure_class"),
+            "session_id": record.get("session_id"),
+            "tokens": {
+                "input": input_tokens, "output": output_tokens,
+                "total": input_tokens + output_tokens,
+            },
+            "last_valid_output": {
+                "stdout": str(record.get("stdout") or ""),
+                "stderr": str(record.get("stderr") or ""),
+            },
+            "output_segments": record.get("output_segments") or [],
+            "output_bytes": record.get("output_bytes") or {
+                "stdout": 0, "stderr": 0, "total": 0,
+            },
+            "generation_model_tokens": 0,
+        }
+        self._write_json(self._output_directory(job_id) / "carry-forward.json", carry)
+
+    def _write_json(self, target: Path, payload: dict[str, Any]) -> None:
+        temporary = target.parent / f".{target.name}.{uuid.uuid4().hex}.tmp"
+        with temporary.open("w", encoding="utf-8") as output:
+            output.write(
+                json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            )
+            output.flush()
+            os.fsync(output.fileno())
         try:
             temporary.chmod(0o600)
         except OSError:
@@ -768,20 +920,68 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _append_bounded(current: str, value: str) -> str:
+def _append_bounded(current: str, value: str, limit: int = MAX_OUTPUT_BYTES) -> str:
     combined = current + value
     encoded = combined.encode("utf-8")
-    if len(encoded) <= MAX_OUTPUT_BYTES:
+    if len(encoded) <= limit:
         return combined
-    marker = "\n[older host job output truncated]\n"
-    room = MAX_OUTPUT_BYTES - len(marker.encode("utf-8"))
-    tail = encoded[-max(room, 0):]
+    tail = encoded[-limit:]
     while tail:
         try:
-            return marker + tail.decode("utf-8")
+            return tail.decode("utf-8")
         except UnicodeDecodeError:
             tail = tail[1:]
-    return marker[:MAX_OUTPUT_BYTES]
+    return ""
+
+
+def _utf8_chunks(value: str, limit: int) -> list[str]:
+    if not value:
+        return []
+    if len(value.encode("utf-8")) <= limit:
+        return [value]
+    chunks: list[str] = []
+    current: list[str] = []
+    size = 0
+    for character in value:
+        encoded_size = len(character.encode("utf-8"))
+        if current and size + encoded_size > limit:
+            chunks.append("".join(current))
+            current = []
+            size = 0
+        current.append(character)
+        size += encoded_size
+    if current:
+        chunks.append("".join(current))
+    return chunks
+
+
+def _tail_from_files(paths: list[Path], limit: int) -> str:
+    remaining = limit
+    chunks: list[bytes] = []
+    for path in reversed(paths):
+        if remaining <= 0:
+            break
+        size = path.stat().st_size
+        with path.open("rb") as output:
+            output.seek(max(0, size - remaining))
+            chunk = output.read(remaining)
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    tail = b"".join(reversed(chunks))
+    while tail:
+        try:
+            return tail.decode("utf-8")
+        except UnicodeDecodeError:
+            tail = tail[1:]
+    return ""
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as output:
+        for chunk in iter(lambda: output.read(65_536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _process_alive(pid: int) -> bool:

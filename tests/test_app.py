@@ -7,6 +7,12 @@ from fastapi.testclient import TestClient
 
 from plow_whip_web.api.app import create_app
 from plow_whip_web.config import Settings
+from plow_whip_web.store import database as database_module
+
+
+def _migration_names() -> list[str]:
+    migration_dir = Path(database_module.__file__).with_name("migrations")
+    return [migration.name for migration in sorted(migration_dir.glob("*.sql"))]
 
 
 def test_health_reports_wal_and_migration() -> None:
@@ -19,7 +25,7 @@ def test_health_reports_wal_and_migration() -> None:
     payload = response.json()
     assert payload["status"] == "ok"
     assert payload["database"]["journal_mode"] == "wal"
-    assert payload["database"]["migration_count"] == 14
+    assert payload["database"]["migration_count"] == len(_migration_names())
 
 
 def test_capabilities_are_zero_token_and_desktop_free() -> None:

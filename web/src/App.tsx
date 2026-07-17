@@ -7,7 +7,7 @@ import {
 import {
   api, AuditEntry, Convention, ConventionSuggestion, OutboxEvent, PermissionGrant,
   Project, Provider, RuntimeHealth, RuntimeSettings, SchedulerStatus, Task, TaskArtifact, TaskEvent,
-  TaskStatus, Usage, Worker,
+  TaskSizingEstimate, TaskSizingInputs, TaskStatus, Usage, Worker,
 } from './api'
 
 type Health = {
@@ -38,11 +38,20 @@ const navItems: { id: View; label: string; icon: typeof Kanban }[] = [
   { id: 'settings', label: '设置', icon: Gear },
 ]
 
+const initialSizingInputs: TaskSizingInputs = {
+  layers_touched: 1, components_touched: 3, estimated_files_changed: 4,
+  has_migration: false, has_deploy: false, verification_commands_count: 3,
+  estimated_verification_seconds: 180, external_dependencies_count: 0,
+  risk_level: 'medium', independent_review_required: false,
+  gate_artifact: true, gate_boundary: true, gate_verification: true, gate_dependency: true,
+}
+
 const initialTask = {
   title: '', objective: '', projectId: '', role: 'fullstack', provider: 'cursor',
-  networkRequirement: 'none', qualityProfile: 'balanced', executable: 'python3',
+  networkRequirement: 'none', executable: 'python3',
   argumentsJson: '["-c", "from pathlib import Path; Path(\'result.txt\').write_text(\'quality-pass\', encoding=\'utf-8\')"]',
   verifyPath: 'result.txt', verifyText: 'quality-pass',
+  sizingInputs: initialSizingInputs,
 }
 
 export function App() {
@@ -69,6 +78,8 @@ export function App() {
   const [taskForm, setTaskForm] = useState(initialTask)
   const [projectForm, setProjectForm] = useState({ name: '', path: '', hostPath: '' })
   const [showCreateTask, setShowCreateTask] = useState(false)
+  const [taskEstimate, setTaskEstimate] = useState<TaskSizingEstimate | null>(null)
+  const [estimatedSizingInputs, setEstimatedSizingInputs] = useState<TaskSizingInputs | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
@@ -126,14 +137,15 @@ export function App() {
 
   async function createTask(event: FormEvent) {
     event.preventDefault()
+    if (taskEstimate?.status !== 'estimated' || estimatedSizingInputs !== taskForm.sizingInputs) return
     await action(async () => {
       const args = JSON.parse(taskForm.argumentsJson) as unknown
       if (!Array.isArray(args) || args.some((value) => typeof value !== 'string')) throw new Error('参数必须是字符串 JSON 数组')
       const created = await api.createTask({
         title: taskForm.title, objective: taskForm.objective, project_id: taskForm.projectId,
         role: taskForm.role, provider: taskForm.provider, network_requirement: taskForm.networkRequirement,
-        quality_profile: taskForm.qualityProfile,
-        command: { argv: [taskForm.executable, ...args], timeout_seconds: taskForm.provider === 'generic-command' ? 60 : 600 },
+        sizing_inputs: taskForm.sizingInputs,
+        command: { argv: [taskForm.executable, ...args] },
         verification: [
           { kind: 'exit_code', expected: 0 },
           { kind: 'file_exists', path: taskForm.verifyPath },
@@ -142,6 +154,18 @@ export function App() {
       })
       await refreshTasks(); setSelectedTask(created); setShowCreateTask(false); setView('tasks')
     }, '任务已加入队列')
+  }
+
+  async function estimateTask() {
+    const sizingInputs = taskForm.sizingInputs
+    setBusy(true); setError(null); setNotice(null); setTaskEstimate(null); setEstimatedSizingInputs(null)
+    try { setTaskEstimate(await api.estimateTask(sizingInputs)); setEstimatedSizingInputs(sizingInputs) } catch (reason) { setError(messageOf(reason)) } finally { setBusy(false) }
+  }
+
+  function setSizingInputs(sizingInputs: TaskSizingInputs) {
+    setTaskForm((current) => ({ ...current, sizingInputs }))
+    setTaskEstimate(null)
+    setEstimatedSizingInputs(null)
   }
 
   async function createProject(event: FormEvent) {
@@ -230,7 +254,7 @@ export function App() {
       <main>
         <div className="context-bar">
           <div><span>项目范围</span><select value={selectedProject} onChange={(event) => setSelectedProject(event.target.value)}><option value="all">全部项目</option>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></div>
-          <div className="context-actions"><button className="ghost" onClick={() => action(async () => { await Promise.all([refreshTasks(), refreshProjects(), refreshProviders()]) }, '状态已刷新')}><ArrowsClockwise size={16} />刷新</button><button className="primary" onClick={() => setShowCreateTask(true)}><Plus size={16} weight="bold" />新建任务</button></div>
+          <div className="context-actions"><button className="ghost" onClick={() => action(async () => { await Promise.all([refreshTasks(), refreshProjects(), refreshProviders()]) }, '状态已刷新')}><ArrowsClockwise size={16} />刷新</button><button className="primary" onClick={() => { setTaskEstimate(null); setEstimatedSizingInputs(null); setShowCreateTask(true) }}><Plus size={16} weight="bold" />新建任务</button></div>
         </div>
 
         {error && <div className="banner error"><WarningCircle size={18} weight="fill" /><span>{error}</span><button aria-label="关闭错误" onClick={() => setError(null)}><X size={16} /></button></div>}
@@ -247,7 +271,7 @@ export function App() {
         {view === 'settings' && <SettingsView settings={settings} setSettings={setSettings} scheduler={scheduler} convention={convention} setConvention={setConvention} suggestion={suggestion} setSuggestion={setSuggestion} projects={projects} tasks={tasks} providers={providers} refineProvider={effectiveRefineProvider} setRefineProvider={setRefineProvider} busy={busy} onSaveSettings={saveSettings} onTick={() => action(async () => { await api.schedulerTick(); setScheduler(await api.schedulerStatus()); await refreshTasks() }, 'Tick 已完成')} onLoadConvention={loadConvention} onSaveConvention={saveConvention} onRefine={refineConvention} />}
       </main>
 
-      {showCreateTask && <TaskDrawer form={taskForm} setForm={setTaskForm} projects={projects} providers={providers} busy={busy} onClose={() => setShowCreateTask(false)} onSubmit={createTask} />}
+      {showCreateTask && <TaskDrawer form={taskForm} setForm={setTaskForm} setSizingInputs={setSizingInputs} estimate={estimatedSizingInputs === taskForm.sizingInputs ? taskEstimate : null} projects={projects} providers={providers} busy={busy} onClose={() => setShowCreateTask(false)} onEstimate={estimateTask} onSubmit={createTask} />}
     </div>
   )
 }
@@ -274,7 +298,7 @@ function Board({ tasks, projects, workers, providers, usage, onNavigate, onSelec
 
 function TasksView({ tasks, selected, events, artifacts, artifactError, busy, onSelect, onDrive, onControl, onOpenArtifact, onCopyArtifact }: { tasks: Task[]; selected: Task | null; events: TaskEvent[]; artifacts: TaskArtifact[]; artifactError: string | null; busy: boolean; onSelect: (task: Task) => void; onDrive: (task: Task) => void; onControl: (task: Task, action: 'pause' | 'resume' | 'cancel' | 'needs_human') => void; onOpenArtifact: (task: Task, artifact: TaskArtifact, target: 'finder' | 'cursor') => void; onCopyArtifact: (artifact: TaskArtifact) => void }) {
   return <div className="split-layout"><section className="panel list-panel"><div className="panel-heading"><div><span className="kicker">任务队列</span><h1>{tasks.length} 个任务</h1></div></div><div className="dense-list">{tasks.map((task) => <button key={task.id} className={selected?.id === task.id ? 'selected' : ''} onClick={() => onSelect(task)}><span className="list-icon"><ListChecks size={18} /></span><span><strong>{task.title}</strong><small>{task.provider} · {statusNames[task.status]}</small></span><StatusPill status={task.status} /></button>)}</div></section>
-    <section className="panel detail-panel">{selected ? <><div className="panel-heading"><div><span className="kicker">{selected.id}</span><h1>{selected.title}</h1></div><StatusPill status={selected.status} /></div><p className="objective">{selected.objective}</p><div className="detail-actions">{selected.status === 'ready' && <button className="primary" disabled={busy} onClick={() => onDrive(selected)}><Play size={16} weight="fill" />立即驱动</button>}{selected.status === 'ready' && <button disabled={busy} onClick={() => onControl(selected, 'pause')}><Pause size={16} />暂停</button>}{selected.status === 'paused' && <button disabled={busy} onClick={() => onControl(selected, 'resume')}><Play size={16} />恢复</button>}{!['completed', 'terminal_failed', 'cancelled'].includes(selected.status) && <button className="danger" disabled={busy} onClick={() => onControl(selected, 'cancel')}><X size={16} />取消</button>}</div><div className="facts"><Fact label="Provider" value={selected.provider} /><Fact label="质量档位" value={selected.quality_profile} /><Fact label="Worker" value={selected.worker_id ?? '尚未领取'} mono /><Fact label="资源锁" value={selected.resource_key ?? '项目级默认锁'} mono /><Fact label="重复失败" value={`${selected.same_failure_count} / 无进展 ${selected.no_progress_count}`} /><Fact label="Token" value={`${selected.tokens_used} / ${selected.token_budget}`} /></div><section className="artifacts"><div className="section-heading"><div><span className="kicker">主机项目目录</span><h2>任务产物</h2></div><span>{artifacts.filter((item) => item.exists).length} 个已定位</span></div>{artifactError ? <p className="artifact-error">Host Bridge 暂时无法定位产物：{artifactError}</p> : artifacts.length ? artifacts.map((artifact) => <article className={artifact.exists ? '' : 'missing'} key={artifact.relative_path}><div className="artifact-icon"><FileCode size={19} /></div><div className="artifact-main"><strong>{artifact.relative_path}</strong><code title={artifact.host_path}>{artifact.host_path}</code><small>{artifact.exists ? `${formatBytes(artifact.bytes)} · SHA-256 ${artifact.sha256?.slice(0, 12) ?? '文件过大未哈希'}…` : '尚未在主机项目目录生成'}</small></div><div className="artifact-actions"><button disabled={busy || !artifact.exists} onClick={() => onCopyArtifact(artifact)}><Copy size={15} />复制路径</button><button disabled={busy || !artifact.actions.includes('finder')} onClick={() => onOpenArtifact(selected, artifact, 'finder')}><FolderOpen size={15} />Finder</button>{artifact.actions.includes('cursor') && <button className="primary" disabled={busy} onClick={() => onOpenArtifact(selected, artifact, 'cursor')}><TerminalWindow size={15} />Cursor 打开</button>}</div></article>) : <p className="artifact-empty">该任务没有声明文件产物。容器不会保存项目报告或代码。</p>}</section><div className="timeline"><h2>状态事件</h2>{events.map((event) => <div key={event.sequence}><span>{event.sequence}</span><strong>{event.event_type}</strong><small>{event.created_at}</small></div>)}</div></> : <div className="empty-state"><ListChecks size={38} /><h2>选择一个任务</h2><p>查看租约、会话绑定、质量证据与状态历史。</p></div>}</section></div>
+    <section className="panel detail-panel">{selected ? <><div className="panel-heading"><div><span className="kicker">{selected.id}</span><h1>{selected.title}</h1></div><StatusPill status={selected.status} /></div><p className="objective">{selected.objective}</p><div className="detail-actions">{selected.status === 'ready' && <button className="primary" disabled={busy} onClick={() => onDrive(selected)}><Play size={16} weight="fill" />立即驱动</button>}{selected.status === 'ready' && <button disabled={busy} onClick={() => onControl(selected, 'pause')}><Pause size={16} />暂停</button>}{selected.status === 'paused' && <button disabled={busy} onClick={() => onControl(selected, 'resume')}><Play size={16} />恢复</button>}{!['completed', 'terminal_failed', 'cancelled'].includes(selected.status) && <button className="danger" disabled={busy} onClick={() => onControl(selected, 'cancel')}><X size={16} />取消</button>}</div><div className="facts"><Fact label="Provider" value={selected.provider} /><Fact label="验证机制" value="确定性验证" /><Fact label="Worker" value={selected.worker_id ?? '尚未领取'} mono /><Fact label="资源锁" value={selected.resource_key ?? '项目级默认锁'} mono /><Fact label="重复失败" value={`${selected.same_failure_count} / 无进展 ${selected.no_progress_count}`} /><Fact label="Token" value={`${selected.tokens_used} / ${selected.token_budget}`} /></div><section className="artifacts"><div className="section-heading"><div><span className="kicker">主机项目目录</span><h2>任务产物</h2></div><span>{artifacts.filter((item) => item.exists).length} 个已定位</span></div>{artifactError ? <p className="artifact-error">Host Bridge 暂时无法定位产物：{artifactError}</p> : artifacts.length ? artifacts.map((artifact) => <article className={artifact.exists ? '' : 'missing'} key={artifact.relative_path}><div className="artifact-icon"><FileCode size={19} /></div><div className="artifact-main"><strong>{artifact.relative_path}</strong><code title={artifact.host_path}>{artifact.host_path}</code><small>{artifact.exists ? `${formatBytes(artifact.bytes)} · SHA-256 ${artifact.sha256?.slice(0, 12) ?? '文件过大未哈希'}…` : '尚未在主机项目目录生成'}</small></div><div className="artifact-actions"><button disabled={busy || !artifact.exists} onClick={() => onCopyArtifact(artifact)}><Copy size={15} />复制路径</button><button disabled={busy || !artifact.actions.includes('finder')} onClick={() => onOpenArtifact(selected, artifact, 'finder')}><FolderOpen size={15} />Finder</button>{artifact.actions.includes('cursor') && <button className="primary" disabled={busy} onClick={() => onOpenArtifact(selected, artifact, 'cursor')}><TerminalWindow size={15} />Cursor 打开</button>}</div></article>) : <p className="artifact-empty">该任务没有声明文件产物。容器不会保存项目报告或代码。</p>}</section><div className="timeline"><h2>状态事件</h2>{events.map((event) => <div key={event.sequence}><span>{event.sequence}</span><strong>{event.event_type}</strong><small>{event.created_at}</small></div>)}</div></> : <div className="empty-state"><ListChecks size={38} /><h2>选择一个任务</h2><p>查看租约、会话绑定、质量证据与状态历史。</p></div>}</section></div>
 }
 
 function ProjectsView({ projects, form, setForm, onCreate, onRelease, busy }: { projects: Project[]; form: { name: string; path: string; hostPath: string }; setForm: (value: { name: string; path: string; hostPath: string }) => void; onCreate: (event: FormEvent) => void; onRelease: (project: Project) => void; busy: boolean }) {
@@ -307,8 +331,27 @@ function SettingsView(props: { settings: RuntimeSettings | null; setSettings: (v
   </div>
 }
 
-function TaskDrawer({ form, setForm, projects, providers, busy, onClose, onSubmit }: { form: typeof initialTask; setForm: (value: typeof initialTask) => void; projects: Project[]; providers: Provider[]; busy: boolean; onClose: () => void; onSubmit: (event: FormEvent) => void }) {
-  return <div className="drawer-backdrop" onMouseDown={onClose}><aside className="drawer" onMouseDown={(event) => event.stopPropagation()}><div className="drawer-head"><div><span className="kicker">质量驱动</span><h1>新建任务</h1></div><button aria-label="关闭" onClick={onClose}><X size={18} /></button></div><form onSubmit={onSubmit}><Field label="标题"><input required value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} placeholder="明确、可验证的结果" /></Field><Field label="目标"><textarea required value={form.objective} onChange={(event) => setForm({ ...form, objective: event.target.value })} placeholder="Worker 必须完成什么？" /></Field><div className="form-grid two"><Field label="项目"><select required value={form.projectId} onChange={(event) => setForm({ ...form, projectId: event.target.value })}><option value="">选择项目</option>{projects.filter((p) => p.status === 'active').map((project) => <option value={project.id} key={project.id}>{project.name}</option>)}</select></Field><Field label="角色"><select value={form.role} onChange={(event) => setForm({ ...form, role: event.target.value })}>{Object.entries(roleNames).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></Field><Field label="Provider"><select value={form.provider} onChange={(event) => setForm({ ...form, provider: event.target.value })}>{providers.filter((provider) => provider.enabled && provider.transport === 'host-bridge').map((provider) => <option value={provider.name} key={provider.name}>{provider.display_name}</option>)}</select></Field><Field label="质量档位"><select value={form.qualityProfile} onChange={(event) => setForm({ ...form, qualityProfile: event.target.value })}><option value="fast">快速</option><option value="balanced">均衡</option><option value="strict">严格</option></select></Field></div><div className="form-grid two"><Field label="验证文件 / 产物路径"><input value={form.verifyPath} onChange={(event) => setForm({ ...form, verifyPath: event.target.value })} /></Field><Field label="必须包含"><input value={form.verifyText} onChange={(event) => setForm({ ...form, verifyText: event.target.value })} /></Field></div><p className="form-help">产物路径相对于本机项目目录；完成后可在任务页复制路径、Finder 定位或用 Cursor 打开。</p><button className="primary full" disabled={busy || !projects.length}><Plus size={16} />加入任务队列</button></form></aside></div>
+function TaskDrawer(props: { form: typeof initialTask; setForm: (value: typeof initialTask) => void; setSizingInputs: (value: TaskSizingInputs) => void; estimate: TaskSizingEstimate | null; projects: Project[]; providers: Provider[]; busy: boolean; onClose: () => void; onEstimate: () => void; onSubmit: (event: FormEvent) => void }) {
+  const { form, setForm, setSizingInputs, estimate, projects, providers, busy, onClose, onEstimate, onSubmit } = props
+  const sizing = form.sizingInputs
+  const setSizing = <K extends keyof TaskSizingInputs>(key: K, value: TaskSizingInputs[K]) => setSizingInputs({ ...sizing, [key]: value })
+  const ready = estimate?.status === 'estimated'
+  return <div className="drawer-backdrop" onMouseDown={onClose}><aside className="drawer" onMouseDown={(event) => event.stopPropagation()}><div className="drawer-head"><div><span className="kicker">确定性验证</span><h1>新建任务</h1></div><button aria-label="关闭" onClick={onClose}><X size={18} /></button></div><form onSubmit={onSubmit}><Field label="标题"><input required value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} placeholder="明确、可验证的结果" /></Field><Field label="目标"><textarea required value={form.objective} onChange={(event) => setForm({ ...form, objective: event.target.value })} placeholder="Worker 必须完成什么？" /></Field><div className="form-grid two"><Field label="项目"><select required value={form.projectId} onChange={(event) => setForm({ ...form, projectId: event.target.value })}><option value="">选择项目</option>{projects.filter((p) => p.status === 'active').map((project) => <option value={project.id} key={project.id}>{project.name}</option>)}</select></Field><Field label="角色"><select value={form.role} onChange={(event) => setForm({ ...form, role: event.target.value })}>{Object.entries(roleNames).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></Field><Field label="Provider"><select value={form.provider} onChange={(event) => setForm({ ...form, provider: event.target.value })}>{providers.filter((provider) => provider.enabled && provider.transport === 'host-bridge').map((provider) => <option value={provider.name} key={provider.name}>{provider.display_name}</option>)}</select></Field></div><div className="form-grid two"><Field label="验证文件 / 产物路径"><input value={form.verifyPath} onChange={(event) => setForm({ ...form, verifyPath: event.target.value })} /></Field><Field label="必须包含"><input value={form.verifyText} onChange={(event) => setForm({ ...form, verifyText: event.target.value })} /></Field></div><p className="form-help">产物路径相对于本机项目目录；完成后可在任务页复制路径、Finder 定位或用 Cursor 打开。</p><section className="preflight"><div className="preflight-heading"><div><span className="kicker">入队前必做</span><h2>0 Token 规则评估</h2></div><span>不调用模型</span></div><div className="form-grid two"><NumberField label="涉及层数" value={sizing.layers_touched} onChange={(value) => setSizing('layers_touched', value)} /><NumberField label="组件数" value={sizing.components_touched} onChange={(value) => setSizing('components_touched', value)} /><NumberField label="预计文件数" value={sizing.estimated_files_changed} onChange={(value) => setSizing('estimated_files_changed', value)} /><Field label="风险"><select value={sizing.risk_level} onChange={(event) => setSizing('risk_level', event.target.value as TaskSizingInputs['risk_level'])}><option value="low">低</option><option value="medium">中</option><option value="high">高</option></select></Field></div><details className="preflight-advanced"><summary>高级预判</summary><div className="form-grid two"><NumberField label="验证命令数" value={sizing.verification_commands_count} onChange={(value) => setSizing('verification_commands_count', value)} /><NumberField label="预计验证秒数" value={sizing.estimated_verification_seconds} onChange={(value) => setSizing('estimated_verification_seconds', value)} /><NumberField label="外部依赖数" value={sizing.external_dependencies_count} onChange={(value) => setSizing('external_dependencies_count', value)} /></div><div className="check-grid"><Check label="包含迁移" checked={sizing.has_migration} onChange={(value) => setSizing('has_migration', value)} /><Check label="包含部署" checked={sizing.has_deploy} onChange={(value) => setSizing('has_deploy', value)} /><Check label="要求独立复审（当前不可入队）" checked={sizing.independent_review_required} onChange={(value) => setSizing('independent_review_required', value)} /></div><p className="form-help">勾选独立复审会触发 Planning Gate；当前尚无独立 reviewer 编排，因此任务不能入队。</p></details><div className="gate-grid"><Check label="产物明确" checked={sizing.gate_artifact} onChange={(value) => setSizing('gate_artifact', value)} /><Check label="边界明确" checked={sizing.gate_boundary} onChange={(value) => setSizing('gate_boundary', value)} /><Check label="验证明确" checked={sizing.gate_verification} onChange={(value) => setSizing('gate_verification', value)} /><Check label="依赖明确" checked={sizing.gate_dependency} onChange={(value) => setSizing('gate_dependency', value)} /></div><button type="button" className="full" disabled={busy} onClick={onEstimate}><Pulse size={16} />执行 0 Token 预判</button>{estimate && <EstimateCard estimate={estimate} />}</section><button className="primary full" disabled={busy || !projects.length || !ready}><Plus size={16} />加入任务队列</button></form></aside></div>
+}
+
+const gateNames = {
+  artifact: '可验证产物',
+  boundary: '文件或组件边界',
+  verification: '验证命令',
+  dependency: '外部依赖',
+  independent_review_orchestration: '尚无独立 reviewer 编排，要求独立复审的任务当前不能入队',
+}
+
+function EstimateCard({ estimate }: { estimate: TaskSizingEstimate }) {
+  if (estimate.status === 'needs_planning') return <div className="estimate-card blocked" role="status"><strong>暂不可入队：先补齐计划</strong><p>缺少：{estimate.missing_gates.map((gate) => gateNames[gate]).join('、')}。请先拆分任务或补齐对应 gate，不能用超大预算绕过。</p><small>0 Token 规则评估 · 未调用模型</small></div>
+  const input = estimate.estimated_input_tokens
+  const output = estimate.estimated_output_tokens
+  return <div className="estimate-card" role="status"><div><strong>服务端 Tier {estimate.size_class}</strong><span>0 Token 规则评估</span></div><dl><Fact label="Input Token" value={`${formatNumber(input?.min)}–${formatNumber(input?.max)} · p90 ${formatNumber(input?.p90)}`} /><Fact label="Output Token" value={`${formatNumber(output?.min)}–${formatNumber(output?.max)} · p90 ${formatNumber(output?.p90)}`} /><Fact label="Token 预算" value={formatNumber(estimate.total_token_hard_cap)} /><Fact label="预留 Token" value={formatNumber(estimate.reserved_tokens)} /><Fact label="Soft Timeout" value={`${estimate.soft_deadline_seconds}s`} /><Fact label="Hard Timeout" value={`${estimate.hard_deadline_seconds}s`} /><Fact label="最大尝试" value={formatNumber(estimate.max_attempts)} /><Fact label="验证超时" value={`${estimate.verification_timeout_seconds}s`} /></dl><p title={estimate.rationale.join('; ')}>{estimate.rationale.slice(-3).join(' · ')}</p><small>{estimate.model_invoked ? '调用了模型' : '未调用模型'} · 服务端规则 {estimate.bootstrap_version}</small></div>
 }
 
 function Metric({ icon: Icon, label, value, hint, onClick }: { icon: typeof Kanban; label: string; value: number; hint: string; onClick?: () => void }) {
@@ -321,8 +364,10 @@ function StatusDot({ ok, label }: { ok: boolean; label: string }) { return <span
 function StatusPill({ status }: { status: TaskStatus }) { return <span className={`status-pill status-${status}`}>{statusNames[status]}</span> }
 function Fact({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) { return <div><dt>{label}</dt><dd className={mono ? 'mono' : ''}>{value}</dd></div> }
 function Field({ label, children }: { label: string; children: React.ReactNode }) { return <label className="field"><span>{label}</span>{children}</label> }
-function NumberField({ label, value, onChange }: { label: string; value: number; onChange: (value: number) => void }) { return <Field label={label}><input type="number" value={value} onChange={(event) => onChange(Number(event.target.value))} /></Field> }
+function NumberField({ label, value, onChange }: { label: string; value: number; onChange: (value: number) => void }) { return <Field label={label}><input type="number" min="0" required value={value} onChange={(event) => onChange(Number(event.target.value))} /></Field> }
+function Check({ label, checked, onChange }: { label: string; checked: boolean; onChange: (value: boolean) => void }) { return <label><input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} />{label}</label> }
 function messageOf(reason: unknown) { return reason instanceof Error ? reason.message : '发生未知错误' }
+function formatNumber(value: number | null | undefined) { return value?.toLocaleString() ?? '—' }
 function formatBytes(value: number | null) {
   if (value === null) return '大小未知'
   if (value < 1024) return `${value} B`

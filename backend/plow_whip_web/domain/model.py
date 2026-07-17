@@ -53,6 +53,11 @@ class TaskRecord:
     last_error: str | None
     created_at: str
     updated_at: str
+    sizing: dict[str, Any]
+    execution_budget: dict[str, Any] | None
+    manual_override: bool
+    override_reason: str | None
+    budget_overrun_evidence: dict[str, Any] | None
 
 
 class DomainError(RuntimeError):
@@ -77,6 +82,14 @@ class ResourceBusyError(DomainError):
 
 class ProviderUnavailableError(DomainError):
     pass
+
+
+class HostBridgeRejectedError(ProviderUnavailableError):
+    """The bridge definitively rejected a call before launching a model process."""
+
+
+class HostBridgeOutcomeUnknownError(ProviderUnavailableError):
+    """The caller cannot prove whether the bridge accepted or launched the call."""
 
 
 class PolicyViolationError(DomainError):

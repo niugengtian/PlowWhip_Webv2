@@ -2,7 +2,36 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import ipaddress
+import os
 from pathlib import Path
+import re
+
+
+_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def load_private_env(path: Path) -> bool:
+    """Load a local key file without overriding an existing process environment."""
+    path = path.expanduser()
+    if not path.is_file():
+        return False
+    if path.stat().st_mode & 0o077:
+        raise ValueError(f"{path} permissions are too open; run: chmod 600 {path}")
+    for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            raise ValueError(f"{path}:{line_number}: expected NAME=value")
+        name, value = line.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if not _ENV_NAME.fullmatch(name):
+            raise ValueError(f"{path}:{line_number}: invalid environment variable name")
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        os.environ.setdefault(name, value)
+    return True
 
 
 @dataclass(frozen=True, slots=True)

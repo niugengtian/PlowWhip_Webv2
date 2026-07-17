@@ -7,14 +7,17 @@ from urllib.request import Request, urlopen
 
 from plow_whip_web.domain.model import ProviderUnavailableError
 from plow_whip_web.providers.generic_command import ExecutionResult
+from plow_whip_web.store.task_repository import MAX_HARD_DEADLINE_SECONDS
 from plow_whip_web.runtime.verification import VerificationResult
+
+_HTTP_TIMEOUT_BUFFER_SECONDS = 20
 
 
 @dataclass(frozen=True, slots=True)
 class HostBridgeClient:
     base_url: str
     token: str | None
-    timeout_seconds: int = 620
+    timeout_seconds: int = MAX_HARD_DEADLINE_SECONDS + _HTTP_TIMEOUT_BUFFER_SECONDS
 
     def probe(self, provider: dict[str, object]) -> tuple[bool, str]:
         payload = self._post("/v1/probe", {
@@ -39,7 +42,10 @@ class HostBridgeClient:
             "prompt": prompt,
             "session_id": session_id,
             "timeout_seconds": timeout_seconds,
-        }, timeout=min(self.timeout_seconds, timeout_seconds + 20))
+        }, timeout=min(
+            self.timeout_seconds,
+            max(timeout_seconds + _HTTP_TIMEOUT_BUFFER_SECONDS, 10),
+        ))
         return ExecutionResult(
             returncode=int(payload.get("returncode", 1)),
             stdout=str(payload.get("stdout", "")),

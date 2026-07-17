@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import io
+import json
+import subprocess
 import sys
 import time
 import uuid
@@ -19,13 +22,20 @@ from plow_whip_web.domain.model import (
 )
 from plow_whip_web.host_bridge import (
     HostJobManager,
+    MAX_OUTPUT_BYTES,
+    MAX_OUTPUT_TAIL_BYTES,
     inspect_artifacts,
     open_artifact,
     verify,
 )
 from plow_whip_web.providers.generic_command import ExecutionResult
 from plow_whip_web.providers.host_bridge import HostBridgeClient
+from plow_whip_web.runtime.sizing import TaskSizingInputs, estimate_task_sizing
 from plow_whip_web.runtime.verification import VerificationEngine
+from plow_whip_web.store.task_repository import (
+    EXECUTION_DEADLINE_GRACE_SECONDS,
+    task_lease_seconds,
+)
 
 
 def _wait_status(manager: HostJobManager, job_id: str, terminal: set[str]) -> dict[str, object]:
@@ -100,19 +110,198 @@ def test_bridge_restart_identifies_orphan_without_duplicate_and_can_cancel() -> 
         assert cancelled["status"] == "cancelled"
 
 
+def test_host_job_output_rotates_redacted_segments_and_survives_restart() -> None:
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        executable = root / "large-output-codex"
+        secret = "sk-test-secret-1234567890"
+        executable.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "sys.stdin.read()\n"
+            f"secret = {secret!r}\n"
+            "for index in range(72):\n"
+            "    print(f'{index:03d}|' + ('界' * 3070) + '|' + (secret if index == 35 else 'safe'), flush=True)\n"
+            "print('Authorization: Bearer stderr-secret-value', file=sys.stderr, flush=True)\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o700)
+        manager = HostJobManager(root / "jobs", (root,))
+        job_id = str(uuid.uuid4())
+
+        manager.start({
+            "job_id": job_id, "adapter": "codex", "executable": str(executable),
+            "project_path": str(root), "prompt": "emit output", "timeout_seconds": 10,
+        })
+        completed = _wait_status(manager, job_id, {"completed"})
+
+        assert completed["returncode"] == 0
+        assert len(completed["stdout"].encode("utf-8")) <= MAX_OUTPUT_TAIL_BYTES
+        assert len(completed["stderr"].encode("utf-8")) <= MAX_OUTPUT_TAIL_BYTES
+        assert completed["output_bytes"]["total"] > MAX_OUTPUT_BYTES * 2
+        assert completed["output_ref"] == f"{job_id}/"
+        assert secret not in completed["stdout"]
+        assert "stderr-secret-value" not in completed["stderr"]
+
+        streams: dict[str, bytes] = {}
+        for stream in ("stdout", "stderr"):
+            segments = [
+                segment for segment in completed["output_segments"]
+                if segment["stream"] == stream
+            ]
+            assert [segment["index"] for segment in segments] == list(range(len(segments)))
+            payload = b""
+            for segment in segments:
+                segment_bytes = (root / "jobs" / segment["ref"]).read_bytes()
+                assert len(segment_bytes) == segment["bytes"] <= MAX_OUTPUT_BYTES
+                assert hashlib.sha256(segment_bytes).hexdigest() == segment["sha256"]
+                payload += segment_bytes
+            assert len(payload) == completed["output_bytes"][stream]
+            streams[stream] = payload
+
+        expected_stdout = "".join(
+            f"{index:03d}|{'界' * 3070}|{'[REDACTED]' if index == 35 else 'safe'}\n"
+            for index in range(72)
+        ).encode("utf-8")
+        assert streams["stdout"] == expected_stdout
+        assert streams["stderr"] == b"Authorization: Bearer [REDACTED]\n"
+        assert secret.encode() not in streams["stdout"]
+
+        rebuilt = HostJobManager(root / "jobs", (root,)).status(job_id)
+        assert rebuilt["output_segments"] == completed["output_segments"]
+        assert rebuilt["output_bytes"] == completed["output_bytes"]
+        carry = json.loads(
+            (root / "jobs" / job_id / "carry-forward.json").read_text(encoding="utf-8")
+        )
+        assert carry["status"] == "completed"
+        assert carry["generation_model_tokens"] == 0
+        assert carry["output_segments"] == completed["output_segments"]
+
+
+def test_host_job_timeout_writes_deterministic_carry_forward() -> None:
+    class TimedOutProcess:
+        pid = 424242
+        stdout = io.StringIO("last valid output\n")
+        stderr = io.StringIO("sk-timeout-secret-1234567890\n")
+        returncode = -15
+
+        def __init__(self) -> None:
+            self.waits = 0
+
+        def wait(self, timeout: int) -> int:
+            self.waits += 1
+            if self.waits == 1:
+                raise subprocess.TimeoutExpired("fake-codex", timeout)
+            return self.returncode
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        manager = HostJobManager(root / "jobs", (root,))
+        job_id = str(uuid.uuid4())
+        manager._write({
+            "job_id": job_id, "status": "running", "pid": 424242,
+            "session_id": "timeout-session", "started_at": "fixed",
+            "stdout": "", "stderr": "", "input_tokens": 7, "output_tokens": 3,
+            "cancel_requested": False,
+        })
+
+        with patch("plow_whip_web.host_bridge._terminate_process"):
+            manager._monitor(job_id, TimedOutProcess(), time.monotonic(), 0)
+
+        snapshot = manager.status(job_id)
+        carry_path = root / "jobs" / job_id / "carry-forward.json"
+        first = carry_path.read_bytes()
+        carry = json.loads(first)
+        manager._write(snapshot)
+
+        assert snapshot["failure_class"] == "timeout"
+        assert carry_path.read_bytes() == first
+        assert carry == {
+            "failure_class": "timeout",
+            "generation_model_tokens": 0,
+            "last_valid_output": {
+                "stderr": "[REDACTED]\n", "stdout": "last valid output\n",
+            },
+            "output_bytes": snapshot["output_bytes"],
+            "output_segments": snapshot["output_segments"],
+            "session_id": "timeout-session",
+            "status": "completed",
+            "tokens": {"input": 7, "output": 3, "total": 10},
+        }
+
+
+def test_host_job_repository_keeps_only_tail_and_output_index_in_sqlite() -> None:
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        app = create_app(Settings(
+            data_dir=root / "runtime", host_bridge_token="test-token-is-long-enough-123"
+        ))
+        bridge = FakeAsyncBridge()
+        app.state.provider_pool.bridge = bridge
+        task = _codex_task(app, root, "bounded-result-json")
+        app.state.task_service.drive(
+            task.id, expected_revision=task.revision, idempotency_key="drive-bounded-json"
+        )
+        job = app.state.host_jobs.active()[0]
+        full_output = "old-output-that-must-not-remain\n" + ("x" * (MAX_OUTPUT_BYTES * 3))
+        snapshot = {
+            **bridge.snapshots[job["job_id"]], "status": "completed", "returncode": 0,
+            "stdout": full_output, "stderr": "", "output_ref": f"{job['job_id']}/",
+            "output_segments": [{
+                "stream": "stdout", "index": 0, "ref": f"{job['job_id']}/stdout.000000.log",
+                "bytes": len(full_output.encode()), "sha256": hashlib.sha256(full_output.encode()).hexdigest(),
+                "content": full_output,
+            }],
+            "output_bytes": {"stdout": len(full_output.encode()), "stderr": 0, "total": len(full_output.encode())},
+        }
+
+        app.state.host_jobs.record(job["job_id"], snapshot)
+        connection = app.state.database.connect()
+        try:
+            stored_text = connection.execute(
+                "SELECT result_json FROM host_jobs WHERE job_id = ?", (job["job_id"],)
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        stored = json.loads(stored_text)
+
+        assert len(stored_text.encode("utf-8")) < 32_768
+        assert len(stored["stdout"].encode("utf-8")) <= MAX_OUTPUT_TAIL_BYTES
+        assert "old-output-that-must-not-remain" not in stored_text
+        assert stored["output_ref"] == snapshot["output_ref"]
+        assert "content" not in stored["output_segments"][0]
+        assert stored["output_segments"][0] == {
+            key: value for key, value in snapshot["output_segments"][0].items()
+            if key != "content"
+        }
+        assert stored["output_bytes"] == snapshot["output_bytes"]
+
+
 class FakeAsyncBridge:
     token = "configured-for-test"
 
     def __init__(self) -> None:
         self.snapshots: dict[str, dict[str, object]] = {}
         self.starts = 0
+        self.verify_calls = 0
+        self.start_sessions: list[str | None] = []
+        self.start_timeouts: list[int] = []
         self.verify_error: str | None = None
 
-    def start_job(self, *, job_id: str, **_kwargs: object) -> dict[str, object]:
+    def start_job(
+        self, *, job_id: str, session_id: str | None = None, timeout_seconds: int = 0,
+        **_kwargs: object
+    ) -> dict[str, object]:
         self.starts += 1
+        self.start_sessions.append(session_id)
+        self.start_timeouts.append(timeout_seconds)
         return self.snapshots.setdefault(job_id, {
             "job_id": job_id, "status": "running", "pid": 4242,
-            "session_id": "cli-session-1", "heartbeat_at": "2026-07-17T00:00:00+00:00",
+            "session_id": session_id or "cli-session-1",
+            "heartbeat_at": "2026-07-17T00:00:00+00:00",
         })
 
     def probe(self, _provider: dict[str, object]) -> tuple[bool, str]:
@@ -132,6 +321,7 @@ class FakeAsyncBridge:
         self, *, project_path: str, execution: ExecutionResult,
         verification: list[dict[str, object]],
     ):
+        self.verify_calls += 1
         if self.verify_error:
             raise ProviderUnavailableError(self.verify_error)
         return VerificationEngine().verify(Path(project_path), execution, verification)
@@ -155,6 +345,128 @@ def _codex_task(app: object, root: Path, key: str, *, token_budget: int = 100):
         verification=[{"kind": "exit_code", "expected": 0}],
         max_attempts=2, token_budget=token_budget, idempotency_key=key,
     )
+
+
+def _estimated_budget_m() -> tuple[dict[str, object], dict[str, object]]:
+    preview = estimate_task_sizing(TaskSizingInputs(
+        layers_touched=2,
+        components_touched=3,
+        estimated_files_changed=5,
+        has_migration=True,
+        has_deploy=False,
+        verification_commands_count=3,
+        estimated_verification_seconds=120,
+        external_dependencies_count=1,
+        risk_level="medium",
+        independent_review_required=False,
+        gate_artifact=True,
+        gate_boundary=True,
+        gate_verification=True,
+        gate_dependency=True,
+    ))
+    sizing = {
+        "status": preview["status"],
+        "size_class": preview["size_class"],
+        "rationale": preview["rationale"],
+        "estimated_input_tokens": preview["estimated_input_tokens"],
+        "estimated_output_tokens": preview["estimated_output_tokens"],
+        "bootstrap_version": preview["bootstrap_version"],
+    }
+    execution_budget = {
+        "soft_deadline_seconds": preview["soft_deadline_seconds"],
+        "hard_deadline_seconds": preview["hard_deadline_seconds"],
+        "max_turns": preview["max_turns"],
+        "max_attempts": preview["max_attempts"],
+        "verification_timeout_seconds": preview["verification_timeout_seconds"],
+        "progress_extension_seconds": preview["progress_extension_seconds"],
+        "total_token_hard_cap": preview["total_token_hard_cap"],
+        "reserved_tokens": preview["reserved_tokens"],
+    }
+    return sizing, execution_budget
+
+
+def _estimated_codex_task(app: object, root: Path, key: str):
+    project_path = root / key
+    project_path.mkdir()
+    project = app.state.project_repository.create(
+        name=key, path=str(project_path), host_path=str(project_path)
+    )
+    role_id = app.state.project_repository.resolve_role(
+        project["id"], "fullstack"
+    )["role_id"]
+    sizing, execution_budget = _estimated_budget_m()
+    return app.state.task_repository.create(
+        title=key, objective="perform bounded work", project_path=str(project_path),
+        project_id=project["id"], role_id=role_id, provider="codex",
+        command={"argv": [sys.executable, "-c", "pass"], "timeout_seconds": 60},
+        verification=[{"kind": "exit_code", "expected": 0}],
+        max_attempts=3, token_budget=int(execution_budget["total_token_hard_cap"]),
+        idempotency_key=key, sizing=sizing, execution_budget=execution_budget,
+    )
+
+
+def test_estimated_host_dispatch_uses_execution_budget_deadline_and_reservation() -> None:
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        app = create_app(Settings(
+            data_dir=root / "runtime", host_bridge_token="test-token-is-long-enough-123"
+        ))
+        bridge = FakeAsyncBridge()
+        app.state.provider_pool.bridge = bridge
+        task = _estimated_codex_task(app, root, "estimated-runtime-budget")
+        _, execution_budget = _estimated_budget_m()
+        assert execution_budget["hard_deadline_seconds"] == 1200
+        assert execution_budget["reserved_tokens"] == 150_000
+
+        running = app.state.task_service.drive(
+            task.id, expected_revision=task.revision,
+            idempotency_key="drive-estimated-runtime-budget",
+        )
+        assert running.status.value == "running"
+        assert bridge.start_timeouts == [1200]
+
+        connection = app.state.database.connect()
+        try:
+            lease = connection.execute(
+                "SELECT expires_at FROM task_leases WHERE task_id = ?",
+                (task.id,),
+            ).fetchone()
+            reservation = connection.execute(
+                "SELECT reserved_tokens FROM token_reservations WHERE task_id = ? AND status = 'active'",
+                (task.id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        assert reservation["reserved_tokens"] == 150_000
+        assert task_lease_seconds(running) == 1200 + EXECUTION_DEADLINE_GRACE_SECONDS
+        assert lease is not None
+
+
+def test_legacy_host_dispatch_keeps_command_timeout_and_remaining_reservation() -> None:
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        app = create_app(Settings(
+            data_dir=root / "runtime", host_bridge_token="test-token-is-long-enough-123"
+        ))
+        bridge = FakeAsyncBridge()
+        app.state.provider_pool.bridge = bridge
+        task = _codex_task(app, root, "legacy-runtime-timeout", token_budget=100)
+
+        app.state.task_service.drive(
+            task.id, expected_revision=task.revision,
+            idempotency_key="drive-legacy-runtime-timeout",
+        )
+
+        assert bridge.start_timeouts == [60]
+        connection = app.state.database.connect()
+        try:
+            reservation = connection.execute(
+                "SELECT reserved_tokens FROM token_reservations WHERE task_id = ? AND status = 'active'",
+                (task.id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        assert reservation["reserved_tokens"] == 100
 
 
 def test_host_task_zero_budget_is_rejected_before_claim_and_dispatch() -> None:
@@ -402,6 +714,7 @@ def test_host_verification_uses_host_project_path() -> None:
         assert result["active"] == 1
         assert app.state.task_repository.get(task.id).status.value == "running"
         assert app.state.host_jobs.active()[0]["status"] == "recovery_hold"
+        assert bridge.verify_calls == 1
 
         bridge.verify_error = None
         result = app.state.task_service.reconcile_host_jobs()
@@ -410,6 +723,7 @@ def test_host_verification_uses_host_project_path() -> None:
         completed = app.state.task_repository.get(task.id)
         assert completed.status.value == "completed"
         assert completed.last_error is None
+        assert bridge.verify_calls == 2
 
 
 def test_host_bridge_verification_accepts_host_artifact() -> None:
@@ -564,6 +878,121 @@ def test_interrupted_host_job_reuses_session_without_spending_attempt() -> None:
         finally:
             connection.close()
         assert (reservation["status"], reservation["actual_tokens"]) == ("settled", 5)
+
+
+def test_timeout_completed_snapshot_resumes_same_session_without_verification() -> None:
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        app = create_app(Settings(
+            data_dir=root / "runtime", host_bridge_token="test-token-is-long-enough-123"
+        ))
+        bridge = FakeAsyncBridge()
+        app.state.provider_pool.bridge = bridge
+        task = _codex_task(app, root, "continuity-timeout")
+        running = app.state.task_service.drive(
+            task.id, expected_revision=task.revision, idempotency_key="drive-timeout"
+        )
+        job = app.state.host_jobs.active()[0]
+        assert running.status.value == "running"
+        assert bridge.starts == 1
+        assert bridge.verify_calls == 0
+
+        bridge.snapshots[job["job_id"]] = {
+            **bridge.snapshots[job["job_id"]], "status": "completed",
+            "returncode": 124, "failure_class": "timeout",
+            "session_id": "timeout-session",
+            "input_tokens": 7, "output_tokens": 3,
+        }
+        result = app.state.task_service.reconcile_host_jobs()
+
+        assert result["settled"] == [{"task_id": task.id, "status": "ready"}]
+        assert bridge.verify_calls == 0
+        assert app.state.host_jobs.active() == []
+        resumed = app.state.task_repository.get(task.id)
+        assert resumed.status.value == "ready"
+        assert resumed.attempts_used == 0
+        assert resumed.tokens_used == 10
+        connection = app.state.database.connect()
+        try:
+            worker = connection.execute(
+                "SELECT external_session_id, last_error FROM workers WHERE id = ?",
+                (running.worker_id,),
+            ).fetchone()
+            reservation = connection.execute(
+                "SELECT status, actual_tokens FROM token_reservations WHERE run_id = ?",
+                (job["run_id"],),
+            ).fetchone()
+            usage_count = connection.execute(
+                "SELECT COUNT(*) FROM token_usage WHERE run_id = ?", (job["run_id"],)
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        assert worker["external_session_id"] == "timeout-session"
+        assert worker["last_error"] == "external_execution_interrupted"
+        assert (reservation["status"], reservation["actual_tokens"]) == ("settled", 10)
+        assert usage_count == 1
+
+        connection = app.state.database.connect()
+        try:
+            connection.execute(
+                "UPDATE host_jobs SET consumed_at = NULL WHERE job_id = ?", (job["job_id"],)
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        app.state.task_service.reconcile_host_jobs()
+        connection = app.state.database.connect()
+        try:
+            replay_usage = connection.execute(
+                "SELECT COUNT(*) FROM token_usage WHERE run_id = ?", (job["run_id"],)
+            ).fetchone()[0]
+            replay_reservation = connection.execute(
+                "SELECT status, actual_tokens FROM token_reservations WHERE run_id = ?",
+                (job["run_id"],),
+            ).fetchone()
+        finally:
+            connection.close()
+        assert replay_usage == 1
+        assert (replay_reservation["status"], replay_reservation["actual_tokens"]) == ("settled", 10)
+        assert bridge.verify_calls == 0
+
+        continuation = app.state.task_service.drive(
+            task.id, expected_revision=resumed.revision,
+            idempotency_key="drive-timeout-resume",
+        )
+        assert continuation.status.value == "running"
+        assert bridge.starts == 2
+        assert bridge.start_sessions[-1] == "timeout-session"
+        assert bridge.verify_calls == 0
+
+
+def test_command_failed_completed_still_runs_verification_path() -> None:
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        app = create_app(Settings(
+            data_dir=root / "runtime", host_bridge_token="test-token-is-long-enough-123"
+        ))
+        bridge = FakeAsyncBridge()
+        app.state.provider_pool.bridge = bridge
+        task = _codex_task(app, root, "continuity-command-failed", token_budget=100)
+        app.state.task_service.drive(
+            task.id, expected_revision=task.revision, idempotency_key="drive-command-failed"
+        )
+        job = app.state.host_jobs.active()[0]
+        bridge.snapshots[job["job_id"]] = {
+            **bridge.snapshots[job["job_id"]], "status": "completed",
+            "returncode": 1, "failure_class": "command_failed",
+            "stdout": "command error", "stderr": "", "input_tokens": 2, "output_tokens": 1,
+        }
+
+        result = app.state.task_service.reconcile_host_jobs()
+
+        assert result["settled"] == [{"task_id": task.id, "status": "ready"}]
+        assert bridge.verify_calls >= 1
+        failed = app.state.task_repository.get(task.id)
+        assert failed.status.value == "ready"
+        assert failed.attempts_used == 1
+        assert failed.last_error is not None
 
 
 def test_running_cancel_waits_for_host_confirmation() -> None:

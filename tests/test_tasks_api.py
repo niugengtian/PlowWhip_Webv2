@@ -176,6 +176,43 @@ def test_verification_failure_cannot_complete() -> None:
         assert "verification failed" in driven.json()["last_error"]
 
 
+def test_attempt_defaults_follow_execution_capability_and_explicit_override() -> None:
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        project = root / "project"
+        project.mkdir()
+        app = create_app(Settings(data_dir=root / "runtime"))
+        command_payload = _task_payload(project)
+        explicit_payload = _task_payload(project)
+        explicit_payload["max_attempts"] = 2
+        model_payload = {
+            **_task_payload(project),
+            "provider": "cursor",
+            "command": {},
+        }
+
+        with TestClient(app) as client:
+            command_task = client.post(
+                "/api/tasks",
+                headers={"Idempotency-Key": "create-command-default-attempts"},
+                json=command_payload,
+            ).json()
+            explicit_task = client.post(
+                "/api/tasks",
+                headers={"Idempotency-Key": "create-command-explicit-attempts"},
+                json=explicit_payload,
+            ).json()
+            model_task = client.post(
+                "/api/tasks",
+                headers={"Idempotency-Key": "create-model-default-attempts"},
+                json=model_payload,
+            ).json()
+
+        assert command_task["max_attempts"] == 1
+        assert explicit_task["max_attempts"] == 2
+        assert model_task["max_attempts"] == 3
+
+
 def test_create_and_drive_are_idempotent() -> None:
     with TemporaryDirectory() as directory:
         root = Path(directory)

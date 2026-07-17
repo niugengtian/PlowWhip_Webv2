@@ -4,7 +4,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from plow_whip_web.runtime.cron import CronExpression, validate_timezone
 
@@ -12,13 +12,15 @@ from plow_whip_web.domain.model import TaskRecord, TaskStatus
 
 
 class CommandSpec(BaseModel):
-    argv: Annotated[list[str], Field(min_length=1, max_length=64)]
+    argv: Annotated[list[str] | None, Field(min_length=1, max_length=64)] = None
     timeout_seconds: Annotated[int, Field(ge=1, le=600)] = 60
     output_limit_bytes: Annotated[int, Field(ge=1024, le=1_048_576)] = 131_072
 
     @field_validator("argv")
     @classmethod
-    def argv_must_be_non_empty(cls, value: list[str]) -> list[str]:
+    def argv_must_be_non_empty(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
         if any(not item or "\x00" in item for item in value):
             raise ValueError("argv entries must be non-empty and cannot contain NUL")
         return value
@@ -40,6 +42,50 @@ class VerificationSpec(BaseModel):
         return self
 
 
+class TokenEstimateBand(BaseModel):
+    min: int
+    max: int
+    p90: int
+
+
+class TaskSizingEstimateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    layers_touched: Annotated[int, Field(ge=0, le=32)] = 1
+    components_touched: Annotated[int, Field(ge=0, le=128)] = 1
+    estimated_files_changed: Annotated[int, Field(ge=0, le=512)] = 1
+    has_migration: bool = False
+    has_deploy: bool = False
+    verification_commands_count: Annotated[int, Field(ge=0, le=64)] = 1
+    estimated_verification_seconds: Annotated[int, Field(ge=0, le=86_400)] = 60
+    external_dependencies_count: Annotated[int, Field(ge=0, le=64)] = 0
+    risk_level: Literal["low", "medium", "high"] = "low"
+    independent_review_required: bool = False
+    gate_artifact: bool = False
+    gate_boundary: bool = False
+    gate_verification: bool = False
+    gate_dependency: bool = False
+
+
+class TaskSizingEstimateResponse(BaseModel):
+    status: Literal["estimated", "needs_planning"]
+    missing_gates: list[str]
+    size_class: Literal["XS", "S", "M", "L", "XL"] | None
+    rationale: list[str]
+    estimated_input_tokens: TokenEstimateBand | None
+    estimated_output_tokens: TokenEstimateBand | None
+    soft_deadline_seconds: int | None
+    hard_deadline_seconds: int | None
+    max_turns: int | None
+    max_attempts: int | None
+    verification_timeout_seconds: int | None
+    progress_extension_seconds: int | None
+    total_token_hard_cap: int | None
+    reserved_tokens: int | None
+    model_invoked: Literal[False] = False
+    bootstrap_version: str
+
+
 class TaskCreate(BaseModel):
     title: Annotated[str, Field(min_length=1, max_length=200)]
     objective: Annotated[str, Field(min_length=1, max_length=4000)]
@@ -49,11 +95,22 @@ class TaskCreate(BaseModel):
     resource_key: Annotated[str | None, Field(max_length=300)] = None
     network_requirement: Literal["none", "any", "domestic", "overseas"] = "none"
     provider: Annotated[str, Field(pattern=r"^[a-z][a-z0-9-]{1,63}$")] = "generic-command"
-    quality_profile: Literal["fast", "balanced", "strict"] = "balanced"
+    # Deprecated compatibility input. Every accepted value has one deterministic
+    # runtime meaning; legacy names are not separate quality commitments.
+    quality_profile: Literal["fast", "balanced", "strict", "deterministic"] = "deterministic"
     command: CommandSpec
     verification: Annotated[list[VerificationSpec], Field(min_length=1, max_length=32)]
-    max_attempts: Annotated[int, Field(ge=1, le=10)] = 1
+    max_attempts: Annotated[int | None, Field(ge=1, le=10)] = None
     token_budget: Annotated[int | None, Field(ge=0)] = None
+    sizing_inputs: TaskSizingEstimateRequest | None = None
+    manual_override_reason: Annotated[str | None, Field(min_length=1, max_length=500)] = None
+
+    @field_validator("quality_profile")
+    @classmethod
+    def normalize_quality_profile(
+        cls, value: Literal["fast", "balanced", "strict", "deterministic"]
+    ) -> Literal["deterministic"]:
+        return "deterministic"
 
     @field_validator("project_path")
     @classmethod
@@ -69,6 +126,8 @@ class TaskCreate(BaseModel):
     def project_reference_required(self) -> "TaskCreate":
         if self.project_id is None and self.project_path is None:
             raise ValueError("project_id or project_path is required")
+        if self.provider == "generic-command" and not self.command.argv:
+            raise ValueError("generic-command requires command.argv")
         return self
 
 
@@ -104,6 +163,11 @@ class TaskView(BaseModel):
     last_error: str | None
     created_at: str
     updated_at: str
+    sizing: dict[str, Any]
+    execution_budget: dict[str, Any] | None
+    manual_override: bool
+    override_reason: str | None
+    budget_overrun_evidence: dict[str, Any] | None
 
     @classmethod
     def from_record(cls, record: TaskRecord) -> "TaskView":
@@ -179,7 +243,8 @@ class RuntimeSettingsValues(BaseModel):
     auto_dispatch: bool = True
     task_default_token_budget: Annotated[int, Field(ge=0, le=100_000_000)] = 50_000
     global_daily_token_budget: Annotated[int, Field(ge=0, le=1_000_000_000)] = 500_000
-    max_same_failure: Annotated[int, Field(ge=1, le=20)] = 3
+    convention_refinement_token_budget: Annotated[int, Field(ge=1, le=100_000_000)] = 10_000
+    max_same_failure: Annotated[int, Field(ge=1, le=20)] = 2
     max_no_progress: Annotated[int, Field(ge=1, le=20)] = 3
     context_max_bytes: Annotated[int, Field(ge=4096, le=1_048_576)] = 32_768
     rotation_max_bytes: Annotated[int, Field(ge=16_384, le=16_777_216)] = 262_144

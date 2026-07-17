@@ -11,7 +11,11 @@ from plow_whip_web.providers.host_bridge import HostBridgeClient
 from plow_whip_web.runtime.verification import VerificationResult
 from plow_whip_web.store.database import Database
 from plow_whip_web.store.provider_repository import ProviderRepository
-from plow_whip_web.store.task_repository import TaskRepository
+from plow_whip_web.store.task_repository import (
+    TaskRepository,
+    task_hard_deadline_seconds,
+    task_host_reserved_tokens,
+)
 
 
 class ProviderPool:
@@ -69,7 +73,7 @@ class ProviderPool:
                 project_path=worker["host_path"],
                 prompt=prompt,
                 session_id=worker["external_session_id"],
-                timeout_seconds=int(task.command.get("timeout_seconds", 600)),
+                timeout_seconds=task_hard_deadline_seconds(task),
             )
         except ProviderUnavailableError as error:
             result = ExecutionResult(
@@ -101,7 +105,7 @@ class ProviderPool:
             project_path=worker["host_path"],
             prompt=prompt,
             session_id=worker["external_session_id"],
-            timeout_seconds=int(task.command.get("timeout_seconds", 600)),
+            timeout_seconds=task_hard_deadline_seconds(task),
         )
 
     def poll_task_job(self, job_id: str) -> dict[str, object]:

@@ -4,7 +4,11 @@ import json
 import uuid
 from typing import Any
 
+from plow_whip_web.security import Redactor
 from plow_whip_web.store.database import Database
+
+
+MAX_OUTPUT_TAIL_BYTES = 16_384
 
 
 class HostJobRepository:
@@ -53,8 +57,10 @@ class HostJobRepository:
             ).fetchone())
 
     def record(self, job_id: str, snapshot: dict[str, Any]) -> dict[str, Any]:
-        result_json = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
+        compact = _compact_snapshot(snapshot)
+        result_json = json.dumps(compact, ensure_ascii=False, sort_keys=True)
         session_id = snapshot.get("session_id") or snapshot.get("external_session_id")
+        error_summary = compact.get("error_summary")
         with self.database.transaction(immediate=True) as connection:
             connection.execute(
                 """
@@ -67,7 +73,7 @@ class HostJobRepository:
                 (
                     str(snapshot.get("status") or "unknown"), snapshot.get("pid"), session_id,
                     snapshot.get("heartbeat_at"), snapshot.get("finished_at"), result_json,
-                    snapshot.get("failure_class"), job_id,
+                    error_summary, job_id,
                 ),
             )
             row = connection.execute(
@@ -82,7 +88,7 @@ class HostJobRepository:
                         last_seen_at = CURRENT_TIMESTAMP, last_error = ?, updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                     """,
-                    (session_id, snapshot.get("failure_class"), row["worker_id"]),
+                    (session_id, error_summary, row["worker_id"]),
                 )
             return dict(row)
 
@@ -165,3 +171,46 @@ class HostJobRepository:
                 "UPDATE host_jobs SET consumed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE job_id = ?",
                 (job_id,),
             )
+
+
+def _compact_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    scalar_fields = {
+        "job_id", "status", "pid", "session_id", "external_session_id",
+        "heartbeat_at", "finished_at", "returncode", "duration_ms",
+        "failure_class", "input_tokens", "output_tokens", "cancel_requested",
+        "output_ref", "carry_forward_ref",
+    }
+    compact = {key: snapshot[key] for key in scalar_fields if key in snapshot}
+    raw_segments = snapshot.get("output_segments")
+    compact["output_segments"] = [
+        {
+            key: segment[key]
+            for key in ("stream", "index", "ref", "bytes", "sha256")
+            if key in segment
+        }
+        for segment in (raw_segments if isinstance(raw_segments, list) else [])
+        if isinstance(segment, dict)
+    ]
+    raw_bytes = snapshot.get("output_bytes")
+    compact["output_bytes"] = {
+        key: int(raw_bytes.get(key) or 0)
+        for key in ("stdout", "stderr", "total")
+    } if isinstance(raw_bytes, dict) else {"stdout": 0, "stderr": 0, "total": 0}
+    compact["stdout"] = _tail(snapshot.get("stdout"))
+    compact["stderr"] = _tail(snapshot.get("stderr"))
+    error = snapshot.get("error_summary") or snapshot.get("failure_class")
+    if not error and compact["stderr"]:
+        error = compact["stderr"][-1000:]
+    compact["error_summary"] = Redactor.redact(str(error))[:1000] if error else None
+    return compact
+
+
+def _tail(value: object) -> str:
+    encoded = Redactor.redact(str(value or "")).encode("utf-8")
+    tail = encoded[-MAX_OUTPUT_TAIL_BYTES:]
+    while tail:
+        try:
+            return tail.decode("utf-8")
+        except UnicodeDecodeError:
+            tail = tail[1:]
+    return ""

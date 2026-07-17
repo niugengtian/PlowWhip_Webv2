@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from plow_whip_web.domain.model import (
+    HostBridgeRejectedError,
     InvalidTransitionError,
     ProviderUnavailableError,
     TaskRecord,
@@ -13,8 +14,14 @@ from plow_whip_web.domain.model import (
 )
 from plow_whip_web.providers.generic_command import ExecutionResult, GenericCommandProvider
 from plow_whip_web.providers.pool import ProviderPool
+from plow_whip_web.store.task_repository import (
+    task_host_reserved_tokens,
+    task_lease_seconds,
+    task_sizing_status,
+)
 from plow_whip_web.runtime.budget import BudgetManager
 from plow_whip_web.runtime.context import ContextCompiler
+from plow_whip_web.runtime.fault_policy import FaultPolicy
 from plow_whip_web.runtime.journal import SessionJournal
 from plow_whip_web.runtime.verification import VerificationEngine, VerificationResult
 from plow_whip_web.security import CommandPolicy
@@ -70,7 +77,13 @@ class TaskService:
         if self.budget:
             self.budget.ensure(pending, estimate)
             if host_model:
-                reserved_tokens = self.budget.host_reservation(pending)
+                if task_sizing_status(pending) == "estimated":
+                    remaining = pending.token_budget - pending.tokens_used
+                    reserved_tokens = task_host_reserved_tokens(
+                        pending, remaining=remaining,
+                    )
+                else:
+                    reserved_tokens = self.budget.host_reservation(pending)
         claim = self.repository.claim(
             task_id, expected_revision=expected_revision,
             idempotency_key=f"{idempotency_key}:claim",
@@ -80,11 +93,6 @@ class TaskService:
             return claim.task
         assert claim.attempt_id is not None
         assert claim.run_id is not None
-        if claim.task.quality_profile in {"balanced", "strict"}:
-            self.repository.record_quality_run(
-                task_id=task_id, attempt_id=claim.attempt_id, run_type="plan",
-                result={"bounded": True, "objective": claim.task.objective, "model_tokens": 0},
-            )
         context = self.context_compiler.compile(task_id) if self.context_compiler else None
         if self.journal:
             self.journal.append(claim.task.worker_id, {
@@ -107,6 +115,21 @@ class TaskService:
                     claim.task, job_id=job["job_id"], prompt=prompt
                 )
                 self.host_jobs.record(job["job_id"], snapshot)
+            except HostBridgeRejectedError as error:
+                result = self._handle_host_fault(
+                    claim.task,
+                    job,
+                    {
+                        "job_id": job["job_id"],
+                        "status": "rejected",
+                        "returncode": 126,
+                        "last_error": str(error),
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                    },
+                )
+                assert result is not None
+                return result
             except ProviderUnavailableError as error:
                 # Dispatch outcome is unknown. Retain lease and reconcile by stable job_id.
                 self.host_jobs.hold(job["job_id"], str(error))
@@ -143,66 +166,57 @@ class TaskService:
             status = str(snapshot.get("status") or "unknown")
             task = self.repository.get(task_id)
             if status in {"dispatching", "running", "orphan_running", "cancelling"}:
-                self.host_jobs.renew(
-                    job_id, seconds=int(task.command.get("timeout_seconds", 600)) + 60
-                )
+                self.host_jobs.renew(job_id, seconds=task_lease_seconds(task))
                 active += 1
                 continue
             if status == "completed":
                 if task.status is TaskStatus.STOPPING:
                     result = self.repository.finalize_running_cancel(task_id, job_id=job_id)
                     self._settle_host_reservation(task, job, snapshot)
-                elif task.status in {TaskStatus.RUNNING, TaskStatus.VERIFYING}:
-                    execution = self.provider_pool.bridge.result(snapshot)
-                    try:
-                        verification = self.provider_pool.verify_host_task(task, execution)
-                        independent = (
-                            self.provider_pool.verify_host_task(task, execution)
-                            if task.quality_profile == "strict" else None
-                        )
-                    except ProviderUnavailableError as error:
-                        self.host_jobs.hold(job_id, str(error))
-                        self.host_jobs.renew(job_id)
-                        active += 1
-                        continue
-                    result = self._finish_execution(
-                        task, job["attempt_id"], job["run_id"], execution,
-                        idempotency_prefix=f"host-job:{job_id}",
-                        verification=verification,
-                        independent_verification=independent,
-                    )
                 else:
-                    result = task
-                    if self.budget and task.status in {
-                        TaskStatus.COMPLETED, TaskStatus.TERMINAL_FAILED,
-                    }:
-                        self.budget.record(
-                            task, self.provider_pool.bridge.result(snapshot).as_dict(),
-                            provider=task.provider, run_id=job["run_id"],
+                    result = self._handle_host_fault(task, job, snapshot)
+                    if result is not None:
+                        settled.append({"task_id": task_id, "status": result.status.value})
+                        continue
+                    if task.status in {TaskStatus.RUNNING, TaskStatus.VERIFYING}:
+                        execution = self.provider_pool.bridge.result(snapshot)
+                        try:
+                            verification = self.provider_pool.verify_host_task(task, execution)
+                        except ProviderUnavailableError as error:
+                            self.host_jobs.hold(job_id, str(error))
+                            self.host_jobs.renew(job_id)
+                            active += 1
+                            continue
+                        result = self._finish_execution(
+                            task, job["attempt_id"], job["run_id"], execution,
+                            idempotency_prefix=f"host-job:{job_id}",
+                            verification=verification,
                         )
+                    else:
+                        result = task
+                        if self.budget and task.status in {
+                            TaskStatus.COMPLETED, TaskStatus.TERMINAL_FAILED,
+                        }:
+                            self.budget.record(
+                                task, self.provider_pool.bridge.result(snapshot).as_dict(),
+                                provider=task.provider, run_id=job["run_id"],
+                            )
                 self.host_jobs.consume(job_id)
                 settled.append({"task_id": task_id, "status": result.status.value})
                 continue
             if status == "cancelled":
-                result = (
-                    self.repository.finalize_running_cancel(task_id, job_id=job_id)
-                    if task.status is TaskStatus.STOPPING else
-                    self.repository.resume_after_external_interruption(
-                        task_id, job_id=job_id,
-                        external_session_id=snapshot.get("session_id"),
-                    )
-                )
-                self._settle_host_reservation(task, job, snapshot)
-                self.host_jobs.consume(job_id)
+                if task.status is TaskStatus.STOPPING:
+                    result = self.repository.finalize_running_cancel(task_id, job_id=job_id)
+                    self._settle_host_reservation(task, job, snapshot)
+                    self.host_jobs.consume(job_id)
+                else:
+                    result = self._handle_host_fault(task, job, snapshot)
+                    assert result is not None
                 settled.append({"task_id": task_id, "status": result.status.value})
                 continue
             if status == "interrupted":
-                result = self.repository.resume_after_external_interruption(
-                    task_id, job_id=job_id,
-                    external_session_id=snapshot.get("session_id"),
-                )
-                self._settle_host_reservation(task, job, snapshot)
-                self.host_jobs.consume(job_id)
+                result = self._handle_host_fault(task, job, snapshot)
+                assert result is not None
                 settled.append({"task_id": task_id, "status": result.status.value})
                 continue
             self.host_jobs.hold(job_id, f"unknown host job status: {status}")
@@ -212,6 +226,35 @@ class TaskService:
             "checked": len(jobs), "active": active, "settled": settled,
             "model_invoked": False,
         }
+
+    def _handle_host_fault(
+        self, task: TaskRecord, job: dict[str, Any], snapshot: dict[str, Any]
+    ) -> TaskRecord | None:
+        decision = FaultPolicy.from_host_snapshot(snapshot)
+        if decision.action == "verify":
+            return None
+        execution = {
+            "returncode": int(snapshot.get("returncode") or 0),
+            "stderr": str(snapshot.get("stderr") or snapshot.get("last_error") or ""),
+            "failure_class": decision.failure_class,
+            "input_tokens": int(snapshot.get("input_tokens") or 0),
+            "output_tokens": int(snapshot.get("output_tokens") or 0),
+        }
+        return self.repository.finalize_host_fault(
+            task.id,
+            job_id=job["job_id"],
+            attempt_id=job["attempt_id"],
+            run_id=job["run_id"],
+            action=decision.action,
+            failure_class=decision.failure_class,
+            reason=decision.reason,
+            execution=execution,
+            external_session_id=(
+                snapshot.get("session_id")
+                or snapshot.get("external_session_id")
+                or job.get("external_session_id")
+            ),
+        )
 
     def _settle_host_reservation(
         self, task: TaskRecord, job: dict[str, Any], snapshot: dict[str, Any]
@@ -265,32 +308,17 @@ class TaskService:
         self, task: TaskRecord, attempt_id: str, run_id: str,
         execution: ExecutionResult, *, idempotency_prefix: str,
         verification: VerificationResult | None = None,
-        independent_verification: VerificationResult | None = None,
     ) -> TaskRecord:
         project_path = Path(task.project_path).resolve()
         verifying = self.repository.mark_verifying(
             task.id, expected_revision=task.revision,
             idempotency_key=f"{idempotency_prefix}:verify",
         )
+        # quality_profile is deprecated compatibility data. Legacy rows and new
+        # tasks intentionally share this single deterministic verification path.
         verification = verification or self.verifier.verify(
             project_path, execution, task.verification
         )
-        if task.quality_profile == "strict":
-            independent = independent_verification or VerificationEngine().verify(
-                project_path, execution, task.verification
-            )
-            self.repository.record_quality_run(
-                task_id=task.id, attempt_id=attempt_id, run_type="independent_review",
-                result={
-                    "evidence_hash": independent.evidence_hash,
-                    "passed": independent.passed, "model_tokens": 0,
-                },
-            )
-            if independent.evidence_hash != verification.evidence_hash:
-                verification = type(verification)(
-                    False, verification.checks, verification.evidence_hash,
-                    "independent review disagreement",
-                )
         verification_payload: dict[str, Any] = {
             "passed": verification.passed, "checks": verification.checks,
             "evidence_hash": verification.evidence_hash,
@@ -306,7 +334,6 @@ class TaskService:
             execution=execution.as_dict(), verification=verification_payload,
             idempotency_key=f"{idempotency_prefix}:finish",
             max_same_failure=limits.get("max_same_failure", 3),
-            max_no_progress=limits.get("max_no_progress", 3),
         )
         execution_payload = execution.as_dict()
         if self.budget:

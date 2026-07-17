@@ -35,10 +35,14 @@ Backend 默认监听 `127.0.0.1:8742`，Frontend 开发服务器默认监听 `12
 宿主机只需要 Docker；Python、Node 构建环境、SQLite 运行库、Web 服务和零 Token Cron engine 都在镜像内。
 
 ```bash
-docker compose up --build -d
+cp .env.local.example .env.local
+chmod 600 .env.local
+# 编辑 .env.local：填写 PLOW_WHIP_BRIDGE_TOKEN；需要 DeepSeek 时再填写 DEEPSEEK_API_KEY
+docker compose --env-file .env.local up --build -d
 open http://127.0.0.1:8742
 ```
 
+- `.env.local` 是本机私密配置，已被 Git 忽略；仓库只提交不含密钥的 `.env.local.example`。不要在聊天、SQLite、Compose 文件或日志中粘贴真实 Key。
 - `plow-whip-web-v2-data`：SQLite、WAL、日志、上下文归档和备份。
 - `plow-whip-web-v2-projects`：受管项目工作区，对应容器内 `/projects`。
 - Compose 使用 `restart: unless-stopped`，Docker 恢复后自动拉起；休眠或停机错过的计划默认只补跑一次。
@@ -54,17 +58,13 @@ Docker 容器不能直接执行 macOS 二进制。Codex CLI、Cursor CLI 和 sim
 仅在需要本机 CLI 时启动桥：
 
 ```bash
-export PLOW_WHIP_BRIDGE_TOKEN="$(openssl rand -hex 24)"
-# 可选：启用内置 DeepSeek simple-worker；不配置时系统仍可正常启动。
-export DEEPSEEK_API_KEY="..."
-export DEEPSEEK_MODEL="deepseek-v4-flash"
-PLOW_WHIP_BRIDGE_TOKEN="$PLOW_WHIP_BRIDGE_TOKEN" docker compose up --build -d
 .venv/bin/python -m plow_whip_web.host_bridge \
+  --env-file .env.local \
   --project-root /Users/your-name/work \
   --state-dir /Users/your-name/.plow-whip-web/host-bridge
 ```
 
-先启动容器，再让 Host Bridge 在当前终端持续运行；两者必须使用同一个令牌。Host Bridge 会把不含 Prompt 和 argv 的 Host Job 状态写入 `--state-dir`。Bridge 暂时不可达时，容器保留任务租约并进入 `recovery_hold`，不会把仍可能存活的 CLI 进程重复派发；Bridge 恢复后由零 Token 调度自动对账。
+`.env.local` 中的 `PLOW_WHIP_BRIDGE_TOKEN` 可用 `openssl rand -hex 24` 生成；`DEEPSEEK_API_KEY` 只由本机 Host Bridge 读取并传给 simple-worker，不传入控制面容器。先启动容器，再让 Host Bridge 在当前终端持续运行；两者必须读取同一个本地文件。每次启动都应确认 Worker Pool：Host Bridge 正在运行，并在 Provider 页面完成 0 Token 探测。Host Bridge 会把不含 Prompt 和 argv 的 Host Job 状态写入 `--state-dir`。Bridge 暂时不可达时，容器保留任务租约并进入 `recovery_hold`，不会把仍可能存活的 CLI 进程重复派发；Bridge 恢复后由零 Token 调度自动对账。
 
 项目注册时分别填写控制面挂载路径和本机项目目录。所有 Web UI 可选 Worker 都通过 Host Bridge 在本机项目目录执行并验收；报告、代码和其他任务产物始终留在原项目目录，Docker 只保存控制面状态和任务声明的产物路径索引。任务详情页通过 Host Bridge 实时确认文件大小、SHA-256 与修改时间，并可复制主机路径、在 Finder 定位或交给 Cursor 打开，不会把文件内容复制进容器。控制台 Provider 页可执行 0 Token 探测。平台 API Key 不是启动前提；凭据只通过环境变量引用接入，不保存在页面、SQLite、日志或镜像里。simple-worker 在缺少 `DEEPSEEK_API_KEY` 时会明确显示不可用，不会伪装就绪。
 

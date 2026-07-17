@@ -3,24 +3,22 @@ from __future__ import annotations
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from plow_whip_web.store import database as database_module
 from plow_whip_web.store.database import Database
 
 
+def _migration_names() -> list[str]:
+    migration_dir = Path(database_module.__file__).with_name("migrations")
+    return [migration.name for migration in sorted(migration_dir.glob("*.sql"))]
+
+
 def test_migrations_are_idempotent() -> None:
+    migration_names = _migration_names()
     with TemporaryDirectory() as directory:
         database = Database(Path(directory) / "test.sqlite3")
-        assert database.migrate() == [
-            "0001_initial.sql", "0002_tasks.sql", "0003_workforce.sql", "0004_scheduler.sql",
-            "0005_context_usage.sql",
-            "0006_resilience.sql",
-            "0007_release_security.sql",
-            "0008_embedded_cron.sql",
-            "0009_worker_provider_pool.sql",
-            "0010_cli_capabilities.sql",
-            "0011_host_jobs.sql",
-            "0012_token_usage_idempotency.sql",
-            "0013_simple_worker.sql",
-            "0014_token_reservations.sql",
-        ]
+        applied_migrations = database.migrate()
+
+        assert applied_migrations == migration_names
+        assert len(applied_migrations) == len(set(applied_migrations))
         assert database.migrate() == []
-        assert database.health()["migration_count"] == 14
+        assert database.health()["migration_count"] == len(migration_names)

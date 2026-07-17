@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import uuid
 from pathlib import Path
@@ -46,6 +47,22 @@ class ContextCompiler:
                     0,
                 )
             )
+        failure_delta = self.tasks.last_failure_delta(task.id)
+        if failure_delta:
+            evidence = _fit_utf8(
+                json.dumps(
+                    failure_delta, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                4096,
+            )
+            sections.append((
+                "## Previous verification Evidence Delta\n"
+                "Fix only the failed checks below. Preserve all already-passing work "
+                "and re-run the deterministic verification after the repair.\n" + evidence,
+                6,
+                768,
+            ))
         for convention in self.conventions.resolve(project_id=task.project_id, task_id=task.id):
             if convention["content"]:
                 priority, floor = {

@@ -9,6 +9,44 @@ export type TaskStatus =
   | 'cancelled'
   | 'paused'
 
+export type TaskSizingInputs = {
+  layers_touched: number
+  components_touched: number
+  estimated_files_changed: number
+  has_migration: boolean
+  has_deploy: boolean
+  verification_commands_count: number
+  estimated_verification_seconds: number
+  external_dependencies_count: number
+  risk_level: 'low' | 'medium' | 'high'
+  independent_review_required: boolean
+  gate_artifact: boolean
+  gate_boundary: boolean
+  gate_verification: boolean
+  gate_dependency: boolean
+}
+
+type TokenEstimateBand = { min: number; max: number; p90: number }
+
+export type TaskSizingEstimate = {
+  status: 'estimated' | 'needs_planning'
+  missing_gates: ('artifact' | 'boundary' | 'verification' | 'dependency' | 'independent_review_orchestration')[]
+  size_class: 'XS' | 'S' | 'M' | 'L' | 'XL' | null
+  rationale: string[]
+  estimated_input_tokens: TokenEstimateBand | null
+  estimated_output_tokens: TokenEstimateBand | null
+  soft_deadline_seconds: number | null
+  hard_deadline_seconds: number | null
+  max_turns: number | null
+  max_attempts: number | null
+  verification_timeout_seconds: number | null
+  progress_extension_seconds: number | null
+  total_token_hard_cap: number | null
+  reserved_tokens: number | null
+  model_invoked: false
+  bootstrap_version: string
+}
+
 export type Task = {
   id: string
   title: string
@@ -37,6 +75,10 @@ export type Task = {
   updated_at: string
   command: Record<string, unknown>
   verification: { kind: string; path?: string; contains?: string; expected?: number }[]
+  sizing: Record<string, unknown>
+  execution_budget: Record<string, unknown> | null
+  manual_override: boolean
+  override_reason: string | null
 }
 
 export type TaskArtifact = {
@@ -230,6 +272,10 @@ export const api = {
       method: 'POST', body: JSON.stringify({ provider, reason: 'operator_rebind' }),
     }),
   tasks: () => request<Task[]>('/api/tasks'),
+  estimateTask: (payload: TaskSizingInputs) =>
+    request<TaskSizingEstimate>('/api/tasks/estimate', {
+      method: 'POST', body: JSON.stringify(payload),
+    }),
   taskEvents: (taskId: string) => request<TaskEvent[]>(`/api/tasks/${taskId}/events`),
   taskArtifacts: (taskId: string) =>
     request<TaskArtifact[]>(`/api/tasks/${taskId}/artifacts`),
@@ -243,7 +289,7 @@ export const api = {
     request<Task>('/api/tasks', {
       method: 'POST',
       idempotencyKey: crypto.randomUUID(),
-      body: JSON.stringify(payload),
+      body: JSON.stringify({ ...payload, quality_profile: 'deterministic' }),
     }),
   driveTask: (task: Task) =>
     request<Task>(`/api/tasks/${task.id}/drive`, {

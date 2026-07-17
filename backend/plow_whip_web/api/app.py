@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, Header, Request
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -29,8 +29,11 @@ from plow_whip_web.api.schemas import (
     TaskControl,
     TaskEventView,
     TaskArtifactView,
+    TaskSizingEstimateRequest,
+    TaskSizingEstimateResponse,
     TaskView,
 )
+from plow_whip_web.runtime.sizing import TaskSizingInputs, estimate_task_sizing
 from plow_whip_web.config import Settings
 from plow_whip_web.domain.model import (
     DomainError,
@@ -438,6 +441,15 @@ def create_app(settings: Settings) -> FastAPI:
         repository: ProjectRepository = request.app.state.project_repository
         return ProjectView(**repository.release(project_id))
 
+    @app.post(
+        "/api/tasks/estimate",
+        response_model=TaskSizingEstimateResponse,
+        tags=["tasks"],
+    )
+    def estimate_task(payload: TaskSizingEstimateRequest) -> TaskSizingEstimateResponse:
+        preview = estimate_task_sizing(TaskSizingInputs(**payload.model_dump()))
+        return TaskSizingEstimateResponse(**preview)
+
     @app.post("/api/tasks", response_model=TaskView, status_code=201, tags=["tasks"])
     def create_task(
         request: Request,
@@ -445,6 +457,7 @@ def create_app(settings: Settings) -> FastAPI:
         idempotency_key: str = Header(alias="Idempotency-Key", min_length=8, max_length=200),
     ) -> TaskView:
         repository: TaskRepository = request.app.state.task_repository
+        settings_repo: SettingsRepository = request.app.state.runtime_settings
         project_path = payload.project_path
         role_id = None
         if payload.project_id:
@@ -453,23 +466,90 @@ def create_app(settings: Settings) -> FastAPI:
             project_path = binding["project_path"]
             role_id = binding["role_id"]
         assert project_path is not None
-        default_budget = runtime_settings.get()["values"]["task_default_token_budget"]
-        record = repository.create(
-            title=payload.title,
-            objective=payload.objective,
-            project_path=project_path,
-            command=payload.command.model_dump(),
-            verification=[item.model_dump(exclude_none=True) for item in payload.verification],
-            max_attempts=payload.max_attempts,
-            token_budget=payload.token_budget if payload.token_budget is not None else default_budget,
-            idempotency_key=idempotency_key,
-            project_id=payload.project_id,
-            role_id=role_id,
-            resource_key=payload.resource_key,
-            network_requirement=payload.network_requirement,
-            provider=payload.provider,
-            quality_profile=payload.quality_profile,
-        )
+
+        create_kwargs: dict[str, object] = {
+            "title": payload.title,
+            "objective": payload.objective,
+            "project_path": project_path,
+            "command": payload.command.model_dump(),
+            "verification": [
+                item.model_dump(exclude_none=True) for item in payload.verification
+            ],
+            "max_attempts": (
+                payload.max_attempts
+                if payload.max_attempts is not None
+                else (1 if payload.command.argv else 3)
+            ),
+            "idempotency_key": idempotency_key,
+            "project_id": payload.project_id,
+            "role_id": role_id,
+            "resource_key": payload.resource_key,
+            "network_requirement": payload.network_requirement,
+            "provider": payload.provider,
+            "quality_profile": payload.quality_profile,
+        }
+
+        if payload.sizing_inputs is not None:
+            preview = estimate_task_sizing(
+                TaskSizingInputs(**payload.sizing_inputs.model_dump())
+            )
+            if preview["status"] == "needs_planning":
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "message": "dispatch gates incomplete; task cannot be created",
+                        "code": "needs_planning",
+                        "missing_gates": preview["missing_gates"],
+                    },
+                )
+            sizing, execution_budget = _preview_to_persistence(preview)
+            estimated_hard_cap = int(execution_budget["total_token_hard_cap"])
+            reserved_tokens = int(execution_budget["reserved_tokens"])
+            if payload.token_budget is not None and payload.token_budget != estimated_hard_cap:
+                reason = (payload.manual_override_reason or "").strip()
+                if not reason:
+                    raise HTTPException(
+                        status_code=400,
+                        detail={
+                            "message": (
+                                "token_budget differs from estimated hard cap; "
+                                "manual_override_reason is required"
+                            ),
+                            "code": "manual_override_required",
+                            "total_token_hard_cap": estimated_hard_cap,
+                        },
+                    )
+                if payload.token_budget < reserved_tokens:
+                    raise HTTPException(
+                        status_code=400,
+                        detail={
+                            "message": (
+                                "token_budget cannot be below reserved_tokens"
+                            ),
+                            "code": "token_budget_below_reserved",
+                            "token_budget": payload.token_budget,
+                            "reserved_tokens": reserved_tokens,
+                        },
+                    )
+                execution_budget["estimated_total_token_hard_cap"] = estimated_hard_cap
+                execution_budget["total_token_hard_cap"] = payload.token_budget
+                create_kwargs["token_budget"] = payload.token_budget
+                create_kwargs["manual_override"] = True
+                create_kwargs["override_reason"] = reason
+            else:
+                create_kwargs["token_budget"] = estimated_hard_cap
+                create_kwargs["manual_override"] = False
+                create_kwargs["override_reason"] = None
+            create_kwargs["sizing"] = sizing
+            create_kwargs["execution_budget"] = execution_budget
+        else:
+            default_budget = settings_repo.get()["values"]["task_default_token_budget"]
+            create_kwargs["token_budget"] = (
+                payload.token_budget
+                if payload.token_budget is not None else default_budget
+            )
+
+        record = repository.create(**create_kwargs)
         return TaskView.from_record(record)
 
     @app.get("/api/tasks", response_model=list[TaskView], tags=["tasks"])
@@ -576,3 +656,27 @@ def _task_host_path(
     project: ProjectRepository = request.app.state.project_repository
     record = project.get(project_id)
     return str(record["host_path"] or record["path"])
+
+
+def _preview_to_persistence(
+    preview: dict[str, object],
+) -> tuple[dict[str, object], dict[str, object]]:
+    sizing = {
+        "status": preview["status"],
+        "size_class": preview["size_class"],
+        "rationale": preview["rationale"],
+        "estimated_input_tokens": preview["estimated_input_tokens"],
+        "estimated_output_tokens": preview["estimated_output_tokens"],
+        "bootstrap_version": preview["bootstrap_version"],
+    }
+    execution_budget = {
+        "soft_deadline_seconds": preview["soft_deadline_seconds"],
+        "hard_deadline_seconds": preview["hard_deadline_seconds"],
+        "max_turns": preview["max_turns"],
+        "max_attempts": preview["max_attempts"],
+        "verification_timeout_seconds": preview["verification_timeout_seconds"],
+        "progress_extension_seconds": preview["progress_extension_seconds"],
+        "total_token_hard_cap": preview["total_token_hard_cap"],
+        "reserved_tokens": preview["reserved_tokens"],
+    }
+    return sizing, execution_budget

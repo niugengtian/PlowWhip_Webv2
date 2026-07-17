@@ -4,9 +4,9 @@ import json
 import os
 import sys
 import zipfile
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 from plow_whip_web.api.app import create_app
 from plow_whip_web.config import Settings
 from plow_whip_web.providers.generic_command import GenericCommandProvider
-from plow_whip_web.runtime.connectivity import ConnectivityResult
+from plow_whip_web.runtime.verification import VerificationEngine
 
 
 def _payload(project: Path, *, provider: str = "generic-command", quality: str = "balanced"):
@@ -154,65 +154,63 @@ def test_backup_export_diagnostics_and_restore_round_trip() -> None:
         assert [project["name"] for project in app.state.project_repository.list()] == ["first"]
 
 
-@pytest.mark.parametrize("quality,expected", [
-    ("fast", {"execute"}),
-    ("balanced", {"execute", "plan"}),
-    ("strict", {"execute", "plan", "independent_review"}),
-])
-def test_quality_profiles_have_bounded_run_shapes(quality: str, expected: set[str]) -> None:
+@pytest.mark.parametrize("quality", ["fast", "balanced", "strict"])
+def test_legacy_quality_profiles_use_one_deterministic_execute(quality: str) -> None:
     with TemporaryDirectory() as directory:
         root = Path(directory)
         project = root / "project"
         project.mkdir()
         app = create_app(Settings(data_dir=root / "runtime"))
+        original_verify = VerificationEngine.verify
         with TestClient(app) as client:
             task = client.post(
                 "/api/tasks", headers={"Idempotency-Key": f"quality-create-{quality}"},
                 json=_payload(project, quality=quality),
             ).json()
-            completed = client.post(
-                f"/api/tasks/{task['id']}/drive", headers={"Idempotency-Key": f"quality-drive-{quality}"},
-                json={"expected_revision": 0},
-            )
-            assert completed.json()["status"] == "completed"
+            assert task["quality_profile"] == "deterministic"
+            assert client.get(f"/api/tasks/{task['id']}").json()["quality_profile"] == "deterministic"
+            with patch.object(
+                VerificationEngine, "verify", autospec=True, side_effect=original_verify
+            ) as verify:
+                completed = client.post(
+                    f"/api/tasks/{task['id']}/drive",
+                    headers={"Idempotency-Key": f"quality-drive-{quality}"},
+                    json={"expected_revision": 0},
+                )
+                assert completed.json()["status"] == "completed"
+                assert completed.json()["quality_profile"] == "deterministic"
+                assert verify.call_count == 1
+
+                legacy = app.state.task_repository.create(
+                    title=f"stored {quality}", objective="legacy compatibility row",
+                    project_path=str(project),
+                    command=_payload(project)["command"],
+                    verification=_payload(project)["verification"],
+                    max_attempts=1, token_budget=0,
+                    idempotency_key=f"stored-quality-create-{quality}",
+                    quality_profile=quality,
+                )
+                assert legacy.quality_profile == quality
+                legacy_completed = app.state.task_service.drive(
+                    legacy.id, expected_revision=legacy.revision,
+                    idempotency_key=f"stored-quality-drive-{quality}",
+                )
+                assert legacy_completed.status.value == "completed"
+                assert verify.call_count == 2
         connection = app.state.database.connect()
         try:
-            run_types = {row["run_type"] for row in connection.execute(
-                "SELECT run_type FROM task_runs WHERE task_id = ?", (task["id"],)
-            )}
+            rows = connection.execute(
+                """
+                SELECT task_id, run_type, result_json FROM task_runs
+                WHERE task_id IN (?, ?) ORDER BY task_id, finished_at
+                """,
+                (task["id"], legacy.id),
+            ).fetchall()
         finally:
             connection.close()
-        assert run_types == expected
-
-
-class OnlineProbe:
-    def check(self):
-        return ConnectivityResult("online", True, True)
-
-
-def test_web3_and_it_projects_complete_in_parallel_with_independent_verification() -> None:
-    with TemporaryDirectory() as directory:
-        root = Path(directory)
-        app = create_app(Settings(data_dir=root / "runtime"))
-        task_ids = []
-        for index, role_kind in enumerate(("web3", "fullstack")):
-            path = root / role_kind
-            path.mkdir()
-            project = app.state.project_repository.create(name=role_kind, path=str(path))
-            role = app.state.project_repository.resolve_role(project["id"], role_kind)
-            task = app.state.task_repository.create(
-                title=role_kind, objective="verified example", project_path=str(path), project_id=project["id"],
-                role_id=role["role_id"], resource_key=f"example:{index}",
-                command={"argv": [sys.executable, "-c", "from pathlib import Path; Path('evidence').write_text('verified')"]},
-                verification=[{"kind": "file_contains", "path": "evidence", "contains": "verified"}],
-                max_attempts=1, token_budget=0, idempotency_key=f"example-{index}", quality_profile="strict",
-            )
-            task_ids.append(task.id)
-        app.state.scheduler_service.connectivity = OnlineProbe()
-        result = app.state.scheduler_service.tick(owner="release-e2e")
-        assert result["selected"] == 2
-        assert all(app.state.task_repository.get(task_id).status.value == "completed" for task_id in task_ids)
-        assert result["model_tokens"] == 0
+        assert [row["run_type"] for row in rows if row["task_id"] == task["id"]] == ["execute"]
+        assert [row["run_type"] for row in rows if row["task_id"] == legacy.id] == ["execute"]
+        assert all('"model_tokens"' not in row["result_json"] for row in rows)
 
 
 def test_openapi_and_provider_capabilities_are_complete() -> None:
