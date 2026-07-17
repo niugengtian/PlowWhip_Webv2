@@ -17,6 +17,16 @@ from plow_whip_web.providers.generic_command import GenericCommandProvider
 from plow_whip_web.runtime.verification import VerificationEngine
 
 
+class MutableProbeBridge:
+    token = "test-token-is-long-enough-123"
+
+    def __init__(self, available: bool) -> None:
+        self.available = available
+
+    def probe(self, _provider: dict[str, object]) -> tuple[bool, str]:
+        return self.available, "ready" if self.available else "worker offline"
+
+
 def _payload(project: Path, *, provider: str = "generic-command", quality: str = "balanced"):
     return {
         "title": f"{quality} delivery", "objective": "complete with evidence",
@@ -71,23 +81,41 @@ def test_cross_project_absolute_argument_is_rejected_before_claim() -> None:
         assert unchanged.status.value == "ready" and unchanged.attempts_used == 0
 
 
-def test_provider_missing_blocks_without_fake_completion() -> None:
+def test_provider_must_be_ready_before_create_and_each_dispatch() -> None:
     with TemporaryDirectory() as directory:
         root = Path(directory)
         project = root / "project"
         project.mkdir()
-        app = create_app(Settings(data_dir=root / "runtime"))
+        app = create_app(Settings(
+            data_dir=root / "runtime",
+            host_bridge_token="test-token-is-long-enough-123",
+        ))
+        bridge = MutableProbeBridge(False)
+        app.state.provider_pool.bridge = bridge
         with TestClient(app) as client:
-            task = client.post(
+            blocked_create = client.post(
                 "/api/tasks", headers={"Idempotency-Key": "missing-provider-create"},
                 json=_payload(project, provider="codex"),
-            ).json()
-            response = client.post(
+            )
+            assert blocked_create.status_code == 409
+            assert blocked_create.json()["code"] == "provider_unavailable"
+            assert client.get("/api/tasks").json() == []
+
+            bridge.available = True
+            created = client.post(
+                "/api/tasks", headers={"Idempotency-Key": "ready-provider-create"},
+                json=_payload(project, provider="codex"),
+            )
+            assert created.status_code == 201
+            task = created.json()
+
+            bridge.available = False
+            blocked_drive = client.post(
                 f"/api/tasks/{task['id']}/drive", headers={"Idempotency-Key": "missing-provider-drive"},
                 json={"expected_revision": 0},
             )
-        assert response.status_code == 409
-        assert response.json()["code"] == "provider_unavailable"
+        assert blocked_drive.status_code == 409
+        assert blocked_drive.json()["code"] == "provider_unavailable"
         current = app.state.task_repository.get(task["id"])
         assert current.status.value == "ready" and current.attempts_used == 0
 

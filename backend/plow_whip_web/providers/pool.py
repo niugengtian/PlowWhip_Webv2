@@ -41,6 +41,14 @@ class ProviderPool:
             raise ProviderUnavailableError("Host Bridge 未配置，不能调用本机 CLI")
         return provider
 
+    def require_ready(self, name: str) -> dict[str, Any]:
+        provider = self.probe(name)
+        if provider["status"] != "available":
+            raise ProviderUnavailableError(
+                f"provider 未通过就绪探测: {name}: {provider['reason'] or '不可用'}"
+            )
+        return provider
+
     def probe(self, name: str) -> dict[str, Any]:
         provider = self.providers.require(name)
         if not provider["enabled"]:

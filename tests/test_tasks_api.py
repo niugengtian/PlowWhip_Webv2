@@ -10,6 +10,13 @@ from plow_whip_web.api.app import create_app
 from plow_whip_web.config import Settings
 
 
+class ReadyProbeBridge:
+    token = "test-token-is-long-enough-123"
+
+    def probe(self, _provider: dict[str, object]) -> tuple[bool, str]:
+        return True, "test provider ready"
+
+
 class ArtifactBridge:
     def __init__(self) -> None:
         self.opened: tuple[str, str, str] | None = None
@@ -181,7 +188,11 @@ def test_attempt_defaults_follow_execution_capability_and_explicit_override() ->
         root = Path(directory)
         project = root / "project"
         project.mkdir()
-        app = create_app(Settings(data_dir=root / "runtime"))
+        app = create_app(Settings(
+            data_dir=root / "runtime",
+            host_bridge_token="test-token-is-long-enough-123",
+        ))
+        app.state.provider_pool.bridge = ReadyProbeBridge()
         command_payload = _task_payload(project)
         explicit_payload = _task_payload(project)
         explicit_payload["max_attempts"] = 2

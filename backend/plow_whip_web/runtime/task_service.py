@@ -57,7 +57,7 @@ class TaskService:
     ) -> TaskRecord:
         pending = self.repository.get(task_id)
         provider_config = (
-            self.provider_pool.require_available(pending.provider)
+            self.provider_pool.require_ready(pending.provider)
             if self.provider_pool else None
         )
         if not self.provider_pool and pending.provider != self.provider.name:

@@ -15,7 +15,7 @@ def load_private_env(path: Path) -> bool:
     path = path.expanduser()
     if not path.is_file():
         return False
-    if path.stat().st_mode & 0o077:
+    if os.name != "nt" and path.stat().st_mode & 0o077:
         raise ValueError(f"{path} permissions are too open; run: chmod 600 {path}")
     for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         line = raw_line.strip()

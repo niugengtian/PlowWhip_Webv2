@@ -141,6 +141,16 @@ test.each([
   expect(screen.getByRole('heading', { name: heading })).toBeInTheDocument()
 })
 
+test('shows Host Bridge commands for macOS, Linux and Windows', () => {
+  render(<App />)
+  fireEvent.click(screen.getByRole('button', { name: '查看可用 Provider详情' }))
+  fireEvent.click(screen.getByText('Host Bridge 启动命令（macOS / Linux / Windows）'))
+  expect(screen.getByText('macOS')).toBeInTheDocument()
+  expect(screen.getByText('Linux')).toBeInTheDocument()
+  expect(screen.getByText('Windows PowerShell')).toBeInTheDocument()
+  expect(screen.getByText(/创建任务和每次派发都会由后端重新探测/)).toBeInTheDocument()
+})
+
 test('opens task creation and completes a 0 Token preflight with dynamic budget facts', async () => {
   await openTaskDrawer()
   expect(screen.queryByLabelText('质量档位')).not.toBeInTheDocument()
@@ -168,7 +178,7 @@ test('blocks enqueue when a gate is missing and the server requires planning', a
 
   expect(await screen.findByText('暂不可入队：先补齐计划')).toBeInTheDocument()
   expect(screen.getByText(/可验证产物/)).toBeInTheDocument()
-  expect(screen.getByRole('button', { name: '加入任务队列' })).toBeDisabled()
+  expect(screen.getByRole('button', { name: '检查 Provider 并加入任务队列' })).toBeDisabled()
 })
 
 test('invalidates a successful preflight as soon as a sizing input changes', async () => {
@@ -178,7 +188,7 @@ test('invalidates a successful preflight as soon as a sizing input changes', asy
 
   fireEvent.change(screen.getByLabelText('涉及层数'), { target: { value: '2' } })
   expect(screen.queryByText('服务端 Tier M')).not.toBeInTheDocument()
-  expect(screen.getByRole('button', { name: '加入任务队列' })).toBeDisabled()
+  expect(screen.getByRole('button', { name: '检查 Provider 并加入任务队列' })).toBeDisabled()
 })
 
 test('sends the exact preflight sizing inputs when creating a task', async () => {
@@ -188,7 +198,7 @@ test('sends the exact preflight sizing inputs when creating a task', async () =>
   fireEvent.change(screen.getByLabelText('项目'), { target: { value: project.id } })
   fireEvent.click(screen.getByRole('button', { name: '执行 0 Token 预判' }))
   await screen.findByText('服务端 Tier M')
-  fireEvent.click(screen.getByRole('button', { name: '加入任务队列' }))
+  fireEvent.click(screen.getByRole('button', { name: '检查 Provider 并加入任务队列' }))
 
   expect(await screen.findByText('任务已加入队列')).toBeInTheDocument()
   expect(createPayloads).toHaveLength(1)
@@ -206,7 +216,7 @@ test('independent review triggers its planning gate and cannot be created', asyn
 
   expect(await screen.findByText('暂不可入队：先补齐计划')).toBeInTheDocument()
   expect(screen.getByText(/尚无独立 reviewer 编排，要求独立复审的任务当前不能入队/)).toBeInTheDocument()
-  expect(screen.getByRole('button', { name: '加入任务队列' })).toBeDisabled()
+  expect(screen.getByRole('button', { name: '检查 Provider 并加入任务队列' })).toBeDisabled()
   expect(createPayloads).toHaveLength(0)
 })
 
@@ -219,7 +229,7 @@ test('clears the successful preflight when the estimate API later fails', async 
   fireEvent.click(screen.getByRole('button', { name: '执行 0 Token 预判' }))
   expect(await screen.findByText('预判服务暂不可用')).toBeInTheDocument()
   expect(screen.queryByText('服务端 Tier M')).not.toBeInTheDocument()
-  expect(screen.getByRole('button', { name: '加入任务队列' })).toBeDisabled()
+  expect(screen.getByRole('button', { name: '检查 Provider 并加入任务队列' })).toBeDisabled()
 })
 
 test('shows every legacy quality profile as deterministic verification', async () => {

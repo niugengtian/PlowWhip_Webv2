@@ -549,6 +549,8 @@ def create_app(settings: Settings) -> FastAPI:
                 if payload.token_budget is not None else default_budget
             )
 
+        provider_pool: ProviderPool = request.app.state.provider_pool
+        provider_pool.require_ready(payload.provider)
         record = repository.create(**create_kwargs)
         return TaskView.from_record(record)
 

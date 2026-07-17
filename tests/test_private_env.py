@@ -31,3 +31,16 @@ def test_private_env_requires_private_permissions_and_never_overrides(
 
 def test_private_env_missing_file_is_optional(tmp_path: Path) -> None:
     assert load_private_env(tmp_path / ".env.local") is False
+
+
+def test_windows_uses_acl_instead_of_posix_mode_bits(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / ".env.local"
+    path.write_text("DEEPSEEK_API_KEY=test-value\n", encoding="utf-8")
+    path.chmod(0o644)
+    monkeypatch.setattr("plow_whip_web.config.os.name", "nt")
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+
+    assert load_private_env(path) is True
+    assert os.environ["DEEPSEEK_API_KEY"] == "test-value"

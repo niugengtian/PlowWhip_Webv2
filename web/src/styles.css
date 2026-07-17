@@ -162,6 +162,11 @@ button.full { width: 100%; }
 .boundary-note { display: flex; gap: 12px; margin: 0 14px 14px; border: 1px solid #263658; border-radius: 6px; padding: 13px; background: #111827; color: var(--acc); }
 .boundary-note strong { color: #cdd8f2; font-size: .75rem; }
 .boundary-note p { margin: 5px 0 0; color: #7486aa; font-size: .68rem; line-height: 1.55; }
+.provider-setup { margin: 0 14px 14px; border: 1px solid var(--line); border-radius: 6px; padding: 12px; color: #9aabd0; }
+.provider-setup summary { cursor: pointer; color: #cdd8f2; font-size: .75rem; }
+.provider-setup h3 { margin: 14px 0 5px; color: var(--acc); font-size: .7rem; }
+.provider-setup pre { overflow-x: auto; margin: 0; border-radius: 4px; padding: 9px; background: #080d18; color: #9eb2dc; font-size: .64rem; line-height: 1.5; }
+.provider-setup p { margin: 12px 0 0; font-size: .68rem; line-height: 1.5; }
 
 .form-panel, .convention-panel { padding-bottom: 18px; }
 .form-panel > .field, .form-panel > .form-grid, .form-panel > .toggle-row, .form-panel > .form-help, .form-panel > button { margin-right: 18px; margin-left: 18px; }
