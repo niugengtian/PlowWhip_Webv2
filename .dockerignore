@@ -1,4 +1,7 @@
 .git
+.env
+.env.local
+.env.*.local
 .venv
 .pytest_cache
 .coverage
