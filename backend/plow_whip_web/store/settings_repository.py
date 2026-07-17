@@ -37,7 +37,13 @@ class SettingsRepository:
             if row is None:
                 return {"revision": 0, "values": dict(DEFAULT_SETTINGS), "updated_at": None}
             values = dict(DEFAULT_SETTINGS)
-            values.update(json.loads(row["settings_json"]))
+            values.update(
+                {
+                    key: value
+                    for key, value in json.loads(row["settings_json"]).items()
+                    if key in DEFAULT_SETTINGS
+                }
+            )
             return {"revision": row["revision"], "values": values, "updated_at": row["updated_at"]}
         finally:
             connection.close()
@@ -52,8 +58,14 @@ class SettingsRepository:
                 )
             merged = dict(DEFAULT_SETTINGS)
             if row:
-                merged.update(json.loads(row["settings_json"]))
-            merged.update(values)
+                merged.update(
+                    {
+                        key: value
+                        for key, value in json.loads(row["settings_json"]).items()
+                        if key in DEFAULT_SETTINGS
+                    }
+                )
+            merged.update({key: value for key, value in values.items() if key in DEFAULT_SETTINGS})
             next_revision = current_revision + 1
             payload = json.dumps(merged, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
             connection.execute(

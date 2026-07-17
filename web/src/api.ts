@@ -79,6 +79,28 @@ export type Task = {
   execution_budget: Record<string, unknown> | null
   manual_override: boolean
   override_reason: string | null
+  goal_id?: string | null
+  parent_task_id?: string | null
+  depends_on?: string[] | null
+  work_item_kind?: string | null
+  ordinal?: number | null
+  blocked_reason?: string | null
+  handoff?: Record<string, unknown> | null
+}
+
+export type Goal = {
+  id: string
+  title: string
+  objective: string
+  project_id: string
+  provider: string
+  status: string
+  plan: Record<string, unknown>
+  sizing_inputs: Record<string, unknown> | null
+  parent_task_id: string | null
+  created_at: string
+  updated_at: string
+  work_items: Record<string, unknown>[]
 }
 
 export type TaskArtifact = {
@@ -105,6 +127,22 @@ export type Worker = {
   last_seen_at: string | null
   last_error: string | null
   released_at: string | null
+  rotation_reason?: string | null
+  last_input_tokens: number
+  last_cached_input_tokens: number
+  last_output_tokens: number
+  last_uncached_input_tokens: number
+  last_context_pressure_tokens: number
+  last_context_pressure_reason: string | null
+  last_context_session_generation: number | null
+  last_attribution_granularity: string
+  last_value_classification: string
+  last_context_guard_decision: string | null
+  last_context_guard_reason: string | null
+  last_guard_estimated_new_tokens: number
+  last_guard_carry_in_cached_tokens: number
+  last_guard_hard_cap: number
+  last_guard_relation: string
 }
 export type Project = {
   id: string
@@ -162,11 +200,16 @@ export type Convention = {
 }
 export type Usage = {
   input_tokens: number
+  cached_input_tokens: number
+  cached_input_tokens_in_total: boolean
   output_tokens: number
   total_tokens: number
+  total_formula: string
+  hard_cap_enforcement: 'settlement_gate'
   control_tokens: number
-  projects: { project_id: string | null; tokens: number }[]
-  tasks: { task_id: string; tokens: number }[]
+  projects: { project_id: string | null; input_tokens: number; cached_input_tokens: number; uncached_input_tokens: number; output_tokens: number; tokens: number }[]
+  tasks: { task_id: string; input_tokens: number; cached_input_tokens: number; uncached_input_tokens: number; output_tokens: number; tokens: number }[]
+  calls: { call_id: string; task_id: string | null; worker_id: string | null; provider: string; session_generation: number | null; input_tokens: number; cached_input_tokens: number; uncached_input_tokens: number; output_tokens: number; attribution_granularity: string; value_classification: string; rotation_reason: string | null; created_at: string }[]
 }
 export type RuntimeHealth = {
   connectivity: string
@@ -189,6 +232,21 @@ export type Provider = {
   capabilities: string[]; reason: string | null; adapter: 'codex' | 'cursor' | 'json-worker' | 'generic-command';
   transport: 'host-bridge' | 'container'; executable: string | null; enabled: boolean;
   credential_env: string | null; revision: number; last_probed_at: string | null
+  credential_slot_count?: number | null
+  readiness?: {
+    installed: boolean
+    installed_at?: string | null
+    installed_reason?: string | null
+    cli_probe: string | { status?: string; checked_at?: string | null; reason?: string | null }
+    cli_probe_at?: string | null
+    cli_probe_reason?: string | null
+    session_resume_ready: boolean
+    session_resume_checked_at?: string | null
+    session_resume_reason?: string | null
+    recent_execution_health: string
+    recent_execution_checked_at?: string | null
+    recent_execution_reason?: string | null
+  }
 }
 export type ConventionSuggestion = {
   id: string; scope: Convention['scope']; scope_id: string; source_revision: number;
@@ -291,6 +349,14 @@ export const api = {
       idempotencyKey: crypto.randomUUID(),
       body: JSON.stringify({ ...payload, quality_profile: 'deterministic' }),
     }),
+  goals: () => request<Goal[]>('/api/goals'),
+  createGoal: (payload: Record<string, unknown>) =>
+    request<Goal>('/api/goals', {
+      method: 'POST',
+      idempotencyKey: crypto.randomUUID(),
+      body: JSON.stringify(payload),
+    }),
+  getGoal: (goalId: string) => request<Goal>(`/api/goals/${goalId}`),
   driveTask: (task: Task) =>
     request<Task>(`/api/tasks/${task.id}/drive`, {
       method: 'POST',

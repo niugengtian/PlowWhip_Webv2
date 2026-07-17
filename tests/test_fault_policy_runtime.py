@@ -134,6 +134,36 @@ def test_fault_policy_uses_last_error_when_stderr_is_empty() -> None:
     assert decision.reason == "transient_provider_transport"
 
 
+def test_fault_policy_classifies_provider_capacity_as_transient() -> None:
+    decision = FaultPolicy.from_host_snapshot({
+        "status": "completed",
+        "returncode": 1,
+        "failure_class": "command_failed",
+        "stderr": "Selected model is at capacity",
+    })
+
+    assert decision.action == "defer"
+    assert decision.failure_class == "provider_capacity"
+    assert decision.reason == "transient_provider_capacity"
+
+
+def test_internal_tool_abort_requires_missing_exit_status() -> None:
+    no_exit = FaultPolicy.from_host_snapshot({
+        "status": "completed",
+        "failure_class": "command_failed",
+        "stderr": "internal tool aborted while awaiting tool",
+    })
+    exited = FaultPolicy.from_host_snapshot({
+        "status": "completed",
+        "returncode": 1,
+        "failure_class": "command_failed",
+        "stderr": "internal tool aborted while awaiting tool",
+    })
+
+    assert (no_exit.action, no_exit.failure_class) == ("resume", "no_progress")
+    assert (exited.action, exited.failure_class) == ("verify", "command_failed")
+
+
 def test_socket_hang_up_replays_to_ready_without_spending_attempt() -> None:
     directory, app, bridge, running, job = _runtime("socket-hang-up")
     try:
@@ -220,6 +250,294 @@ def test_socket_hang_up_replays_to_ready_without_spending_attempt() -> None:
         assert continued.status.value == "running"
         assert continued.attempts_used == 1
         assert bridge.start_sessions[-1] == "confirmed-session"
+    finally:
+        directory.cleanup()
+
+
+def test_capacity_text_overrides_command_failed_and_retains_session() -> None:
+    directory, app, bridge, running, job = _runtime("provider-capacity")
+    try:
+        worker_id = running.worker_id
+        first_session = bridge.snapshots[job["job_id"]]["session_id"]
+        current = running
+        for occurrence in range(1, 4):
+            job = app.state.host_jobs.active()[0]
+            bridge.snapshots[job["job_id"]] = {
+                **bridge.snapshots[job["job_id"]],
+                "status": "completed",
+                "returncode": 1,
+                "failure_class": "command_failed",
+                "stderr": "Selected model is at capacity",
+                "input_tokens": 0,
+                "cached_input_tokens": 0,
+                "output_tokens": 0,
+            }
+            app.state.task_service.reconcile_host_jobs()
+            current = app.state.task_repository.get(current.id)
+            if occurrence < 3:
+                assert current.status.value == "ready"
+                assert current.last_error == "transient_provider_capacity"
+                current = app.state.task_service.drive(
+                    current.id,
+                    expected_revision=current.revision,
+                    idempotency_key=f"capacity-retry-{occurrence}",
+                )
+
+        worker = app.state.project_repository.list()[0]["workers"][0]
+        connection = app.state.database.connect()
+        try:
+            archives = connection.execute(
+                "SELECT COUNT(*) FROM worker_session_archives WHERE worker_id = ?",
+                (worker_id,),
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        assert current.status.value == "needs_human"
+        assert current.last_error == "provider_capacity_repeated"
+        assert worker["session_generation"] == 1
+        assert worker["external_session_id"] == first_session
+        assert archives == 0
+        assert bridge.verify_calls == 0
+    finally:
+        directory.cleanup()
+
+
+def test_real_hard_cap_breach_rotates_once_across_reconcile_replay() -> None:
+    directory, app, bridge, running, job = _runtime("hard-cap-rotate")
+    try:
+        bridge.snapshots[job["job_id"]] = {
+            **bridge.snapshots[job["job_id"]],
+            "status": "completed",
+            "returncode": 0,
+            "failure_class": None,
+            "stdout": "",
+            "stderr": "",
+            "input_tokens": 120,
+            "cached_input_tokens": 100,
+            "output_tokens": 1,
+        }
+        app.state.task_service.reconcile_host_jobs()
+        failed = app.state.task_repository.get(running.id)
+
+        with app.state.database.transaction(immediate=True) as connection:
+            connection.execute(
+                "UPDATE host_jobs SET consumed_at = NULL WHERE job_id = ?",
+                (job["job_id"],),
+            )
+        app.state.task_service.reconcile_host_jobs()
+
+        worker = app.state.project_repository.list()[0]["workers"][0]
+        connection = app.state.database.connect()
+        try:
+            archives = connection.execute(
+                """
+                SELECT reason, trigger_key FROM worker_session_archives
+                WHERE worker_id = ?
+                """,
+                (running.worker_id,),
+            ).fetchall()
+            usage = connection.execute(
+                """
+                SELECT input_tokens, cached_input_tokens, output_tokens,
+                       attribution_granularity, value_classification,
+                       rotation_reason, session_generation
+                FROM token_usage WHERE task_id = ?
+                """,
+                (running.id,),
+            ).fetchall()
+        finally:
+            connection.close()
+        assert failed.status.value == "terminal_failed"
+        assert failed.last_error == "budget_exceeded"
+        assert worker["session_generation"] == 2
+        assert worker["external_session_id"] is None
+        assert [(row["reason"], row["trigger_key"]) for row in archives] == [
+            ("budget_exceeded", f"budget-exceeded:{job['run_id']}")
+        ]
+        assert [tuple(row) for row in usage] == [
+            (
+                120, 100, 1, "turn", "unknown",
+                "budget_exceeded", 1,
+            )
+        ]
+    finally:
+        directory.cleanup()
+
+
+def test_provider_capacity_defers_boundedly_without_rotating_session() -> None:
+    directory, app, bridge, running, job = _runtime("bounded-capacity")
+    try:
+        worker_id = running.worker_id
+        for occurrence in range(1, 4):
+            bridge.snapshots[job["job_id"]] = {
+                **bridge.snapshots[job["job_id"]],
+                "status": "completed",
+                "returncode": 1,
+                "failure_class": "command_failed",
+                "stderr": "Selected model is at capacity",
+                "session_id": "confirmed-session",
+                "input_tokens": 0,
+                "cached_input_tokens": 0,
+                "output_tokens": 0,
+            }
+            app.state.task_service.reconcile_host_jobs()
+            task = app.state.task_repository.get(running.id)
+            if occurrence < 3:
+                assert task.status.value == "ready"
+                assert task.last_error == "transient_provider_capacity"
+                running = app.state.task_service.drive(
+                    task.id,
+                    expected_revision=task.revision,
+                    idempotency_key=f"capacity-retry-{occurrence}",
+                )
+                job = app.state.host_jobs.active()[0]
+            else:
+                assert task.status.value == "needs_human"
+                assert task.last_error == "provider_capacity_repeated"
+
+        worker = app.state.project_repository.get(
+            app.state.task_repository.get(running.id).project_id
+        )["workers"][0]
+        connection = app.state.database.connect()
+        try:
+            archives = connection.execute(
+                "SELECT COUNT(*) FROM worker_session_archives WHERE worker_id = ?",
+                (worker_id,),
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        assert worker["session_generation"] == 1
+        assert worker["external_session_id"] == "confirmed-session"
+        assert archives == 0
+    finally:
+        directory.cleanup()
+
+
+def test_budget_exceeded_settlement_rotates_once_across_reconcile_replay() -> None:
+    directory, app, bridge, running, job = _runtime("budget-rotate-once")
+    try:
+        bridge.snapshots[job["job_id"]] = {
+            **bridge.snapshots[job["job_id"]],
+            "status": "completed",
+            "returncode": 0,
+            "failure_class": None,
+            "stderr": "",
+            "session_id": "oversized-session",
+            "input_tokens": 120,
+            "cached_input_tokens": 100,
+            "output_tokens": 0,
+        }
+        app.state.task_service.reconcile_host_jobs()
+        failed = app.state.task_repository.get(running.id)
+        assert failed.status.value == "terminal_failed"
+        assert failed.last_error == "budget_exceeded"
+
+        with app.state.database.transaction(immediate=True) as connection:
+            connection.execute(
+                "UPDATE host_jobs SET consumed_at = NULL WHERE job_id = ?",
+                (job["job_id"],),
+            )
+        app.state.task_service.reconcile_host_jobs()
+
+        worker = app.state.project_repository.get(failed.project_id)["workers"][0]
+        connection = app.state.database.connect()
+        try:
+            archives = connection.execute(
+                """
+                SELECT reason, COUNT(*) count
+                FROM worker_session_archives WHERE worker_id = ?
+                GROUP BY reason
+                """,
+                (running.worker_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+        assert worker["session_generation"] == 2
+        assert worker["external_session_id"] is None
+        assert worker["last_input_tokens"] == 120
+        assert worker["last_cached_input_tokens"] == 100
+        assert worker["last_context_pressure_reason"] == "budget_exceeded"
+        assert [(row["reason"], row["count"]) for row in archives] == [
+            ("budget_exceeded", 1)
+        ]
+    finally:
+        directory.cleanup()
+
+
+def test_consecutive_internal_tool_aborts_rotate_only_at_threshold() -> None:
+    directory, app, bridge, running, first_job = _runtime("bounded-no-progress")
+    try:
+        first_session = bridge.snapshots[first_job["job_id"]]["session_id"]
+        bridge.snapshots[first_job["job_id"]] = {
+            **bridge.snapshots[first_job["job_id"]],
+            "status": "completed",
+            "failure_class": "command_failed",
+            "stderr": "internal tool aborted while awaiting tool",
+            "input_tokens": 0,
+            "output_tokens": 0,
+        }
+        app.state.task_service.reconcile_host_jobs()
+        recovered = app.state.task_repository.get(running.id)
+        worker_id = first_job["worker_id"]
+        connection = app.state.database.connect()
+        try:
+            first_worker = connection.execute(
+                """
+                SELECT session_id, external_session_id, session_generation
+                FROM workers WHERE id = ?
+                """,
+                (worker_id,),
+            ).fetchone()
+            first_archives = connection.execute(
+                "SELECT COUNT(*) FROM worker_session_archives WHERE worker_id = ?",
+                (worker_id,),
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        assert recovered.status.value == "ready"
+        assert recovered.last_error == "internal_tool_no_progress"
+        assert first_worker["session_generation"] == 1
+        assert first_worker["external_session_id"] == first_session
+        assert first_archives == 0
+
+        running_again = app.state.task_service.drive(
+            recovered.id,
+            expected_revision=recovered.revision,
+            idempotency_key="drive-bounded-no-progress-again",
+        )
+        second_job = app.state.host_jobs.active()[0]
+        assert bridge.start_sessions[-1] == first_session
+        bridge.snapshots[second_job["job_id"]] = {
+            **bridge.snapshots[second_job["job_id"]],
+            "status": "completed",
+            "failure_class": "command_failed",
+            "stderr": "internal tool aborted while awaiting tool",
+            "input_tokens": 0,
+            "output_tokens": 0,
+        }
+        app.state.task_service.reconcile_host_jobs()
+        second_recovery = app.state.task_repository.get(running_again.id)
+        connection = app.state.database.connect()
+        try:
+            rotated_worker = connection.execute(
+                """
+                SELECT session_id, external_session_id, session_generation
+                FROM workers WHERE id = ?
+                """,
+                (worker_id,),
+            ).fetchone()
+            archives = connection.execute(
+                "SELECT COUNT(*) FROM worker_session_archives WHERE worker_id = ?",
+                (worker_id,),
+            ).fetchone()[0]
+        finally:
+            connection.close()
+
+        assert second_recovery.status.value == "ready"
+        assert rotated_worker["session_generation"] == 2
+        assert rotated_worker["session_id"] != first_worker["session_id"]
+        assert rotated_worker["external_session_id"] is None
+        assert archives == 1
     finally:
         directory.cleanup()
 

@@ -58,6 +58,13 @@ class TaskRecord:
     manual_override: bool
     override_reason: str | None
     budget_overrun_evidence: dict[str, Any] | None
+    goal_id: str | None = None
+    parent_task_id: str | None = None
+    depends_on: list[str] | None = None
+    work_item_kind: str | None = None
+    ordinal: int | None = None
+    blocked_reason: str | None = None
+    handoff: dict[str, Any] | None = None
 
 
 class DomainError(RuntimeError):

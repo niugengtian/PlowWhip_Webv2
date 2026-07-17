@@ -1,5 +1,5 @@
 import '@testing-library/jest-dom/vitest'
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import { App } from './App'
 
@@ -11,6 +11,12 @@ const provider = {
   name: 'cursor', display_name: 'Cursor', status: 'available', model_invoked: false,
   capabilities: [], reason: null, adapter: 'cursor', transport: 'host-bridge', executable: 'cursor-agent',
   enabled: true, credential_env: null, revision: 0, last_probed_at: null,
+  readiness: {
+    installed: true, installed_at: '2026-07-17T00:01:00Z', installed_reason: 'binary found',
+    cli_probe: 'ok', cli_probe_at: '2026-07-17T00:02:00Z', cli_probe_reason: 'version ok',
+    session_resume_ready: true, session_resume_checked_at: '2026-07-17T00:03:00Z', session_resume_reason: 'resume probe passed',
+    recent_execution_health: 'healthy', recent_execution_checked_at: '2026-07-17T00:04:00Z', recent_execution_reason: 'last run passed',
+  },
 }
 const estimate = {
   status: 'estimated', missing_gates: [], size_class: 'M',
@@ -26,6 +32,25 @@ let estimateFails = false
 let estimatePayloads: Record<string, unknown>[] = []
 let createPayloads: Record<string, unknown>[] = []
 let listedTasks: Record<string, unknown>[] = []
+let listedGoals: Record<string, unknown>[] = []
+let listedProviders: Record<string, unknown>[] = []
+let listedProjects: Record<string, unknown>[] = []
+
+class FakeEventSource {
+  static instances: FakeEventSource[] = []
+  onmessage: (() => void) | null = null
+  onerror: (() => void) | null = null
+  listeners: Record<string, () => void> = {}
+  close = vi.fn()
+
+  constructor(readonly url: string) {
+    FakeEventSource.instances.push(this)
+  }
+
+  addEventListener(type: string, listener: () => void) {
+    this.listeners[type] = listener
+  }
+}
 
 function taskWithQualityProfile(qualityProfile: string, index: number) {
   return {
@@ -44,6 +69,10 @@ beforeEach(() => {
   estimatePayloads = []
   createPayloads = []
   listedTasks = []
+  listedGoals = []
+  listedProviders = [provider]
+  listedProjects = [project]
+  FakeEventSource.instances = []
   vi.stubGlobal(
     'fetch',
     vi.fn().mockImplementation(async (input: string | URL | Request, init?: RequestInit) => {
@@ -105,7 +134,7 @@ beforeEach(() => {
       }
       return {
         ok: true,
-        json: async () => path === '/api/projects' ? [project] : path === '/api/providers' ? [provider] : path === '/api/tasks' ? listedTasks : path.endsWith('/events') || path.endsWith('/artifacts') || ['/api/outbox', '/api/audit', '/api/permissions'].includes(path) ? [] : path === '/api/settings' ? settings : path === '/api/scheduler/status' ? scheduler : path === '/api/system/health' ? ({ connectivity: 'unknown', domestic_ok: null, overseas_ok: null, last_tick_at: null, last_resume_at: null, consecutive_failures: 0 }) : path === '/api/usage' ? ({ input_tokens: 0, output_tokens: 0, total_tokens: 0, control_tokens: 0, projects: [], tasks: [] }) : path === '/api/conventions/global/global' ? ({ scope: 'global', scope_id: 'global', content: '', revision: 0, updated_at: null }) : ({
+        json: async () => path === '/api/projects' ? listedProjects : path === '/api/providers' ? listedProviders : path === '/api/goals' ? listedGoals : path === '/api/tasks' ? listedTasks : path.endsWith('/events') || path.endsWith('/artifacts') || ['/api/outbox', '/api/audit', '/api/permissions'].includes(path) ? [] : path === '/api/settings' ? settings : path === '/api/scheduler/status' ? scheduler : path === '/api/system/health' ? ({ connectivity: 'unknown', domestic_ok: null, overseas_ok: null, last_tick_at: null, last_resume_at: null, consecutive_failures: 0 }) : path === '/api/usage' ? ({ input_tokens: 0, output_tokens: 0, total_tokens: 0, control_tokens: 0, projects: [], tasks: [] }) : path === '/api/conventions/global/global' ? ({ scope: 'global', scope_id: 'global', content: '', revision: 0, updated_at: null }) : ({
           status: 'ok',
           version: '0.1.0',
           database: { status: 'ok', journal_mode: 'wal', migration_count: 8 },
@@ -115,19 +144,63 @@ beforeEach(() => {
   )
 })
 
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  vi.useRealTimers()
+  vi.unstubAllGlobals()
+})
 
 async function openTaskDrawer() {
   render(<App />)
-  fireEvent.click(await screen.findByRole('button', { name: '新建任务' }))
+  fireEvent.click(await screen.findByRole('button', { name: '诊断任务' }))
   await screen.findByRole('heading', { name: '新建任务' })
 }
 
 test('shows the approved product priority', () => {
   render(<App />)
   expect(
-    screen.getByText('保障质量的前提下实现无人值守完成，尽量减少 Token 消费。'),
+    screen.getByText('保障质量并消除无价值循环，同时保留高价值上下文。'),
   ).toBeInTheDocument()
+})
+
+test('uses EventSource refresh and closes it on unmount', async () => {
+  vi.stubGlobal('EventSource', FakeEventSource)
+  const { unmount } = render(<App />)
+  await screen.findByText('Console')
+  const source = FakeEventSource.instances[0]
+  expect(source.url).toBe('/api/events/stream')
+  const before = vi.mocked(fetch).mock.calls.filter(([input]) => String(input) === '/api/tasks').length
+
+  source.listeners['task.updated']()
+  await vi.waitFor(() => {
+    expect(vi.mocked(fetch).mock.calls.filter(([input]) => String(input) === '/api/tasks').length).toBeGreaterThan(before)
+  })
+
+  unmount()
+  expect(source.close).toHaveBeenCalledOnce()
+})
+
+test('falls back to one low-frequency poller without EventSource and clears it', () => {
+  vi.useFakeTimers()
+  vi.stubGlobal('EventSource', undefined)
+  const { unmount } = render(<App />)
+
+  expect(vi.getTimerCount()).toBe(1)
+  unmount()
+  expect(vi.getTimerCount()).toBe(0)
+})
+
+test('falls back after an EventSource error and cleans both resources', () => {
+  vi.useFakeTimers()
+  vi.stubGlobal('EventSource', FakeEventSource)
+  const { unmount } = render(<App />)
+  const source = FakeEventSource.instances[0]
+
+  source.onerror?.()
+  expect(source.close).toHaveBeenCalledOnce()
+  expect(vi.getTimerCount()).toBe(1)
+  unmount()
+  expect(vi.getTimerCount()).toBe(0)
 })
 
 test.each([
@@ -149,6 +222,171 @@ test('shows Host Bridge commands for macOS, Linux and Windows', () => {
   expect(screen.getByText('Linux')).toBeInTheDocument()
   expect(screen.getByText('Windows PowerShell')).toBeInTheDocument()
   expect(screen.getByText(/创建任务和每次派发都会由后端重新探测/)).toBeInTheDocument()
+})
+
+test('keeps task and goal selection mutually exclusive and shows layered goal runtime metadata', async () => {
+  listedTasks = [{
+    ...taskWithQualityProfile('deterministic', 1),
+    id: 'child-1', title: 'UI child', worker_id: 'worker-1', work_item_kind: 'ui',
+    provider: 'cursor', depends_on: ['child-0'], blocked_reason: 'waiting for backend',
+    status: 'running', attempts_used: 1, max_attempts: 3, tokens_used: 184_000,
+    token_budget: 225_000, input_tokens: 120_000, cached_input_tokens: 96_000,
+    output_tokens: 64_000, total_tokens: 184_000,
+    output_ref: 'sessions/ui/current.jsonl', output_segments: 3, output_bytes: 8192,
+    output_offset: 4096, last_evidence_hash: null,
+  }]
+  listedGoals = [{
+    id: 'goal-1', title: 'Release Goal', objective: 'ship verified UI', project_id: project.id,
+    provider: 'cursor', status: 'running',
+    plan: { status: 'planned', model_invoked: false, model_pm_implemented: false },
+    sizing_inputs: { size_class: 'M', risk_level: 'medium' }, parent_task_id: 'parent-1',
+    created_at: '2026-07-17T00:00:00Z', updated_at: '2026-07-17T00:00:00Z',
+    work_items: [{
+      id: 'child-1', ordinal: 2, title: 'UI child', work_item_kind: 'ui', provider: 'cursor',
+      depends_on: ['child-0'], status: 'running', blocked_reason: 'waiting for backend',
+      sizing: { size_class: 'M', status: 'estimated' },
+      execution_budget: { total_token_hard_cap: 225_000, hard_deadline_seconds: 1200 },
+      verification: [{ kind: 'file_exists', path: 'result.txt' }],
+    }],
+  }]
+  listedProjects = [{
+    ...project,
+    workers: [{
+      id: 'worker-1', role_id: 'role-ui', role: 'ui', provider: 'cursor',
+      session_id: 'session-local', external_session_id: 'cursor-session-7', session_generation: 18,
+      status: 'busy', active_task_id: 'child-1', last_seen_at: '2026-07-17T00:05:00Z',
+      last_error: null, released_at: null, rotation_reason: 'context_threshold',
+      last_input_tokens: 120_000, last_cached_input_tokens: 96_000,
+      last_output_tokens: 64_000, last_context_pressure_tokens: 120_000,
+      last_context_pressure_reason: 'usage_observed', last_context_session_generation: 18,
+    }],
+  }]
+  render(<App />)
+
+  fireEvent.click(await screen.findByRole('button', { name: /UI child/ }))
+  expect(screen.getByText('确定性验证')).toBeInTheDocument()
+  fireEvent.click(screen.getByRole('button', { name: /Release Goal/ }))
+
+  expect(screen.getByRole('heading', { name: 'Release Goal' })).toBeInTheDocument()
+  expect(screen.getByText('结构化/确定性计划，模型 PM 尚未实现')).toBeInTheDocument()
+  for (const label of ['角色 / Provider', '依赖', '阻塞原因', 'Worker session', 'Generation', 'Rotation reason', 'Last context pressure', 'Pressure trigger', 'Sizing', 'Budget', 'Attempt / progress', 'Verification', 'Output ref', 'Segments / bytes / offset', 'Cached 计入 Total', 'Hard cap']) {
+    expect(screen.getByText(label)).toBeInTheDocument()
+  }
+  expect(screen.getByText('cursor-session-7')).toBeInTheDocument()
+  expect(screen.getByText('context_threshold')).toBeInTheDocument()
+  expect(screen.getByText('usage_observed')).toBeInTheDocument()
+  expect(screen.getByText('sessions/ui/current.jsonl')).toBeInTheDocument()
+  expect(screen.getByText('3 / 8192 / 4096')).toBeInTheDocument()
+  expect(screen.getByText('是，已包含在 Input 中，不重复相加')).toBeInTheDocument()
+  expect(screen.getByText('结算硬门；派发前执行 context-pressure guard')).toBeInTheDocument()
+  expect(screen.getByText(/turn \/ unknown/)).toBeInTheDocument()
+  expect(screen.getByText(/Uncached 不等于新工作或有价值/)).toBeInTheDocument()
+})
+
+test('ignores stale task details after the operator selects another task', async () => {
+  listedTasks = [
+    taskWithQualityProfile('fast', 1),
+    taskWithQualityProfile('balanced', 2),
+  ]
+  let resolveOldEvents!: (value: Record<string, unknown>[]) => void
+  let resolveOldArtifacts!: (value: Record<string, unknown>[]) => void
+  const oldEvents = new Promise<Record<string, unknown>[]>((resolve) => {
+    resolveOldEvents = resolve
+  })
+  const oldArtifacts = new Promise<Record<string, unknown>[]>((resolve) => {
+    resolveOldArtifacts = resolve
+  })
+  const defaultFetch = vi.mocked(fetch)
+  vi.stubGlobal(
+    'fetch',
+    vi.fn().mockImplementation(async (input: string | URL | Request, init?: RequestInit) => {
+      const path = String(input)
+      if (path === '/api/tasks/task-1/events') {
+        return { ok: true, json: async () => oldEvents }
+      }
+      if (path === '/api/tasks/task-1/artifacts') {
+        return { ok: true, json: async () => oldArtifacts }
+      }
+      if (path === '/api/tasks/task-2/events') {
+        return {
+          ok: true,
+          json: async () => [{
+            sequence: 22, event_type: 'task.two.event', payload: {},
+            state_revision: 0, created_at: '2026-07-17T00:02:00Z',
+          }],
+        }
+      }
+      if (path === '/api/tasks/task-2/artifacts') {
+        return {
+          ok: true,
+          json: async () => [{
+            relative_path: 'task-two.txt', host_path: '/projects/console/task-two.txt',
+            exists: true, bytes: 8, sha256: 'b'.repeat(64), modified_at_ns: 2,
+            actions: ['finder'],
+          }],
+        }
+      }
+      return defaultFetch(input, init)
+    }),
+  )
+
+  render(<App />)
+  fireEvent.click(await screen.findByRole('button', { name: /legacy-fast/ }))
+  await vi.waitFor(() => {
+    expect(vi.mocked(fetch).mock.calls.some(
+      ([input]) => String(input) === '/api/tasks/task-1/events',
+    )).toBe(true)
+  })
+  fireEvent.click(screen.getByRole('button', { name: /legacy-balanced/ }))
+
+  expect(await screen.findByText('task.two.event')).toBeInTheDocument()
+  expect(await screen.findByText('task-two.txt')).toBeInTheDocument()
+
+  await act(async () => {
+    resolveOldEvents([{
+      sequence: 11, event_type: 'task.one.stale', payload: {},
+      state_revision: 0, created_at: '2026-07-17T00:01:00Z',
+    }])
+    resolveOldArtifacts([{
+      relative_path: 'task-one-stale.txt',
+      host_path: '/projects/console/task-one-stale.txt',
+      exists: true, bytes: 8, sha256: 'a'.repeat(64), modified_at_ns: 1,
+      actions: ['finder'],
+    }])
+    await Promise.resolve()
+  })
+
+  expect(screen.queryByText('task.one.stale')).not.toBeInTheDocument()
+  expect(screen.queryByText('task-one-stale.txt')).not.toBeInTheDocument()
+  expect(screen.getByText('task.two.event')).toBeInTheDocument()
+  expect(screen.getByText('task-two.txt')).toBeInTheDocument()
+})
+
+test('shows provider readiness layers and does not hide unhealthy execution behind a successful probe', async () => {
+  listedProviders = [{
+    ...provider,
+    name: 'deepseek', display_name: 'DeepSeek', adapter: 'json-worker',
+    credential_env: 'DEEPSEEK_API_KEY_SLOTS', credential_slot_count: 3,
+    status: 'available',
+    readiness: {
+      ...provider.readiness,
+      recent_execution_health: 'unhealthy',
+      recent_execution_checked_at: '2026-07-17T00:09:00Z',
+      recent_execution_reason: 'last execution failed',
+    },
+  }]
+  render(<App />)
+  await screen.findByText('Console')
+  fireEvent.click(screen.getByRole('button', { name: '查看可用 Provider详情' }))
+
+  expect(screen.getByText('未完全就绪')).toBeInTheDocument()
+  expect(screen.getByText('installed / cli_probe')).toBeInTheDocument()
+  expect(screen.getByText('session_resume_ready')).toBeInTheDocument()
+  expect(screen.getByText('recent_execution_health')).toBeInTheDocument()
+  expect(screen.queryByText('healthy')).not.toBeInTheDocument()
+  expect(screen.getByText('unhealthy')).toBeInTheDocument()
+  expect(screen.getByText(/2026-07-17T00:09:00Z · last execution failed/)).toBeInTheDocument()
+  expect(screen.getByText('env DEEPSEEK_API_KEY_SLOTS · slots 3')).toBeInTheDocument()
 })
 
 test('opens task creation and completes a 0 Token preflight with dynamic budget facts', async () => {
@@ -200,7 +438,7 @@ test('sends the exact preflight sizing inputs when creating a task', async () =>
   await screen.findByText('服务端 Tier M')
   fireEvent.click(screen.getByRole('button', { name: '检查 Provider 并加入任务队列' }))
 
-  expect(await screen.findByText('任务已加入队列')).toBeInTheDocument()
+  expect(await screen.findByText('诊断任务已加入队列')).toBeInTheDocument()
   expect(createPayloads).toHaveLength(1)
   expect(createPayloads[0].quality_profile).toBe('deterministic')
   expect(createPayloads[0].sizing_inputs).toEqual(estimatePayloads[0])
@@ -230,6 +468,68 @@ test('clears the successful preflight when the estimate API later fails', async 
   expect(await screen.findByText('预判服务暂不可用')).toBeInTheDocument()
   expect(screen.queryByText('服务端 Tier M')).not.toBeInTheDocument()
   expect(screen.getByRole('button', { name: '检查 Provider 并加入任务队列' })).toBeDisabled()
+})
+
+test('submits a goal through the primary PM entry', async () => {
+  let goalPayload: Record<string, unknown> | null = null
+  vi.stubGlobal(
+    'fetch',
+    vi.fn().mockImplementation(async (input: string | URL | Request, init?: RequestInit) => {
+      const path = String(input)
+      if (path === '/api/tasks/estimate') {
+        return { ok: true, json: async () => estimate }
+      }
+      if (path === '/api/goals' && init?.method === 'POST') {
+        goalPayload = JSON.parse(String(init.body)) as Record<string, unknown>
+        return {
+          ok: true,
+          json: async () => ({
+            id: 'goal-1', title: goalPayload?.title, objective: goalPayload?.objective,
+            project_id: project.id, provider: 'cursor', status: 'running',
+            plan: { status: 'planned', items: [], model_invoked: false },
+            sizing_inputs: goalPayload?.sizing_inputs ?? null,
+            parent_task_id: 'parent-1', created_at: '2026-07-17T00:00:00Z',
+            updated_at: '2026-07-17T00:00:00Z', work_items: [],
+          }),
+        }
+      }
+      return {
+        ok: true,
+        json: async () => path === '/api/projects' ? [project] : path === '/api/providers' ? [provider] : path === '/api/goals' ? [] : path === '/api/tasks' ? [] : path === '/api/settings' ? ({
+          revision: 0, updated_at: null, values: {
+            scheduler_interval_seconds: 30, scheduler_lease_seconds: 90, cron_enabled: true,
+            cron_expression: '*/1 * * * *', cron_timezone: 'Asia/Shanghai', cron_misfire_policy: 'catch_up_once',
+            max_parallel_workers: 4, auto_dispatch: true, task_default_token_budget: 50000,
+            global_daily_token_budget: 500000, max_same_failure: 3, max_no_progress: 3,
+            context_max_bytes: 32768, rotation_max_bytes: 262144,
+          },
+        }) : path === '/api/scheduler/status' ? ({
+          runtime: { fencing_token: 0, last_tick_at: null, last_result: null, last_error: null, runner_id: null, runner_started_at: null, runner_heartbeat_at: null, runner_stopped_at: null, runner_error: null },
+          engine: { backend: 'embedded-cron', active: true, managed_by: 'docker', data_dir: '/data' },
+          schedule: { enabled: true, expression: '*/1 * * * *', timezone: 'Asia/Shanghai', misfire_policy: 'catch_up_once', next_run_at: null },
+          authorization_required: false, model_invoked: false,
+        }) : path === '/api/system/health' ? ({ connectivity: 'unknown', domestic_ok: null, overseas_ok: null, last_tick_at: null, last_resume_at: null, consecutive_failures: 0 }) : path === '/api/usage' ? ({ input_tokens: 0, output_tokens: 0, total_tokens: 0, control_tokens: 0, projects: [], tasks: [] }) : path === '/api/conventions/global/global' ? ({ scope: 'global', scope_id: 'global', content: '', revision: 0, updated_at: null }) : ['/api/outbox', '/api/audit', '/api/permissions'].includes(path) || path.endsWith('/events') || path.endsWith('/artifacts') ? [] : ({
+          status: 'ok', version: '0.1.0', database: { status: 'ok', journal_mode: 'wal', migration_count: 17 },
+        }),
+      }
+    }),
+  )
+  render(<App />)
+  fireEvent.click(await screen.findByRole('button', { name: '提交目标' }))
+  await screen.findByRole('heading', { name: '提交目标' })
+  fireEvent.change(screen.getByLabelText('标题'), { target: { value: '无人值守目标' } })
+  fireEvent.change(screen.getByLabelText('目标'), { target: { value: '自动拆分并推进' } })
+  fireEvent.change(screen.getByLabelText('项目'), { target: { value: project.id } })
+  fireEvent.click(screen.getByRole('button', { name: '执行 0 Token 预判' }))
+  await screen.findByText('服务端 Tier M')
+  fireEvent.click(screen.getByRole('button', { name: '检查 Provider 并提交目标' }))
+  expect(await screen.findByText('目标已拆分并进入自动推进')).toBeInTheDocument()
+  expect(goalPayload).toMatchObject({
+    title: '无人值守目标',
+    objective: '自动拆分并推进',
+    project_id: project.id,
+  })
+  expect(goalPayload).not.toHaveProperty('role')
 })
 
 test('shows every legacy quality profile as deterministic verification', async () => {

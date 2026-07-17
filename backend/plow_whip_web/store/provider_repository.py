@@ -94,26 +94,47 @@ class ProviderRepository:
                 )
         return self.require(name)
 
-    def record_probe(self, name: str, *, available: bool, detail: str) -> dict[str, Any]:
+    def record_probe(
+        self,
+        name: str,
+        *,
+        available: bool,
+        detail: str,
+        readiness: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         with self.database.transaction(immediate=True) as connection:
             row = connection.execute(
-                "SELECT enabled FROM provider_configs WHERE name = ?", (name,)
+                "SELECT enabled, config_json FROM provider_configs WHERE name = ?",
+                (name,),
             ).fetchone()
             if row is None:
                 raise NotFoundError(f"provider not found: {name}")
             status = "available" if available else ("unavailable" if row["enabled"] else "disabled")
+            config = json.loads(row["config_json"] or "{}")
+            if readiness is not None:
+                config["readiness"] = readiness
             connection.execute(
                 """
                 UPDATE provider_configs SET status = ?, reason = ?,
-                    last_probed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+                    config_json = ?, last_probed_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE name = ?
                 """,
-                (status, detail, name),
+                (status, detail, _dump(config), name),
             )
         return self.require(name)
 
     @staticmethod
     def _view(row: Any) -> dict[str, Any]:
+        config = json.loads(row["config_json"] or "{}")
+        readiness = config.get("readiness") if isinstance(config, dict) else None
+        if not isinstance(readiness, dict):
+            readiness = {
+                "installed": row["status"] in {"available", "unavailable", "unknown"},
+                "cli_probe": row["status"],
+                "session_resume_ready": False,
+                "recent_execution_health": "unknown",
+            }
         return {
             "name": row["name"],
             "display_name": row["display_name"] or row["name"],
@@ -128,6 +149,7 @@ class ProviderRepository:
             "credential_env": row["credential_env"],
             "revision": int(row["revision"]),
             "last_probed_at": row["last_probed_at"],
+            "readiness": readiness,
         }
 
 

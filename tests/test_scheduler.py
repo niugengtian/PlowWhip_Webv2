@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,6 +44,45 @@ def test_settings_are_validated_and_revision_guarded() -> None:
                 json={"expected_revision": 1, "values": invalid},
             )
             assert rejected.status_code == 422
+
+
+def test_settings_drop_unknown_persisted_keys_on_read_and_next_write() -> None:
+    with TemporaryDirectory() as directory:
+        app = create_app(Settings(data_dir=Path(directory) / "runtime"))
+        with app.state.database.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO system_settings(id, revision, settings_json, updated_at)
+                VALUES (1, 4, ?, CURRENT_TIMESTAMP)
+                """,
+                (json.dumps({"max_parallel_workers": 6, "deprecated_setting": 999}),),
+            )
+
+        with TestClient(app) as client:
+            current = client.get("/api/settings")
+            assert current.status_code == 200
+            assert current.json()["values"]["max_parallel_workers"] == 6
+            assert "deprecated_setting" not in current.json()["values"]
+
+            values = current.json()["values"]
+            values["max_parallel_workers"] = 7
+            updated = client.put(
+                "/api/settings",
+                json={"expected_revision": 4, "values": values},
+            )
+            assert updated.status_code == 200
+
+        connection = app.state.database.connect()
+        try:
+            persisted = json.loads(
+                connection.execute(
+                    "SELECT settings_json FROM system_settings WHERE id = 1"
+                ).fetchone()["settings_json"]
+            )
+        finally:
+            connection.close()
+        assert persisted["max_parallel_workers"] == 7
+        assert "deprecated_setting" not in persisted
 
 
 def test_tick_scans_all_projects_and_uses_zero_control_tokens() -> None:

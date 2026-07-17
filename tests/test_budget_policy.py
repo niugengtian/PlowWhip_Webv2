@@ -548,6 +548,25 @@ def _m_sizing_inputs() -> dict[str, object]:
     }
 
 
+def _xl_sizing_inputs() -> dict[str, object]:
+    return {
+        "layers_touched": 8,
+        "components_touched": 12,
+        "estimated_files_changed": 20,
+        "has_migration": True,
+        "has_deploy": True,
+        "verification_commands_count": 8,
+        "estimated_verification_seconds": 900,
+        "external_dependencies_count": 4,
+        "risk_level": "high",
+        "independent_review_required": False,
+        "gate_artifact": True,
+        "gate_boundary": True,
+        "gate_verification": True,
+        "gate_dependency": True,
+    }
+
+
 def _api_task_payload(project: Path, key: str, **overrides: object) -> dict[str, object]:
     payload: dict[str, object] = {
         "title": f"api-{key}",
@@ -599,6 +618,76 @@ def test_create_with_sizing_inputs_matches_estimate_preview() -> None:
             fetched = client.get(f"/api/tasks/{body['id']}").json()
             assert fetched["sizing"] == body["sizing"]
             assert fetched["execution_budget"] == body["execution_budget"]
+
+
+def test_estimated_max_attempts_is_persisted_and_drives_terminal_decision() -> None:
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        project = root / "project"
+        project.mkdir()
+        app = create_app(Settings(data_dir=root / "runtime"))
+        with TestClient(app) as client:
+            preview = client.post("/api/tasks/estimate", json=_xl_sizing_inputs()).json()
+            assert preview["max_attempts"] == 4
+            response = client.post(
+                "/api/tasks",
+                headers={"Idempotency-Key": "create-xl-attempt-truth-001"},
+                json=_api_task_payload(
+                    project,
+                    "xl-attempt-truth",
+                    sizing_inputs=_xl_sizing_inputs(),
+                    max_attempts=1,
+                ),
+            )
+            assert response.status_code == 201, response.text
+            body = response.json()
+            assert body["max_attempts"] == 4
+            assert body["execution_budget"]["max_attempts"] == 4
+        connection = app.state.database.connect()
+        try:
+            stored = connection.execute(
+                "SELECT max_attempts FROM tasks WHERE id = ?", (body["id"],)
+            ).fetchone()
+        finally:
+            connection.close()
+        assert stored["max_attempts"] == 4
+
+        repository = _repository(root)
+        create_kwargs = _create_kwargs(project, "attempt-terminal")
+        create_kwargs["max_attempts"] = 1
+        create_kwargs["sizing"] = {"status": "estimated"}
+        create_kwargs["execution_budget"] = {
+            "total_token_hard_cap": 100,
+            "max_attempts": 4,
+        }
+        task = repository.create(**create_kwargs)
+        for attempt in range(1, 5):
+            claim = repository.claim(
+                task.id,
+                expected_revision=task.revision,
+                idempotency_key=f"attempt-claim-{attempt}",
+            )
+            verifying = repository.mark_verifying(
+                task.id,
+                expected_revision=claim.task.revision,
+                idempotency_key=f"attempt-verify-{attempt}",
+            )
+            task = repository.finish(
+                task.id,
+                expected_revision=verifying.revision,
+                attempt_id=claim.attempt_id,
+                run_id=claim.run_id,
+                execution={"input_tokens": 0, "output_tokens": 0},
+                verification=_verification(
+                    passed=False, evidence_hash=f"attempt-proof-{attempt}"
+                ),
+                idempotency_key=f"attempt-finish-{attempt}",
+                max_same_failure=10,
+            )
+            assert task.status.value == (
+                "ready" if attempt < 4 else "terminal_failed"
+            )
+        assert task.attempts_used == task.max_attempts == 4
 
 
 def test_create_rejects_missing_gates_with_machine_readable_detail() -> None:

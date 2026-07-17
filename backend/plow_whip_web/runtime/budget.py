@@ -92,7 +92,7 @@ class BudgetManager:
                 call_id, call_kind, idempotency_key, run_id,
                 task.id if task else None,
                 task.project_id if task else project_id,
-                task.worker_id if task else worker_id,
+                (task.worker_id if task else None) or worker_id,
                 provider, reserved_tokens,
             ),
         )
@@ -111,23 +111,41 @@ class BudgetManager:
             "SELECT * FROM token_reservations WHERE call_id = ?", (call_id,)
         ).fetchone()
         input_tokens = int(execution.get("input_tokens", 0))
+        cached_input_tokens = min(
+            input_tokens, int(execution.get("cached_input_tokens", 0))
+        )
         output_tokens = int(execution.get("output_tokens", 0))
+        worker_id = (
+            reservation["worker_id"] if reservation else (task.worker_id if task else None)
+        )
+        generation = None
+        if worker_id:
+            worker = connection.execute(
+                "SELECT session_generation FROM workers WHERE id = ?", (worker_id,)
+            ).fetchone()
+            generation = worker["session_generation"] if worker else None
         inserted = connection.execute(
             """
             INSERT OR IGNORE INTO token_usage(
-                task_id, project_id, worker_id, input_tokens, output_tokens,
-                provider, run_id, call_id, call_kind
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                task_id, project_id, worker_id, input_tokens, cached_input_tokens,
+                output_tokens, provider, run_id, call_id, call_kind,
+                session_generation, attribution_granularity,
+                value_classification, rotation_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 reservation["task_id"] if reservation else (task.id if task else None),
                 reservation["project_id"] if reservation else (task.project_id if task else None),
-                reservation["worker_id"] if reservation else (task.worker_id if task else None),
-                input_tokens, output_tokens,
+                worker_id,
+                input_tokens, cached_input_tokens, output_tokens,
                 reservation["provider"] if reservation else provider,
                 reservation["run_id"] if reservation else call_id,
                 call_id,
                 reservation["call_kind"] if reservation else "task_execution",
+                generation,
+                str(execution.get("attribution_granularity") or "turn"),
+                str(execution.get("value_classification") or "unknown"),
+                execution.get("rotation_reason"),
             ),
         )
         if add_to_task and task is not None and inserted.rowcount:
@@ -193,17 +211,26 @@ class BudgetManager:
         try:
             total = connection.execute(
                 "SELECT COALESCE(SUM(input_tokens),0) input, "
+                "COALESCE(SUM(cached_input_tokens),0) cached_input, "
                 "COALESCE(SUM(output_tokens),0) output FROM token_usage"
             ).fetchone()
             projects = connection.execute(
                 """
-                SELECT project_id, SUM(input_tokens + output_tokens) tokens
+                SELECT project_id, SUM(input_tokens) input_tokens,
+                       SUM(cached_input_tokens) cached_input_tokens,
+                       SUM(input_tokens - cached_input_tokens) uncached_input_tokens,
+                       SUM(output_tokens) output_tokens,
+                       SUM(input_tokens + output_tokens) tokens
                 FROM token_usage GROUP BY project_id ORDER BY tokens DESC
                 """
             ).fetchall()
             tasks = connection.execute(
                 """
-                SELECT task_id, SUM(input_tokens + output_tokens) tokens
+                SELECT task_id, SUM(input_tokens) input_tokens,
+                       SUM(cached_input_tokens) cached_input_tokens,
+                       SUM(input_tokens - cached_input_tokens) uncached_input_tokens,
+                       SUM(output_tokens) output_tokens,
+                       SUM(input_tokens + output_tokens) tokens
                 FROM token_usage WHERE task_id IS NOT NULL
                 GROUP BY task_id ORDER BY tokens DESC LIMIT 100
                 """
@@ -214,12 +241,28 @@ class BudgetManager:
                 FROM token_reservations WHERE status = 'active'
                 """
             ).fetchone()[0]
+            calls = connection.execute(
+                """
+                SELECT call_id, task_id, worker_id, provider, session_generation,
+                       input_tokens, cached_input_tokens,
+                       input_tokens - cached_input_tokens AS uncached_input_tokens,
+                       output_tokens, attribution_granularity,
+                       value_classification, rotation_reason, created_at
+                FROM token_usage ORDER BY created_at DESC, id DESC LIMIT 100
+                """
+            ).fetchall()
             return {
-                "input_tokens": total["input"], "output_tokens": total["output"],
+                "input_tokens": total["input"],
+                "cached_input_tokens": total["cached_input"],
+                "cached_input_tokens_in_total": True,
+                "output_tokens": total["output"],
                 "total_tokens": total["input"] + total["output"],
+                "total_formula": "input_tokens + output_tokens",
+                "hard_cap_enforcement": "settlement_gate",
                 "control_tokens": 0, "reserved_tokens": reserved,
                 "projects": [dict(row) for row in projects],
                 "tasks": [dict(row) for row in tasks],
+                "calls": [dict(row) for row in calls],
             }
         finally:
             connection.close()

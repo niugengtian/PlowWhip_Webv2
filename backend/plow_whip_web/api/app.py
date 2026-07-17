@@ -16,6 +16,8 @@ from plow_whip_web.api.schemas import (
     ExpectedRevision,
     ConventionPut,
     ConventionRefineRequest,
+    GoalCreate,
+    GoalView,
     ProjectCreate,
     ProjectView,
     ProviderPut,
@@ -34,6 +36,8 @@ from plow_whip_web.api.schemas import (
     TaskView,
 )
 from plow_whip_web.runtime.sizing import TaskSizingInputs, estimate_task_sizing
+from plow_whip_web.runtime.orchestration import plan_goal_work_items
+from dataclasses import replace
 from plow_whip_web.config import Settings
 from plow_whip_web.domain.model import (
     DomainError,
@@ -63,6 +67,7 @@ from plow_whip_web.store.audit_repository import AuditRepository
 from plow_whip_web.store.permission_repository import PermissionRepository
 from plow_whip_web.store.provider_repository import ProviderRepository
 from plow_whip_web.store.task_repository import TaskRepository
+from plow_whip_web.store.goal_repository import GoalRepository
 from plow_whip_web.store.host_job_repository import HostJobRepository
 from plow_whip_web.providers.host_bridge import HostBridgeClient
 from plow_whip_web.providers.pool import ProviderPool
@@ -75,6 +80,7 @@ def create_app(settings: Settings) -> FastAPI:
     database = Database(settings.database_path)
     database.migrate()
     task_repository = TaskRepository(database)
+    goal_repository = GoalRepository(database)
     host_jobs = HostJobRepository(database)
     project_repository = ProjectRepository(database)
     runtime_settings = SettingsRepository(database)
@@ -97,13 +103,13 @@ def create_app(settings: Settings) -> FastAPI:
     )
     task_service = TaskService(
         task_repository, budget=budget, context_compiler=context_compiler, journal=journal,
-        provider_pool=provider_pool, host_jobs=host_jobs,
+        provider_pool=provider_pool, host_jobs=host_jobs, projects=project_repository,
     )
     scheduler_repository = SchedulerRepository(database)
     scheduler_service = SchedulerService(
         scheduler_repository, runtime_settings, task_repository, task_service,
         connectivity=ConnectivityProbe(), health=health_repository, recovery=recovery,
-        provider_pool=provider_pool,
+        provider_pool=provider_pool, goals=goal_repository,
     )
     embedded_cron_runner = EmbeddedCronRunner(
         scheduler_service, scheduler_repository, runtime_settings
@@ -117,6 +123,7 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.settings = settings
     app.state.database = database
     app.state.task_repository = task_repository
+    app.state.goal_repository = goal_repository
     app.state.host_jobs = host_jobs
     app.state.project_repository = project_repository
     app.state.task_service = task_service
@@ -449,6 +456,90 @@ def create_app(settings: Settings) -> FastAPI:
     def estimate_task(payload: TaskSizingEstimateRequest) -> TaskSizingEstimateResponse:
         preview = estimate_task_sizing(TaskSizingInputs(**payload.model_dump()))
         return TaskSizingEstimateResponse(**preview)
+
+    @app.post("/api/goals", response_model=GoalView, status_code=201, tags=["goals"])
+    def create_goal(
+        request: Request,
+        payload: GoalCreate,
+        idempotency_key: str = Header(alias="Idempotency-Key", min_length=8, max_length=200),
+    ) -> GoalView:
+        projects: ProjectRepository = request.app.state.project_repository
+        goals: GoalRepository = request.app.state.goal_repository
+        provider_pool: ProviderPool = request.app.state.provider_pool
+        project = projects.get(payload.project_id)
+        role_ids = {role["kind"]: role["id"] for role in project["roles"]}
+        required_roles = {
+            "coordination", "backend", "frontend", "ui", "devops_sre", "verification",
+            "fullstack", "web3",
+        }
+        missing = sorted(kind for kind in required_roles if kind not in role_ids)
+        if missing:
+            raise NotFoundError(
+                f"role catalog incomplete for {payload.project_id}: {', '.join(missing)}"
+            )
+        unknown_provider_roles = sorted(set(payload.role_providers) - set(role_ids))
+        if unknown_provider_roles:
+            raise DomainError(
+                f"unknown role provider decision: {', '.join(unknown_provider_roles)}"
+            )
+        sizing_inputs = TaskSizingInputs(**payload.sizing_inputs.model_dump())
+        plan = plan_goal_work_items(
+            title=payload.title,
+            objective=payload.objective,
+            sizing_inputs=sizing_inputs,
+            structured_items=payload.plan_items,
+        )
+        if plan.status == "needs_planning":
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "dispatch gates incomplete; goal cannot be created",
+                    "code": "needs_planning",
+                    "missing_gates": list(plan.missing_gates),
+                },
+            )
+        bindings = projects.role_provider_bindings(payload.project_id)
+        role_providers: dict[str, str] = {"coordination": bindings.get("coordination", payload.provider)}
+        for item in plan.items:
+            selected = bindings.get(item.role) or payload.role_providers.get(item.role)
+            if selected is None:
+                raise DomainError(
+                    f"explicit provider decision required for unbound role: {item.role}"
+                )
+            role_providers[item.role] = selected
+        # Live 0-Token probe per distinct provider before atomic create.
+        for provider_name in sorted(set(role_providers.values())):
+            provider_pool.require_ready(provider_name)
+        binding = projects.resolve_role(payload.project_id, "coordination")
+        record = goals.create_with_plan(
+            title=payload.title,
+            objective=payload.objective,
+            project_id=payload.project_id,
+            project_path=binding["project_path"],
+            role_providers=role_providers,
+            plan=plan,
+            sizing_inputs=payload.sizing_inputs.model_dump(),
+            verification=[item.model_dump(exclude_none=True) for item in payload.verification],
+            role_ids=role_ids,
+            idempotency_key=idempotency_key,
+            network_requirement=payload.network_requirement,
+            command=(
+                payload.command.model_dump()
+                if payload.command is not None
+                else {"argv": None, "timeout_seconds": 60, "output_limit_bytes": 131_072}
+            ),
+        )
+        return GoalView(**record)
+
+    @app.get("/api/goals", response_model=list[GoalView], tags=["goals"])
+    def list_goals(request: Request) -> list[GoalView]:
+        goals: GoalRepository = request.app.state.goal_repository
+        return [GoalView(**item) for item in goals.list()]
+
+    @app.get("/api/goals/{goal_id}", response_model=GoalView, tags=["goals"])
+    def get_goal(request: Request, goal_id: str) -> GoalView:
+        goals: GoalRepository = request.app.state.goal_repository
+        return GoalView(**goals.get(goal_id))
 
     @app.post("/api/tasks", response_model=TaskView, status_code=201, tags=["tasks"])
     def create_task(

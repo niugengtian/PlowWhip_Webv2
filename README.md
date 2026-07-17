@@ -60,6 +60,7 @@ docker compose --env-file .env.local up --build -d
 - 只有一个全局计划扫描所有项目/角色/Worker/Task；数据库租约与 fencing token 防止重复调度和脑裂。
 - `max_parallel_workers` 同时约束跨 Tick 已在途任务和手工派发；Host 模型任务在事务性 claim 中预留剩余任务 Token 额度，并计入全局当日额度。
 - 控制路径只做 SQLite 扫描、网络探测和状态判断，模型调用数与 Token 消费均为 0。
+- **主流程是提交目标**：PM（coordination）0 Token 确定性拆分为有序角色工作项；Scheduler 按依赖自动派发、同角色稳定会话续接，父目标仅在全部实现项与独立 verification 项通过后完成。诊断用的单任务创建仍保留，但不是主入口。
 
 ## 本机 CLI Worker Pool
 

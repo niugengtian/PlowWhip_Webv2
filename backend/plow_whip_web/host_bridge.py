@@ -30,6 +30,8 @@ MAX_OUTPUT_BYTES = 262_144
 MAX_OUTPUT_TAIL_BYTES = 16_384
 MAX_ARTIFACT_HASH_BYTES = 67_108_864
 SUPPORTED_ADAPTERS = {"codex", "cursor", "json-worker"}
+_LOCAL_PROCESSES: dict[tuple[str, str], subprocess.Popen[str]] = {}
+_LOCAL_PROCESSES_LOCK = threading.Lock()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -187,7 +189,9 @@ class HostJobManager:
             "output_bytes": {"stdout": 0, "stderr": 0, "total": 0},
             "duration_ms": 0,
             "failure_class": None,
+            "detected_failure_class": None,
             "input_tokens": 0,
+            "cached_input_tokens": 0,
             "output_tokens": 0,
             "cancel_requested": False,
         }
@@ -227,6 +231,8 @@ class HostJobManager:
                 "process_identity": _process_identity(process.pid),
             })
             self._processes[job_id] = process
+            with _LOCAL_PROCESSES_LOCK:
+                _LOCAL_PROCESSES[(str(self.root), job_id)] = process
             self._write(record)
         if process.stdin is not None:
             try:
@@ -297,7 +303,10 @@ class HostJobManager:
         stdout_thread.join(timeout=2)
         stderr_thread.join(timeout=2)
         with self._lock:
-            record = self._read(job_id)
+            record = self._read(job_id, required=False)
+            if record is None:
+                self._processes.pop(job_id, None)
+                return
             cancelled = bool(record.get("cancel_requested"))
             if timed_out:
                 status, returncode, failure = "completed", 124, "timeout"
@@ -306,7 +315,14 @@ class HostJobManager:
             else:
                 returncode = int(process.returncode or 0)
                 status = "completed"
-                failure = None if returncode == 0 else "command_failed"
+                failure = (
+                    record.get("detected_failure_class")
+                    or _provider_failure_class(
+                        returncode,
+                        str(record.get("stdout") or ""),
+                        str(record.get("stderr") or ""),
+                    )
+                )
             record.update({
                 "status": status,
                 "returncode": returncode,
@@ -317,6 +333,8 @@ class HostJobManager:
                 "finished_at": _utc_now(),
             })
             self._processes.pop(job_id, None)
+            with _LOCAL_PROCESSES_LOCK:
+                _LOCAL_PROCESSES.pop((str(self.root), job_id), None)
             self._write(record)
 
     def _read_stream(self, job_id: str, stream: Any, field: str) -> None:
@@ -324,15 +342,23 @@ class HostJobManager:
             return
         for line in iter(stream.readline, ""):
             with self._lock:
-                record = self._read(job_id)
+                record = self._read(job_id, required=False)
+                if record is None:
+                    return
                 sanitized = Redactor.redact(line)
                 self._append_output(record, field, sanitized)
+                if _provider_failure_class(1, sanitized, "") == "provider_capacity":
+                    record["detected_failure_class"] = "provider_capacity"
                 record["heartbeat_at"] = _utc_now()
                 if field == "stdout":
                     parsed = _parse_stream(sanitized)
                     record["session_id"] = record.get("session_id") or parsed["session_id"]
                     record["input_tokens"] = max(
                         int(record.get("input_tokens") or 0), int(parsed["input_tokens"])
+                    )
+                    record["cached_input_tokens"] = max(
+                        int(record.get("cached_input_tokens") or 0),
+                        int(parsed["cached_input_tokens"]),
                     )
                     record["output_tokens"] = max(
                         int(record.get("output_tokens") or 0), int(parsed["output_tokens"])
@@ -392,8 +418,13 @@ class HostJobManager:
                     })
                     self._write(record)
                     continue
+                with _LOCAL_PROCESSES_LOCK:
+                    local_process = _LOCAL_PROCESSES.get((str(self.root), job_id))
+                if local_process is not None and local_process.poll() is None:
+                    self._processes[job_id] = local_process
                 record["status"] = (
-                    "orphan_running" if _same_process(record)
+                    "orphan_running"
+                    if local_process is not None or _same_process(record)
                     else "interrupted"
                 )
                 if record["status"] == "interrupted":
@@ -553,13 +584,17 @@ class HostJobManager:
     def _write_carry_forward(self, record: dict[str, Any]) -> None:
         job_id = _job_id(record.get("job_id"))
         input_tokens = int(record.get("input_tokens") or 0)
+        cached_input_tokens = int(record.get("cached_input_tokens") or 0)
         output_tokens = int(record.get("output_tokens") or 0)
         carry = {
             "status": record.get("status"),
             "failure_class": record.get("failure_class"),
             "session_id": record.get("session_id"),
             "tokens": {
-                "input": input_tokens, "output": output_tokens,
+                "input": input_tokens,
+                "cached_input": cached_input_tokens,
+                "cached_input_in_total": True,
+                "output": output_tokens,
                 "total": input_tokens + output_tokens,
             },
             "last_valid_output": {
@@ -639,8 +674,11 @@ def execute(payload: dict[str, Any], roots: tuple[Path, ...]) -> dict[str, objec
             "stdout": stdout,
             "stderr": stderr,
             "duration_ms": int((monotonic() - started) * 1000),
-            "failure_class": None if completed.returncode == 0 else "command_failed",
+            "failure_class": _provider_failure_class(
+                completed.returncode, stdout, stderr
+            ),
             "input_tokens": parsed["input_tokens"],
+            "cached_input_tokens": parsed["cached_input_tokens"],
             "output_tokens": parsed["output_tokens"],
             "session_id": parsed["session_id"] or session_id,
         }
@@ -652,6 +690,7 @@ def execute(payload: dict[str, Any], roots: tuple[Path, ...]) -> dict[str, objec
             "duration_ms": int((monotonic() - started) * 1000),
             "failure_class": "timeout",
             "input_tokens": 0,
+            "cached_input_tokens": 0,
             "output_tokens": 0,
             "session_id": session_id,
         }
@@ -674,6 +713,7 @@ def verify(payload: dict[str, Any], roots: tuple[Path, ...]) -> dict[str, object
         duration_ms=int(execution_payload.get("duration_ms", 0)),
         failure_class=execution_payload.get("failure_class"),
         input_tokens=int(execution_payload.get("input_tokens", 0)),
+        cached_input_tokens=int(execution_payload.get("cached_input_tokens", 0)),
         output_tokens=int(execution_payload.get("output_tokens", 0)),
         external_session_id=execution_payload.get("external_session_id"),
     )
@@ -810,6 +850,7 @@ def _cursor_create_chat(executable: str, project: Path) -> str:
 def _parse_stream(output: str) -> dict[str, object]:
     session_id: str | None = None
     input_tokens = 0
+    cached_input_tokens = 0
     output_tokens = 0
     for line in output.splitlines():
         try:
@@ -818,8 +859,36 @@ def _parse_stream(output: str) -> dict[str, object]:
             continue
         session_id = session_id or _find_string(event, {"thread_id", "threadId", "session_id", "sessionId", "chat_id", "chatId"})
         input_tokens = max(input_tokens, _find_int(event, {"input_tokens", "inputTokens"}))
+        cached_input_tokens = max(
+            cached_input_tokens,
+            _find_int(event, {"cached_input_tokens", "cachedInputTokens", "cached_tokens"}),
+        )
         output_tokens = max(output_tokens, _find_int(event, {"output_tokens", "outputTokens"}))
-    return {"session_id": session_id, "input_tokens": input_tokens, "output_tokens": output_tokens}
+    return {
+        "session_id": session_id,
+        "input_tokens": input_tokens,
+        "cached_input_tokens": min(input_tokens, cached_input_tokens),
+        "output_tokens": output_tokens,
+    }
+
+
+def _provider_failure_class(returncode: int, stdout: str, stderr: str) -> str | None:
+    if returncode == 0:
+        return None
+    evidence = f"{stdout}\n{stderr}".lower()
+    if any(marker in evidence for marker in (
+        "selected model is at capacity",
+        "model is at capacity",
+        "rate limit exceeded",
+        "rate_limit_exceeded",
+        "too many requests",
+        "http 429",
+        "status 429",
+        "server is overloaded",
+        "overloaded_error",
+    )):
+        return "provider_capacity"
+    return "command_failed"
 
 
 def _find_string(value: Any, keys: set[str]) -> str | None:
@@ -997,15 +1066,22 @@ def _process_alive(pid: int) -> bool:
 def _process_identity(pid: int) -> str | None:
     if not _process_alive(pid):
         return None
-    try:
-        completed = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "lstart="],
-            capture_output=True, text=True, timeout=2, check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    value = completed.stdout.strip()
-    return value or None
+    # A just-spawned process can briefly be visible to kill(0) before ps exposes
+    # its start identity. Keep the PID-reuse guard and retry only that short race.
+    for attempt in range(3):
+        try:
+            completed = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "lstart="],
+                capture_output=True, text=True, timeout=2, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        value = completed.stdout.strip()
+        if value:
+            return value
+        if attempt < 2 and _process_alive(pid):
+            time.sleep(0.01)
+    return None
 
 
 def _same_process(record: dict[str, Any]) -> bool:

@@ -91,7 +91,16 @@ class TaskCreate(BaseModel):
     objective: Annotated[str, Field(min_length=1, max_length=4000)]
     project_path: str | None = None
     project_id: str | None = None
-    role: Literal["coordination", "fullstack", "web3", "devops_sre", "verification"] = "fullstack"
+    role: Literal[
+        "coordination",
+        "backend",
+        "frontend",
+        "ui",
+        "devops_sre",
+        "verification",
+        "fullstack",
+        "web3",
+    ] = "fullstack"
     resource_key: Annotated[str | None, Field(max_length=300)] = None
     network_requirement: Literal["none", "any", "domestic", "overseas"] = "none"
     provider: Annotated[str, Field(pattern=r"^[a-z][a-z0-9-]{1,63}$")] = "generic-command"
@@ -168,10 +177,51 @@ class TaskView(BaseModel):
     manual_override: bool
     override_reason: str | None
     budget_overrun_evidence: dict[str, Any] | None
+    goal_id: str | None = None
+    parent_task_id: str | None = None
+    depends_on: list[str] | None = None
+    work_item_kind: str | None = None
+    ordinal: int | None = None
+    blocked_reason: str | None = None
+    handoff: dict[str, Any] | None = None
 
     @classmethod
     def from_record(cls, record: TaskRecord) -> "TaskView":
         return cls(**asdict(record))
+
+
+class GoalCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: Annotated[str, Field(min_length=1, max_length=200)]
+    objective: Annotated[str, Field(min_length=1, max_length=4000)]
+    project_id: str
+    provider: Annotated[str, Field(pattern=r"^[a-z][a-z0-9-]{1,63}$")] = "generic-command"
+    role_providers: dict[
+        str, Annotated[str, Field(pattern=r"^[a-z][a-z0-9-]{1,63}$")]
+    ] = Field(default_factory=dict)
+    network_requirement: Literal["none", "any", "domestic", "overseas"] = "none"
+    verification: Annotated[list[VerificationSpec], Field(min_length=1, max_length=32)]
+    sizing_inputs: TaskSizingEstimateRequest
+    command: CommandSpec | None = None
+    # Optional bounded structured plan. Model PM is not implemented this sprint;
+    # when omitted, a deterministic template (sizing flags only) is used.
+    plan_items: list[dict[str, Any]] | None = None
+
+
+class GoalView(BaseModel):
+    id: str
+    title: str
+    objective: str
+    project_id: str
+    provider: str
+    status: str
+    plan: dict[str, Any]
+    sizing_inputs: dict[str, Any] | None
+    parent_task_id: str | None
+    created_at: str
+    updated_at: str
+    work_items: list[dict[str, Any]]
 
 
 class TaskEventView(BaseModel):
@@ -248,7 +298,6 @@ class RuntimeSettingsValues(BaseModel):
     max_no_progress: Annotated[int, Field(ge=1, le=20)] = 3
     context_max_bytes: Annotated[int, Field(ge=4096, le=1_048_576)] = 32_768
     rotation_max_bytes: Annotated[int, Field(ge=16_384, le=16_777_216)] = 262_144
-
     @model_validator(mode="after")
     def lease_must_exceed_interval(self) -> "RuntimeSettingsValues":
         if self.scheduler_lease_seconds < self.scheduler_interval_seconds * 2:

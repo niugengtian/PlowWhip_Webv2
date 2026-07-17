@@ -5,10 +5,85 @@ from pathlib import Path
 from typing import Any
 
 from plow_whip_web.domain.model import InvalidTransitionError, NotFoundError
+from plow_whip_web.roles import DEFAULT_PROJECT_ROLES
 from plow_whip_web.store.database import Database
 
 
-DEFAULT_ROLES = ("coordination", "fullstack", "web3", "devops_sre", "verification")
+DEFAULT_ROLES = DEFAULT_PROJECT_ROLES
+
+
+def rotate_worker_in_transaction(
+    connection: Any,
+    worker_id: str,
+    *,
+    reason: str,
+    trigger_key: str | None = None,
+) -> dict[str, Any]:
+    worker = connection.execute(
+        """
+        SELECT w.*, r.kind role FROM workers w JOIN roles r ON r.id = w.role_id
+        WHERE w.id = ?
+        """,
+        (worker_id,),
+    ).fetchone()
+    if worker is None:
+        raise NotFoundError(f"worker not found: {worker_id}")
+    if trigger_key and connection.execute(
+        "SELECT 1 FROM worker_session_archives WHERE trigger_key = ?",
+        (trigger_key,),
+    ).fetchone():
+        return _worker_view(connection, worker_id)
+    if worker["status"] != "idle":
+        raise InvalidTransitionError("only an idle worker session can rotate")
+    connection.execute(
+        """
+        INSERT INTO worker_session_archives(
+            worker_id, project_id, role_id, session_id, session_generation,
+            reason, trigger_key
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            worker_id, worker["project_id"], worker["role_id"], worker["session_id"],
+            worker["session_generation"], reason, trigger_key,
+        ),
+    )
+    connection.execute(
+        """
+        UPDATE workers SET session_id = ?, external_session_id = NULL,
+            last_error = NULL, session_generation = session_generation + 1,
+            updated_at = CURRENT_TIMESTAMP WHERE id = ?
+        """,
+        (str(uuid.uuid4()), worker_id),
+    )
+    return _worker_view(connection, worker_id)
+
+
+def _worker_view(connection: Any, worker_id: str) -> dict[str, Any]:
+    row = connection.execute(
+        """
+        SELECT w.id, w.role_id, r.kind role, w.provider, w.session_id,
+               w.external_session_id, w.session_generation, w.status,
+               w.active_task_id, w.last_seen_at, w.last_error, w.released_at,
+               w.last_input_tokens, w.last_cached_input_tokens,
+               w.last_output_tokens, w.last_uncached_input_tokens,
+               w.last_context_pressure_tokens,
+               w.last_context_pressure_reason, w.last_context_session_generation,
+               w.last_attribution_granularity, w.last_value_classification,
+               w.last_context_guard_decision, w.last_context_guard_reason,
+               w.last_guard_estimated_new_tokens,
+               w.last_guard_carry_in_cached_tokens, w.last_guard_hard_cap,
+               w.last_guard_relation,
+               (
+                   SELECT a.reason FROM worker_session_archives a
+                   WHERE a.worker_id = w.id
+                   ORDER BY a.archived_at DESC, a.id DESC LIMIT 1
+               ) rotation_reason
+        FROM workers w JOIN roles r ON r.id = w.role_id WHERE w.id = ?
+        """,
+        (worker_id,),
+    ).fetchone()
+    assert row is not None
+    return dict(row)
 
 
 class ProjectRepository:
@@ -30,6 +105,23 @@ class ProjectRepository:
                 )
         return self.get(project_id)
 
+    def role_provider_bindings(self, project_id: str) -> dict[str, str]:
+        """Return stable project+role → provider bindings from existing workers."""
+        connection = self.database.connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT r.kind role, w.provider
+                FROM workers w
+                JOIN roles r ON r.id = w.role_id
+                WHERE w.project_id = ? AND w.released_at IS NULL
+                """,
+                (project_id,),
+            ).fetchall()
+            return {row["role"]: row["provider"] for row in rows}
+        finally:
+            connection.close()
+
     def get(self, project_id: str) -> dict[str, Any]:
         connection = self.database.connect()
         try:
@@ -44,7 +136,21 @@ class ProjectRepository:
                 """
                 SELECT w.id, w.role_id, r.kind role, w.provider, w.session_id,
                        w.external_session_id, w.session_generation, w.status,
-                       w.active_task_id, w.last_seen_at, w.last_error, w.released_at
+                       w.active_task_id, w.last_seen_at, w.last_error, w.released_at,
+                       w.last_input_tokens, w.last_cached_input_tokens,
+                       w.last_output_tokens, w.last_uncached_input_tokens,
+                       w.last_context_pressure_tokens,
+                       w.last_context_pressure_reason, w.last_context_session_generation,
+                       w.last_attribution_granularity, w.last_value_classification,
+                       w.last_context_guard_decision, w.last_context_guard_reason,
+                       w.last_guard_estimated_new_tokens,
+                       w.last_guard_carry_in_cached_tokens, w.last_guard_hard_cap,
+                       w.last_guard_relation,
+                       (
+                           SELECT a.reason FROM worker_session_archives a
+                           WHERE a.worker_id = w.id
+                           ORDER BY a.archived_at DESC, a.id DESC LIMIT 1
+                       ) rotation_reason
                 FROM workers w JOIN roles r ON r.id = w.role_id
                 WHERE w.project_id = ? ORDER BY r.kind
                 """,
@@ -128,46 +234,13 @@ class ProjectRepository:
             )
         return self.get(project_id)
 
-    def rotate_worker(self, worker_id: str, *, reason: str) -> dict[str, Any]:
+    def rotate_worker(
+        self, worker_id: str, *, reason: str, trigger_key: str | None = None
+    ) -> dict[str, Any]:
         with self.database.transaction(immediate=True) as connection:
-            worker = connection.execute(
-                """
-                SELECT w.*, r.kind role FROM workers w JOIN roles r ON r.id = w.role_id
-                WHERE w.id = ?
-                """,
-                (worker_id,),
-            ).fetchone()
-            if worker is None:
-                raise NotFoundError(f"worker not found: {worker_id}")
-            if worker["status"] != "idle":
-                raise InvalidTransitionError("only an idle worker session can rotate")
-            connection.execute(
-                """
-                INSERT INTO worker_session_archives(
-                    worker_id, project_id, role_id, session_id, session_generation, reason
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (worker_id, worker["project_id"], worker["role_id"], worker["session_id"], worker["session_generation"], reason),
+            return rotate_worker_in_transaction(
+                connection, worker_id, reason=reason, trigger_key=trigger_key
             )
-            session_id = str(uuid.uuid4())
-            connection.execute(
-                """
-                UPDATE workers SET session_id = ?, external_session_id = NULL,
-                    last_error = NULL, session_generation = session_generation + 1,
-                    updated_at = CURRENT_TIMESTAMP WHERE id = ?
-                """,
-                (session_id, worker_id),
-            )
-            updated = connection.execute(
-                """
-                SELECT w.id, w.role_id, r.kind role, w.provider, w.session_id,
-                       w.external_session_id, w.session_generation, w.status,
-                       w.active_task_id, w.last_seen_at, w.last_error, w.released_at
-                FROM workers w JOIN roles r ON r.id = w.role_id WHERE w.id = ?
-                """,
-                (worker_id,),
-            ).fetchone()
-            return dict(updated)
 
     def rebind_worker(self, worker_id: str, *, provider: str, reason: str) -> dict[str, Any]:
         with self.database.transaction(immediate=True) as connection:

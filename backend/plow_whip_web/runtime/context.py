@@ -63,6 +63,22 @@ class ContextCompiler:
                 6,
                 768,
             ))
+        if task.handoff:
+            handoff = _fit_utf8(
+                json.dumps(
+                    task.handoff, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                2048,
+            )
+            sections.append((
+                "## Role Handoff\n"
+                "Structured pointers from the previous work item only. Do not assume "
+                "cross-role chat history exists; inspect the listed artifact paths.\n"
+                + handoff,
+                5,
+                512,
+            ))
         for convention in self.conventions.resolve(project_id=task.project_id, task_id=task.id):
             if convention["content"]:
                 priority, floor = {

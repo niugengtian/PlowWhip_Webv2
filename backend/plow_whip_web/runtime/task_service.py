@@ -18,6 +18,7 @@ from plow_whip_web.store.task_repository import (
     task_host_reserved_tokens,
     task_lease_seconds,
     task_sizing_status,
+    task_token_hard_cap,
 )
 from plow_whip_web.runtime.budget import BudgetManager
 from plow_whip_web.runtime.context import ContextCompiler
@@ -26,7 +27,12 @@ from plow_whip_web.runtime.journal import SessionJournal
 from plow_whip_web.runtime.verification import VerificationEngine, VerificationResult
 from plow_whip_web.security import CommandPolicy
 from plow_whip_web.store.host_job_repository import HostJobRepository
+from plow_whip_web.store.project_repository import (
+    ProjectRepository,
+)
 from plow_whip_web.store.task_repository import TaskRepository
+
+NO_PROGRESS_ROTATION_THRESHOLD = 2
 
 
 class TaskService:
@@ -41,6 +47,7 @@ class TaskService:
         command_policy: CommandPolicy | None = None,
         provider_pool: ProviderPool | None = None,
         host_jobs: HostJobRepository | None = None,
+        projects: ProjectRepository | None = None,
     ) -> None:
         self.repository = repository
         self.provider = provider or GenericCommandProvider()
@@ -51,11 +58,14 @@ class TaskService:
         self.command_policy = command_policy or CommandPolicy()
         self.provider_pool = provider_pool
         self.host_jobs = host_jobs
+        self.projects = projects
 
     def drive(
         self, task_id: str, *, expected_revision: int, idempotency_key: str
     ) -> TaskRecord:
         pending = self.repository.get(task_id)
+        if pending.work_item_kind == "coordination":
+            raise InvalidTransitionError("coordination parent is advanced by orchestration, not driven")
         provider_config = (
             self.provider_pool.require_ready(pending.provider)
             if self.provider_pool else None
@@ -84,6 +94,9 @@ class TaskService:
                     )
                 else:
                     reserved_tokens = self.budget.host_reservation(pending)
+        self._evaluate_context_guard(
+            pending, reserved_tokens=reserved_tokens if host_model else 0
+        )
         claim = self.repository.claim(
             task_id, expected_revision=expected_revision,
             idempotency_key=f"{idempotency_key}:claim",
@@ -166,6 +179,28 @@ class TaskService:
             status = str(snapshot.get("status") or "unknown")
             task = self.repository.get(task_id)
             if status in {"dispatching", "running", "orphan_running", "cancelling"}:
+                if (
+                    status in {"running", "orphan_running"}
+                    and FaultPolicy.is_no_progress(snapshot)
+                ):
+                    try:
+                        snapshot = self.provider_pool.cancel_task_job(job_id)
+                        self.host_jobs.record(job_id, snapshot)
+                    except ProviderUnavailableError as error:
+                        self.host_jobs.hold(job_id, str(error))
+                        self.host_jobs.renew(job_id)
+                        active += 1
+                        continue
+                    result = self._handle_host_fault(task, job, {
+                        **snapshot,
+                        "failure_class": "no_progress",
+                        "error_summary": snapshot.get("error_summary")
+                        or "internal_tool_no_progress",
+                    })
+                    assert result is not None
+                    self.host_jobs.consume(job_id)
+                    settled.append({"task_id": task_id, "status": result.status.value})
+                    continue
                 self.host_jobs.renew(job_id, seconds=task_lease_seconds(task))
                 active += 1
                 continue
@@ -233,14 +268,51 @@ class TaskService:
         decision = FaultPolicy.from_host_snapshot(snapshot)
         if decision.action == "verify":
             return None
+        if decision.failure_class == "provider_capacity" and self.host_jobs:
+            limits = (
+                self.budget.settings.get()["values"]
+                if self.budget else {"max_no_progress": 3}
+            )
+            threshold = int(limits["max_no_progress"])
+            occurrences = 1 + self.host_jobs.consecutive_faults(
+                job.get("worker_id") or task.worker_id,
+                session_generation=job.get("session_generation"),
+                reason=decision.reason,
+                before_job_id=job["job_id"],
+                limit=threshold - 1,
+            )
+            if FaultPolicy.decide(
+                decision.failure_class,
+                occurrences=occurrences,
+                attempts_left=max(0, task.max_attempts - task.attempts_used),
+            ) == "needs_human":
+                decision = type(decision)(
+                    "needs_human",
+                    "provider_capacity",
+                    "provider_capacity_repeated",
+                )
+        rotate_session = (
+            decision.failure_class == "no_progress"
+            and self.host_jobs.consecutive_faults(
+                job.get("worker_id") or task.worker_id,
+                session_generation=job.get("session_generation"),
+                reason=decision.reason,
+                before_job_id=job["job_id"],
+                limit=NO_PROGRESS_ROTATION_THRESHOLD - 1,
+            ) + 1 >= NO_PROGRESS_ROTATION_THRESHOLD
+        )
         execution = {
             "returncode": int(snapshot.get("returncode") or 0),
-            "stderr": str(snapshot.get("stderr") or snapshot.get("last_error") or ""),
             "failure_class": decision.failure_class,
             "input_tokens": int(snapshot.get("input_tokens") or 0),
+            "cached_input_tokens": int(snapshot.get("cached_input_tokens") or 0),
             "output_tokens": int(snapshot.get("output_tokens") or 0),
+            "attribution_granularity": "turn",
+            "value_classification": "unknown",
+            "output_ref": snapshot.get("output_ref"),
+            "output_bytes": snapshot.get("output_bytes"),
         }
-        return self.repository.finalize_host_fault(
+        result = self.repository.finalize_host_fault(
             task.id,
             job_id=job["job_id"],
             attempt_id=job["attempt_id"],
@@ -255,6 +327,17 @@ class TaskService:
                 or job.get("external_session_id")
             ),
         )
+        if rotate_session and self.projects and result.worker_id is None:
+            worker_id = job.get("worker_id") or task.worker_id
+            if worker_id:
+                try:
+                    self.projects.rotate_worker(
+                        str(worker_id), reason="no_progress_tool_aborted",
+                    )
+                except Exception:
+                    # Rotation is best-effort once; bounded resume still proceeds.
+                    pass
+        return result
 
     def _settle_host_reservation(
         self, task: TaskRecord, job: dict[str, Any], snapshot: dict[str, Any]
@@ -346,9 +429,66 @@ class TaskService:
                 "status": completed.status.value,
                 "evidence_hash": completed.last_evidence_hash,
                 "input_tokens": execution_payload["input_tokens"],
+                "cached_input_tokens": execution_payload["cached_input_tokens"],
                 "output_tokens": execution_payload["output_tokens"],
             })
         return completed
+
+    def _evaluate_context_guard(
+        self, task: TaskRecord, *, reserved_tokens: int
+    ) -> None:
+        if not self.projects or not task.project_id or not task.role_id:
+            return
+        connection = self.repository.database.connect()
+        try:
+            worker = connection.execute(
+                """
+                SELECT id, status, session_generation, last_cached_input_tokens,
+                       last_context_pressure_tokens, last_context_pressure_reason,
+                       last_context_session_generation
+                FROM workers
+                WHERE project_id = ? AND role_id = ? AND released_at IS NULL
+                """,
+                (task.project_id, task.role_id),
+            ).fetchone()
+        finally:
+            connection.close()
+        if worker is None or worker["status"] != "idle":
+            return
+        settings_repository = (
+            self.journal.settings if self.journal else (
+                self.budget.settings if self.budget else None
+            )
+        )
+        if settings_repository is None:
+            return
+        settings = settings_repository.get()["values"]
+        maximum = int(settings["rotation_max_bytes"])
+        persisted = self.journal.current_bytes(worker["id"]) if self.journal else 0
+        if persisted >= maximum and self.journal:
+            # File Journal rotation is independent from Provider session rotation.
+            self.journal.rotate_current(worker["id"])
+        generation = int(worker["session_generation"])
+        same_generation = worker["last_context_session_generation"] == generation
+        carry_in = int(worker["last_cached_input_tokens"] or 0) if same_generation else 0
+        hard_cap = task_token_hard_cap(task)
+        with self.repository.database.transaction(immediate=True) as connection:
+            connection.execute(
+                """
+                UPDATE workers SET last_context_guard_decision = ?,
+                    last_context_guard_reason = ?,
+                    last_guard_estimated_new_tokens = ?,
+                    last_guard_carry_in_cached_tokens = ?,
+                    last_guard_hard_cap = ?, last_guard_relation = 'unknown',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND session_generation = ?
+                """,
+                (
+                    "reuse", "turn_attribution_unknown_no_rotation",
+                    reserved_tokens, carry_in, hard_cap,
+                    worker["id"], generation,
+                ),
+            )
 
 
 def _failure_fingerprint(

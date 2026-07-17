@@ -11,6 +11,7 @@ from plow_whip_web.config import Settings
 from plow_whip_web.host_bridge import (
     _execution_argv,
     _parse_stream,
+    _provider_failure_class,
     _resolve_executable,
     _safe_environment,
     _version_argv,
@@ -153,9 +154,18 @@ def test_host_bridge_argv_is_fixed_and_stream_parser_keeps_session_and_usage() -
     assert "--sandbox" in cursor and "enabled" in cursor
     parsed = _parse_stream(
         '{"type":"thread.started","thread_id":"session-1"}\n'
-        '{"usage":{"input_tokens":17,"output_tokens":9}}\n'
+        '{"usage":{"input_tokens":17,"cached_input_tokens":13,"output_tokens":9}}\n'
     )
-    assert parsed == {"session_id": "session-1", "input_tokens": 17, "output_tokens": 9}
+    assert parsed == {
+        "session_id": "session-1",
+        "input_tokens": 17,
+        "cached_input_tokens": 13,
+        "output_tokens": 9,
+    }
+    assert _provider_failure_class(
+        1, "", "Selected model is at capacity"
+    ) == "provider_capacity"
+    assert _provider_failure_class(1, "", "application assertion failed") == "command_failed"
     assert _version_argv("json-worker", "/bin/simple-worker") == [
         "/bin/simple-worker", "--probe",
     ]

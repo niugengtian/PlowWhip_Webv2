@@ -125,6 +125,15 @@ button.full { width: 100%; }
 .timeline h2, .usage-columns h2 { margin: 0 0 10px; font-size: .79rem; }
 .timeline > div { display: grid; grid-template-columns: 38px 1fr auto; gap: 9px; padding: 9px 0; border-bottom: 1px solid var(--line); color: #7788ab; font-size: .67rem; }
 .timeline strong { color: #b9c4df; }
+.work-items { padding: 17px 18px; }
+.work-item-card { overflow: hidden; border: 1px solid #26324d; border-radius: 6px; background: #111725; }
+.work-item-card + .work-item-card { margin-top: 10px; }
+.work-item-card header { display: flex; align-items: center; gap: 10px; padding: 11px 13px; border-bottom: 1px solid var(--line); }
+.work-item-card header > span { display: grid; place-items: center; width: 26px; height: 26px; border-radius: 13px; background: #1b2942; color: #8db1f7; font-size: .65rem; }
+.work-item-card header strong, .work-item-card header small { display: block; }
+.work-item-card header strong { color: #dce5f8; font-size: .75rem; }
+.work-item-card header small { margin-top: 3px; color: #687b9f; font-size: .62rem; }
+.work-item-card .facts { border: 0; }
 .artifacts { border-bottom: 1px solid var(--line); padding: 17px 18px; }
 .section-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
 .section-heading h2 { margin: 3px 0 0; color: #d9e2f7; font-size: .86rem; }
@@ -157,6 +166,7 @@ button.full { width: 100%; }
 .provider-card dl div { display: grid; grid-template-columns: 74px minmax(0, 1fr); gap: 8px; padding: 7px 0; border-top: 1px solid var(--line); font-size: .67rem; }
 .provider-card dt { color: #5d6e92; }
 .provider-card dd { overflow-wrap: anywhere; margin: 0; color: #a5b2d2; }
+.provider-card dd small { display: block; margin-top: 4px; color: #617398; line-height: 1.4; }
 .provider-reason { min-height: 34px; color: #65769b; font-size: .65rem; line-height: 1.45; }
 .provider-icon { width: 34px; height: 34px; }
 .boundary-note { display: flex; gap: 12px; margin: 0 14px 14px; border: 1px solid #263658; border-radius: 6px; padding: 13px; background: #111827; color: var(--acc); }

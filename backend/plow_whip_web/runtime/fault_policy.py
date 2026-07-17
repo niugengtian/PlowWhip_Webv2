@@ -23,13 +23,61 @@ class FaultPolicy:
         r"^\s*(?:error:\s*)?bridge temporary unavailable(?:\b.*)?$",
     )
 
+    _NO_PROGRESS_MARKERS = (
+        "tool call aborted",
+        "tools aborted",
+        "internal tool aborted",
+        "awaiting tool",
+        "waiting for tool",
+        "no progress",
+        "stalled",
+    )
+    _CAPACITY_MARKERS = (
+        "selected model is at capacity",
+        "model is at capacity",
+        "rate limit exceeded",
+        "rate_limit_exceeded",
+        "too many requests",
+        "http 429",
+        "status 429",
+        "server is overloaded",
+        "overloaded_error",
+    )
+
+    @classmethod
+    def evidence_text(cls, snapshot: dict[str, Any]) -> str:
+        return "\n".join(
+            str(snapshot.get(key) or "").lower()
+            for key in (
+                "stderr", "last_error", "error_summary", "failure_class", "status",
+            )
+        )
+
+    @classmethod
+    def is_no_progress(cls, snapshot: dict[str, Any]) -> bool:
+        failure_class = str(snapshot.get("failure_class") or "").strip().lower()
+        if failure_class in {"no_progress", "tool_aborted", "internal_tool_aborted"}:
+            return True
+        evidence = cls.evidence_text(snapshot)
+        if not any(marker in evidence for marker in cls._NO_PROGRESS_MARKERS):
+            return False
+        try:
+            returncode = int(snapshot["returncode"])
+        except (KeyError, TypeError, ValueError):
+            returncode = None
+        if returncode is not None:
+            return False
+        # Internal tool abort/wait with no process exit status and no useful output.
+        output_bytes = snapshot.get("output_bytes") or {}
+        total = 0
+        if isinstance(output_bytes, dict):
+            total = int(output_bytes.get("total") or 0)
+        return total < 256
+
     @classmethod
     def from_host_snapshot(cls, snapshot: dict[str, Any]) -> HostFaultDecision:
         failure_class = str(snapshot.get("failure_class") or "").strip().lower()
-        evidence = "\n".join(
-            str(snapshot.get(key) or "").lower()
-            for key in ("stderr", "last_error", "error_summary")
-        )
+        evidence = cls.evidence_text(snapshot)
         try:
             returncode = int(snapshot["returncode"])
         except (KeyError, TypeError, ValueError):
@@ -46,9 +94,11 @@ class FaultPolicy:
             return HostFaultDecision(
                 "needs_human", "permission_denied", "permission_denied"
             )
-        if failure_class == "timeout" or returncode == 124:
+        if failure_class == "provider_capacity" or any(
+            marker in evidence for marker in cls._CAPACITY_MARKERS
+        ):
             return HostFaultDecision(
-                "resume", "timeout", "external_execution_interrupted"
+                "defer", "provider_capacity", "transient_provider_capacity"
             )
         if (
             failure_class == "transient_transport"
@@ -59,6 +109,14 @@ class FaultPolicy:
         ):
             return HostFaultDecision(
                 "defer", "transient_transport", "transient_provider_transport"
+            )
+        if cls.is_no_progress(snapshot):
+            return HostFaultDecision(
+                "resume", "no_progress", "internal_tool_no_progress"
+            )
+        if failure_class == "timeout" or returncode == 124:
+            return HostFaultDecision(
+                "resume", "timeout", "external_execution_interrupted"
             )
         if failure_class in {"command_failed", "verification_failed"}:
             return HostFaultDecision("verify", failure_class, failure_class)
@@ -76,6 +134,8 @@ class FaultPolicy:
 
     @staticmethod
     def decide(failure_class: str, *, occurrences: int, attempts_left: int) -> str:
+        if failure_class == "provider_capacity":
+            return "needs_human" if occurrences >= 3 else "defer"
         if failure_class in {
             "database_locked", "domestic_unavailable", "overseas_unavailable",
             "offline", "transient_transport",
@@ -85,6 +145,8 @@ class FaultPolicy:
             return "needs_human"
         if occurrences >= 3 or attempts_left <= 0:
             return "terminal_failed"
-        if failure_class in {"timeout", "command_failed", "verification_failed", "no_progress"}:
+        if failure_class in {
+            "timeout", "command_failed", "verification_failed", "no_progress",
+        }:
             return "retry_backoff"
         return "needs_human"

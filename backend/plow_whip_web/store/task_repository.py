@@ -19,6 +19,7 @@ from plow_whip_web.domain.model import (
 )
 from plow_whip_web.store.database import Database
 from plow_whip_web.store.settings_repository import DEFAULT_SETTINGS
+from plow_whip_web.store.project_repository import rotate_worker_in_transaction
 from plow_whip_web.runtime.budget import BudgetManager
 
 # XL bootstrap tier hard deadline; single safety cap for Host dispatch and leases.
@@ -51,6 +52,14 @@ def task_host_reserved_tokens(task: TaskRecord, *, remaining: int) -> int:
             raise DomainError("estimated task is missing execution_budget")
         return int(task.execution_budget["reserved_tokens"])
     return remaining
+
+
+def task_token_hard_cap(task: TaskRecord) -> int:
+    if task_sizing_status(task) == "estimated":
+        if task.execution_budget is None:
+            raise DomainError("estimated task is missing execution_budget")
+        return int(task.execution_budget["total_token_hard_cap"])
+    return int(task.token_budget)
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +105,9 @@ class TaskRepository:
             if execution_budget is not None:
                 raise DomainError("execution_budget requires an explicit sizing record")
             sizing = {"status": "legacy_fallback"}
+        # Single source of truth: execution_budget.max_attempts overrides column input.
+        if execution_budget is not None and execution_budget.get("max_attempts") is not None:
+            max_attempts = int(execution_budget["max_attempts"])
         with self.database.transaction(immediate=True) as connection:
             duplicate = connection.execute(
                 "SELECT task_id FROM task_events WHERE idempotency_key = ?",
@@ -186,6 +198,7 @@ class TaskRepository:
                 """
                 SELECT * FROM tasks WHERE status = 'ready'
                 AND (next_eligible_at IS NULL OR next_eligible_at <= CURRENT_TIMESTAMP)
+                AND COALESCE(work_item_kind, '') != 'coordination'
                 ORDER BY created_at, id LIMIT ?
                 """,
                 (limit,),
@@ -269,7 +282,7 @@ class TaskRepository:
                 raise InvalidTransitionError(f"terminal task cannot run: {task.status}")
             if task.status is not TaskStatus.READY:
                 raise InvalidTransitionError(f"task is not ready: {task.status}")
-            if task.attempts_used >= task.max_attempts:
+            if task.attempts_used >= _authoritative_max_attempts(task):
                 raise InvalidTransitionError("task attempt budget exhausted")
             limits = dict(DEFAULT_SETTINGS)
             settings = connection.execute(
@@ -417,14 +430,9 @@ class TaskRepository:
             )
             actual_tokens = task.tokens_used + token_delta
             sizing_status = task.sizing.get("status")
-            if sizing_status == "estimated":
-                if task.execution_budget is None:
-                    raise DomainError("estimated task is missing execution_budget")
-                token_hard_cap = int(task.execution_budget["total_token_hard_cap"])
-            elif sizing_status == "legacy_fallback":
-                token_hard_cap = task.token_budget
-            else:
+            if sizing_status not in {"estimated", "legacy_fallback"}:
                 raise DomainError("task has no authoritative token hard cap")
+            token_hard_cap = task_token_hard_cap(task)
             over_cap = actual_tokens > token_hard_cap
             if over_cap:
                 budget_reason = "budget_exceeded"
@@ -443,7 +451,8 @@ class TaskRepository:
             no_progress_count = 0
             can_retry = (
                 budget_reason is None
-                and not passed and task.attempts_used < task.max_attempts
+                and not passed
+                and task.attempts_used < _authoritative_max_attempts(task)
                 and same_failure_count <= max_same_failure
             )
             target = TaskStatus.TERMINAL_FAILED if over_cap else (
@@ -456,7 +465,10 @@ class TaskRepository:
             BudgetManager.settle_in_transaction(
                 connection,
                 call_id=run_id,
-                execution=execution,
+                execution={
+                    **execution,
+                    "rotation_reason": "budget_exceeded" if over_cap else None,
+                },
                 task=task,
                 provider=task.provider,
             )
@@ -488,6 +500,22 @@ class TaskRepository:
                 ),
             )
             self._release_worker_and_lock(connection, task.id, task.worker_id)
+            _record_worker_context_pressure(
+                connection,
+                task.worker_id,
+                execution,
+                reason=(
+                    "budget_exceeded"
+                    if over_cap else _context_pressure_reason(connection, execution)
+                ),
+            )
+            if over_cap and task.worker_id:
+                rotate_worker_in_transaction(
+                    connection,
+                    task.worker_id,
+                    reason="budget_exceeded",
+                    trigger_key=f"budget-exceeded:{run_id}",
+                )
             run_status = "completed" if target is TaskStatus.COMPLETED else (
                 "needs_human" if target is TaskStatus.NEEDS_HUMAN else "failed"
             )
@@ -495,7 +523,10 @@ class TaskRepository:
                 "UPDATE task_attempts SET status = ?, finished_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (run_status, attempt_id),
             )
-            result = {"execution": execution, "verification": verification}
+            result = {
+                "execution": _execution_metadata(execution),
+                "verification": verification,
+            }
             if budget_reason:
                 result["budget"] = {
                     "reason": budget_reason,
@@ -504,12 +535,17 @@ class TaskRepository:
                 }
             connection.execute(
                 """
-                UPDATE task_runs SET status = ?, input_tokens = ?, output_tokens = ?,
+                UPDATE task_runs SET status = ?, input_tokens = ?,
+                    cached_input_tokens = ?, output_tokens = ?,
                     result_json = ?, finished_at = CURRENT_TIMESTAMP WHERE id = ?
                 """,
                 (
                     run_status,
                     execution.get("input_tokens", 0),
+                    min(
+                        int(execution.get("input_tokens", 0)),
+                        int(execution.get("cached_input_tokens", 0)),
+                    ),
                     execution.get("output_tokens", 0),
                     _dump(result),
                     run_id,
@@ -628,26 +664,44 @@ class TaskRepository:
                         SELECT last_error FROM tasks WHERE id = ?
                     ), updated_at = CURRENT_TIMESTAMP
                     WHERE id = (SELECT worker_id FROM host_jobs WHERE job_id = ?)
+                      AND session_generation IS (
+                          SELECT session_generation FROM host_jobs WHERE job_id = ?
+                      )
                     """,
-                    (task_id, job_id),
+                    (task_id, job_id, job_id),
                 )
                 return self._get_with_connection(connection, task_id)
             task = self._get_with_connection(connection, task_id)
             if task.status not in {TaskStatus.RUNNING, TaskStatus.VERIFYING}:
                 raise InvalidTransitionError(f"task has no active Host fault: {task.status}")
-            target = (
-                TaskStatus.NEEDS_HUMAN
-                if action == "needs_human" else TaskStatus.READY
-            )
-            revision = task.revision + 1
             token_total = int(execution.get("input_tokens", 0)) + int(
                 execution.get("output_tokens", 0)
             )
+            budget_exceeded = (
+                token_total > 0
+                and task.tokens_used + token_total > task_token_hard_cap(task)
+            )
+            if budget_exceeded:
+                action = "needs_human"
+                failure_class = reason = "budget_exceeded"
+            target = (
+                TaskStatus.TERMINAL_FAILED
+                if budget_exceeded else (
+                    TaskStatus.NEEDS_HUMAN
+                    if action == "needs_human" else TaskStatus.READY
+                )
+            )
+            revision = task.revision + 1
             if token_total:
                 BudgetManager.settle_in_transaction(
                     connection,
                     call_id=run_id,
-                    execution=execution,
+                    execution={
+                        **execution,
+                        "rotation_reason": (
+                            "budget_exceeded" if budget_exceeded else None
+                        ),
+                    },
                     task=task,
                     provider=task.provider,
                     add_to_task=True,
@@ -658,7 +712,11 @@ class TaskRepository:
             connection.execute(
                 """
                 UPDATE tasks SET status = ?, revision = ?,
-                    attempts_used = MAX(0, attempts_used - 1), worker_id = NULL,
+                    attempts_used = CASE
+                        WHEN ? THEN attempts_used
+                        ELSE MAX(0, attempts_used - 1)
+                    END,
+                    worker_id = NULL,
                     last_error = ?,
                     next_eligible_at = CASE
                         WHEN ? = 'defer' THEN datetime('now', ?)
@@ -668,7 +726,7 @@ class TaskRepository:
                     updated_at = CURRENT_TIMESTAMP WHERE id = ?
                 """,
                 (
-                    target.value, revision, reason[:1000],
+                    target.value, revision, 1 if budget_exceeded else 0, reason[:1000],
                     action, backoff, action, task.id,
                 ),
             )
@@ -688,23 +746,47 @@ class TaskRepository:
                     (retained_session_id, reason[:1000], task.worker_id),
                 )
             self._release_worker_and_lock(connection, task.id, task.worker_id)
+            _record_worker_context_pressure(
+                connection,
+                task.worker_id,
+                execution,
+                reason=(
+                    "budget_exceeded"
+                    if budget_exceeded
+                    else _context_pressure_reason(connection, execution)
+                ),
+            )
+            if budget_exceeded and task.worker_id:
+                rotate_worker_in_transaction(
+                    connection,
+                    task.worker_id,
+                    reason="budget_exceeded",
+                    trigger_key=f"budget-exceeded:{run_id}",
+                )
             run_status = {
                 "defer": "deferred",
                 "resume": "interrupted",
                 "needs_human": "needs_human",
             }[action]
+            if budget_exceeded:
+                run_status = "failed"
             connection.execute(
                 "UPDATE task_attempts SET status = ?, finished_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (run_status, attempt_id),
             )
             connection.execute(
                 """
-                UPDATE task_runs SET status = ?, input_tokens = ?, output_tokens = ?,
+                UPDATE task_runs SET status = ?, input_tokens = ?,
+                    cached_input_tokens = ?, output_tokens = ?,
                     result_json = ?, finished_at = CURRENT_TIMESTAMP WHERE id = ?
                 """,
                 (
                     run_status,
                     execution.get("input_tokens", 0),
+                    min(
+                        int(execution.get("input_tokens", 0)),
+                        int(execution.get("cached_input_tokens", 0)),
+                    ),
                     execution.get("output_tokens", 0),
                     _dump({
                         "fault": {
@@ -712,7 +794,7 @@ class TaskRepository:
                             "failure_class": failure_class,
                             "reason": reason[:1000],
                         },
-                        "execution": execution,
+                        "execution": _execution_metadata(execution),
                     }),
                     run_id,
                 ),
@@ -730,8 +812,11 @@ class TaskRepository:
                 connection,
                 task_id=task.id,
                 event_type=(
-                    "task.needs_human"
-                    if target is TaskStatus.NEEDS_HUMAN else "task.retry_scheduled"
+                    "task.terminal_failed"
+                    if target is TaskStatus.TERMINAL_FAILED else (
+                        "task.needs_human"
+                        if target is TaskStatus.NEEDS_HUMAN else "task.retry_scheduled"
+                    )
                 ),
                 payload={
                     "host_job_id": job_id,
@@ -739,11 +824,11 @@ class TaskRepository:
                     "failure_class": failure_class,
                     "reason": reason,
                     "tokens": token_total,
-                    "session_retained": bool(retained_session_id),
+                    "session_retained": bool(retained_session_id) and not budget_exceeded,
                 },
                 revision=revision, idempotency_key=idempotency_key,
             )
-            if target is TaskStatus.NEEDS_HUMAN:
+            if target in {TaskStatus.NEEDS_HUMAN, TaskStatus.TERMINAL_FAILED}:
                 connection.execute(
                     """
                     INSERT INTO outbox_events(topic, aggregate_id, event_type, payload_json)
@@ -1015,6 +1100,13 @@ class TaskRepository:
 
 
 def _task_from_row(row: Any) -> TaskRecord:
+    execution_budget = (
+        json.loads(row["execution_budget_json"])
+        if row["execution_budget_json"] else None
+    )
+    max_attempts = int(row["max_attempts"])
+    if execution_budget is not None and execution_budget.get("max_attempts") is not None:
+        max_attempts = int(execution_budget["max_attempts"])
     return TaskRecord(
         id=row["id"],
         title=row["title"],
@@ -1035,7 +1127,7 @@ def _task_from_row(row: Any) -> TaskRecord:
         revision=row["revision"],
         command=json.loads(row["command_json"]),
         verification=json.loads(row["verification_json"]),
-        max_attempts=row["max_attempts"],
+        max_attempts=max_attempts,
         attempts_used=row["attempts_used"],
         token_budget=row["token_budget"],
         tokens_used=row["tokens_used"],
@@ -1047,15 +1139,94 @@ def _task_from_row(row: Any) -> TaskRecord:
             json.loads(row["sizing_json"]) if row["sizing_json"]
             else {"status": "legacy_fallback"}
         ),
-        execution_budget=(
-            json.loads(row["execution_budget_json"])
-            if row["execution_budget_json"] else None
-        ),
+        execution_budget=execution_budget,
         manual_override=bool(row["manual_override"]),
         override_reason=row["override_reason"],
         budget_overrun_evidence=(
             json.loads(row["budget_overrun_evidence_json"])
             if row["budget_overrun_evidence_json"] else None
+        ),
+        goal_id=_optional(row, "goal_id"),
+        parent_task_id=_optional(row, "parent_task_id"),
+        depends_on=json.loads(_optional(row, "depends_on_json") or "[]"),
+        work_item_kind=_optional(row, "work_item_kind"),
+        ordinal=_optional(row, "ordinal"),
+        blocked_reason=_optional(row, "blocked_reason"),
+        handoff=_parse_json_object(_optional(row, "handoff_json")),
+    )
+
+
+def _authoritative_max_attempts(task: TaskRecord) -> int:
+    if task.execution_budget and task.execution_budget.get("max_attempts") is not None:
+        return int(task.execution_budget["max_attempts"])
+    return int(task.max_attempts)
+
+
+def _optional(row: Any, key: str) -> Any:
+    try:
+        return row[key]
+    except (KeyError, IndexError):
+        return None
+
+
+def _parse_json_object(raw: Any) -> dict[str, Any] | None:
+    if not raw:
+        return None
+    return json.loads(raw)
+
+
+def _execution_metadata(execution: dict[str, Any]) -> dict[str, Any]:
+    """Persist only metadata in SQLite; full stdout/stderr/prompt stay in files."""
+    blocked = {"stdout", "stderr", "prompt", "prompt_text"}
+    meta = {key: value for key, value in execution.items() if key not in blocked}
+    if "output_bytes" not in meta:
+        meta["output_bytes"] = {
+            "stdout": len(str(execution.get("stdout") or "").encode("utf-8")),
+            "stderr": len(str(execution.get("stderr") or "").encode("utf-8")),
+        }
+        meta["output_bytes"]["total"] = (
+            int(meta["output_bytes"]["stdout"]) + int(meta["output_bytes"]["stderr"])
+        )
+    return meta
+
+
+def _context_pressure_reason(_connection: Any, _execution: dict[str, Any]) -> str:
+    return "turn_usage_observed"
+
+
+def _record_worker_context_pressure(
+    connection: Any,
+    worker_id: str | None,
+    execution: dict[str, Any],
+    *,
+    reason: str,
+) -> None:
+    if not worker_id:
+        return
+    input_tokens = max(0, int(execution.get("input_tokens", 0)))
+    cached_input_tokens = min(
+        input_tokens, max(0, int(execution.get("cached_input_tokens", 0)))
+    )
+    output_tokens = max(0, int(execution.get("output_tokens", 0)))
+    connection.execute(
+        """
+        UPDATE workers SET last_input_tokens = ?,
+            last_cached_input_tokens = ?, last_output_tokens = ?,
+            last_uncached_input_tokens = ?,
+            last_context_pressure_tokens = ?,
+            last_context_pressure_reason = ?,
+            last_context_session_generation = session_generation,
+            last_attribution_granularity = ?,
+            last_value_classification = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (
+            input_tokens, cached_input_tokens, output_tokens,
+            input_tokens - cached_input_tokens, input_tokens, reason,
+            str(execution.get("attribution_granularity") or "turn"),
+            str(execution.get("value_classification") or "unknown"),
+            worker_id,
         ),
     )
 

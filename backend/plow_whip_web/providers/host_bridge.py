@@ -53,8 +53,11 @@ class HostBridgeClient:
             duration_ms=int(payload.get("duration_ms", 0)),
             failure_class=payload.get("failure_class"),
             input_tokens=int(payload.get("input_tokens", 0)),
+            cached_input_tokens=int(payload.get("cached_input_tokens", 0)),
             output_tokens=int(payload.get("output_tokens", 0)),
             external_session_id=payload.get("session_id"),
+            attribution_granularity="turn",
+            value_classification="unknown",
         )
 
     def start_job(
@@ -88,6 +91,7 @@ class HostBridgeClient:
                 "duration_ms": execution.duration_ms,
                 "failure_class": execution.failure_class,
                 "input_tokens": execution.input_tokens,
+                "cached_input_tokens": execution.cached_input_tokens,
                 "output_tokens": execution.output_tokens,
                 "external_session_id": execution.external_session_id,
             },
@@ -133,8 +137,11 @@ class HostBridgeClient:
             duration_ms=int(snapshot.get("duration_ms") or 0),
             failure_class=snapshot.get("failure_class"),
             input_tokens=int(snapshot.get("input_tokens") or 0),
+            cached_input_tokens=int(snapshot.get("cached_input_tokens") or 0),
             output_tokens=int(snapshot.get("output_tokens") or 0),
             external_session_id=snapshot.get("session_id"),
+            attribution_granularity="turn",
+            value_classification="unknown",
         )
 
     def _post(self, path: str, payload: dict[str, object], *, timeout: int) -> dict[str, object]:

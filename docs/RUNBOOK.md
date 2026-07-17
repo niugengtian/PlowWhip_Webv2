@@ -7,9 +7,19 @@ docker compose up --build -d
 docker compose ps
 ```
 
-Open `http://127.0.0.1:8742`. Register projects, save Convention and Settings, then create tasks. The built frontend is served by FastAPI.
+Open `http://127.0.0.1:8742`. Register projects, save Convention and Settings, then **submit a goal**. The control plane PM-splits it into ordered role work items and the scheduler advances them. Manual single-task create remains available under “诊断任务” for debugging only. The built frontend is served by FastAPI.
 
 Python, Node, SQLite runtime and the scheduler are image internals. Source-mode commands remain available to contributors, but they are not production prerequisites.
+
+## Goal flow
+
+1. Ensure the selected Provider probes ready (`/api/providers/{name}/probe`).
+2. Submit a goal with sizing gates and verification paths (`POST /api/goals`).
+3. Inspect the returned plan: role, ordinal, depends_on, sizing/execution_budget.
+4. Let Cron/Tick auto-dispatch ready children, or run a manual zero-token tick.
+5. Parent goal completes only when all implementation items and the independent verification item are completed.
+
+Provider session rotation reasons visible in Worker status are limited to provable policy events: explicit operator rotate/rebind, settled `budget_exceeded`, and bounded consecutive no-progress/tool-abort recovery. The local Journal byte threshold rotates only `events.current.jsonl`; it does not discard the Provider session. Provider capacity does not rotate a session. Same-role work continues to reuse its external session even when cached context is large, unless one of those explicit policies fires.
 
 ## Scheduler
 
@@ -21,11 +31,15 @@ docker compose exec control-plane python -m plow_whip_web --data-dir /data sched
 
 `max_parallel_workers` includes work already running from prior ticks and manual drives. A Tick result reports `active` and `available_slots`; `selected: 0` with no error is expected when existing Host Jobs occupy every slot.
 
-Host model tasks require positive task and global Token budgets. The control plane reserves the task's remaining budget before dispatch and exposes active reservation totals from `/api/usage`. Reported actual usage releases unused capacity after settlement. Treat this as an allocation gate, not a provider-side generation cutoff: stop or cancel a CLI job if its provider does not honor an external spending limit.
+Host model tasks require positive task and global Token budgets. The control plane reserves the sized allocation before dispatch and exposes active reservation totals from `/api/usage`. Reported actual usage releases unused capacity after settlement. `cached_input_tokens` is already included in `input_tokens`; total is `input + output`, never `input + cached + output`.
+
+Treat the task hard cap as a turn-end settlement gate, not a provider-side generation cutoff. Before dispatch, the guard reports estimated new-work reserve, prior same-generation cached carry-in, and hard cap separately. Current Provider usage has only turn-level attribution, so their projected relationship is `unknown`: pressure and cached values are telemetry/alerts, not proof of repeated work or permission to rotate. The guard therefore conservatively reuses the external session. If settled `input + output` exceeds the cap, the task becomes `terminal_failed` with `budget_exceeded` and its Worker session is archived/rotated once; an idempotency trigger prevents repeated ticks from incrementing the generation again. There is no mid-turn cancellation claim until a Provider supplies reliable streaming usage with deterministic tests. Content-level value attribution, proof of repeated context, and reliable compression are not implemented.
+
+`provider_capacity` means the Provider explicitly reported capacity, rate-limit, HTTP 429, or overload. FaultPolicy defers it with backoff while retaining the external session; repeated no-progress reaches `max_no_progress`. Do not manually rotate a session for one capacity response.
 
 ## Upgrade and migration
 
-Create a backup from Health, build the new image, then run `docker compose up -d`. Migrations are ordered and idempotent. Check `/health` and the migration count. Never use `down -v` during an upgrade.
+Create a backup from Health, build the new image, then run `docker compose up -d`. Migrations are ordered and idempotent. Migration `0020_provider_context_pressure.sql` adds zero-valued legacy usage/pressure defaults and no body backfill; it preserves 0017/0018/0019 behavior. Check `/health` and the migration count. Never use `down -v` during an upgrade.
 
 ## Backup, diagnostics and restore
 

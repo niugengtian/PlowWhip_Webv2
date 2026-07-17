@@ -18,8 +18,11 @@ class ExecutionResult:
     duration_ms: int
     failure_class: str | None = None
     input_tokens: int = 0
+    cached_input_tokens: int = 0
     output_tokens: int = 0
     external_session_id: str | None = None
+    attribution_granularity: str = "turn"
+    value_classification: str = "unknown"
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -29,8 +32,11 @@ class ExecutionResult:
             "duration_ms": self.duration_ms,
             "failure_class": self.failure_class,
             "input_tokens": self.input_tokens,
+            "cached_input_tokens": self.cached_input_tokens,
             "output_tokens": self.output_tokens,
             "external_session_id": self.external_session_id,
+            "attribution_granularity": self.attribution_granularity,
+            "value_classification": self.value_classification,
         }
 
 

@@ -13,6 +13,7 @@ from plow_whip_web.store.health_repository import HealthRepository
 from plow_whip_web.store.scheduler_repository import SchedulerRepository
 from plow_whip_web.store.settings_repository import SettingsRepository
 from plow_whip_web.store.task_repository import TaskRepository
+from plow_whip_web.store.goal_repository import GoalRepository
 from plow_whip_web.providers.pool import ProviderPool
 
 
@@ -31,6 +32,7 @@ class SchedulerService:
         health: HealthRepository | None = None,
         recovery: RecoveryService | None = None,
         provider_pool: ProviderPool | None = None,
+        goals: GoalRepository | None = None,
     ) -> None:
         self.scheduler = scheduler
         self.settings = settings
@@ -40,6 +42,7 @@ class SchedulerService:
         self.health = health
         self.recovery = recovery
         self.provider_pool = provider_pool
+        self.goals = goals
 
     def tick(self, *, owner: str | None = None) -> dict[str, Any]:
         try:
@@ -57,6 +60,9 @@ class SchedulerService:
             return {"status": "skipped_lease_busy", "model_tokens": 0, "fencing_token": lease.fencing_token}
         host_jobs_result = self.task_service.reconcile_host_jobs()
         recovery_result = self.recovery.reconcile() if self.recovery else {"recovered_tasks": [], "model_invoked": False}
+        orchestration = self.goals.advance() if self.goals else {
+            "unblocked": [], "completed_goals": [], "blocked_goals": [], "model_invoked": False,
+        }
         provider_status = self.provider_pool.probe_all() if self.provider_pool else []
         connectivity = self.connectivity.check()
         health_result = self.health.record(
@@ -75,6 +81,7 @@ class SchedulerService:
             "active": active, "available_slots": available_slots,
             "completed": [],
             "deferred": [{"task_id": task.id, "reason": f"network:{connectivity.state}"} for task in blocked],
+            "orchestration": orchestration,
             "model_tokens": 0, "health": health_result, "recovery": recovery_result,
             "host_jobs": host_jobs_result,
             "providers": [
@@ -103,6 +110,8 @@ class SchedulerService:
                         result["deferred"].append({"task_id": task_id, "reason": str(error)})
                     except Exception as error:  # one task must not stop the global tick
                         result["deferred"].append({"task_id": task_id, "reason": type(error).__name__})
+            if self.goals:
+                result["orchestration"] = self.goals.advance()
         elif selected:
             result["deferred"].extend(
                 {"task_id": task.id, "reason": "auto_dispatch_disabled"} for task in selected

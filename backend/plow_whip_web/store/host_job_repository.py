@@ -8,9 +8,6 @@ from plow_whip_web.security import Redactor
 from plow_whip_web.store.database import Database
 
 
-MAX_OUTPUT_TAIL_BYTES = 16_384
-
-
 class HostJobRepository:
     """Container-side source of truth for durable Host Bridge execution."""
 
@@ -86,9 +83,12 @@ class HostJobRepository:
                     """
                     UPDATE workers SET external_session_id = COALESCE(?, external_session_id),
                         last_seen_at = CURRENT_TIMESTAMP, last_error = ?, updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ?
+                    WHERE id = ? AND session_generation IS ?
                     """,
-                    (session_id, error_summary, row["worker_id"]),
+                    (
+                        session_id, error_summary, row["worker_id"],
+                        row["session_generation"],
+                    ),
                 )
             return dict(row)
 
@@ -172,12 +172,45 @@ class HostJobRepository:
                 (job_id,),
             )
 
+    def consecutive_faults(
+        self,
+        worker_id: str | None,
+        *,
+        session_generation: int | None,
+        reason: str,
+        before_job_id: str,
+        limit: int,
+    ) -> int:
+        if not worker_id or limit <= 0:
+            return 0
+        connection = self.database.connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT last_error FROM host_jobs
+                WHERE worker_id = ? AND session_generation IS ?
+                  AND job_id != ? AND consumed_at IS NOT NULL
+                ORDER BY updated_at DESC, created_at DESC LIMIT ?
+                """,
+                (worker_id, session_generation, before_job_id, limit),
+            ).fetchall()
+        finally:
+            connection.close()
+        count = 0
+        for row in rows:
+            if row["last_error"] != reason:
+                break
+            count += 1
+        return count
+
 
 def _compact_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Persist refs/segments/hashes/bytes/status only — never stdout/stderr/prompt bodies."""
     scalar_fields = {
         "job_id", "status", "pid", "session_id", "external_session_id",
         "heartbeat_at", "finished_at", "returncode", "duration_ms",
-        "failure_class", "input_tokens", "output_tokens", "cancel_requested",
+        "failure_class", "input_tokens", "cached_input_tokens", "output_tokens",
+        "cancel_requested",
         "output_ref", "carry_forward_ref",
     }
     compact = {key: snapshot[key] for key in scalar_fields if key in snapshot}
@@ -185,7 +218,7 @@ def _compact_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     compact["output_segments"] = [
         {
             key: segment[key]
-            for key in ("stream", "index", "ref", "bytes", "sha256")
+            for key in ("stream", "index", "ref", "bytes", "sha256", "offset")
             if key in segment
         }
         for segment in (raw_segments if isinstance(raw_segments, list) else [])
@@ -196,21 +229,12 @@ def _compact_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
         key: int(raw_bytes.get(key) or 0)
         for key in ("stdout", "stderr", "total")
     } if isinstance(raw_bytes, dict) else {"stdout": 0, "stderr": 0, "total": 0}
-    compact["stdout"] = _tail(snapshot.get("stdout"))
-    compact["stderr"] = _tail(snapshot.get("stderr"))
     error = snapshot.get("error_summary") or snapshot.get("failure_class")
-    if not error and compact["stderr"]:
-        error = compact["stderr"][-1000:]
+    if not error:
+        # Prefer failure_class over copying stderr body into SQLite.
+        error = snapshot.get("failure_class")
     compact["error_summary"] = Redactor.redact(str(error))[:1000] if error else None
+    compact["stdout_len"] = int(compact["output_bytes"].get("stdout") or 0)
+    compact["stderr_len"] = int(compact["output_bytes"].get("stderr") or 0)
+    compact["segment_count"] = len(compact["output_segments"])
     return compact
-
-
-def _tail(value: object) -> str:
-    encoded = Redactor.redact(str(value or "")).encode("utf-8")
-    tail = encoded[-MAX_OUTPUT_TAIL_BYTES:]
-    while tail:
-        try:
-            return tail.decode("utf-8")
-        except UnicodeDecodeError:
-            tail = tail[1:]
-    return ""

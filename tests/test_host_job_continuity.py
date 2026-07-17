@@ -229,11 +229,17 @@ def test_host_job_timeout_writes_deterministic_carry_forward() -> None:
             "output_segments": snapshot["output_segments"],
             "session_id": "timeout-session",
             "status": "completed",
-            "tokens": {"input": 7, "output": 3, "total": 10},
+            "tokens": {
+                "input": 7,
+                "cached_input": 0,
+                "cached_input_in_total": True,
+                "output": 3,
+                "total": 10,
+            },
         }
 
 
-def test_host_job_repository_keeps_only_tail_and_output_index_in_sqlite() -> None:
+def test_host_job_repository_keeps_only_output_metadata_in_sqlite() -> None:
     with TemporaryDirectory() as directory:
         root = Path(directory)
         app = create_app(Settings(
@@ -269,7 +275,7 @@ def test_host_job_repository_keeps_only_tail_and_output_index_in_sqlite() -> Non
         stored = json.loads(stored_text)
 
         assert len(stored_text.encode("utf-8")) < 32_768
-        assert len(stored["stdout"].encode("utf-8")) <= MAX_OUTPUT_TAIL_BYTES
+        assert {"stdout", "stderr", "prompt", "prompt_text"}.isdisjoint(stored)
         assert "old-output-that-must-not-remain" not in stored_text
         assert stored["output_ref"] == snapshot["output_ref"]
         assert "content" not in stored["output_segments"][0]
@@ -278,6 +284,9 @@ def test_host_job_repository_keeps_only_tail_and_output_index_in_sqlite() -> Non
             if key != "content"
         }
         assert stored["output_bytes"] == snapshot["output_bytes"]
+        assert stored["stdout_len"] == snapshot["output_bytes"]["stdout"]
+        assert stored["stderr_len"] == snapshot["output_bytes"]["stderr"]
+        assert stored["error_summary"] is None
 
 
 class FakeAsyncBridge:

@@ -43,25 +43,88 @@ class ProviderPool:
 
     def require_ready(self, name: str) -> dict[str, Any]:
         provider = self.probe(name)
+        readiness = provider.get("readiness") or {}
         if provider["status"] != "available":
             raise ProviderUnavailableError(
                 f"provider 未通过就绪探测: {name}: {provider['reason'] or '不可用'}"
             )
+        # Host-bridge providers must be CLI-installed; session resume readiness is
+        # reported separately and does not block first-bind dispatch.
+        if provider["transport"] == "host-bridge" and not readiness.get("installed", True):
+            raise ProviderUnavailableError(f"provider CLI 未安装: {name}")
         return provider
 
     def probe(self, name: str) -> dict[str, Any]:
         provider = self.providers.require(name)
         if not provider["enabled"]:
-            return self.providers.record_probe(name, available=False, detail="已停用")
+            return self.providers.record_probe(
+                name,
+                available=False,
+                detail="已停用",
+                readiness={
+                    "installed": False,
+                    "cli_probe": "disabled",
+                    "session_resume_ready": False,
+                    "recent_execution_health": "unknown",
+                },
+            )
         if provider["transport"] == "container":
             available = provider["adapter"] == "generic-command"
             detail = "容器内置执行器可用" if available else "容器适配器未安装"
+            readiness = {
+                "installed": available,
+                "cli_probe": "available" if available else "unavailable",
+                "session_resume_ready": True,
+                "recent_execution_health": "healthy" if available else "unknown",
+            }
         else:
             try:
                 available, detail = self.bridge.probe(provider)
             except ProviderUnavailableError as error:
                 available, detail = False, str(error)
-        return self.providers.record_probe(name, available=available, detail=detail)
+            health = self._recent_execution_health(name)
+            resume_ready = available and health != "tooling_broken"
+            readiness = {
+                "installed": available,
+                "cli_probe": "available" if available else "unavailable",
+                "session_resume_ready": resume_ready,
+                "recent_execution_health": health,
+            }
+            # CLI installed is not enough when recent resumes only abort tools.
+            if available and health == "tooling_broken":
+                available = False
+                detail = f"{detail}; session resume not ready ({health})"
+        return self.providers.record_probe(
+            name, available=available, detail=detail, readiness=readiness,
+        )
+
+    def _recent_execution_health(self, provider_name: str) -> str:
+        connection = self.database.connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT last_error, result_json FROM host_jobs
+                WHERE provider = ?
+                ORDER BY updated_at DESC LIMIT 5
+                """,
+                (provider_name,),
+            ).fetchall()
+        finally:
+            connection.close()
+        if not rows:
+            return "unknown"
+        abort_hits = 0
+        for row in rows:
+            blob = f"{row['last_error'] or ''}\n{row['result_json'] or ''}".lower()
+            if any(marker in blob for marker in (
+                "no_progress", "tool_aborted", "internal_tool_no_progress",
+            )):
+                abort_hits += 1
+        if abort_hits >= 2:
+            return "tooling_broken"
+        if abort_hits == 1:
+            return "degraded"
+        return "healthy"
 
     def probe_all(self) -> list[dict[str, Any]]:
         names = [item["name"] for item in self.providers.list() if item["enabled"]]
@@ -194,6 +257,7 @@ class ProviderPool:
             "provider": provider_name,
             "suggestion": suggestion,
             "input_tokens": result.input_tokens,
+            "cached_input_tokens": result.cached_input_tokens,
             "output_tokens": result.output_tokens,
             "applied": False,
         }
