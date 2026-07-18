@@ -193,6 +193,7 @@ afterEach(() => {
   cleanup()
   vi.useRealTimers()
   vi.unstubAllGlobals()
+  vi.restoreAllMocks()
 })
 
 async function openTaskDrawer() {
@@ -283,7 +284,9 @@ test('worker click shows canonical host identity and never treats heartbeat as c
   expect(screen.getByText('real progress')).toBeInTheDocument()
   expect(screen.getByText('running')).toBeInTheDocument()
   expect(screen.queryByText('已完成')).not.toBeInTheDocument()
-  expect(interval).toHaveBeenCalledWith(expect.any(Function), 1500)
+  await vi.waitFor(() => {
+    expect(interval).toHaveBeenCalledWith(expect.any(Function), 1500)
+  })
 })
 
 test('falls back to one low-frequency poller without EventSource and clears it', () => {
