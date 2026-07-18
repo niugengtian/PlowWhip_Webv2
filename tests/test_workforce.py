@@ -111,6 +111,67 @@ def test_sessions_never_cross_project_boundary() -> None:
         assert sessions[0] != sessions[1]
 
 
+def test_amended_terminal_task_gets_a_fresh_ephemeral_worker() -> None:
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        project_path = root / "project"
+        project_path.mkdir()
+        app = create_app(Settings(data_dir=root / "runtime"))
+        projects = app.state.project_repository
+        repository = app.state.task_repository
+        project = projects.create(name="amend", path=str(project_path))
+        role_id = projects.resolve_role(project["id"], "fullstack")["role_id"]
+        task = repository.create(
+            title="amend",
+            objective="run twice with a fresh execution worker",
+            project_path=str(project_path),
+            project_id=project["id"],
+            role_id=role_id,
+            resource_key="repo:amend",
+            command={"argv": [sys.executable, "-c", "pass"]},
+            verification=[{"kind": "exit_code", "expected": 0}],
+            max_attempts=1,
+            idempotency_key="amend-create",
+        )
+        service = TaskService(repository)
+        first = service.drive(
+            task.id,
+            expected_revision=task.revision,
+            idempotency_key="amend-first-drive",
+        )
+        amended = repository.amend_spec(
+            task.id,
+            spec=first.spec,
+            reason="new execution episode",
+            expected_revision=first.revision,
+            idempotency_key="amend-spec",
+        )
+        second = service.drive(
+            task.id,
+            expected_revision=amended.revision,
+            idempotency_key="amend-second-drive",
+        )
+
+        assert first.status.value == "completed"
+        assert second.status.value == "completed"
+        assert second.worker_id != first.worker_id
+        assert second.role_id != first.role_id
+        connection = app.state.database.connect()
+        try:
+            workers = connection.execute(
+                """
+                SELECT status, released_at FROM workers
+                WHERE id IN (?, ?) ORDER BY created_at
+                """,
+                (first.worker_id, second.worker_id),
+            ).fetchall()
+            assert len(workers) == 2
+            assert all(row["status"] == "released" for row in workers)
+            assert all(row["released_at"] is not None for row in workers)
+        finally:
+            connection.close()
+
+
 def test_worker_and_resource_leases_prevent_brain_split() -> None:
     with TemporaryDirectory() as directory:
         root = Path(directory)

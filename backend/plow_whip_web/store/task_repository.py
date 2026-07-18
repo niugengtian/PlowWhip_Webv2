@@ -1317,19 +1317,40 @@ class TaskRepository:
         connection.execute("DELETE FROM resource_locks WHERE expires_at <= CURRENT_TIMESTAMP")
         connection.execute("DELETE FROM task_leases WHERE expires_at <= CURRENT_TIMESTAMP")
         role = connection.execute(
-            "SELECT status FROM roles WHERE id = ?", (task.role_id,)
+            "SELECT kind, status FROM roles WHERE id = ?", (task.role_id,)
         ).fetchone()
+        role_id = task.role_id
         if role is None or role["status"] == "released" or (
             role["status"] == "draining" and task.worker_id is None
         ):
-            raise ProviderUnavailableError("legacy role worker is retired")
+            role_id = str(uuid.uuid4())
+            role_kind = (
+                str(role["kind"]).split(":replacement:", 1)[0]
+                if role is not None
+                else str(task.work_item_kind or "worker")
+            )
+            connection.execute(
+                """
+                INSERT INTO roles(id, project_id, kind, status)
+                VALUES (?, ?, ?, 'ephemeral')
+                """,
+                (
+                    role_id,
+                    task.project_id,
+                    f"{role_kind}:replacement:{role_id}",
+                ),
+            )
+            connection.execute(
+                "UPDATE tasks SET role_id = ?, worker_id = NULL WHERE id = ?",
+                (role_id, task.id),
+            )
         worker = connection.execute(
             """
             SELECT w.*, r.status role_status FROM workers w
             JOIN roles r ON r.id = w.role_id
             WHERE w.project_id = ? AND w.role_id = ? AND w.released_at IS NULL
             """,
-            (task.project_id, task.role_id),
+            (task.project_id, role_id),
         ).fetchone()
         if worker is None:
             worker_id = str(uuid.uuid4())
@@ -1338,7 +1359,7 @@ class TaskRepository:
                 INSERT INTO workers(id, project_id, role_id, provider, session_id)
                 VALUES (?, ?, ?, ?, ?)
                 """,
-                (worker_id, task.project_id, task.role_id, task.provider, str(uuid.uuid4())),
+                (worker_id, task.project_id, role_id, task.provider, str(uuid.uuid4())),
             )
         else:
             worker_id = worker["id"]
