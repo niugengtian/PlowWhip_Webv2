@@ -18,6 +18,7 @@ from plow_whip_web.domain.model import (
     TERMINAL_TASK_STATUSES,
 )
 from plow_whip_web.store.database import Database
+from plow_whip_web.store.project_repository import rotate_worker_in_transaction
 from plow_whip_web.store.settings_repository import DEFAULT_SETTINGS
 from plow_whip_web.runtime.evidence import manifest_hash
 from plow_whip_web.runtime.token_ledger import TokenLedger
@@ -847,6 +848,8 @@ class TaskRepository:
         reason: str,
         execution: dict[str, Any],
         external_session_id: str | None,
+        episode: dict[str, Any] | None = None,
+        rotate_worker_reason: str | None = None,
     ) -> TaskRecord:
         if action not in {"defer", "resume", "needs_human"}:
             raise ValueError(f"unsupported Host fault action: {action}")
@@ -934,6 +937,17 @@ class TaskRepository:
                     (retained_session_id, reason[:1000], task.worker_id),
                 )
             self._release_worker_and_lock(connection, task.id, task.worker_id)
+            if rotate_worker_reason and task.worker_id:
+                rotate_worker_in_transaction(
+                    connection,
+                    task.worker_id,
+                    reason=rotate_worker_reason,
+                    trigger_key=(
+                        f"execution-episode:{episode['episode_id']}:replacement"
+                        if episode and episode.get("episode_id")
+                        else f"host-job:{job_id}:replacement"
+                    ),
+                )
             _record_worker_context_pressure(
                 connection,
                 task.worker_id,
@@ -969,6 +983,7 @@ class TaskRepository:
                             "failure_class": failure_class,
                             "reason": reason[:1000],
                         },
+                        "execution_episode": episode,
                         "execution": _execution_metadata(execution),
                     }),
                     run_id,
@@ -1000,6 +1015,7 @@ class TaskRepository:
                     "reason": reason,
                     "tokens": token_total,
                     "session_retained": bool(retained_session_id),
+                    "execution_episode": episode,
                 },
                 revision=revision, idempotency_key=idempotency_key,
             )
@@ -1401,6 +1417,9 @@ def _task_from_row(row: Any) -> TaskRecord:
         spec_revision=int(row["current_spec_revision"]),
         spec=spec,
         evidence_manifest=_parse_json_object(_optional(row, "evidence_manifest_json")),
+        execution_episode=_parse_json_object(
+            _optional(row, "execution_episode_json")
+        ),
     )
 
 
@@ -1433,7 +1452,35 @@ SELECT t.*, s.spec_json AS task_spec_json, s.spec_hash AS task_spec_hash,
            SELECT em.manifest_json FROM evidence_manifests em
            WHERE em.task_id = t.id
            ORDER BY em.created_at DESC, em.rowid DESC LIMIT 1
-       ) AS evidence_manifest_json
+       ) AS evidence_manifest_json,
+       (
+           SELECT json_object(
+               'id', e.id,
+               'spec_revision', e.spec_revision,
+               'ordinal', e.ordinal,
+               'recovery_count', e.recovery_count,
+               'recovery_stage', e.recovery_stage,
+               'status', e.status,
+               'deadline_at', e.deadline_at,
+               'wall_deadline_at', e.wall_deadline_at,
+               'host_process_count', e.host_process_count,
+               'max_host_processes', e.max_host_processes,
+               'same_fault_count', e.same_fault_count,
+               'zero_progress_rounds', e.zero_progress_rounds,
+               'progress_bytes', e.progress_bytes,
+               'observed_tokens', e.observed_tokens,
+               'burn_rate_tokens_per_minute', e.burn_rate_tokens_per_minute,
+               'burn_rate_alert', json(e.burn_rate_alert),
+               'checkpoint', CASE
+                   WHEN e.checkpoint_json IS NULL THEN NULL
+                   ELSE json(e.checkpoint_json)
+               END,
+               'end_reason', e.end_reason
+           )
+           FROM execution_episodes e
+           WHERE e.task_id = t.id
+           ORDER BY e.ordinal DESC LIMIT 1
+       ) AS execution_episode_json
 FROM tasks t
 JOIN task_specs s ON s.task_id = t.id
     AND s.spec_revision = t.current_spec_revision

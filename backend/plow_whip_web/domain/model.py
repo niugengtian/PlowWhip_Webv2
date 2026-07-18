@@ -64,6 +64,7 @@ class TaskRecord:
     spec_revision: int = 1
     spec: dict[str, Any] = field(default_factory=dict)
     evidence_manifest: dict[str, Any] | None = None
+    execution_episode: dict[str, Any] | None = None
 
 
 class DomainError(RuntimeError):

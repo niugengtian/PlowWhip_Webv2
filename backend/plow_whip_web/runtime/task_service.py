@@ -27,14 +27,10 @@ from plow_whip_web.runtime.journal import SessionJournal
 from plow_whip_web.runtime.verification import VerificationEngine, VerificationResult
 from plow_whip_web.security import CommandPolicy
 from plow_whip_web.store.host_job_repository import HostJobRepository
-from plow_whip_web.store.project_repository import (
-    ProjectRepository,
-)
+from plow_whip_web.store.project_repository import ProjectRepository
 from plow_whip_web.store.task_repository import TaskRepository
 from plow_whip_web.store.settings_repository import SettingsRepository
 from plow_whip_web.runtime.token_ledger import TokenLedger
-
-NO_PROGRESS_ROTATION_THRESHOLD = 2
 
 
 class TaskService:
@@ -120,6 +116,7 @@ class TaskService:
                     claim.task, job_id=job["job_id"], prompt=prompt
                 )
                 self.host_jobs.record(job["job_id"], snapshot)
+                self._observe_episode(job, snapshot)
             except HostBridgeRejectedError as error:
                 result = self._handle_host_fault(
                     claim.task,
@@ -153,10 +150,14 @@ class TaskService:
 
     def reconcile_host_jobs(self) -> dict[str, Any]:
         if not self.host_jobs or not self.provider_pool:
-            return {"checked": 0, "active": 0, "settled": [], "model_invoked": False}
+            return {
+                "checked": 0, "active": 0, "settled": [],
+                "burn_rate_alerts": [], "model_invoked": False,
+            }
         jobs = self.host_jobs.active()
         active = 0
         settled: list[dict[str, str]] = []
+        burn_rate_alerts: list[dict[str, Any]] = []
         for job in jobs:
             job_id = job["job_id"]
             task_id = job["task_id"]
@@ -166,31 +167,57 @@ class TaskService:
             except ProviderUnavailableError as error:
                 self.host_jobs.hold(job_id, str(error))
                 self.host_jobs.renew(job_id)
+                watch = self._observe_episode(
+                    job,
+                    {"status": "recovery_hold"},
+                )
+                if watch["alert_raised"]:
+                    burn_rate_alerts.append(watch)
                 active += 1
                 continue
             status = str(snapshot.get("status") or "unknown")
             task = self.repository.get(task_id)
+            decision = (
+                FaultPolicy.from_host_snapshot(snapshot)
+                if status not in {
+                    "dispatching", "running", "orphan_running", "cancelling",
+                }
+                else None
+            )
+            fault_class = (
+                "no_progress"
+                if status in {"running", "orphan_running"}
+                and FaultPolicy.is_no_progress(snapshot)
+                else (
+                    decision.failure_class
+                    if decision is not None and decision.action != "verify"
+                    else None
+                )
+            )
+            watch = self._observe_episode(
+                job, snapshot, fault_class=fault_class,
+            )
+            if watch["alert_raised"]:
+                burn_rate_alerts.append(watch)
             if status in {"dispatching", "running", "orphan_running", "cancelling"}:
-                if (
-                    status in {"running", "orphan_running"}
-                    and FaultPolicy.is_no_progress(snapshot)
-                ):
+                if watch["bounded"]:
                     try:
-                        snapshot = self.provider_pool.cancel_task_job(job_id)
+                        cancelled = self.provider_pool.cancel_task_job(job_id)
+                        snapshot = {
+                            **snapshot,
+                            **cancelled,
+                            "failure_class": fault_class or "watchdog_boundary",
+                        }
                         self.host_jobs.record(job_id, snapshot)
                     except ProviderUnavailableError as error:
                         self.host_jobs.hold(job_id, str(error))
                         self.host_jobs.renew(job_id)
                         active += 1
                         continue
-                    result = self._handle_host_fault(task, job, {
-                        **snapshot,
-                        "failure_class": "no_progress",
-                        "error_summary": snapshot.get("error_summary")
-                        or "internal_tool_no_progress",
-                    })
-                    assert result is not None
-                    self.host_jobs.consume(job_id)
+                    result = self._finalize_episode_boundary(
+                        task, job, snapshot, watch,
+                        failure_class=fault_class or "watchdog_boundary",
+                    )
                     settled.append({"task_id": task_id, "status": result.status.value})
                     continue
                 self.host_jobs.renew(job_id, seconds=task_lease_seconds(task))
@@ -200,8 +227,11 @@ class TaskService:
                 if task.status is TaskStatus.STOPPING:
                     result = self.repository.finalize_running_cancel(task_id, job_id=job_id)
                     self._record_host_usage(task, job, snapshot)
+                    self.host_jobs.complete_episode(job_id)
                 else:
-                    result = self._handle_host_fault(task, job, snapshot)
+                    result = self._handle_host_fault(
+                        task, job, snapshot, decision=decision, watch=watch,
+                    )
                     if result is not None:
                         settled.append({"task_id": task_id, "status": result.status.value})
                         continue
@@ -210,6 +240,28 @@ class TaskService:
                         try:
                             verification = self.provider_pool.verify_host_task(task, execution)
                         except ProviderUnavailableError as error:
+                            transport_watch = self._observe_episode(
+                                job,
+                                {
+                                    **snapshot,
+                                    "failure_class": "transient_transport",
+                                    "error_summary": str(error),
+                                },
+                                fault_class="transient_transport",
+                            )
+                            if transport_watch["bounded"]:
+                                result = self._finalize_episode_boundary(
+                                    task,
+                                    job,
+                                    snapshot,
+                                    transport_watch,
+                                    failure_class="transient_transport",
+                                )
+                                settled.append({
+                                    "task_id": task_id,
+                                    "status": result.status.value,
+                                })
+                                continue
                             self.host_jobs.hold(job_id, str(error))
                             self.host_jobs.renew(job_id)
                             active += 1
@@ -219,6 +271,7 @@ class TaskService:
                             idempotency_prefix=f"host-job:{job_id}",
                             verification=verification,
                         )
+                        self.host_jobs.complete_episode(job_id)
                     else:
                         result = task
                 self.host_jobs.consume(job_id)
@@ -228,14 +281,19 @@ class TaskService:
                 if task.status is TaskStatus.STOPPING:
                     result = self.repository.finalize_running_cancel(task_id, job_id=job_id)
                     self._record_host_usage(task, job, snapshot)
+                    self.host_jobs.complete_episode(job_id)
                     self.host_jobs.consume(job_id)
                 else:
-                    result = self._handle_host_fault(task, job, snapshot)
+                    result = self._handle_host_fault(
+                        task, job, snapshot, decision=decision, watch=watch,
+                    )
                     assert result is not None
                 settled.append({"task_id": task_id, "status": result.status.value})
                 continue
             if status == "interrupted":
-                result = self._handle_host_fault(task, job, snapshot)
+                result = self._handle_host_fault(
+                    task, job, snapshot, decision=decision, watch=watch,
+                )
                 assert result is not None
                 settled.append({"task_id": task_id, "status": result.status.value})
                 continue
@@ -244,48 +302,102 @@ class TaskService:
             active += 1
         return {
             "checked": len(jobs), "active": active, "settled": settled,
-            "model_invoked": False,
+            "burn_rate_alerts": burn_rate_alerts, "model_invoked": False,
         }
 
     def _handle_host_fault(
-        self, task: TaskRecord, job: dict[str, Any], snapshot: dict[str, Any]
+        self, task: TaskRecord, job: dict[str, Any], snapshot: dict[str, Any],
+        *,
+        decision: Any | None = None,
+        watch: dict[str, Any] | None = None,
     ) -> TaskRecord | None:
-        decision = FaultPolicy.from_host_snapshot(snapshot)
+        decision = decision or FaultPolicy.from_host_snapshot(snapshot)
         if decision.action == "verify":
             return None
-        if decision.failure_class == "provider_capacity" and self.host_jobs:
-            limits = self.settings.get()["values"] if self.settings else {"max_no_progress": 3}
-            threshold = int(limits["max_no_progress"])
-            occurrences = 1 + self.host_jobs.consecutive_faults(
-                job.get("worker_id") or task.worker_id,
-                session_generation=job.get("session_generation"),
-                reason=decision.reason,
-                before_job_id=job["job_id"],
-                limit=threshold - 1,
-            )
-            if FaultPolicy.decide(
-                decision.failure_class,
-                occurrences=occurrences,
-                attempts_left=max(0, task.max_attempts - task.attempts_used),
-            ) == "needs_human":
-                decision = type(decision)(
-                    "needs_human",
-                    "provider_capacity",
-                    "provider_capacity_repeated",
-                )
-        rotate_session = (
-            decision.failure_class == "no_progress"
-            and self.host_jobs.consecutive_faults(
-                job.get("worker_id") or task.worker_id,
-                session_generation=job.get("session_generation"),
-                reason=decision.reason,
-                before_job_id=job["job_id"],
-                limit=NO_PROGRESS_ROTATION_THRESHOLD - 1,
-            ) + 1 >= NO_PROGRESS_ROTATION_THRESHOLD
+        watch = watch or self._observe_episode(
+            job, snapshot, fault_class=decision.failure_class,
         )
+        if decision.action == "needs_human":
+            checkpoint = self.host_jobs.terminate_episode(
+                job["job_id"],
+                reason=decision.reason,
+                snapshot={**snapshot, "failure_class": decision.failure_class},
+                force_circuit=True,
+            )
+            return self._finalize_host_fault(
+                task, job, snapshot,
+                action="needs_human",
+                failure_class=decision.failure_class,
+                reason=decision.reason,
+                episode=checkpoint,
+            )
+        if watch["bounded"]:
+            return self._finalize_episode_boundary(
+                task, job, snapshot, watch,
+                failure_class=decision.failure_class,
+            )
+        return self._finalize_host_fault(
+            task, job, snapshot,
+            action=decision.action,
+            failure_class=decision.failure_class,
+            reason=decision.reason,
+            episode=watch,
+        )
+
+    def _finalize_episode_boundary(
+        self,
+        task: TaskRecord,
+        job: dict[str, Any],
+        snapshot: dict[str, Any],
+        watch: dict[str, Any],
+        *,
+        failure_class: str,
+    ) -> TaskRecord:
+        assert self.host_jobs is not None
+        checkpoint = self.host_jobs.terminate_episode(
+            job["job_id"],
+            reason=str(watch["reason"]),
+            snapshot={**snapshot, "failure_class": failure_class},
+        )
+        recovery_action = str(checkpoint["recovery_action"])
+        action = (
+            "needs_human"
+            if recovery_action == "circuit_open"
+            else (
+                "defer"
+                if failure_class in {"provider_capacity", "transient_transport"}
+                else "resume"
+            )
+        )
+        reason = f"execution_episode_{recovery_action}:{watch['reason']}"
+        result = self._finalize_host_fault(
+            task, job, snapshot,
+            action=action,
+            failure_class=failure_class,
+            reason=reason,
+            episode=checkpoint,
+            rotate_worker_reason=(
+                "execution_episode_replacement"
+                if recovery_action == "replacement" else None
+            ),
+        )
+        return result
+
+    def _finalize_host_fault(
+        self,
+        task: TaskRecord,
+        job: dict[str, Any],
+        snapshot: dict[str, Any],
+        *,
+        action: str,
+        failure_class: str,
+        reason: str,
+        episode: dict[str, Any],
+        rotate_worker_reason: str | None = None,
+    ) -> TaskRecord:
         execution = {
             "returncode": int(snapshot.get("returncode") or 0),
-            "failure_class": decision.failure_class,
+            "failure_class": failure_class,
             "input_tokens": int(snapshot.get("input_tokens") or 0),
             "cached_input_tokens": int(snapshot.get("cached_input_tokens") or 0),
             "output_tokens": int(snapshot.get("output_tokens") or 0),
@@ -299,27 +411,36 @@ class TaskService:
             job_id=job["job_id"],
             attempt_id=job["attempt_id"],
             run_id=job["run_id"],
-            action=decision.action,
-            failure_class=decision.failure_class,
-            reason=decision.reason,
+            action=action,
+            failure_class=failure_class,
+            reason=reason,
             execution=execution,
             external_session_id=(
                 snapshot.get("session_id")
                 or snapshot.get("external_session_id")
                 or job.get("external_session_id")
             ),
+            episode=episode,
+            rotate_worker_reason=rotate_worker_reason,
         )
-        if rotate_session and self.projects and result.worker_id is None:
-            worker_id = job.get("worker_id") or task.worker_id
-            if worker_id:
-                try:
-                    self.projects.rotate_worker(
-                        str(worker_id), reason="no_progress_tool_aborted",
-                    )
-                except Exception:
-                    # Rotation is best-effort once; bounded resume still proceeds.
-                    pass
         return result
+
+    def _observe_episode(
+        self,
+        job: dict[str, Any],
+        snapshot: dict[str, Any],
+        *,
+        fault_class: str | None = None,
+    ) -> dict[str, Any]:
+        assert self.host_jobs is not None
+        limits = self.settings.get()["values"] if self.settings else {}
+        return self.host_jobs.observe_episode(
+            job["job_id"],
+            snapshot,
+            fault_class=fault_class,
+            same_fault_limit=int(limits.get("max_same_failure", 2)),
+            zero_progress_limit=int(limits.get("max_no_progress", 3)),
+        )
 
     def _record_host_usage(
         self, task: TaskRecord, job: dict[str, Any], snapshot: dict[str, Any]

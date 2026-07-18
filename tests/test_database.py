@@ -538,9 +538,7 @@ def test_0024_upgrades_0023_and_backfills_immutable_goal_spec() -> None:
         finally:
             connection.close()
 
-        assert Database(db_path).migrate() == [
-            "0024_goal_specs_evidence_manifests.sql"
-        ]
+        assert Database(db_path).migrate() == names[start:]
         connection = Database(db_path).connect()
         try:
             goal = connection.execute(
@@ -575,3 +573,128 @@ def test_0024_upgrades_0023_and_backfills_immutable_goal_spec() -> None:
             "run_evidence_baselines",
             "evidence_manifests",
         }
+
+
+def test_0025_upgrades_0024_and_binds_existing_host_job_to_episode() -> None:
+    with TemporaryDirectory() as directory:
+        db_path = Path(directory) / "upgrade-0024.sqlite3"
+        migration_dir = Path(database_module.__file__).with_name("migrations")
+        migrations = sorted(migration_dir.glob("*.sql"))
+        names = [item.name for item in migrations]
+        start = names.index("0025_execution_episodes.sql")
+        connection = Database(db_path).connect()
+        try:
+            connection.execute(
+                """
+                CREATE TABLE schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            for migration in migrations[:start]:
+                for statement in database_module._split_statements(
+                    migration.read_text(encoding="utf-8")
+                ):
+                    connection.execute(statement)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version) VALUES (?)",
+                    (migration.name,),
+                )
+            connection.commit()
+        finally:
+            connection.close()
+
+        task_id = "upgrade-episode-task"
+        spec_json = json.dumps({
+            "objective": "retain running Host work",
+            "scope": [],
+            "acceptance": [],
+            "verification": [{"kind": "exit_code", "expected": 0}],
+            "artifacts": [],
+            "constraints": [],
+            "deadline": {"hard_seconds": 321},
+        }, sort_keys=True, separators=(",", ":"))
+        connection = Database(db_path).connect()
+        try:
+            connection.execute(
+                """
+                INSERT INTO tasks(
+                    id, title, objective, project_path, status, command_json,
+                    verification_json, max_attempts, token_budget, provider,
+                    quality_profile, sizing_json, current_spec_revision
+                ) VALUES (
+                    ?, 'upgrade episode', 'retain running Host work',
+                    '/projects/upgrade-episode', 'running',
+                    '{"argv":["true"],"timeout_seconds":321}',
+                    '[{"expected":0,"kind":"exit_code"}]', 1, 0, 'codex',
+                    'deterministic', '{"status":"legacy_fallback"}', 1
+                )
+                """,
+                (task_id,),
+            )
+            connection.execute(
+                """
+                INSERT INTO task_specs(
+                    task_id, spec_revision, spec_json, spec_hash
+                ) VALUES (?, 1, ?, sha256(?))
+                """,
+                (task_id, spec_json, spec_json),
+            )
+            connection.execute(
+                """
+                INSERT INTO task_attempts(
+                    id, task_id, attempt_number, status, spec_revision
+                ) VALUES ('upgrade-attempt', ?, 1, 'running', 1)
+                """,
+                (task_id,),
+            )
+            connection.execute(
+                """
+                INSERT INTO task_runs(
+                    id, task_id, attempt_id, run_type, provider, status,
+                    spec_revision
+                ) VALUES (
+                    'upgrade-run', ?, 'upgrade-attempt', 'execute',
+                    'codex', 'running', 1
+                )
+                """,
+                (task_id,),
+            )
+            connection.execute(
+                """
+                INSERT INTO host_jobs(
+                    job_id, task_id, attempt_id, run_id, provider, spec_revision
+                ) VALUES (
+                    'upgrade-host-job', ?, 'upgrade-attempt', 'upgrade-run',
+                    'codex', 1
+                )
+                """,
+                (task_id,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        assert Database(db_path).migrate() == [names[start]]
+        connection = Database(db_path).connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT h.episode_process_number, e.status, e.host_process_count,
+                       CAST(
+                           (julianday(e.deadline_at) - julianday(e.started_at))
+                           * 86400 AS INTEGER
+                       ) AS deadline_seconds
+                FROM host_jobs h
+                JOIN execution_episodes e ON e.id = h.episode_id
+                WHERE h.job_id = 'upgrade-host-job'
+                """
+            ).fetchone()
+        finally:
+            connection.close()
+
+        assert row["episode_process_number"] == 1
+        assert row["status"] == "active"
+        assert row["host_process_count"] == 1
+        assert row["deadline_seconds"] in {320, 321}

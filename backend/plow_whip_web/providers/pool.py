@@ -93,10 +93,9 @@ class ProviderPool:
                 "session_resume_ready": resume_ready,
                 "recent_execution_health": health,
             }
-            # CLI installed is not enough when recent resumes only abort tools.
-            if available and health == "tooling_broken":
-                available = False
-                detail = f"{detail}; session resume not ready ({health})"
+            # Health is telemetry. ExecutionEpisode owns bounded recovery and
+            # replacement, so historical tool aborts must not create a second
+            # dispatch gate here.
         return self.providers.record_probe(
             name, available=available, detail=detail, readiness=readiness,
         )

@@ -179,22 +179,3 @@ def test_database_lock_becomes_safe_skip_not_recursive_retry() -> None:
         with patch.object(app.state.scheduler_repository, "acquire", side_effect=sqlite3.OperationalError("database is locked")):
             result = app.state.scheduler_service.tick(owner="locked")
         assert result == {"status": "skipped_database_busy", "model_tokens": 0, "reason": "database_locked"}
-
-
-@pytest.mark.parametrize("case", range(100))
-def test_one_hundred_fault_injection_policy_cases_are_bounded(case: int) -> None:
-    classes = [
-        "timeout", "command_failed", "verification_failed", "no_progress",
-        "database_locked", "domestic_unavailable", "overseas_unavailable", "offline",
-        "provider_auth", "permission_denied", "unknown",
-    ]
-    failure = classes[case % len(classes)]
-    occurrences = case % 5 + 1
-    attempts_left = case % 4
-    decision = FaultPolicy.decide(failure, occurrences=occurrences, attempts_left=attempts_left)
-    assert decision in {"defer", "needs_human", "terminal_failed", "retry_backoff"}
-    if failure in {"database_locked", "domestic_unavailable", "overseas_unavailable", "offline"}:
-        assert decision == "defer"
-    if failure in {"provider_auth", "permission_denied"}:
-        assert decision == "needs_human"
-    assert FaultPolicy.model_invoked is False

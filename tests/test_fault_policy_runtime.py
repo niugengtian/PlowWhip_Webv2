@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -11,6 +12,7 @@ from plow_whip_web.config import Settings
 from plow_whip_web.domain.model import ProviderUnavailableError
 from plow_whip_web.providers.generic_command import ExecutionResult
 from plow_whip_web.providers.host_bridge import HostBridgeClient
+from plow_whip_web.runtime.execution_episode import ExecutionEpisodeWatchdog
 from plow_whip_web.runtime.fault_policy import FaultPolicy
 from plow_whip_web.runtime.verification import VerificationEngine
 
@@ -22,6 +24,8 @@ class FakeHostBridge:
         self.snapshots: dict[str, dict[str, object]] = {}
         self.verify_calls = 0
         self.start_sessions: list[str | None] = []
+        self.cancel_available = False
+        self.verify_unavailable = False
 
     def start_job(
         self, *, job_id: str, session_id: str | None = None, **_kwargs: object
@@ -42,13 +46,23 @@ class FakeHostBridge:
         verification: list[dict[str, object]],
     ):
         self.verify_calls += 1
+        if self.verify_unavailable:
+            raise ProviderUnavailableError("verification bridge unavailable")
         return VerificationEngine().verify(Path(project_path), execution, verification)
 
     def probe(self, _provider: dict[str, object]) -> tuple[bool, str]:
         return True, "available"
 
-    def cancel_job(self, _job_id: str) -> dict[str, object]:
-        raise ProviderUnavailableError("unused")
+    def cancel_job(self, job_id: str) -> dict[str, object]:
+        if not self.cancel_available:
+            raise ProviderUnavailableError("unused")
+        snapshot = {
+            **self.snapshots[job_id],
+            "status": "cancelled",
+            "returncode": 124,
+        }
+        self.snapshots[job_id] = snapshot
+        return snapshot
 
     result = staticmethod(HostBridgeClient.result)
 
@@ -254,7 +268,7 @@ def test_capacity_text_overrides_command_failed_and_retains_session() -> None:
         worker_id = running.worker_id
         first_session = bridge.snapshots[job["job_id"]]["session_id"]
         current = running
-        for occurrence in range(1, 4):
+        for occurrence in range(1, 9):
             job = app.state.host_jobs.active()[0]
             bridge.snapshots[job["job_id"]] = {
                 **bridge.snapshots[job["job_id"]],
@@ -268,9 +282,14 @@ def test_capacity_text_overrides_command_failed_and_retains_session() -> None:
             }
             app.state.task_service.reconcile_host_jobs()
             current = app.state.task_repository.get(current.id)
-            if occurrence < 3:
+            if occurrence < 8:
                 assert current.status.value == "ready"
-                assert current.last_error == "transient_provider_capacity"
+                assert current.last_error in {
+                    "transient_provider_capacity",
+                    "execution_episode_resume:host_processes",
+                    "execution_episode_replan:host_processes",
+                    "execution_episode_replacement:host_processes",
+                }
                 current = app.state.task_service.drive(
                     current.id,
                     expected_revision=current.revision,
@@ -287,11 +306,33 @@ def test_capacity_text_overrides_command_failed_and_retains_session() -> None:
         finally:
             connection.close()
         assert current.status.value == "needs_human"
-        assert current.last_error == "provider_capacity_repeated"
-        assert worker["session_generation"] == 1
-        assert worker["external_session_id"] == first_session
-        assert archives == 0
+        assert current.last_error == "execution_episode_circuit_open:host_processes"
+        assert worker["session_generation"] == 2
+        assert worker["external_session_id"] == "confirmed-session"
+        assert archives == 1
         assert bridge.verify_calls == 0
+        connection = app.state.database.connect()
+        try:
+            jobs = connection.execute(
+                "SELECT COUNT(*) FROM host_jobs WHERE task_id = ?", (current.id,)
+            ).fetchone()[0]
+            episodes = connection.execute(
+                """
+                SELECT status, checkpoint_json FROM execution_episodes
+                WHERE task_id = ? ORDER BY ordinal
+                """,
+                (current.id,),
+            ).fetchall()
+        finally:
+            connection.close()
+        assert jobs == 8
+        assert [row["status"] for row in episodes] == [
+            "terminated", "terminated", "terminated", "circuit_open",
+        ]
+        assert [
+            json.loads(row["checkpoint_json"])["recovery_action"]
+            for row in episodes
+        ] == ["resume", "replan", "replacement", "circuit_open"]
     finally:
         directory.cleanup()
 
@@ -355,11 +396,10 @@ def test_large_token_usage_completes_without_rotation_across_reconcile_replay() 
         directory.cleanup()
 
 
-def test_provider_capacity_defers_boundedly_without_rotating_session() -> None:
+def test_provider_capacity_keeps_backoff_at_episode_boundary() -> None:
     directory, app, bridge, running, job = _runtime("bounded-capacity")
     try:
-        worker_id = running.worker_id
-        for occurrence in range(1, 4):
+        for occurrence in range(1, 3):
             bridge.snapshots[job["job_id"]] = {
                 **bridge.snapshots[job["job_id"]],
                 "status": "completed",
@@ -373,8 +413,9 @@ def test_provider_capacity_defers_boundedly_without_rotating_session() -> None:
             }
             app.state.task_service.reconcile_host_jobs()
             task = app.state.task_repository.get(running.id)
-            if occurrence < 3:
-                assert task.status.value == "ready"
+            assert task.status.value == "ready"
+            assert task.next_eligible_at is not None
+            if occurrence == 1:
                 assert task.last_error == "transient_provider_capacity"
                 running = app.state.task_service.drive(
                     task.id,
@@ -383,28 +424,28 @@ def test_provider_capacity_defers_boundedly_without_rotating_session() -> None:
                 )
                 job = app.state.host_jobs.active()[0]
             else:
-                assert task.status.value == "needs_human"
-                assert task.last_error == "provider_capacity_repeated"
-
-        worker = app.state.project_repository.get(
-            app.state.task_repository.get(running.id).project_id
-        )["workers"][0]
+                assert task.last_error == "execution_episode_resume:host_processes"
         connection = app.state.database.connect()
         try:
-            archives = connection.execute(
-                "SELECT COUNT(*) FROM worker_session_archives WHERE worker_id = ?",
-                (worker_id,),
-            ).fetchone()[0]
+            checkpoint = connection.execute(
+                """
+                SELECT checkpoint_json FROM execution_episodes
+                WHERE task_id = ? ORDER BY ordinal DESC LIMIT 1
+                """,
+                (running.id,),
+            ).fetchone()["checkpoint_json"]
         finally:
             connection.close()
-        assert worker["session_generation"] == 1
-        assert worker["external_session_id"] == "confirmed-session"
-        assert archives == 0
+        assert '"recovery_action": "resume"' in checkpoint
+        context = app.state.context_compiler.compile(running.id)["content"]
+        assert "## ExecutionEpisode checkpoint" in context
+        assert "Recovery action: resume" in context
+        assert "Do not replay steps already reflected in the workspace." in context
     finally:
         directory.cleanup()
 
 
-def test_consecutive_internal_tool_aborts_rotate_only_at_threshold() -> None:
+def test_internal_tool_aborts_rotate_only_at_replacement_episode() -> None:
     directory, app, bridge, running, first_job = _runtime("bounded-no-progress")
     try:
         first_session = bridge.snapshots[first_job["job_id"]]["session_id"]
@@ -457,6 +498,31 @@ def test_consecutive_internal_tool_aborts_rotate_only_at_threshold() -> None:
         }
         app.state.task_service.reconcile_host_jobs()
         second_recovery = app.state.task_repository.get(running_again.id)
+        assert second_recovery.status.value == "ready"
+        worker = app.state.project_repository.get(
+            second_recovery.project_id
+        )["workers"][0]
+        assert worker["session_generation"] == 1
+
+        current = second_recovery
+        for occurrence in range(3, 7):
+            current = app.state.task_service.drive(
+                current.id,
+                expected_revision=current.revision,
+                idempotency_key=f"drive-no-progress-{occurrence}",
+            )
+            current_job = app.state.host_jobs.active()[0]
+            bridge.snapshots[current_job["job_id"]] = {
+                **bridge.snapshots[current_job["job_id"]],
+                "status": "completed",
+                "failure_class": "command_failed",
+                "stderr": "internal tool aborted while awaiting tool",
+                "input_tokens": 0,
+                "output_tokens": 0,
+            }
+            app.state.task_service.reconcile_host_jobs()
+            current = app.state.task_repository.get(current.id)
+
         connection = app.state.database.connect()
         try:
             rotated_worker = connection.execute(
@@ -472,12 +538,169 @@ def test_consecutive_internal_tool_aborts_rotate_only_at_threshold() -> None:
             ).fetchone()[0]
         finally:
             connection.close()
-
-        assert second_recovery.status.value == "ready"
         assert rotated_worker["session_generation"] == 2
         assert rotated_worker["session_id"] != first_worker["session_id"]
         assert rotated_worker["external_session_id"] is None
         assert archives == 1
+    finally:
+        directory.cleanup()
+
+
+def test_watchdog_token_burn_rate_is_alert_only() -> None:
+    decision = ExecutionEpisodeWatchdog.evaluate(
+        {
+            "progress_bytes": 0,
+            "zero_progress_rounds": 0,
+            "last_fault_class": None,
+            "same_fault_count": 0,
+            "host_process_count": 1,
+            "max_host_processes": 2,
+        },
+        {
+            "status": "completed",
+            "input_tokens": 2_000_000,
+            "output_tokens": 1_000_000,
+        },
+        fault_class=None,
+        elapsed_seconds=1,
+        deadline_reached=False,
+        wall_clock_reached=False,
+        same_fault_limit=2,
+        zero_progress_limit=3,
+    )
+
+    assert decision.burn_rate_alert is True
+    assert decision.bounded is False
+    assert decision.reason is None
+
+
+def test_watchdog_wall_clock_is_a_hard_episode_boundary() -> None:
+    decision = ExecutionEpisodeWatchdog.evaluate(
+        {
+            "progress_bytes": 1024,
+            "zero_progress_rounds": 0,
+            "last_fault_class": None,
+            "same_fault_count": 0,
+            "host_process_count": 1,
+            "max_host_processes": 2,
+        },
+        {"status": "running", "output_bytes": {"total": 2048}},
+        fault_class=None,
+        elapsed_seconds=901,
+        deadline_reached=False,
+        wall_clock_reached=True,
+        same_fault_limit=2,
+        zero_progress_limit=3,
+    )
+
+    assert decision.bounded is True
+    assert decision.reason == "wall_clock"
+
+
+def test_burn_rate_alert_is_reported_without_stopping_task() -> None:
+    directory, app, bridge, running, job = _runtime("burn-rate-alert")
+    try:
+        bridge.snapshots[job["job_id"]] = {
+            **bridge.snapshots[job["job_id"]],
+            "status": "running",
+            "input_tokens": 2_000_000,
+            "output_tokens": 1_000_000,
+            "output_bytes": {"total": 1024},
+        }
+
+        result = app.state.task_service.reconcile_host_jobs()
+        current = app.state.task_repository.get(running.id)
+        episode = app.state.host_jobs.latest_episode(running.id)
+
+        assert result["active"] == 1
+        assert len(result["burn_rate_alerts"]) == 1
+        assert current.status.value == "running"
+        assert current.execution_episode["burn_rate_alert"] == 1
+        assert current.execution_episode["status"] == "active"
+        assert episode["burn_rate_alert"] == 1
+        assert episode["status"] == "active"
+    finally:
+        directory.cleanup()
+
+
+def test_running_no_progress_terminates_only_current_episode() -> None:
+    directory, app, bridge, running, job = _runtime("running-no-progress")
+    try:
+        bridge.cancel_available = True
+        bridge.snapshots[job["job_id"]] = {
+            **bridge.snapshots[job["job_id"]],
+            "status": "running",
+            "error_summary": "internal tool aborted while awaiting tool",
+            "output_bytes": {"total": 0},
+        }
+
+        first = app.state.task_service.reconcile_host_jobs()
+        second = app.state.task_service.reconcile_host_jobs()
+        recovered = app.state.task_repository.get(running.id)
+        episode = app.state.host_jobs.latest_episode(running.id)
+
+        assert first["active"] == 1
+        assert second["settled"] == [{"task_id": running.id, "status": "ready"}]
+        assert recovered.status.value == "ready"
+        assert recovered.last_error.startswith("execution_episode_resume:")
+        assert episode["status"] == "terminated"
+        assert episode["checkpoint"]["recovery_action"] == "resume"
+        assert len(bridge.snapshots) == 1
+    finally:
+        directory.cleanup()
+
+
+def test_real_taskspec_deadline_cancels_only_current_episode() -> None:
+    directory, app, bridge, running, job = _runtime("episode-deadline")
+    try:
+        bridge.cancel_available = True
+        with app.state.database.transaction(immediate=True) as connection:
+            connection.execute(
+                """
+                UPDATE execution_episodes
+                SET deadline_at = datetime('now', '-1 second')
+                WHERE id = ?
+                """,
+                (job["episode_id"],),
+            )
+
+        result = app.state.task_service.reconcile_host_jobs()
+        recovered = app.state.task_repository.get(running.id)
+        episode = app.state.host_jobs.latest_episode(running.id)
+
+        assert result["settled"] == [{"task_id": running.id, "status": "ready"}]
+        assert recovered.status.value == "ready"
+        assert recovered.last_error == "execution_episode_resume:deadline"
+        assert recovered.attempts_used == 0
+        assert episode["status"] == "terminated"
+        assert episode["end_reason"] == "deadline"
+    finally:
+        directory.cleanup()
+
+
+def test_verification_transport_fault_uses_same_episode_circuit() -> None:
+    directory, app, bridge, running, job = _runtime("verification-transport")
+    try:
+        bridge.verify_unavailable = True
+        bridge.snapshots[job["job_id"]] = {
+            **bridge.snapshots[job["job_id"]],
+            "status": "completed",
+            "returncode": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+        }
+
+        first = app.state.task_service.reconcile_host_jobs()
+        second = app.state.task_service.reconcile_host_jobs()
+        recovered = app.state.task_repository.get(running.id)
+        episode = app.state.host_jobs.latest_episode(running.id)
+
+        assert first["active"] == 1
+        assert second["settled"] == [{"task_id": running.id, "status": "ready"}]
+        assert recovered.last_error == "execution_episode_resume:same_fault"
+        assert episode["status"] == "terminated"
+        assert episode["checkpoint"]["fault_class"] == "transient_transport"
+        assert bridge.verify_calls == 2
     finally:
         directory.cleanup()
 

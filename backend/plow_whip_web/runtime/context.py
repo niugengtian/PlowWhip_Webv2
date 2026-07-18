@@ -45,6 +45,36 @@ class ContextCompiler:
             ),
             ("## Role\n" + ROLE_PROMPTS.get(role, ROLE_PROMPTS["fullstack"]), 2, 384),
         ]
+        checkpoint = self._episode_checkpoint(task.id)
+        if checkpoint:
+            action = str(checkpoint.get("recovery_action") or "resume")
+            instruction = {
+                "resume": (
+                    "Continue from the checkpoint and retained session. Do not replay "
+                    "steps already reflected in the workspace."
+                ),
+                "replan": (
+                    "Inspect the checkpoint and workspace, then make a bounded plan for "
+                    "only the remaining work before continuing."
+                ),
+                "replacement": (
+                    "This is a replacement session. Treat the workspace and checkpoint "
+                    "as canonical; do not replay completed work."
+                ),
+            }.get(action, "Inspect the checkpoint before continuing.")
+            payload = _fit_utf8(
+                json.dumps(
+                    checkpoint, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                4096,
+            )
+            sections.append((
+                "## ExecutionEpisode checkpoint\n"
+                f"Recovery action: {action}\n{instruction}\n{payload}",
+                6,
+                768,
+            ))
         if task.last_error == "external_execution_interrupted":
             sections.append(
                 (
@@ -140,6 +170,21 @@ class ContextCompiler:
         try:
             row = connection.execute("SELECT kind FROM roles WHERE id = ?", (role_id,)).fetchone()
             return row["kind"] if row else "fullstack"
+        finally:
+            connection.close()
+
+    def _episode_checkpoint(self, task_id: str) -> dict[str, Any] | None:
+        connection = self.database.connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT checkpoint_json FROM execution_episodes
+                WHERE task_id = ? AND checkpoint_json IS NOT NULL
+                ORDER BY ordinal DESC LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+            return json.loads(row["checkpoint_json"]) if row else None
         finally:
             connection.close()
 

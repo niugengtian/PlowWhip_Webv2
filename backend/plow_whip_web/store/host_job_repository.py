@@ -2,8 +2,15 @@ from __future__ import annotations
 
 import json
 import uuid
+from dataclasses import asdict
 from typing import Any
 
+from plow_whip_web.runtime.execution_episode import (
+    ExecutionEpisodeWatchdog,
+    MAX_EPISODE_HOST_PROCESSES,
+    MAX_EPISODE_WALL_SECONDS,
+    next_recovery_action,
+)
 from plow_whip_web.security import Redactor
 from plow_whip_web.store.database import Database
 
@@ -28,12 +35,15 @@ class HostJobRepository:
                 """
                 SELECT t.worker_id, t.current_spec_revision, l.fencing_token,
                        w.session_generation, a.spec_revision AS attempt_spec_revision,
-                       r.spec_revision AS run_spec_revision
+                       r.spec_revision AS run_spec_revision,
+                       s.spec_json
                 FROM tasks t
                 LEFT JOIN task_leases l ON l.task_id = t.id
                 LEFT JOIN workers w ON w.id = t.worker_id
                 JOIN task_attempts a ON a.id = ? AND a.task_id = t.id
                 JOIN task_runs r ON r.id = ? AND r.attempt_id = a.id
+                JOIN task_specs s ON s.task_id = t.id
+                    AND s.spec_revision = t.current_spec_revision
                 WHERE t.id = ?
                 """,
                 (attempt_id, run_id, task_id),
@@ -47,23 +57,209 @@ class HostJobRepository:
             }
             if len(revisions) != 1:
                 raise ValueError("Host Job TaskSpec revision mismatch")
+            deadline_seconds = int(
+                json.loads(context["spec_json"])["deadline"]["hard_seconds"]
+            )
+            episode = self._episode_for_process(
+                connection,
+                task_id=task_id,
+                spec_revision=int(context["current_spec_revision"]),
+                deadline_seconds=deadline_seconds,
+            )
             job_id = str(uuid.uuid4())
             connection.execute(
                 """
                 INSERT INTO host_jobs(
                     job_id, task_id, attempt_id, run_id, worker_id, provider,
-                    fencing_token, session_generation, spec_revision
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    fencing_token, session_generation, spec_revision,
+                    episode_id, episode_process_number
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id, task_id, attempt_id, run_id, context["worker_id"], provider,
                     context["fencing_token"], context["session_generation"],
                     context["current_spec_revision"],
+                    episode["id"], episode["host_process_count"],
                 ),
             )
             return dict(connection.execute(
                 "SELECT * FROM host_jobs WHERE job_id = ?", (job_id,)
             ).fetchone())
+
+    def observe_episode(
+        self,
+        job_id: str,
+        snapshot: dict[str, Any],
+        *,
+        fault_class: str | None,
+        same_fault_limit: int,
+        zero_progress_limit: int,
+    ) -> dict[str, Any]:
+        with self.database.transaction(immediate=True) as connection:
+            row = connection.execute(
+                """
+                SELECT e.*,
+                       MAX(0, CAST(
+                           (julianday(CURRENT_TIMESTAMP) - julianday(e.started_at))
+                           * 86400 AS INTEGER
+                       )) AS elapsed_seconds,
+                       CURRENT_TIMESTAMP >= e.deadline_at AS deadline_reached,
+                       CURRENT_TIMESTAMP >= e.wall_deadline_at AS wall_clock_reached
+                FROM host_jobs h
+                JOIN execution_episodes e ON e.id = h.episode_id
+                WHERE h.job_id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"execution episode not found for Host Job: {job_id}")
+            episode = dict(row)
+            decision = ExecutionEpisodeWatchdog.evaluate(
+                episode,
+                snapshot,
+                fault_class=fault_class,
+                elapsed_seconds=int(row["elapsed_seconds"]),
+                deadline_reached=bool(row["deadline_reached"]),
+                wall_clock_reached=bool(row["wall_clock_reached"]),
+                same_fault_limit=max(1, same_fault_limit),
+                zero_progress_limit=max(1, zero_progress_limit),
+            )
+            previous_alert = bool(row["burn_rate_alert"])
+            burn_rate_alert = previous_alert or decision.burn_rate_alert
+            running = str(snapshot.get("status") or "") in {
+                "dispatching", "running", "orphan_running", "cancelling",
+            }
+            last_fault_class = (
+                fault_class
+                if fault_class is not None
+                else None if running else row["last_fault_class"]
+            )
+            observed_tokens = max(
+                int(row["observed_tokens"]),
+                int(snapshot.get("input_tokens") or 0)
+                + int(snapshot.get("output_tokens") or 0),
+            )
+            connection.execute(
+                """
+                UPDATE execution_episodes
+                SET last_fault_class = ?,
+                    same_fault_count = ?, zero_progress_rounds = ?,
+                    progress_bytes = ?, observed_tokens = ?,
+                    burn_rate_tokens_per_minute = ?,
+                    burn_rate_alert = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND status = 'active'
+                """,
+                (
+                    last_fault_class,
+                    decision.same_fault_count,
+                    decision.zero_progress_rounds,
+                    decision.progress_bytes,
+                    observed_tokens,
+                    decision.burn_rate_tokens_per_minute,
+                    1 if burn_rate_alert else 0,
+                    row["id"],
+                ),
+            )
+            return {
+                **asdict(decision),
+                "burn_rate_alert": burn_rate_alert,
+                "episode_id": row["id"],
+                "recovery_count": int(row["recovery_count"]),
+                "recovery_stage": row["recovery_stage"],
+                "alert_raised": decision.burn_rate_alert and not previous_alert,
+            }
+
+    def terminate_episode(
+        self,
+        job_id: str,
+        *,
+        reason: str,
+        snapshot: dict[str, Any],
+        force_circuit: bool = False,
+    ) -> dict[str, Any]:
+        with self.database.transaction(immediate=True) as connection:
+            row = connection.execute(
+                """
+                SELECT e.*, h.run_id, h.external_session_id
+                FROM host_jobs h
+                JOIN execution_episodes e ON e.id = h.episode_id
+                WHERE h.job_id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"execution episode not found for Host Job: {job_id}")
+            recovery_action = (
+                "circuit_open"
+                if force_circuit
+                else next_recovery_action(int(row["recovery_count"]))
+            )
+            checkpoint = {
+                "episode_id": row["id"],
+                "host_job_id": job_id,
+                "run_id": row["run_id"],
+                "recovery_action": recovery_action,
+                "reason": reason,
+                "fault_class": snapshot.get("failure_class"),
+                "progress_bytes": int(row["progress_bytes"]),
+                "output_ref": snapshot.get("output_ref"),
+                "carry_forward_ref": snapshot.get("carry_forward_ref"),
+                "external_session_id": (
+                    snapshot.get("session_id")
+                    or snapshot.get("external_session_id")
+                    or row["external_session_id"]
+                ),
+            }
+            connection.execute(
+                """
+                UPDATE execution_episodes
+                SET status = ?, checkpoint_json = ?, end_reason = ?,
+                    ended_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND status = 'active'
+                """,
+                (
+                    "circuit_open" if recovery_action == "circuit_open" else "terminated",
+                    json.dumps(checkpoint, ensure_ascii=False, sort_keys=True),
+                    reason,
+                    row["id"],
+                ),
+            )
+            return checkpoint
+
+    def complete_episode(self, job_id: str) -> None:
+        with self.database.transaction(immediate=True) as connection:
+            connection.execute(
+                """
+                UPDATE execution_episodes
+                SET status = 'completed', ended_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = (
+                    SELECT episode_id FROM host_jobs WHERE job_id = ?
+                ) AND status = 'active'
+                """,
+                (job_id,),
+            )
+
+    def latest_episode(self, task_id: str) -> dict[str, Any] | None:
+        connection = self.database.connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT * FROM execution_episodes
+                WHERE task_id = ? ORDER BY ordinal DESC LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            episode = dict(row)
+            episode["checkpoint"] = (
+                json.loads(episode.pop("checkpoint_json"))
+                if episode["checkpoint_json"] else None
+            )
+            return episode
+        finally:
+            connection.close()
 
     def record(self, job_id: str, snapshot: dict[str, Any]) -> dict[str, Any]:
         compact = _compact_snapshot(snapshot)
@@ -184,36 +380,83 @@ class HostJobRepository:
                 (job_id,),
             )
 
-    def consecutive_faults(
-        self,
-        worker_id: str | None,
+    @staticmethod
+    def _episode_for_process(
+        connection: Any,
         *,
-        session_generation: int | None,
-        reason: str,
-        before_job_id: str,
-        limit: int,
-    ) -> int:
-        if not worker_id or limit <= 0:
-            return 0
-        connection = self.database.connect()
-        try:
-            rows = connection.execute(
+        task_id: str,
+        spec_revision: int,
+        deadline_seconds: int,
+    ) -> dict[str, Any]:
+        latest = connection.execute(
+            """
+            SELECT * FROM execution_episodes
+            WHERE task_id = ? ORDER BY ordinal DESC LIMIT 1
+            """,
+            (task_id,),
+        ).fetchone()
+        if latest is not None and latest["status"] == "circuit_open":
+            raise ValueError("execution episode circuit is open")
+        if latest is None or latest["status"] != "active":
+            ordinal = 1 if latest is None else int(latest["ordinal"]) + 1
+            recovery_count = (
+                int(latest["recovery_count"]) + 1
+                if latest is not None and latest["status"] == "terminated"
+                else 0
+            )
+            recovery_stage = {
+                0: "execute",
+                1: "resume",
+                2: "replan",
+                3: "replacement",
+            }.get(recovery_count)
+            if recovery_stage is None:
+                raise ValueError("execution episode recovery is exhausted")
+            episode_id = str(uuid.uuid4())
+            connection.execute(
                 """
-                SELECT last_error FROM host_jobs
-                WHERE worker_id = ? AND session_generation IS ?
-                  AND job_id != ? AND consumed_at IS NOT NULL
-                ORDER BY updated_at DESC, created_at DESC LIMIT ?
+                INSERT INTO execution_episodes(
+                    id, task_id, spec_revision, ordinal, recovery_count,
+                    recovery_stage, deadline_at, wall_deadline_at,
+                    max_host_processes
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?,
+                    datetime('now', ?), datetime('now', ?), ?
+                )
                 """,
-                (worker_id, session_generation, before_job_id, limit),
-            ).fetchall()
-        finally:
-            connection.close()
-        count = 0
-        for row in rows:
-            if row["last_error"] != reason:
-                break
-            count += 1
-        return count
+                (
+                    episode_id,
+                    task_id,
+                    spec_revision,
+                    ordinal,
+                    recovery_count,
+                    recovery_stage,
+                    f"+{max(1, deadline_seconds)} seconds",
+                    f"+{MAX_EPISODE_WALL_SECONDS} seconds",
+                    MAX_EPISODE_HOST_PROCESSES,
+                ),
+            )
+        else:
+            episode_id = str(latest["id"])
+        reserved = connection.execute(
+            """
+            UPDATE execution_episodes
+            SET host_process_count = host_process_count + 1,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status = 'active'
+              AND host_process_count < max_host_processes
+            """,
+            (episode_id,),
+        )
+        if reserved.rowcount != 1:
+            raise ValueError("execution episode Host process limit reached")
+        episode = connection.execute(
+            "SELECT * FROM execution_episodes WHERE id = ?",
+            (episode_id,),
+        ).fetchone()
+        if episode is None:
+            raise ValueError("execution episode Host process limit reached")
+        return dict(episode)
 
 
 def _compact_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:

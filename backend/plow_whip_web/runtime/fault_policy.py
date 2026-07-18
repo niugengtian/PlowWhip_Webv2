@@ -131,22 +131,3 @@ class FaultPolicy:
         return HostFaultDecision(
             "needs_human", "unknown_host_failure", "unknown_host_failure"
         )
-
-    @staticmethod
-    def decide(failure_class: str, *, occurrences: int, attempts_left: int) -> str:
-        if failure_class == "provider_capacity":
-            return "needs_human" if occurrences >= 3 else "defer"
-        if failure_class in {
-            "database_locked", "domestic_unavailable", "overseas_unavailable",
-            "offline", "transient_transport",
-        }:
-            return "defer"
-        if failure_class in {"provider_auth", "permission_denied"}:
-            return "needs_human"
-        if occurrences >= 3 or attempts_left <= 0:
-            return "terminal_failed"
-        if failure_class in {
-            "timeout", "command_failed", "verification_failed", "no_progress",
-        }:
-            return "retry_backoff"
-        return "needs_human"

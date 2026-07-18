@@ -214,6 +214,7 @@ class TaskView(BaseModel):
     handoff: dict[str, Any] | None = None
     spec_revision: int
     spec: dict[str, Any]
+    execution_episode: dict[str, Any] | None = None
 
     @classmethod
     def from_record(cls, record: TaskRecord) -> "TaskView":
