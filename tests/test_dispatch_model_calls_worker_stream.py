@@ -11,6 +11,11 @@ from plow_whip_web.config import Settings
 from plow_whip_web.domain.model import HostBridgeRejectedError, ProviderUnavailableError
 from plow_whip_web.providers.generic_command import ExecutionResult
 from plow_whip_web.providers.host_bridge import HostBridgeClient
+from plow_whip_web.runtime.host_reconciliation import (
+    dispatch_outcome,
+    reconciliation_deadline_modifier,
+    requires_reconciliation,
+)
 
 
 class BridgeFixture:
@@ -152,6 +157,16 @@ def test_unknown_dispatch_deadline_is_deterministic_and_never_redispatched() -> 
             assert tuple(call) == ("failed", "dispatch_reconciliation_timeout")
         finally:
             connection.close()
+
+
+def test_host_reconciliation_reduces_to_three_states_and_bounds_recovery_hold() -> None:
+    assert dispatch_outcome("running", host_pid=42) == "accepted"
+    assert dispatch_outcome("rejected") == "rejected"
+    assert dispatch_outcome("unknown") == "unknown"
+    assert dispatch_outcome("recovery_hold", host_pid=42) == "accepted"
+    assert requires_reconciliation("accepted", "recovery_hold")
+    assert not requires_reconciliation("accepted", "running")
+    assert reconciliation_deadline_modifier() == "+120 seconds"
 
 
 def test_rejected_dispatch_is_terminal_fact_not_unknown() -> None:

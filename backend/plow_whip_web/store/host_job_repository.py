@@ -11,11 +11,13 @@ from plow_whip_web.runtime.execution_episode import (
     MAX_EPISODE_WALL_SECONDS,
     next_recovery_action,
 )
+from plow_whip_web.runtime.host_reconciliation import (
+    dispatch_outcome,
+    reconciliation_deadline_modifier,
+    requires_reconciliation,
+)
 from plow_whip_web.security import Redactor
 from plow_whip_web.store.database import Database
-
-
-RECONCILIATION_SECONDS = 120
 
 
 class HostJobRepository:
@@ -84,7 +86,7 @@ class HostJobRepository:
                     context["fencing_token"], context["session_generation"],
                     context["current_spec_revision"],
                     episode["id"], episode["host_process_count"],
-                    f"+{RECONCILIATION_SECONDS} seconds",
+                    reconciliation_deadline_modifier(),
                 ),
             )
             return dict(connection.execute(
@@ -272,7 +274,8 @@ class HostJobRepository:
         session_id = snapshot.get("session_id") or snapshot.get("external_session_id")
         error_summary = compact.get("error_summary")
         status = str(snapshot.get("status") or "unknown")
-        accepted = status not in {"unknown", "recovery_hold", "rejected"}
+        outcome = dispatch_outcome(status, host_pid=snapshot.get("pid"))
+        accepted = outcome == "accepted"
         with self.database.transaction(immediate=True) as connection:
             connection.execute(
                 """
@@ -343,15 +346,18 @@ class HostJobRepository:
         try:
             row = connection.execute(
                 """
-                SELECT (dispatch_outcome = 'unknown'
-                        OR status = 'recovery_hold') AS reconciling,
+                SELECT dispatch_outcome, status,
                        reconciliation_deadline_at IS NOT NULL
                        AND CURRENT_TIMESTAMP >= reconciliation_deadline_at AS expired
                 FROM host_jobs WHERE job_id = ? AND consumed_at IS NULL
                 """,
                 (job_id,),
             ).fetchone()
-            return bool(row and row["reconciling"] and row["expired"])
+            return bool(
+                row
+                and requires_reconciliation(row["dispatch_outcome"], row["status"])
+                and row["expired"]
+            )
         finally:
             connection.close()
 
@@ -422,7 +428,7 @@ class HostJobRepository:
                     updated_at = CURRENT_TIMESTAMP
                 WHERE job_id = ? AND consumed_at IS NULL
                 """,
-                (f"+{RECONCILIATION_SECONDS} seconds", error[:1000], job_id),
+                (reconciliation_deadline_modifier(), error[:1000], job_id),
             )
             row = connection.execute(
                 "SELECT task_id, worker_id FROM host_jobs WHERE job_id = ?", (job_id,)
