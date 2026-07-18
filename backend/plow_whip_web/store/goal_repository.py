@@ -305,7 +305,8 @@ class GoalRepository:
                     """
                     SELECT t.id, t.status, t.revision, t.last_evidence_hash,
                            t.last_error, t.depends_on_json, t.manual_override,
-                           t.current_spec_revision, s.spec_json, s.spec_hash,
+                           t.current_spec_revision, t.work_item_kind,
+                           s.spec_json, s.spec_hash,
                            em.manifest_hash, em.rowid AS evidence_sequence
                     FROM tasks t
                     LEFT JOIN task_specs s ON s.task_id = t.id
@@ -334,10 +335,19 @@ class GoalRepository:
                         safety_reason = safety_reason or "task_spec_missing_or_corrupt"
                     if any(dependency not in facts for dependency in depends):
                         safety_reason = safety_reason or "dependency_missing"
-                    dependencies_complete = all(
+                    dependencies_valid = all(
                         facts[dependency]["valid_completion"] for dependency in depends
                         if dependency in facts
                     ) and len(depends) == sum(dependency in facts for dependency in depends)
+                    dependencies_state_completed = all(
+                        facts[dependency]["status"] == TaskStatus.COMPLETED.value
+                        for dependency in depends if dependency in facts
+                    ) and len(depends) == sum(dependency in facts for dependency in depends)
+                    dependencies_complete = (
+                        dependencies_state_completed
+                        if child["work_item_kind"] == "verification"
+                        else dependencies_valid
+                    )
                     dependency_evidence_sequence = max(
                         (
                             int(facts[dependency]["evidence_sequence"] or 0)
@@ -356,6 +366,17 @@ class GoalRepository:
                     facts[child["id"]] = {
                         "valid_completion": valid_completion,
                         "evidence_sequence": child["evidence_sequence"],
+                        "status": child["status"],
+                        "work_item_kind": child["work_item_kind"],
+                        "own_evidence": own_evidence,
+                        "dependency_closure": {
+                            ancestor
+                            for dependency in depends if dependency in facts
+                            for ancestor in (
+                                dependency,
+                                *facts[dependency]["dependency_closure"],
+                            )
+                        },
                     }
 
                     if (
@@ -463,8 +484,6 @@ class GoalRepository:
                                 TaskStatus.TERMINAL_FAILED.value
                             )
 
-                    if child["status"] == TaskStatus.COMPLETED.value and not own_evidence:
-                        safety_reason = safety_reason or "evidence_manifest_missing"
                     if (
                         child["status"] == TaskStatus.COMPLETED.value
                         and own_evidence
@@ -519,7 +538,12 @@ class GoalRepository:
                             next_revision = int(child["revision"]) + 1
                             handoff = (
                                 _handoff_from_completed(connection, depends[-1])
-                                if desired == TaskStatus.READY.value and depends else None
+                                if (
+                                    desired == TaskStatus.READY.value
+                                    and depends
+                                    and dependencies_valid
+                                )
+                                else None
                             )
                             connection.execute(
                                 """
@@ -559,6 +583,36 @@ class GoalRepository:
                             if desired == TaskStatus.READY.value:
                                 unblocked.append(child["id"])
 
+                verification_candidates = [
+                    fact for fact in facts.values()
+                    if fact["work_item_kind"] == "verification"
+                    and fact["status"] not in {
+                        TaskStatus.CANCELLED.value,
+                        TaskStatus.TERMINAL_FAILED.value,
+                    }
+                ]
+                candidate_coverage = {
+                    task_id
+                    for fact in verification_candidates
+                    for task_id in fact["dependency_closure"]
+                }
+                valid_verification_coverage = {
+                    task_id
+                    for fact in verification_candidates if fact["valid_completion"]
+                    for task_id in fact["dependency_closure"]
+                }
+                uncovered_missing_evidence = [
+                    task_id for task_id, fact in facts.items()
+                    if fact["status"] == TaskStatus.COMPLETED.value
+                    and not fact["own_evidence"]
+                    and not (
+                        fact["work_item_kind"] == "implementation"
+                        and task_id in candidate_coverage
+                    )
+                ]
+                if uncovered_missing_evidence:
+                    safety_reason = safety_reason or "evidence_manifest_missing"
+
                 statuses = {
                     status_overrides.get(row["id"], row["status"])
                     for row in children
@@ -575,7 +629,12 @@ class GoalRepository:
                     safety_reason=safety_reason,
                     child_statuses=statuses,
                     all_completed=bool(children) and all(
-                        facts[row["id"]]["valid_completion"] for row in children
+                        facts[row["id"]]["valid_completion"]
+                        or (
+                            facts[row["id"]]["work_item_kind"] == "implementation"
+                            and row["id"] in valid_verification_coverage
+                        )
+                        for row in children
                     ),
                     has_autonomy_blocker=human_child is not None,
                 )

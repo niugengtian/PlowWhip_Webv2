@@ -9,7 +9,7 @@ from plow_whip_web.config import Settings
 from plow_whip_web.runtime.orchestration import GoalPlan, PlannedWorkItem
 
 
-def _goal(app, project_path: Path):
+def _goal(app, project_path: Path, *, include_verifier: bool = False):
     project = app.state.project_repository.create(
         name="goal-reducer", path=str(project_path)
     )
@@ -21,6 +21,15 @@ def _goal(app, project_path: Path):
         items=(
             PlannedWorkItem(1, "capability", "implementation", "one", "one", ()),
             PlannedWorkItem(2, "capability", "implementation", "two", "two", (1,)),
+            *(
+                (
+                    PlannedWorkItem(
+                        3, "verification", "verification",
+                        "verify", "verify all completed implementation", (2,),
+                    ),
+                )
+                if include_verifier else ()
+            ),
         ),
     )
     return app.state.goal_repository.create_with_plan(
@@ -218,6 +227,46 @@ def test_missing_spec_or_completion_evidence_requires_human() -> None:
         assert evidence_result["blocked_goals"] == [{
             "goal_id": goal["id"], "reason": "evidence_manifest_missing",
         }]
+
+
+def test_aggregate_verifier_can_attest_legacy_completed_dependencies() -> None:
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        project_path = root / "project"
+        project_path.mkdir()
+        app = create_app(Settings(data_dir=root / "runtime"))
+        goal = _goal(app, project_path, include_verifier=True)
+        first_id, second_id, verifier_id = [
+            item["id"] for item in goal["work_items"]
+        ]
+        with app.state.database.transaction(immediate=True) as connection:
+            connection.execute(
+                """
+                UPDATE tasks SET status = 'completed', last_evidence_hash = NULL
+                WHERE id IN (?, ?)
+                """,
+                (first_id, second_id),
+            )
+
+        pending = app.state.goal_repository.advance()
+        verifier = app.state.task_repository.get(verifier_id)
+
+        assert pending["blocked_goals"] == []
+        assert verifier.status.value == "ready"
+        assert verifier.handoff is None
+        assert app.state.goal_repository.get(goal["id"])["status"] == "running"
+
+        completed_verifier = app.state.task_service.drive(
+            verifier.id,
+            expected_revision=verifier.revision,
+            idempotency_key="aggregate-verifier-drive",
+        )
+        settled = app.state.goal_repository.advance()
+
+        assert completed_verifier.status.value == "completed"
+        assert completed_verifier.evidence_manifest is not None
+        assert settled["completed_goals"] == [goal["id"]]
+        assert app.state.goal_repository.get(goal["id"])["status"] == "completed"
 
 
 def test_episode_exhaustion_replans_once_then_converges_without_job_loop() -> None:
