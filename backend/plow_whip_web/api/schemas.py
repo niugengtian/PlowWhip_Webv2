@@ -162,6 +162,27 @@ class TaskDeleteRequest(ExpectedRevision):
     reason: Annotated[str, Field(min_length=1, max_length=500)]
 
 
+class TaskAmendRequest(ExpectedRevision):
+    reason: Annotated[str, Field(min_length=1, max_length=500)]
+    objective: Annotated[str, Field(min_length=1, max_length=4000)]
+    scope: Annotated[list[str], Field(max_length=64)] = Field(default_factory=list)
+    acceptance: Annotated[list[str], Field(max_length=64)] = Field(default_factory=list)
+    verification: Annotated[list[VerificationSpec], Field(min_length=1, max_length=32)]
+    artifacts: Annotated[list[str], Field(max_length=64)] = Field(default_factory=list)
+    constraints: Annotated[list[str], Field(max_length=64)] = Field(default_factory=list)
+    deadline: TaskDeadline
+
+    @field_validator("artifacts")
+    @classmethod
+    def artifact_paths_must_be_safe(cls, value: list[str]) -> list[str]:
+        if any(
+            not item or Path(item).is_absolute() or ".." in Path(item).parts
+            for item in value
+        ):
+            raise ValueError("artifacts require safe relative paths")
+        return value
+
+
 class TaskDeletionEligibilityView(BaseModel):
     deletable: bool
     reason: str | None
@@ -420,7 +441,9 @@ class RebindWorkerRequest(BaseModel):
 
 
 class TaskControl(BaseModel):
-    action: Literal["pause", "resume", "cancel", "needs_human"]
+    action: Literal[
+        "pause", "resume", "cancel", "needs_human", "retry", "restart",
+    ]
     reason: Annotated[str, Field(min_length=1, max_length=500)]
     expected_revision: Annotated[int, Field(ge=0)]
 

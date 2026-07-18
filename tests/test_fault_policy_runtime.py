@@ -333,6 +333,24 @@ def test_capacity_text_overrides_command_failed_and_retains_session() -> None:
             json.loads(row["checkpoint_json"])["recovery_action"]
             for row in episodes
         ] == ["resume", "replan", "replacement", "circuit_open"]
+
+        restarted = app.state.task_repository.control(
+            current.id,
+            action="restart",
+            reason="explicit new TaskSpec revision",
+            expected_revision=current.revision,
+            idempotency_key="restart-after-episode-circuit",
+        )
+        running_again = app.state.task_service.drive(
+            restarted.id,
+            expected_revision=restarted.revision,
+            idempotency_key="drive-after-episode-circuit",
+        )
+        next_episode = app.state.host_jobs.latest_episode(current.id)
+        assert running_again.status.value == "running"
+        assert restarted.spec_revision == 2
+        assert next_episode["status"] == "active"
+        assert next_episode["spec_revision"] == 2
     finally:
         directory.cleanup()
 

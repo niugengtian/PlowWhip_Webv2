@@ -6,6 +6,7 @@ import uuid
 from typing import Any
 
 from plow_whip_web.domain.model import DomainError, NotFoundError, TaskStatus
+from plow_whip_web.runtime.goal_reducer import reduce_goal_status
 from plow_whip_web.runtime.orchestration import (
     GoalPlan,
     PlannedWorkItem,
@@ -273,135 +274,327 @@ class GoalRepository:
             connection.close()
 
     def advance(self) -> dict[str, Any]:
-        """Unblock ready children and settle parents. Idempotent and 0 Token."""
+        """Normalize task gates and recompute every Goal from immutable facts."""
         unblocked: list[str] = []
+        replanned: list[str] = []
         completed_goals: list[str] = []
         blocked_goals: list[dict[str, str]] = []
         with self.database.transaction(immediate=True) as connection:
-            paused = connection.execute(
+            # Legacy parent ids are compatibility columns, never Goal truth.
+            connection.execute(
+                "UPDATE goals SET parent_task_id = NULL WHERE parent_task_id IS NOT NULL"
+            )
+            connection.execute(
                 """
-                SELECT id, depends_on_json, parent_task_id, goal_id, revision
-                FROM tasks
-                WHERE status = 'paused'
-                  AND work_item_kind IN ('implementation', 'verification')
-                  AND goal_id IS NOT NULL
-                ORDER BY ordinal, created_at, id
+                UPDATE tasks SET parent_task_id = NULL
+                WHERE goal_id IS NOT NULL AND parent_task_id IS NOT NULL
                 """
-            ).fetchall()
-            for row in paused:
-                depends = json.loads(row["depends_on_json"] or "[]")
-                if not depends:
-                    continue
-                pending = connection.execute(
-                    f"""
-                    SELECT id, status FROM tasks
-                    WHERE id IN ({",".join("?" for _ in depends)})
-                    """,
-                    tuple(depends),
-                ).fetchall()
-                if len(pending) != len(depends):
-                    continue
-                if any(item["status"] != TaskStatus.COMPLETED.value for item in pending):
-                    if any(
-                        item["status"] in {
-                            TaskStatus.TERMINAL_FAILED.value,
-                            TaskStatus.NEEDS_HUMAN.value,
-                            TaskStatus.CANCELLED.value,
-                        }
-                        for item in pending
-                    ):
-                        continue
-                    continue
-                handoff = _handoff_from_completed(connection, depends[-1])
-                next_revision = int(row["revision"]) + 1
-                connection.execute(
-                    """
-                    UPDATE tasks SET status = 'ready', revision = ?, blocked_reason = NULL,
-                        handoff_json = ?, updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ? AND status = 'paused' AND revision = ?
-                    """,
-                    (
-                        next_revision,
-                        json.dumps(handoff, ensure_ascii=False, sort_keys=True)
-                        if handoff else None,
-                        row["id"],
-                        row["revision"],
-                    ),
-                )
-                connection.execute(
-                    """
-                    INSERT INTO task_events(
-                        task_id, event_type, payload_json, state_revision, idempotency_key
-                    ) VALUES (?, 'goal.work_item_unblocked', ?, ?, ?)
-                    """,
-                    (
-                        row["id"],
-                        json.dumps(
-                            {"depends_on": depends, "handoff": handoff},
-                            ensure_ascii=False,
-                            sort_keys=True,
-                        ),
-                        next_revision,
-                        f"goal-unblock:{row['id']}:{next_revision}",
-                    ),
-                )
-                unblocked.append(row["id"])
-
+            )
             goals = connection.execute(
-                "SELECT id FROM goals WHERE status = 'running'"
+                "SELECT id, status, current_spec_revision FROM goals ORDER BY created_at, id"
             ).fetchall()
             for goal in goals:
+                goal_spec = connection.execute(
+                    """
+                    SELECT spec_json, spec_hash FROM goal_specs
+                    WHERE goal_id = ? AND spec_revision = ?
+                    """,
+                    (goal["id"], goal["current_spec_revision"]),
+                ).fetchone()
                 children = connection.execute(
                     """
-                    SELECT id, status, revision, last_evidence_hash FROM tasks
-                    WHERE goal_id = ?
+                    SELECT t.id, t.status, t.revision, t.last_evidence_hash,
+                           t.last_error, t.depends_on_json, t.manual_override,
+                           t.current_spec_revision, s.spec_json, s.spec_hash,
+                           em.manifest_hash, em.rowid AS evidence_sequence
+                    FROM tasks t
+                    LEFT JOIN task_specs s ON s.task_id = t.id
+                        AND s.spec_revision = t.current_spec_revision
+                    LEFT JOIN evidence_manifests em ON em.task_id = t.id
+                        AND em.spec_revision = t.current_spec_revision
+                        AND em.manifest_hash = t.last_evidence_hash
+                        AND em.passed = 1
+                    WHERE t.goal_id = ?
                       AND work_item_kind IN ('implementation', 'verification')
-                    ORDER BY ordinal, created_at, id
+                    ORDER BY t.ordinal, t.created_at, t.id
                     """,
                     (goal["id"],),
                 ).fetchall()
-                if not children:
-                    continue
-                statuses = {row["status"] for row in children}
-                if TaskStatus.NEEDS_HUMAN.value in statuses:
-                    self._settle_goal(
-                        connection, goal["id"], children[-1],
-                        status="needs_human", reason="child_needs_human",
+                safety_reason = None
+                if not _valid_spec_row(goal_spec):
+                    safety_reason = "goal_spec_missing_or_corrupt"
+                elif not children:
+                    safety_reason = "task_spec_missing"
+
+                facts: dict[str, dict[str, Any]] = {}
+                status_overrides: dict[str, str] = {}
+                for child in children:
+                    depends = json.loads(child["depends_on_json"] or "[]")
+                    if not _valid_spec_row(child):
+                        safety_reason = safety_reason or "task_spec_missing_or_corrupt"
+                    if any(dependency not in facts for dependency in depends):
+                        safety_reason = safety_reason or "dependency_missing"
+                    dependencies_complete = all(
+                        facts[dependency]["valid_completion"] for dependency in depends
+                        if dependency in facts
+                    ) and len(depends) == sum(dependency in facts for dependency in depends)
+                    dependency_evidence_sequence = max(
+                        (
+                            int(facts[dependency]["evidence_sequence"] or 0)
+                            for dependency in depends if dependency in facts
+                        ),
+                        default=0,
                     )
-                    blocked_goals.append(
-                        {"goal_id": goal["id"], "reason": "child_needs_human"}
+                    own_evidence = child["manifest_hash"] is not None
+                    valid_completion = (
+                        child["status"] == TaskStatus.COMPLETED.value
+                        and own_evidence
+                        and dependencies_complete
+                        and int(child["evidence_sequence"] or 0)
+                        >= dependency_evidence_sequence
                     )
-                    continue
-                if TaskStatus.TERMINAL_FAILED.value in statuses or TaskStatus.CANCELLED.value in statuses:
-                    self._settle_goal(
-                        connection, goal["id"], children[-1],
-                        status="terminal_failed", reason="child_terminal_failed",
-                    )
-                    blocked_goals.append(
-                        {"goal_id": goal["id"], "reason": "child_terminal_failed"}
-                    )
-                    continue
-                all_done = all(
-                    row["status"] == TaskStatus.COMPLETED.value
-                    and row["last_evidence_hash"]
-                    and connection.execute(
-                        """
-                        SELECT 1 FROM evidence_manifests
-                        WHERE task_id = ? AND passed = 1
-                          AND manifest_hash = ?
-                        """,
-                        (row["id"], row["last_evidence_hash"]),
-                    ).fetchone()
+                    facts[child["id"]] = {
+                        "valid_completion": valid_completion,
+                        "evidence_sequence": child["evidence_sequence"],
+                    }
+
+                    if (
+                        child["status"] == TaskStatus.NEEDS_HUMAN.value
+                        and not _autonomy_blocker(child["last_error"])
+                        and _valid_spec_row(child)
+                    ):
+                        prior_replan = connection.execute(
+                            """
+                            SELECT 1 FROM task_events
+                            WHERE task_id = ?
+                              AND event_type = 'goal.work_item_replanned'
+                              AND json_extract(
+                                  payload_json, '$.to_spec_revision'
+                              ) = ?
+                            LIMIT 1
+                            """,
+                            (child["id"], child["current_spec_revision"]),
+                        ).fetchone()
+                        next_revision = int(child["revision"]) + 1
+                        if prior_replan is None:
+                            spec_revision = int(child["current_spec_revision"]) + 1
+                            insert_task_spec(
+                                connection,
+                                child["id"],
+                                json.loads(child["spec_json"]),
+                                revision=spec_revision,
+                            )
+                            target = (
+                                TaskStatus.READY.value
+                                if dependencies_complete else TaskStatus.PAUSED.value
+                            )
+                            connection.execute(
+                                """
+                                UPDATE tasks SET current_spec_revision = ?, status = ?,
+                                    revision = ?, attempts_used = 0,
+                                    same_failure_count = 0, no_progress_count = 0,
+                                    last_failure_fingerprint = NULL,
+                                    last_evidence_hash = NULL, last_error = NULL,
+                                    next_eligible_at = NULL, manual_override = 0,
+                                    blocked_reason = ?, handoff_json = NULL,
+                                    updated_at = CURRENT_TIMESTAMP
+                                WHERE id = ? AND revision = ?
+                                """,
+                                (
+                                    spec_revision, target, next_revision,
+                                    None if dependencies_complete
+                                    else f"waiting_on:{','.join(depends)}",
+                                    child["id"], child["revision"],
+                                ),
+                            )
+                            connection.execute(
+                                """
+                                INSERT INTO task_events(
+                                    task_id, event_type, payload_json,
+                                    state_revision, idempotency_key
+                                ) VALUES (?, 'goal.work_item_replanned', ?, ?, ?)
+                                """,
+                                (
+                                    child["id"],
+                                    json.dumps(
+                                        {
+                                            "from_spec_revision": child[
+                                                "current_spec_revision"
+                                            ],
+                                            "to_spec_revision": spec_revision,
+                                            "reason": child["last_error"],
+                                        },
+                                        ensure_ascii=False, sort_keys=True,
+                                    ),
+                                    next_revision,
+                                    f"goal-replan:{child['id']}:{spec_revision}",
+                                ),
+                            )
+                            status_overrides[child["id"]] = target
+                            replanned.append(child["id"])
+                        else:
+                            connection.execute(
+                                """
+                                UPDATE tasks SET status = 'terminal_failed', revision = ?,
+                                    last_error = 'goal_replan_exhausted',
+                                    updated_at = CURRENT_TIMESTAMP
+                                WHERE id = ? AND revision = ?
+                                """,
+                                (next_revision, child["id"], child["revision"]),
+                            )
+                            connection.execute(
+                                """
+                                INSERT INTO task_events(
+                                    task_id, event_type, payload_json,
+                                    state_revision, idempotency_key
+                                ) VALUES (?, 'task.terminal_failed', ?, ?, ?)
+                                """,
+                                (
+                                    child["id"],
+                                    json.dumps(
+                                        {"reason": "goal_replan_exhausted"},
+                                        sort_keys=True,
+                                    ),
+                                    next_revision,
+                                    f"goal-replan-exhausted:{child['id']}",
+                                ),
+                            )
+                            status_overrides[child["id"]] = (
+                                TaskStatus.TERMINAL_FAILED.value
+                            )
+
+                    if child["status"] == TaskStatus.COMPLETED.value and not own_evidence:
+                        safety_reason = safety_reason or "evidence_manifest_missing"
+                    if (
+                        child["status"] == TaskStatus.COMPLETED.value
+                        and own_evidence
+                        and not valid_completion
+                    ):
+                        next_revision = int(child["revision"]) + 1
+                        connection.execute(
+                            """
+                            UPDATE tasks SET status = 'paused', revision = ?,
+                                attempts_used = 0, last_evidence_hash = NULL,
+                                blocked_reason = ?, handoff_json = NULL,
+                                updated_at = CURRENT_TIMESTAMP
+                            WHERE id = ? AND revision = ?
+                            """,
+                            (
+                                next_revision,
+                                f"waiting_on:{','.join(depends)}",
+                                child["id"], child["revision"],
+                            ),
+                        )
+                        connection.execute(
+                            """
+                            INSERT INTO task_events(
+                                task_id, event_type, payload_json,
+                                state_revision, idempotency_key
+                            ) VALUES (?, 'goal.work_item_invalidated', ?, ?, ?)
+                            """,
+                            (
+                                child["id"],
+                                json.dumps(
+                                    {"depends_on": depends},
+                                    ensure_ascii=False, sort_keys=True,
+                                ),
+                                next_revision,
+                                f"goal-invalidate:{child['id']}:{next_revision}",
+                            ),
+                        )
+                    if child["status"] in {
+                        TaskStatus.READY.value,
+                        TaskStatus.PAUSED.value,
+                    }:
+                        desired = (
+                            TaskStatus.READY.value
+                            if dependencies_complete and not child["manual_override"]
+                            else TaskStatus.PAUSED.value
+                        )
+                        blocked_reason = (
+                            None if desired == TaskStatus.READY.value
+                            else f"waiting_on:{','.join(depends)}" if depends else "manual_pause"
+                        )
+                        if child["status"] != desired:
+                            next_revision = int(child["revision"]) + 1
+                            handoff = (
+                                _handoff_from_completed(connection, depends[-1])
+                                if desired == TaskStatus.READY.value and depends else None
+                            )
+                            connection.execute(
+                                """
+                                UPDATE tasks SET status = ?, revision = ?, blocked_reason = ?,
+                                    handoff_json = ?, updated_at = CURRENT_TIMESTAMP
+                                WHERE id = ? AND revision = ?
+                                """,
+                                (
+                                    desired, next_revision, blocked_reason,
+                                    json.dumps(handoff, ensure_ascii=False, sort_keys=True)
+                                    if handoff else None,
+                                    child["id"], child["revision"],
+                                ),
+                            )
+                            event_type = (
+                                "goal.work_item_unblocked"
+                                if desired == TaskStatus.READY.value
+                                else "goal.work_item_blocked"
+                            )
+                            connection.execute(
+                                """
+                                INSERT INTO task_events(
+                                    task_id, event_type, payload_json,
+                                    state_revision, idempotency_key
+                                ) VALUES (?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    child["id"], event_type,
+                                    json.dumps(
+                                        {"depends_on": depends, "handoff": handoff},
+                                        ensure_ascii=False, sort_keys=True,
+                                    ),
+                                    next_revision,
+                                    f"goal-gate:{child['id']}:{next_revision}:{desired}",
+                                ),
+                            )
+                            if desired == TaskStatus.READY.value:
+                                unblocked.append(child["id"])
+
+                statuses = {
+                    status_overrides.get(row["id"], row["status"])
                     for row in children
+                }
+                human_child = next(
+                    (
+                        row for row in children
+                        if row["status"] == TaskStatus.NEEDS_HUMAN.value
+                        and _autonomy_blocker(row["last_error"])
+                    ),
+                    None,
                 )
-                if all_done:
-                    self._settle_goal(
-                        connection, goal["id"], children[-1],
-                        status="completed", reason="task_gates_verified",
-                    )
+                desired, reason = reduce_goal_status(
+                    safety_reason=safety_reason,
+                    child_statuses=statuses,
+                    all_completed=bool(children) and all(
+                        facts[row["id"]]["valid_completion"] for row in children
+                    ),
+                    has_autonomy_blocker=human_child is not None,
+                )
+                changed = self._settle_goal(
+                    connection,
+                    goal["id"],
+                    children[-1] if children else None,
+                    current_status=goal["status"],
+                    status=desired,
+                    reason=reason,
+                    fact_hash=_goal_fact_hash(goal, children, desired, reason),
+                )
+                if desired == "completed" and changed:
                     completed_goals.append(goal["id"])
+                elif desired in {"needs_human", "terminal_failed", "cancelled"}:
+                    blocked_goals.append({"goal_id": goal["id"], "reason": reason})
         return {
             "unblocked": unblocked,
+            "replanned": replanned,
             "completed_goals": completed_goals,
             "blocked_goals": blocked_goals,
             "model_invoked": False,
@@ -413,31 +606,37 @@ class GoalRepository:
         goal_id: str,
         event_task: Any,
         *,
+        current_status: str,
         status: str,
         reason: str,
-    ) -> None:
+        fact_hash: str,
+    ) -> bool:
+        if status == current_status:
+            return False
         connection.execute(
             "UPDATE goals SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
             (status, goal_id),
         )
-        connection.execute(
-            """
-            INSERT INTO task_events(
-                task_id, event_type, payload_json, state_revision, idempotency_key
-            ) VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                event_task["id"],
-                f"goal.{status}",
-                json.dumps(
-                    {"goal_id": goal_id, "reason": reason},
-                    ensure_ascii=False,
-                    sort_keys=True,
+        if event_task is not None:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO task_events(
+                    task_id, event_type, payload_json, state_revision, idempotency_key
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    event_task["id"],
+                    f"goal.{status}",
+                    json.dumps(
+                        {"goal_id": goal_id, "reason": reason},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    event_task["revision"],
+                    f"goal-recompute:{goal_id}:{status}:{fact_hash}",
                 ),
-                event_task["revision"],
-                f"goal-settle:{goal_id}:{status}",
-            ),
-        )
+            )
+        return True
 
     def _get_with_connection(self, connection: Any, goal_id: str) -> dict[str, Any]:
         row = connection.execute("SELECT * FROM goals WHERE id = ?", (goal_id,)).fetchone()
@@ -645,6 +844,49 @@ def _execution_policy(raw: str | None) -> dict[str, Any] | None:
             "estimated_total_token_hard_cap",
         }
     }
+
+
+def _valid_spec_row(row: Any) -> bool:
+    if row is None or not row["spec_json"] or not row["spec_hash"]:
+        return False
+    return hashlib.sha256(row["spec_json"].encode("utf-8")).hexdigest() == row[
+        "spec_hash"
+    ]
+
+
+def _autonomy_blocker(reason: str | None) -> bool:
+    value = str(reason or "").lower()
+    return any(marker in value for marker in (
+        "provider_auth", "permission_denied", "credential", "secret",
+        "policy_violation", "security_boundary", "spec_missing",
+    ))
+
+
+def _goal_fact_hash(
+    goal: Any,
+    children: list[Any],
+    status: str,
+    reason: str,
+) -> str:
+    payload = {
+        "goal_spec_revision": int(goal["current_spec_revision"]),
+        "status": status,
+        "reason": reason,
+        "tasks": [
+            {
+                "id": row["id"],
+                "status": row["status"],
+                "revision": int(row["revision"]),
+                "spec_revision": int(row["current_spec_revision"]),
+                "evidence": row["last_evidence_hash"],
+                "depends_on": json.loads(row["depends_on_json"] or "[]"),
+            }
+            for row in children
+        ],
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:24]
 
 
 def _child_command_and_verification(

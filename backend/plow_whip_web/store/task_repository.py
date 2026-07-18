@@ -1048,6 +1048,23 @@ class TaskRepository:
                 raise RevisionConflictError(
                     f"expected revision {expected_revision}, current revision {task.revision}"
                 )
+            if action in {"retry", "restart"}:
+                if task.status not in {
+                    TaskStatus.TERMINAL_FAILED,
+                    TaskStatus.CANCELLED,
+                    TaskStatus.NEEDS_HUMAN,
+                    TaskStatus.PAUSED,
+                }:
+                    raise InvalidTransitionError(
+                        f"cannot {action} task in state {task.status}"
+                    )
+                return self._restart_with_new_spec(
+                    connection,
+                    task,
+                    action=action,
+                    reason=reason,
+                    idempotency_key=idempotency_key,
+                )
             if task.status in TERMINAL_TASK_STATUSES:
                 raise InvalidTransitionError(f"terminal task cannot be controlled: {task.status}")
             transitions = {
@@ -1062,9 +1079,26 @@ class TaskRepository:
             if task.status not in allowed:
                 raise InvalidTransitionError(f"cannot {action} task in state {task.status}")
             revision = task.revision + 1
+            if action == "resume" and not _dependencies_satisfied(connection, task):
+                target = TaskStatus.PAUSED
+            blocked_reason = (
+                _dependency_blocked_reason(task)
+                if target is TaskStatus.PAUSED and action == "resume"
+                else None
+            )
             connection.execute(
-                "UPDATE tasks SET status = ?, revision = ?, next_eligible_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (target.value, revision, task.id),
+                """
+                UPDATE tasks SET status = ?, revision = ?, next_eligible_at = NULL,
+                    manual_override = ?, blocked_reason = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    target.value,
+                    revision,
+                    1 if action == "pause" else 0,
+                    blocked_reason,
+                    task.id,
+                ),
             )
             connection.execute(
                 "INSERT INTO task_controls(task_id, action, reason) VALUES (?, ?, ?)",
@@ -1083,6 +1117,130 @@ class TaskRepository:
                     (task.id, _dump({"task_id": task.id, "reason": reason})),
                 )
             return self._get_with_connection(connection, task.id)
+
+    def amend_spec(
+        self,
+        task_id: str,
+        *,
+        spec: dict[str, Any],
+        reason: str,
+        expected_revision: int,
+        idempotency_key: str,
+    ) -> TaskRecord:
+        with self.database.transaction(immediate=True) as connection:
+            duplicate = connection.execute(
+                "SELECT task_id FROM task_events WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if duplicate:
+                return self._get_with_connection(connection, duplicate["task_id"])
+            task = self._get_with_connection(connection, task_id)
+            if task.revision != expected_revision:
+                raise RevisionConflictError(
+                    f"expected revision {expected_revision}, current revision {task.revision}"
+                )
+            if task.status in {
+                TaskStatus.RUNNING, TaskStatus.VERIFYING, TaskStatus.STOPPING,
+            }:
+                raise InvalidTransitionError("active task cannot be amended")
+            canonical = canonical_task_spec(
+                objective=str(spec.get("objective") or ""),
+                scope=list(spec.get("scope") or []),
+                acceptance=list(spec.get("acceptance") or []),
+                verification=list(spec.get("verification") or []),
+                artifacts=list(spec.get("artifacts") or []),
+                constraints=list(spec.get("constraints") or []),
+                deadline=dict(spec.get("deadline") or {}),
+            )
+            return self._replace_spec(
+                connection,
+                task,
+                spec=canonical,
+                action="spec_amended",
+                reason=reason,
+                idempotency_key=idempotency_key,
+            )
+
+    def _restart_with_new_spec(
+        self,
+        connection: Any,
+        task: TaskRecord,
+        *,
+        action: str,
+        reason: str,
+        idempotency_key: str,
+    ) -> TaskRecord:
+        return self._replace_spec(
+            connection,
+            task,
+            spec=task.spec,
+            action=action,
+            reason=reason,
+            idempotency_key=idempotency_key,
+        )
+
+    def _replace_spec(
+        self,
+        connection: Any,
+        task: TaskRecord,
+        *,
+        spec: dict[str, Any],
+        action: str,
+        reason: str,
+        idempotency_key: str,
+    ) -> TaskRecord:
+        active_dependent = connection.execute(
+            """
+            SELECT id FROM tasks
+            WHERE status IN ('running', 'verifying', 'stopping')
+              AND EXISTS (
+                  SELECT 1 FROM json_each(COALESCE(depends_on_json, '[]'))
+                  WHERE json_each.value = ?
+              )
+            LIMIT 1
+            """,
+            (task.id,),
+        ).fetchone()
+        if active_dependent:
+            raise InvalidTransitionError("active dependent must stop before amendment")
+        spec_revision = task.spec_revision + 1
+        insert_task_spec(connection, task.id, spec, revision=spec_revision)
+        ready = _dependencies_satisfied(connection, task)
+        revision = task.revision + 1
+        connection.execute(
+            """
+            UPDATE tasks SET objective = ?, verification_json = ?,
+                current_spec_revision = ?, status = ?, revision = ?,
+                attempts_used = 0, same_failure_count = 0, no_progress_count = 0,
+                last_failure_fingerprint = NULL, last_evidence_hash = NULL,
+                last_error = NULL, next_eligible_at = NULL, manual_override = 0,
+                blocked_reason = ?, handoff_json = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                spec["objective"],
+                _dump(spec["verification"]),
+                spec_revision,
+                TaskStatus.READY.value if ready else TaskStatus.PAUSED.value,
+                revision,
+                None if ready else _dependency_blocked_reason(task),
+                task.id,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO task_controls(task_id, action, reason) VALUES (?, ?, ?)",
+            (task.id, action, reason),
+        )
+        self._event(
+            connection,
+            task_id=task.id,
+            event_type=f"task.{action}",
+            payload={"reason": reason, "spec_revision": spec_revision},
+            revision=revision,
+            idempotency_key=idempotency_key,
+        )
+        return self._get_with_connection(connection, task.id)
 
     def request_running_cancel(
         self, task_id: str, *, reason: str, expected_revision: int, idempotency_key: str
@@ -1440,6 +1598,37 @@ def _parse_json_object(raw: Any) -> dict[str, Any] | None:
     if not raw:
         return None
     return json.loads(raw)
+
+
+def _dependencies_satisfied(connection: Any, task: TaskRecord) -> bool:
+    depends = list(task.depends_on or [])
+    if not depends:
+        return True
+    placeholders = ",".join("?" for _ in depends)
+    rows = connection.execute(
+        f"""
+        SELECT t.id, t.status, t.current_spec_revision, t.last_evidence_hash,
+               em.manifest_hash
+        FROM tasks t
+        LEFT JOIN evidence_manifests em
+          ON em.task_id = t.id
+         AND em.spec_revision = t.current_spec_revision
+         AND em.manifest_hash = t.last_evidence_hash
+         AND em.passed = 1
+        WHERE t.id IN ({placeholders})
+        """,
+        tuple(depends),
+    ).fetchall()
+    return len(rows) == len(depends) and all(
+        row["status"] == TaskStatus.COMPLETED.value
+        and row["manifest_hash"] is not None
+        for row in rows
+    )
+
+
+def _dependency_blocked_reason(task: TaskRecord) -> str | None:
+    depends = list(task.depends_on or [])
+    return f"waiting_on:{','.join(depends)}" if depends else None
 
 
 TASK_SPEC_FIELDS = {

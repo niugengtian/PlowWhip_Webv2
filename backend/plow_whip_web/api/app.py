@@ -34,6 +34,7 @@ from plow_whip_web.api.schemas import (
     TaskDeletionView,
     TaskEventView,
     TaskArtifactView,
+    TaskAmendRequest,
     TaskSizingEstimateRequest,
     TaskSizingEstimateResponse,
     TaskView,
@@ -600,6 +601,29 @@ def create_app(settings: Settings) -> FastAPI:
     def get_task(request: Request, task_id: str) -> TaskView:
         repository: TaskRepository = request.app.state.task_repository
         return TaskView.from_record(repository.get(task_id))
+
+    @app.post("/api/tasks/{task_id}/amend", response_model=TaskView, tags=["tasks"])
+    def amend_task(
+        request: Request,
+        task_id: str,
+        payload: TaskAmendRequest,
+        idempotency_key: str = Header(
+            alias="Idempotency-Key", min_length=8, max_length=200
+        ),
+    ) -> TaskView:
+        repository: TaskRepository = request.app.state.task_repository
+        values = payload.model_dump(exclude={"expected_revision", "reason"})
+        values["verification"] = [
+            item.model_dump(exclude_none=True) for item in payload.verification
+        ]
+        values["deadline"] = payload.deadline.model_dump()
+        return TaskView.from_record(repository.amend_spec(
+            task_id,
+            spec=values,
+            reason=payload.reason,
+            expected_revision=payload.expected_revision,
+            idempotency_key=idempotency_key,
+        ))
 
     @app.get(
         "/api/tasks/{task_id}/deletion-eligibility",

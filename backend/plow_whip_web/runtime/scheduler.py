@@ -61,7 +61,8 @@ class SchedulerService:
         host_jobs_result = self.task_service.reconcile_host_jobs()
         recovery_result = self.recovery.reconcile() if self.recovery else {"recovered_tasks": [], "model_invoked": False}
         orchestration = self.goals.advance() if self.goals else {
-            "unblocked": [], "completed_goals": [], "blocked_goals": [], "model_invoked": False,
+            "unblocked": [], "replanned": [], "completed_goals": [],
+            "blocked_goals": [], "model_invoked": False,
         }
         provider_status = self.provider_pool.probe_all() if self.provider_pool else []
         connectivity = self.connectivity.check()

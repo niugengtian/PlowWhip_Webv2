@@ -395,7 +395,11 @@ class HostJobRepository:
             """,
             (task_id,),
         ).fetchone()
-        if latest is not None and latest["status"] == "circuit_open":
+        if (
+            latest is not None
+            and latest["status"] == "circuit_open"
+            and int(latest["spec_revision"]) == spec_revision
+        ):
             raise ValueError("execution episode circuit is open")
         if latest is None or latest["status"] != "active":
             ordinal = 1 if latest is None else int(latest["ordinal"]) + 1
