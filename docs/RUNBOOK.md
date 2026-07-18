@@ -22,7 +22,8 @@ Python, Node, SQLite runtime and the scheduler are image internals. Source-mode 
 2. Submit a goal with sizing gates and verification paths (`POST /api/goals`).
 3. Inspect the returned plan: role, ordinal, depends_on, sizing/execution_policy.
 4. Let Cron/Tick auto-dispatch ready children, or run a manual zero-token tick.
-5. Parent goal completes only when all implementation items and the independent verification item are completed.
+5. A goal completes only when every implementation item has a passing immutable
+   `EvidenceManifest`; a writable verification Worker is not treated as independent proof.
 
 Provider session rotation reasons visible in Worker status are limited to explicit operator rotate/rebind and bounded consecutive no-progress/tool-abort recovery. The local Journal byte threshold rotates only `events.current.jsonl`; it does not discard the Provider session. Provider capacity does not rotate a session. Token usage never rotates a session.
 

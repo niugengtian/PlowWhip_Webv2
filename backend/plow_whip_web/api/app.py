@@ -501,6 +501,11 @@ def create_app(settings: Settings) -> FastAPI:
             plan=plan,
             sizing_inputs=payload.sizing_inputs.model_dump(),
             verification=[item.model_dump(exclude_none=True) for item in payload.verification],
+            scope=payload.scope,
+            acceptance=payload.acceptance,
+            artifacts=payload.artifacts,
+            constraints=payload.constraints,
+            deadline=payload.deadline.model_dump() if payload.deadline else None,
             idempotency_key=idempotency_key,
             network_requirement=payload.network_requirement,
             command=(

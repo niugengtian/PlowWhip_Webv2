@@ -22,6 +22,7 @@ from typing import Any
 from plow_whip_web.config import load_private_env
 from plow_whip_web.providers.generic_command import ExecutionResult
 from plow_whip_web.runtime.verification import VerificationEngine
+from plow_whip_web.runtime.evidence import snapshot_environment
 from plow_whip_web.security import Redactor
 
 
@@ -98,6 +99,8 @@ def _handler(
                     self._send(200, verify(payload, roots))
                 elif self.path == "/v1/artifacts/inspect":
                     self._send(200, inspect_artifacts(payload, roots))
+                elif self.path == "/v1/evidence/snapshot":
+                    self._send(200, evidence_snapshot(payload, roots))
                 elif self.path == "/v1/artifacts/open":
                     self._send(200, open_artifact(payload, roots))
                 elif self.path == "/v1/jobs/start":
@@ -764,6 +767,16 @@ def inspect_artifacts(
             "actions": ["finder", *(["cursor"] if cursor else [])] if exists else [],
         })
     return {"project_path": str(project_path), "artifacts": artifacts}
+
+
+def evidence_snapshot(
+    payload: dict[str, Any], roots: tuple[Path, ...]
+) -> dict[str, Any]:
+    project_path = _project_path(payload, roots)
+    paths = payload.get("paths")
+    if not isinstance(paths, list) or len(paths) > 64:
+        raise ValueError("paths must contain at most 64 relative artifact paths")
+    return snapshot_environment(project_path, [str(path) for path in paths])
 
 
 def open_artifact(

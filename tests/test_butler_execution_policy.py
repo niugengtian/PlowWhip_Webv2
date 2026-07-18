@@ -70,13 +70,18 @@ def _create_goal(client: TestClient, project_id: str, size: str):
             "command": {
                 "argv": [
                     sys.executable, "-c",
-                    "from pathlib import Path; Path('done.txt').write_text('ok')",
+                    "from pathlib import Path; Path('release-evidence.json').write_text('{\"status\":\"ok\"}')",
                 ]
             },
             "verification": [
                 {"kind": "exit_code", "expected": 0},
-                {"kind": "file_contains", "path": "done.txt", "contains": "ok"},
+                {
+                    "kind": "file_contains",
+                    "path": "release-evidence.json",
+                    "contains": "\"status\":\"ok\"",
+                },
             ],
+            "artifacts": ["release-evidence.json"],
         },
     )
 

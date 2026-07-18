@@ -18,6 +18,10 @@ from plow_whip_web.store.task_repository import (
     task_lease_seconds,
 )
 from plow_whip_web.runtime.context import ContextCompiler
+from plow_whip_web.runtime.evidence import (
+    build_evidence_manifest,
+    snapshot_environment,
+)
 from plow_whip_web.runtime.fault_policy import FaultPolicy
 from plow_whip_web.runtime.journal import SessionJournal
 from plow_whip_web.runtime.verification import VerificationEngine, VerificationResult
@@ -85,6 +89,14 @@ class TaskService:
             return claim.task
         assert claim.attempt_id is not None
         assert claim.run_id is not None
+        baseline = self._evidence_snapshot(claim.task)
+        self.repository.record_evidence_baseline(
+            task_id=claim.task.id,
+            attempt_id=claim.attempt_id,
+            run_id=claim.run_id,
+            spec_revision=claim.task.spec_revision,
+            baseline=baseline,
+        )
         context = self.context_compiler.compile(task_id) if self.context_compiler else None
         if self.journal:
             self.journal.append(claim.task.worker_id, {
@@ -374,19 +386,23 @@ class TaskService:
         verification = verification or self.verifier.verify(
             project_path, execution, task.verification
         )
-        verification_payload: dict[str, Any] = {
-            "passed": verification.passed, "checks": verification.checks,
-            "evidence_hash": verification.evidence_hash,
-            "failure_fingerprint": _failure_fingerprint(
-                execution, verification.checks
-            ),
-            "summary": verification.summary,
-        }
+        baseline = self.repository.evidence_baseline(run_id)
+        manifest = build_evidence_manifest(
+            task=task,
+            attempt_id=attempt_id,
+            run_id=run_id,
+            call_id=run_id,
+            task_revision=verifying.revision,
+            baseline=baseline,
+            after=self._evidence_snapshot(task),
+            execution=execution,
+            verification=verification,
+        )
         limits = self.settings.get()["values"] if self.settings else {}
         completed = self.repository.finish(
             task.id, expected_revision=verifying.revision,
             attempt_id=attempt_id, run_id=run_id,
-            execution=execution.as_dict(), verification=verification_payload,
+            execution=execution.as_dict(), evidence_manifest=manifest,
             idempotency_key=f"{idempotency_prefix}:finish",
             max_same_failure=limits.get("max_same_failure", 3),
         )
@@ -401,6 +417,30 @@ class TaskService:
                 "output_tokens": execution_payload["output_tokens"],
             })
         return completed
+
+    def _evidence_snapshot(self, task: TaskRecord) -> dict[str, Any]:
+        paths = [str(path) for path in task.spec["artifacts"]]
+        transport = "container"
+        worker_context: dict[str, Any] = {}
+        if self.provider_pool:
+            provider = self.provider_pool.require_available(task.provider)
+            transport = str(provider["transport"])
+            if provider["transport"] == "host-bridge":
+                if task.worker_id:
+                    worker_context = self.repository.worker_execution_context(
+                        task.worker_id
+                    )
+                snapshot = self.provider_pool.snapshot_task_evidence(task, paths=paths)
+            else:
+                snapshot = snapshot_environment(Path(task.project_path), paths)
+        else:
+            snapshot = snapshot_environment(Path(task.project_path), paths)
+        snapshot["environment"] = {
+            "transport": transport,
+            "session_generation": worker_context.get("session_generation"),
+            "external_session_id": worker_context.get("external_session_id"),
+        }
+        return snapshot
 
     def _rotate_local_journal(self, task: TaskRecord) -> None:
         if not self.projects or not task.project_id or not task.role_id:

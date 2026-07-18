@@ -285,6 +285,16 @@ test('keeps task and goal selection mutually exclusive and shows layered goal ru
   listedGoals = [{
     id: 'goal-1', title: 'Release Goal', objective: 'ship verified UI', project_id: project.id,
     provider: 'cursor', status: 'running',
+    spec_revision: 1,
+    spec: {
+      objective: 'ship verified UI',
+      scope: ['frontend'],
+      acceptance: ['artifact:result.txt:contains:quality-pass'],
+      verification: [{ kind: 'file_exists', path: 'result.txt' }],
+      artifacts: ['result.txt'],
+      constraints: [],
+      deadline: { hard_seconds: 1200 },
+    },
     plan: { status: 'planned', model_invoked: false, model_pm_implemented: false },
     sizing_inputs: { size_class: 'M', risk_level: 'medium' }, parent_task_id: 'parent-1',
     created_at: '2026-07-17T00:00:00Z', updated_at: '2026-07-17T00:00:00Z',
@@ -315,7 +325,7 @@ test('keeps task and goal selection mutually exclusive and shows layered goal ru
   fireEvent.click(screen.getByRole('button', { name: /Release Goal/ }))
 
   expect(screen.getByRole('heading', { name: 'Release Goal' })).toBeInTheDocument()
-  expect(screen.getByText('Goal / Butler aggregate')).toBeInTheDocument()
+  expect(screen.getByText('GoalSpec / Butler aggregate')).toBeInTheDocument()
   for (const label of ['角色 / Provider', '依赖', '阻塞原因', 'Worker session', 'Generation', 'Rotation reason', 'Last context pressure', 'Pressure trigger', 'Sizing', 'Execution', 'Attempt / progress', 'Verification', 'Output ref', 'Segments / bytes / offset', 'Cached 计入 Total', 'Token control']) {
     expect(screen.getByText(label)).toBeInTheDocument()
   }
@@ -530,6 +540,16 @@ test('submits a goal through the primary PM entry', async () => {
           json: async () => ({
             id: 'goal-1', title: goalPayload?.title, objective: goalPayload?.objective,
             project_id: project.id, provider: 'cursor', status: 'running',
+            spec_revision: 1,
+            spec: {
+              objective: goalPayload?.objective,
+              scope: goalPayload?.scope,
+              acceptance: goalPayload?.acceptance,
+              verification: goalPayload?.verification,
+              artifacts: goalPayload?.artifacts,
+              constraints: goalPayload?.constraints,
+              deadline: goalPayload?.deadline,
+            },
             plan: { status: 'planned', items: [], model_invoked: false },
             sizing_inputs: goalPayload?.sizing_inputs ?? null,
             parent_task_id: 'parent-1', created_at: '2026-07-17T00:00:00Z',

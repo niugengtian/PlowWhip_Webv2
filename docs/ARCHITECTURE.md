@@ -15,16 +15,21 @@ Probe, wake, lease, recovery and scheduling are deterministic 0 Token actions. A
 
 SQLite, WAL, logs and archives live in `/data`; `/projects` is a control-plane mount, not an artifact destination. Host and container paths are stored separately because a Docker named volume cannot be treated as a macOS CLI workspace. Project workers execute and deterministically verify against `projects.host_path` through authenticated structured Host Bridge endpoints. Reports, code, and other deliverables remain in the original host checkout.
 
-Completion is impossible without deterministic verification. Balanced adds one bounded planning record. Strict adds exactly one independent deterministic review; there is no review recursion.
+Completion is impossible without a deterministic, immutable `EvidenceManifest`.
+A writable verification Worker is an implementation capability, not independent proof.
 
 ## Goal orchestration
 
 The primary product path is goal submission, not manual role picking.
 
-1. `POST /api/goals` is the sole split entry. A deterministic 0 Token PM planner creates a coordination parent plus an ordered linear chain of implementation/verification work items (1-7). There is no general DAG in this release.
+1. `POST /api/goals` is the sole split entry. The Butler routes an immutable GoalSpec
+   into a bounded ordered chain of implementation work items. There is no general DAG in this release.
 2. Each `project + role` reuses one stable Worker session. Task slices do not open a new session by default. Token usage and cached/context pressure are telemetry only and never rotate a Provider session. Consecutive no-progress/tool aborts retain the bounded FaultPolicy rotation, while explicit operator rotate/rebind remains available. Provider capacity is deferred with backoff, and the local Journal byte threshold rotates the file generation only.
 3. Cross-role handoff is structured metadata only: evidence hash and artifact paths. Full model history is never copied between roles. SQLite stores goals/tasks/leases/session ids, Token usage, and file path/hash/offset metadata; stdout/stderr and journals remain file-backed and rotate by `rotation_max_bytes`.
-4. Child work items reuse the existing 0 Token sizing → deadline/attempt/lease path and Provider readiness probes. The Scheduler advances ready children, feeds Evidence Delta into the same-role session on repairable failure, and completes the parent only after every implementation child and the independent verification child succeed.
+4. Child work items reuse the existing 0 Token sizing → deadline/attempt/lease path
+   and Provider readiness probes. The Scheduler advances ready children, feeds Evidence
+   Delta into the same-role session on repairable failure, and completes the goal only
+   after every child has a passing EvidenceManifest bound to its run and TaskSpec revision.
 
 Manual `POST /api/tasks` remains a diagnostic escape hatch.
 

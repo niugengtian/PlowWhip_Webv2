@@ -6,6 +6,9 @@ from fastapi.testclient import TestClient
 from plow_whip_web.api.app import create_app
 from plow_whip_web.config import Settings
 from plow_whip_web.runtime.sizing import TaskSizingInputs, estimate_task_sizing
+from plow_whip_web.providers.generic_command import ExecutionResult
+from plow_whip_web.runtime.evidence import build_evidence_manifest, snapshot_environment
+from plow_whip_web.runtime.verification import VerificationResult
 
 
 def _sizing(**changes: object) -> TaskSizingInputs:
@@ -105,19 +108,46 @@ def test_large_usage_completes_and_is_recorded_once() -> None:
             "cached_input_tokens": 3_423_488,
             "output_tokens": 17_304,
         }
-        verification = {
-            "passed": True,
-            "checks": [{"kind": "exit_code", "passed": True}],
-            "evidence_hash": "large-usage-proof",
-            "summary": "passed",
-        }
+        baseline = snapshot_environment(project, [])
+        repository.record_evidence_baseline(
+            task_id=task.id,
+            attempt_id=claim.attempt_id,
+            run_id=claim.run_id,
+            spec_revision=task.spec_revision,
+            baseline=baseline,
+        )
+        execution_result = ExecutionResult(
+            returncode=0,
+            stdout="",
+            stderr="",
+            duration_ms=1,
+            input_tokens=3_589_597,
+            cached_input_tokens=3_423_488,
+            output_tokens=17_304,
+        )
+        manifest = build_evidence_manifest(
+            task=claim.task,
+            attempt_id=claim.attempt_id,
+            run_id=claim.run_id,
+            call_id=claim.run_id,
+            task_revision=verifying.revision,
+            baseline=baseline,
+            after=snapshot_environment(project, []),
+            execution=execution_result,
+            verification=VerificationResult(
+                passed=True,
+                checks=[{"kind": "exit_code", "passed": True}],
+                evidence_hash="large-usage-proof",
+                summary="passed",
+            ),
+        )
         finished = repository.finish(
             task.id,
             expected_revision=verifying.revision,
             attempt_id=claim.attempt_id,
             run_id=claim.run_id,
             execution=execution,
-            verification=verification,
+            evidence_manifest=manifest,
             idempotency_key="large-usage-finish",
         )
         replayed = repository.finish(
@@ -126,7 +156,7 @@ def test_large_usage_completes_and_is_recorded_once() -> None:
             attempt_id=claim.attempt_id,
             run_id=claim.run_id,
             execution=execution,
-            verification=verification,
+            evidence_manifest=manifest,
             idempotency_key="large-usage-finish",
         )
         summary = app.state.token_ledger.summary()

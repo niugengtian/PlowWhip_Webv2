@@ -119,6 +119,17 @@ class HostBridgeClient:
             raise ProviderUnavailableError("Host Bridge 返回了无效的产物索引")
         return artifacts
 
+    def snapshot_evidence(
+        self, *, project_path: str, paths: list[str]
+    ) -> dict[str, object]:
+        payload = self._post("/v1/evidence/snapshot", {
+            "project_path": project_path,
+            "paths": paths,
+        }, timeout=30)
+        if not isinstance(payload.get("artifacts"), list):
+            raise ProviderUnavailableError("Host Bridge 返回了无效的证据快照")
+        return payload
+
     def open_artifact(
         self, *, project_path: str, relative_path: str, action: str
     ) -> dict[str, object]:

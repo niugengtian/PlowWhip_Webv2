@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 from dataclasses import asdict
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from fastapi.testclient import TestClient
+import pytest
 
 from plow_whip_web.api.app import create_app
 from plow_whip_web.config import Settings
@@ -61,7 +63,7 @@ def test_butler_routing_is_deterministic_and_bounded() -> None:
     assert {item.role for item in first.items} == {"capability"}
     assert {item.kind for item in first.items} == {"implementation"}
     assert 2 <= len(first.items) <= 6
-    assert all("task_verification_gate_passed" in item.acceptance for item in first.items)
+    assert all(item.acceptance == () for item in first.items)
     assert all(
         item.depends_on_ordinals == ((item.ordinal - 1,) if item.ordinal > 1 else ())
         for item in first.items
@@ -109,7 +111,11 @@ def test_goal_to_auto_advance_e2e_with_real_http() -> None:
             ).json()
             payload = {
                 "title": "写出验收文件",
-                "objective": "fullstack 交付后由 verification 独立验收",
+                "objective": "fullstack 交付后由只读确定性 Gate 验收",
+                "scope": ["backend"],
+                "acceptance": ["manifest_bound_completion"],
+                "artifacts": ["release-evidence.json"],
+                "constraints": ["verification_worker_not_independent"],
                 "project_id": project["id"],
                 "provider": "generic-command",
                 "sizing_inputs": {
@@ -132,12 +138,16 @@ def test_goal_to_auto_advance_e2e_with_real_http() -> None:
                     "argv": [
                         sys.executable,
                         "-c",
-                        "from pathlib import Path; Path('goal-done.txt').write_text('ok')",
+                        "from pathlib import Path; Path('release-evidence.json').write_text('{\"status\":\"ok\"}')",
                     ]
                 },
                 "verification": [
                     {"kind": "exit_code", "expected": 0},
-                    {"kind": "file_contains", "path": "goal-done.txt", "contains": "ok"},
+                    {
+                        "kind": "file_contains",
+                        "path": "release-evidence.json",
+                        "contains": "\"status\":\"ok\"",
+                    },
                 ],
             }
             created = client.post(
@@ -148,6 +158,10 @@ def test_goal_to_auto_advance_e2e_with_real_http() -> None:
             assert created.status_code == 201, created.text
             goal = created.json()
             assert goal["status"] == "running"
+            assert goal["spec_revision"] == 1
+            assert goal["spec"]["scope"] == ["backend"]
+            assert goal["spec"]["acceptance"] == ["manifest_bound_completion"]
+            assert goal["spec"]["artifacts"] == ["release-evidence.json"]
             assert goal["plan"]["model_invoked"] is False
             children = [
                 item for item in goal["work_items"]
@@ -157,6 +171,12 @@ def test_goal_to_auto_advance_e2e_with_real_http() -> None:
             assert all(item["status"] == "paused" for item in children[1:])
             assert all(item["execution_policy"] is not None for item in children)
             assert children[0]["sizing"]["status"] == "estimated"
+            assert children[0]["spec"]["acceptance"] == [
+                "manifest_bound_completion"
+            ]
+            assert children[0]["spec"]["artifacts"] == [
+                "release-evidence.json"
+            ]
 
             # Provider not ready path uses host provider separately; generic-command is always local.
             first_tick = client.post("/api/scheduler/tick")
@@ -195,10 +215,14 @@ def test_goal_to_auto_advance_e2e_with_real_http() -> None:
                     "SELECT result_json FROM task_runs WHERE result_json IS NOT NULL"
                 ).fetchall()
                 for row in rows:
-                    blob = row["result_json"]
-                    assert "write_text(" not in blob
-                    payload = json.loads(blob)
+                    payload = json.loads(row["result_json"])
                     assert "stdout" not in payload.get("execution", {})
+                    assert "stderr" not in payload.get("execution", {})
+                with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+                    connection.execute(
+                        "UPDATE goal_specs SET spec_json = '{}' WHERE goal_id = ?",
+                        (goal["id"],),
+                    )
             finally:
                 connection.close()
 

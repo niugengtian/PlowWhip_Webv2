@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from typing import Any
@@ -62,6 +63,11 @@ class GoalRepository:
         plan: GoalPlan,
         sizing_inputs: dict[str, Any],
         verification: list[dict[str, Any]],
+        scope: list[str],
+        acceptance: list[str],
+        artifacts: list[str],
+        constraints: list[str],
+        deadline: dict[str, Any] | None,
         idempotency_key: str,
         network_requirement: str = "none",
         command: dict[str, Any] | None = None,
@@ -70,6 +76,19 @@ class GoalRepository:
             raise DomainError("goal plan is not dispatchable")
         command = command or {"argv": None, "timeout_seconds": 60, "output_limit_bytes": 131_072}
         base_inputs = TaskSizingInputs(**sizing_inputs)
+        goal_preview = estimate_task_sizing(base_inputs)
+        goal_deadline = deadline or {
+            "hard_seconds": int(goal_preview["hard_deadline_seconds"] or 600)
+        }
+        goal_spec = canonical_task_spec(
+            objective=objective,
+            scope=scope,
+            acceptance=acceptance,
+            verification=verification,
+            artifacts=artifacts,
+            constraints=constraints,
+            deadline=goal_deadline,
+        )
 
         with self.database.transaction(immediate=True) as connection:
             duplicate = connection.execute(
@@ -101,6 +120,7 @@ class GoalRepository:
                     json.dumps(sizing_inputs, ensure_ascii=False, sort_keys=True),
                 ),
             )
+            _insert_goal_spec(connection, goal_id, goal_spec, revision=1)
 
             ordinal_to_task: dict[int, str] = {}
             first_task_id: str | None = None
@@ -191,15 +211,16 @@ class GoalRepository:
                     task_id,
                     canonical_task_spec(
                         objective=item.objective,
-                        scope=[item.role, item.kind],
-                        acceptance=list(item.acceptance),
+                        scope=list(dict.fromkeys([*scope, item.role, item.kind])),
+                        acceptance=list(dict.fromkeys([*acceptance, *item.acceptance])),
                         verification=child_verification,
-                        artifacts=list(item.artifacts) or None,
-                        constraints=[
+                        artifacts=list(dict.fromkeys([*artifacts, *item.artifacts])),
+                        constraints=list(dict.fromkeys([
+                            *constraints,
                             f"network:{network_requirement}",
                             f"provider:{provider}",
                             "worker_lifecycle:ephemeral",
-                        ],
+                        ])),
                         deadline={
                             "hard_seconds": execution_policy["hard_deadline_seconds"]
                         },
@@ -363,6 +384,14 @@ class GoalRepository:
                 all_done = all(
                     row["status"] == TaskStatus.COMPLETED.value
                     and row["last_evidence_hash"]
+                    and connection.execute(
+                        """
+                        SELECT 1 FROM evidence_manifests
+                        WHERE task_id = ? AND passed = 1
+                          AND manifest_hash = ?
+                        """,
+                        (row["id"], row["last_evidence_hash"]),
+                    ).fetchone()
                     for row in children
                 )
                 if all_done:
@@ -422,6 +451,12 @@ class GoalRepository:
                    t.last_error, t.last_evidence_hash, t.attempts_used, t.max_attempts,
                    t.tokens_used, t.sizing_json, t.execution_budget_json,
                    t.handoff_json, t.command_json, t.verification_json,
+                   t.current_spec_revision, s.spec_json AS task_spec_json,
+                   (
+                       SELECT em.manifest_json FROM evidence_manifests em
+                       WHERE em.task_id = t.id
+                       ORDER BY em.created_at DESC, em.rowid DESC LIMIT 1
+                   ) AS evidence_manifest_json,
                    w.session_id, w.external_session_id, w.session_generation, w.last_error
                      AS worker_last_error, w.last_input_tokens,
                    w.last_cached_input_tokens, w.last_output_tokens,
@@ -429,6 +464,8 @@ class GoalRepository:
                    w.last_context_pressure_reason, w.last_attribution_granularity,
                    w.last_value_classification
             FROM tasks t
+            JOIN task_specs s ON s.task_id = t.id
+                AND s.spec_revision = t.current_spec_revision
             LEFT JOIN workers w ON w.id = t.worker_id
             WHERE t.goal_id = ? AND COALESCE(t.work_item_kind, '') != 'coordination'
             ORDER BY t.ordinal, t.created_at, t.id
@@ -454,6 +491,7 @@ class GoalRepository:
         }
         work_items = []
         for task in tasks:
+            task_spec = json.loads(task["task_spec_json"])
             worker = None
             if task["worker_id"]:
                 worker = {
@@ -501,7 +539,7 @@ class GoalRepository:
                 {
                     "id": task["id"],
                     "title": task["title"],
-                    "objective": task["objective"],
+                    "objective": task_spec["objective"],
                     "status": task["status"],
                     "role_id": task["role_id"],
                     "worker_id": task["worker_id"] or (worker["id"] if worker else None),
@@ -523,9 +561,12 @@ class GoalRepository:
                     "execution_policy": _execution_policy(task["execution_budget_json"]),
                     "handoff": json.loads(task["handoff_json"]) if task["handoff_json"] else None,
                     "command": json.loads(task["command_json"]) if task["command_json"] else {},
-                    "verification": (
-                        json.loads(task["verification_json"])
-                        if task["verification_json"] else []
+                    "verification": task_spec["verification"],
+                    "spec_revision": int(task["current_spec_revision"]),
+                    "spec": task_spec,
+                    "evidence_manifest": (
+                        json.loads(task["evidence_manifest_json"])
+                        if task["evidence_manifest_json"] else None
                     ),
                     "session_id": worker["session_id"] if worker else None,
                     "external_session_id": worker["external_session_id"] if worker else None,
@@ -560,6 +601,18 @@ class GoalRepository:
                     },
                 }
             )
+        spec_row = connection.execute(
+            """
+            SELECT spec_revision, spec_json, spec_hash
+            FROM goal_specs
+            WHERE goal_id = ? AND spec_revision = ?
+            """,
+            (goal_id, row["current_spec_revision"]),
+        ).fetchone()
+        if spec_row is None or hashlib.sha256(
+            spec_row["spec_json"].encode("utf-8")
+        ).hexdigest() != spec_row["spec_hash"]:
+            raise DomainError("immutable GoalSpec is missing or corrupt")
         return {
             "id": row["id"],
             "title": row["title"],
@@ -575,6 +628,8 @@ class GoalRepository:
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
             "work_items": work_items,
+            "spec_revision": int(spec_row["spec_revision"]),
+            "spec": json.loads(spec_row["spec_json"]),
         }
 
 
@@ -605,21 +660,18 @@ def _child_command_and_verification(
 def _handoff_from_completed(connection: Any, task_id: str) -> dict[str, Any] | None:
     row = connection.execute(
         """
-        SELECT id, title, last_evidence_hash, verification_json, work_item_kind, role_id
-        FROM tasks WHERE id = ? AND status = 'completed'
+        SELECT t.id, t.title, t.last_evidence_hash, t.work_item_kind, t.role_id,
+               s.spec_json
+        FROM tasks t
+        JOIN task_specs s ON s.task_id = t.id
+            AND s.spec_revision = t.current_spec_revision
+        WHERE t.id = ? AND t.status = 'completed'
         """,
         (task_id,),
     ).fetchone()
     if row is None:
         return None
-    verification = json.loads(row["verification_json"] or "[]")
-    artifact_paths = [
-        str(spec["path"])
-        for spec in verification
-        if isinstance(spec, dict)
-        and spec.get("kind") in {"file_exists", "file_contains"}
-        and spec.get("path")
-    ]
+    artifact_paths = list(json.loads(row["spec_json"])["artifacts"])
     return {
         "from_task_id": row["id"],
         "from_title": row["title"],
@@ -627,3 +679,24 @@ def _handoff_from_completed(connection: Any, task_id: str) -> dict[str, Any] | N
         "evidence_hash": row["last_evidence_hash"],
         "artifact_paths": artifact_paths[:32],
     }
+
+
+def _insert_goal_spec(
+    connection: Any,
+    goal_id: str,
+    spec: dict[str, Any],
+    *,
+    revision: int,
+) -> str:
+    spec_json = json.dumps(
+        spec, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    digest = hashlib.sha256(spec_json.encode("utf-8")).hexdigest()
+    connection.execute(
+        """
+        INSERT INTO goal_specs(goal_id, spec_revision, spec_json, spec_hash)
+        VALUES (?, ?, ?, ?)
+        """,
+        (goal_id, revision, spec_json, digest),
+    )
+    return digest

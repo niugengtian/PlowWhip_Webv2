@@ -229,7 +229,6 @@ def _default_items(
                 f"must pass before termination.{suffix}"
             ),
             depends_on_ordinals=((index - 1,) if index > 1 else ()),
-            acceptance=("task_verification_gate_passed",),
         )
         for index in range(1, count + 1)
     ]
@@ -262,8 +261,7 @@ def _parse_structured_items(
                 title=str(raw["title"]),
                 objective=str(raw["objective"]),
                 depends_on_ordinals=tuple(int(dep) for dep in depends),
-                acceptance=tuple(str(item) for item in acceptance)
-                + ("task_verification_gate_passed",),
+                acceptance=tuple(str(item) for item in acceptance),
                 artifacts=tuple(str(item) for item in artifacts),
             )
         )

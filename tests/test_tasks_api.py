@@ -131,9 +131,10 @@ def test_task_artifacts_point_to_host_project_and_open_only_declared_files() -> 
             project_id=project["id"],
             role_id=role["role_id"],
             provider="cursor",
-            command={"argv": ["cursor"], "timeout_seconds": 60},
-            verification=[{"kind": "file_exists", "path": "报告.md"}],
-            max_attempts=1,
+                command={"argv": ["cursor"], "timeout_seconds": 60},
+                verification=[{"kind": "file_exists", "path": "报告.md"}],
+                artifacts=["报告.md"],
+                max_attempts=1,
             idempotency_key="artifact-index-create",
         )
 

@@ -161,12 +161,9 @@ def test_0021_upgrades_0019_database_and_removes_reservations() -> None:
         db_path = Path(directory) / "upgrade-0019.sqlite3"
         migration_dir = Path(database_module.__file__).with_name("migrations")
         migrations = sorted(migration_dir.glob("*.sql"))
-        assert [item.name for item in migrations[-4:]] == [
-            "0020_provider_context_pressure.sql",
-            "0021_remove_token_budget.sql",
-            "0022_task_spec_continuity.sql",
-            "0023_butler_execution_policy.sql",
-        ]
+        names = [item.name for item in migrations]
+        start = names.index("0020_provider_context_pressure.sql")
+        upgrade = migrations[start:]
         connection = sqlite3.connect(db_path)
         try:
             connection.execute(
@@ -177,7 +174,7 @@ def test_0021_upgrades_0019_database_and_removes_reservations() -> None:
                 )
                 """
             )
-            for migration in migrations[:-4]:
+            for migration in migrations[:start]:
                 for statement in database_module._split_statements(
                     migration.read_text(encoding="utf-8")
                 ):
@@ -211,12 +208,7 @@ def test_0021_upgrades_0019_database_and_removes_reservations() -> None:
             connection.close()
 
         database = Database(db_path)
-        assert database.migrate() == [
-            "0020_provider_context_pressure.sql",
-            "0021_remove_token_budget.sql",
-            "0022_task_spec_continuity.sql",
-            "0023_butler_execution_policy.sql",
-        ]
+        assert database.migrate() == [item.name for item in upgrade]
         assert database.migrate() == []
         connection = database.connect()
         try:
@@ -267,10 +259,9 @@ def test_0022_upgrades_0021_and_preserves_terminal_task() -> None:
         db_path = Path(directory) / "upgrade-0021.sqlite3"
         migration_dir = Path(database_module.__file__).with_name("migrations")
         migrations = sorted(migration_dir.glob("*.sql"))
-        assert [item.name for item in migrations[-2:]] == [
-            "0022_task_spec_continuity.sql",
-            "0023_butler_execution_policy.sql",
-        ]
+        names = [item.name for item in migrations]
+        start = names.index("0022_task_spec_continuity.sql")
+        upgrade = migrations[start:]
         connection = sqlite3.connect(db_path)
         try:
             connection.execute(
@@ -281,7 +272,7 @@ def test_0022_upgrades_0021_and_preserves_terminal_task() -> None:
                 )
                 """
             )
-            for migration in migrations[:-2]:
+            for migration in migrations[:start]:
                 for statement in database_module._split_statements(
                     migration.read_text(encoding="utf-8")
                 ):
@@ -308,10 +299,7 @@ def test_0022_upgrades_0021_and_preserves_terminal_task() -> None:
             connection.close()
 
         database = Database(db_path)
-        assert database.migrate() == [
-            "0022_task_spec_continuity.sql",
-            "0023_butler_execution_policy.sql",
-        ]
+        assert database.migrate() == [item.name for item in upgrade]
         connection = database.connect()
         try:
             task = connection.execute(
@@ -338,6 +326,9 @@ def test_0023_retires_legacy_coordination_parent_without_failing_goal() -> None:
         db_path = Path(directory) / "upgrade-0022.sqlite3"
         migration_dir = Path(database_module.__file__).with_name("migrations")
         migrations = sorted(migration_dir.glob("*.sql"))
+        names = [item.name for item in migrations]
+        start = names.index("0023_butler_execution_policy.sql")
+        upgrade = migrations[start:]
         connection = Database(db_path).connect()
         try:
             connection.execute(
@@ -348,7 +339,7 @@ def test_0023_retires_legacy_coordination_parent_without_failing_goal() -> None:
                 )
                 """
             )
-            for migration in migrations[:-1]:
+            for migration in migrations[:start]:
                 for statement in database_module._split_statements(
                     migration.read_text(encoding="utf-8")
                 ):
@@ -412,7 +403,7 @@ def test_0023_retires_legacy_coordination_parent_without_failing_goal() -> None:
         finally:
             connection.close()
 
-        assert Database(db_path).migrate() == ["0023_butler_execution_policy.sql"]
+        assert Database(db_path).migrate() == [item.name for item in upgrade]
         connection = Database(db_path).connect()
         try:
             parent = connection.execute(
@@ -469,3 +460,118 @@ def test_0023_retires_legacy_coordination_parent_without_failing_goal() -> None:
         assert tuple(drained)[0] == "released"
         assert drained["released_at"] is not None
         assert drained["role_status"] == "released"
+
+
+def test_0024_upgrades_0023_and_backfills_immutable_goal_spec() -> None:
+    with TemporaryDirectory() as directory:
+        db_path = Path(directory) / "upgrade-0023.sqlite3"
+        migration_dir = Path(database_module.__file__).with_name("migrations")
+        migrations = sorted(migration_dir.glob("*.sql"))
+        names = [item.name for item in migrations]
+        start = names.index("0024_goal_specs_evidence_manifests.sql")
+        connection = Database(db_path).connect()
+        try:
+            connection.execute(
+                """
+                CREATE TABLE schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            for migration in migrations[:start]:
+                for statement in database_module._split_statements(
+                    migration.read_text(encoding="utf-8")
+                ):
+                    connection.execute(statement)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version) VALUES (?)",
+                    (migration.name,),
+                )
+            connection.execute(
+                "INSERT INTO projects(id, name, path) VALUES ('p24', 'upgrade', '/projects/p24')"
+            )
+            connection.execute(
+                """
+                INSERT INTO goals(
+                    id, title, objective, project_id, provider, status, plan_json
+                ) VALUES (
+                    'g24', 'upgrade goal', 'goal objective', 'p24',
+                    'generic-command', 'running', '{}'
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO tasks(
+                    id, title, objective, project_path, status, command_json,
+                    verification_json, max_attempts, token_budget, project_id,
+                    provider, quality_profile, goal_id, work_item_kind, ordinal
+                ) VALUES (
+                    't24', 'child', 'child objective', '/projects/p24',
+                    'terminal_failed', '{}', '[]', 1, 0, 'p24',
+                    'generic-command', 'deterministic', 'g24', 'implementation', 1
+                )
+                """
+            )
+            spec = {
+                "objective": "child objective",
+                "scope": ["backend"],
+                "acceptance": ["upgrade_preserves_contract"],
+                "verification": [{"kind": "exit_code", "expected": 0}],
+                "artifacts": ["release.json"],
+                "constraints": ["no_rerun"],
+                "deadline": {"hard_seconds": 321},
+            }
+            spec_json = json.dumps(
+                spec, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+            connection.execute(
+                """
+                INSERT INTO task_specs(
+                    task_id, spec_revision, spec_json, spec_hash
+                ) VALUES ('t24', 1, ?, sha256(?))
+                """,
+                (spec_json, spec_json),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        assert Database(db_path).migrate() == [
+            "0024_goal_specs_evidence_manifests.sql"
+        ]
+        connection = Database(db_path).connect()
+        try:
+            goal = connection.execute(
+                "SELECT current_spec_revision FROM goals WHERE id = 'g24'"
+            ).fetchone()
+            goal_spec = connection.execute(
+                "SELECT spec_json, spec_hash FROM goal_specs WHERE goal_id = 'g24'"
+            ).fetchone()
+            task = connection.execute(
+                "SELECT status FROM tasks WHERE id = 't24'"
+            ).fetchone()
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    """
+                    SELECT name FROM sqlite_master
+                    WHERE type = 'table' AND name IN (
+                        'goal_specs', 'run_evidence_baselines', 'evidence_manifests'
+                    )
+                    """
+                )
+            }
+        finally:
+            connection.close()
+        payload = json.loads(goal_spec["spec_json"])
+        assert goal["current_spec_revision"] == 1
+        assert task["status"] == "terminal_failed"
+        assert payload == {**spec, "objective": "goal objective"}
+        assert len(goal_spec["spec_hash"]) == 64
+        assert tables == {
+            "goal_specs",
+            "run_evidence_baselines",
+            "evidence_manifests",
+        }

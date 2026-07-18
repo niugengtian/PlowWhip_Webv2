@@ -55,29 +55,10 @@ def test_one_immutable_spec_binds_create_context_claim_retry_and_view() -> None:
         assert first_context["spec_revision"] == 1
         assert json.dumps(task.spec, ensure_ascii=False, sort_keys=True, separators=(",", ":")) in first_context["content"]
 
-        claim = repository.claim(
-            task.id, expected_revision=task.revision, idempotency_key="task-spec-claim-1"
-        )
-        running = claim.task
-        verifying = repository.mark_verifying(
+        retry = app.state.task_service.drive(
             task.id,
-            expected_revision=running.revision,
-            idempotency_key="task-spec-verifying-1",
-        )
-        retry = repository.finish(
-            task.id,
-            expected_revision=verifying.revision,
-            attempt_id=str(claim.attempt_id),
-            run_id=str(claim.run_id),
-            execution={"returncode": 0, "input_tokens": 0, "output_tokens": 0},
-            verification={
-                "passed": False,
-                "checks": [{"kind": "file_exists", "passed": False}],
-                "evidence_hash": "a" * 64,
-                "failure_fingerprint": "missing-result",
-                "summary": "result.txt missing",
-            },
-            idempotency_key="task-spec-finish-1",
+            expected_revision=task.revision,
+            idempotency_key="task-spec-run-1",
         )
 
         retry_context_a = app.state.context_compiler.compile(task.id)

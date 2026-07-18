@@ -87,6 +87,7 @@ export type Task = {
     constraints: string[]
     deadline: Record<string, number>
   }
+  evidence_manifest: Record<string, unknown> | null
 }
 
 export type Goal = {
@@ -102,6 +103,8 @@ export type Goal = {
   created_at: string
   updated_at: string
   work_items: Record<string, unknown>[]
+  spec_revision: number
+  spec: Task['spec']
 }
 
 export type TaskArtifact = {

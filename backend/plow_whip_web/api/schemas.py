@@ -229,11 +229,26 @@ class GoalCreate(BaseModel):
     provider: Annotated[str, Field(pattern=r"^[a-z][a-z0-9-]{1,63}$")] = "generic-command"
     network_requirement: Literal["none", "any", "domestic", "overseas"] = "none"
     verification: Annotated[list[VerificationSpec], Field(min_length=1, max_length=32)]
+    scope: Annotated[list[str], Field(max_length=64)] = Field(default_factory=list)
+    acceptance: Annotated[list[str], Field(max_length=64)] = Field(default_factory=list)
+    artifacts: Annotated[list[str], Field(max_length=64)] = Field(default_factory=list)
+    constraints: Annotated[list[str], Field(max_length=64)] = Field(default_factory=list)
+    deadline: TaskDeadline | None = None
     sizing_inputs: TaskSizingEstimateRequest
     command: CommandSpec | None = None
     # Optional bounded structured plan. Model PM is not implemented this sprint;
     # when omitted, a deterministic template (sizing flags only) is used.
     plan_items: list[dict[str, Any]] | None = None
+
+    @field_validator("artifacts")
+    @classmethod
+    def artifact_paths_must_be_safe(cls, value: list[str]) -> list[str]:
+        if any(
+            not item or Path(item).is_absolute() or ".." in Path(item).parts
+            for item in value
+        ):
+            raise ValueError("artifacts require safe relative paths")
+        return value
 
 
 class GoalView(BaseModel):
@@ -249,6 +264,8 @@ class GoalView(BaseModel):
     created_at: str
     updated_at: str
     work_items: list[dict[str, Any]]
+    spec_revision: int
+    spec: dict[str, Any]
 
 
 class TaskEventView(BaseModel):

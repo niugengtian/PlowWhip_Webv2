@@ -26,7 +26,7 @@ const roleNames: Record<string, string> = {
   frontend: '前端',
   ui: 'UI',
   devops_sre: 'DevOps / SRE',
-  verification: '独立验证',
+  verification: '验证实现（非独立证据）',
   fullstack: '全栈（遗留）',
   web3: 'Web3（遗留）',
 }
@@ -238,6 +238,13 @@ export function App() {
         provider: goalForm.provider,
         network_requirement: goalForm.networkRequirement,
         sizing_inputs: goalForm.sizingInputs,
+        scope: [`project:${goalForm.projectId}`],
+        acceptance: [
+          `artifact:${goalForm.verifyPath}:contains:${goalForm.verifyText}`,
+        ],
+        artifacts: [goalForm.verifyPath],
+        constraints: [`network:${goalForm.networkRequirement}`],
+        deadline: { hard_seconds: goalEstimate.hard_deadline_seconds },
         verification: [
           { kind: 'exit_code', expected: 0 },
           { kind: 'file_exists', path: goalForm.verifyPath },
@@ -445,7 +452,7 @@ function TasksView({ tasks, goals, workers, selected, selectedGoal, events, arti
 }
 
 function GoalDetail({ goal, tasks, workers }: { goal: Goal; tasks: Task[]; workers: Worker[] }) {
-  return <><div className="panel-heading"><div><span className="kicker">{goal.id}</span><h1>{goal.title}</h1></div><span className="status-pill">{goal.status}</span></div><p className="objective">{goal.objective}</p><div className="facts"><Fact label="协调真源" value="Goal / Butler aggregate" /><Fact label="策略路由" value={String(goal.plan.route ?? 'unknown')} /><Fact label="Provider" value={goal.provider} /><Fact label="工作项" value={String(goal.work_items.length)} /><Fact label="Goal sizing" value={summary(goal.sizing_inputs, ['size_class', 'status', 'risk_level'])} /><Fact label="Goal 状态" value={goal.status} /></div><section className="work-items"><div className="section-heading"><div><span className="kicker">策略路由 → 任务 Gate</span><h2>工作项运行态</h2></div><span>只显示元数据，不读取 stdout/stderr</span></div>{goal.work_items.map((item) => {
+  return <><div className="panel-heading"><div><span className="kicker">{goal.id}</span><h1>{goal.title}</h1></div><span className="status-pill">{goal.status}</span></div><p className="objective">{goal.spec.objective}</p><div className="facts"><Fact label="协调真源" value="GoalSpec / Butler aggregate" /><Fact label="GoalSpec revision" value={String(goal.spec_revision)} /><Fact label="Scope" value={listValue(goal.spec.scope) || '无'} /><Fact label="Acceptance" value={listValue(goal.spec.acceptance) || '无'} /><Fact label="Artifacts" value={listValue(goal.spec.artifacts) || '无'} mono /><Fact label="策略路由" value={String(goal.plan.route ?? 'unknown')} /><Fact label="Provider" value={goal.provider} /><Fact label="工作项" value={String(goal.work_items.length)} /><Fact label="Goal sizing" value={summary(goal.sizing_inputs, ['size_class', 'status', 'risk_level'])} /><Fact label="Goal 状态" value={goal.status} /></div><section className="work-items"><div className="section-heading"><div><span className="kicker">策略路由 → 任务 Gate</span><h2>工作项运行态</h2></div><span>只显示元数据，不读取 stdout/stderr</span></div>{goal.work_items.map((item) => {
     const task = tasks.find((candidate) => candidate.id === String(item.id))
     const detail = { ...item, ...(task ?? {}) } as Record<string, unknown>
     const worker = workers.find((candidate) => candidate.id === value(detail, ['worker_id']))
@@ -466,6 +473,8 @@ function TaskRuntimeFacts({ item }: { item: Record<string, unknown> }) {
   const bytes = value(item, ['output_bytes', 'bytes'], value(handoff, ['output_bytes', 'bytes'], '暂无（API 未提供）'))
   const offset = value(item, ['output_offset', 'offset'], value(handoff, ['output_offset', 'offset'], '暂无（API 未提供）'))
   const deadline = recordValue(spec.deadline)
+  const manifest = recordValue(item.evidence_manifest)
+  const testReport = recordValue(manifest.test_report)
   return <>
     <Fact label="TaskSpec revision" value={value(item, ['spec_revision'], '不可见')} />
     <Fact label="Scope" value={listValue(spec.scope) || '无'} />
@@ -473,6 +482,10 @@ function TaskRuntimeFacts({ item }: { item: Record<string, unknown> }) {
     <Fact label="Artifacts" value={listValue(spec.artifacts) || '无'} mono />
     <Fact label="Constraints" value={listValue(spec.constraints) || '无'} />
     <Fact label="Deadline" value={`${value(deadline, ['hard_seconds'], '—')}s`} />
+    <Fact label="EvidenceManifest" value={value(manifest, ['manifest_hash'], '尚未生成')} mono />
+    <Fact label="Call / Run" value={`${value(manifest, ['call_id'], '—')} / ${value(manifest, ['run_id'], '—')}`} mono />
+    <Fact label="Evidence environment" value={value(manifest, ['environment_hash'], '—')} mono />
+    <Fact label="Test report" value={`${value(testReport, ['checks_passed'], '—')}/${value(testReport, ['checks_total'], '—')} · exit ${value(testReport, ['execution_exit_code'], '—')}`} />
     <Fact label="Input / Cached carry-in / Uncached input / Output / Total" value={`${input} / ${cachedInput} / ${uncachedInput} / ${output} / ${total}`} />
     <Fact label="Cached 计入 Total" value="是，已包含在 Input 中，不重复相加" />
     <Fact label="Attribution" value={`${value(item, ['attribution_granularity'], 'turn')} / ${value(item, ['value_classification'], 'unknown')}（Uncached 不等于新工作或有价值）`} />

@@ -19,6 +19,7 @@ from plow_whip_web.domain.model import (
 )
 from plow_whip_web.store.database import Database
 from plow_whip_web.store.settings_repository import DEFAULT_SETTINGS
+from plow_whip_web.runtime.evidence import manifest_hash
 from plow_whip_web.runtime.token_ledger import TokenLedger
 
 # XL bootstrap tier hard deadline; single safety cap for Host dispatch and leases.
@@ -338,7 +339,8 @@ class TaskRepository:
         try:
             row = connection.execute(
                 """
-                SELECT w.external_session_id, w.provider, p.path project_path,
+                SELECT w.external_session_id, w.provider, w.session_generation,
+                       p.path project_path,
                        COALESCE(p.host_path, p.path) host_path
                 FROM workers w JOIN projects p ON p.id = w.project_id
                 WHERE w.id = ?
@@ -522,6 +524,77 @@ class TaskRepository:
             idempotency_key=idempotency_key,
         )
 
+    def record_evidence_baseline(
+        self,
+        *,
+        task_id: str,
+        attempt_id: str,
+        run_id: str,
+        spec_revision: int,
+        baseline: dict[str, Any],
+    ) -> dict[str, Any]:
+        baseline_json = _dump(baseline)
+        baseline_hash = hashlib.sha256(baseline_json.encode("utf-8")).hexdigest()
+        with self.database.transaction(immediate=True) as connection:
+            context = connection.execute(
+                """
+                SELECT t.id, t.current_spec_revision, a.task_id AS attempt_task_id,
+                       a.spec_revision AS attempt_spec_revision,
+                       r.task_id AS run_task_id, r.attempt_id AS run_attempt_id,
+                       r.spec_revision AS run_spec_revision
+                FROM tasks t
+                JOIN task_attempts a ON a.id = ?
+                JOIN task_runs r ON r.id = ?
+                WHERE t.id = ?
+                """,
+                (attempt_id, run_id, task_id),
+            ).fetchone()
+            if context is None or {
+                context["id"],
+                context["attempt_task_id"],
+                context["run_task_id"],
+            } != {task_id}:
+                raise DomainError("evidence baseline task binding mismatch")
+            if context["run_attempt_id"] != attempt_id or {
+                int(context["current_spec_revision"]),
+                int(context["attempt_spec_revision"]),
+                int(context["run_spec_revision"]),
+            } != {spec_revision}:
+                raise DomainError("evidence baseline run/spec binding mismatch")
+            connection.execute(
+                """
+                INSERT INTO run_evidence_baselines(
+                    run_id, task_id, attempt_id, spec_revision,
+                    baseline_json, baseline_hash
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id, task_id, attempt_id, spec_revision,
+                    baseline_json, baseline_hash,
+                ),
+            )
+        return baseline
+
+    def evidence_baseline(self, run_id: str) -> dict[str, Any]:
+        connection = self.database.connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT baseline_json, baseline_hash
+                FROM run_evidence_baselines WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise DomainError("run evidence baseline is missing")
+            if hashlib.sha256(row["baseline_json"].encode("utf-8")).hexdigest() != row[
+                "baseline_hash"
+            ]:
+                raise DomainError("run evidence baseline is corrupt")
+            return json.loads(row["baseline_json"])
+        finally:
+            connection.close()
+
     def finish(
         self,
         task_id: str,
@@ -530,11 +603,22 @@ class TaskRepository:
         attempt_id: str,
         run_id: str,
         execution: dict[str, Any],
-        verification: dict[str, Any],
+        evidence_manifest: dict[str, Any],
         idempotency_key: str,
         max_same_failure: int = 2,
     ) -> TaskRecord:
-        passed = bool(verification["passed"])
+        evidence_hash = manifest_hash(evidence_manifest)
+        passed = bool(evidence_manifest["passed"])
+        verification = {
+            "passed": passed,
+            "checks": [
+                item["check"]
+                for item in evidence_manifest["verification_commands"]
+            ],
+            "evidence_hash": evidence_hash,
+            "failure_fingerprint": evidence_manifest["failure_fingerprint"],
+            "summary": evidence_manifest["summary"],
+        }
         with self.database.transaction(immediate=True) as connection:
             duplicate = connection.execute(
                 "SELECT task_id FROM task_events WHERE idempotency_key = ?",
@@ -549,6 +633,46 @@ class TaskRepository:
                 )
             if task.status is not TaskStatus.VERIFYING:
                 raise InvalidTransitionError(f"task is not verifying: {task.status}")
+            _validate_evidence_manifest(task, evidence_manifest)
+            binding = connection.execute(
+                """
+                SELECT a.task_id AS attempt_task_id,
+                       a.spec_revision AS attempt_spec_revision,
+                       r.task_id AS run_task_id, r.attempt_id AS run_attempt_id,
+                       r.spec_revision AS run_spec_revision,
+                       b.run_id AS baseline_run_id
+                FROM task_attempts a
+                JOIN task_runs r ON r.id = ?
+                LEFT JOIN run_evidence_baselines b ON b.run_id = r.id
+                WHERE a.id = ?
+                """,
+                (run_id, attempt_id),
+            ).fetchone()
+            expected_binding = {
+                "task_id": task.id,
+                "attempt_id": attempt_id,
+                "run_id": run_id,
+                "spec_revision": task.spec_revision,
+                "task_revision": task.revision,
+            }
+            if (
+                binding is None
+                or binding["attempt_task_id"] != task.id
+                or binding["run_task_id"] != task.id
+                or binding["run_attempt_id"] != attempt_id
+                or binding["baseline_run_id"] != run_id
+                or {
+                    int(binding["attempt_spec_revision"]),
+                    int(binding["run_spec_revision"]),
+                }
+                != {task.spec_revision}
+                or any(
+                    evidence_manifest.get(key) != value
+                    for key, value in expected_binding.items()
+                )
+                or evidence_manifest.get("call_id") != run_id
+            ):
+                raise DomainError("EvidenceManifest call/run/spec/revision binding mismatch")
             token_delta = int(execution.get("input_tokens", 0)) + int(
                 execution.get("output_tokens", 0)
             )
@@ -592,7 +716,7 @@ class TaskRepository:
                     target.value,
                     next_revision,
                     actual_tokens,
-                    verification["evidence_hash"],
+                    evidence_hash,
                     None if passed else verification["summary"],
                     same_failure_count,
                     no_progress_count,
@@ -619,8 +743,23 @@ class TaskRepository:
             )
             result = {
                 "execution": _execution_metadata(execution),
-                "verification": verification,
+                "evidence_manifest": evidence_manifest,
             }
+            connection.execute(
+                """
+                INSERT INTO evidence_manifests(
+                    id, task_id, attempt_id, run_id, call_id, spec_revision,
+                    task_revision, environment_hash, passed,
+                    manifest_json, manifest_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()), task.id, attempt_id, run_id,
+                    evidence_manifest["call_id"], task.spec_revision, task.revision,
+                    evidence_manifest["environment_hash"], 1 if passed else 0,
+                    _dump(evidence_manifest), evidence_hash,
+                ),
+            )
             connection.execute(
                 """
                 UPDATE task_runs SET status = ?, input_tokens = ?,
@@ -642,7 +781,8 @@ class TaskRepository:
             event_payload = {
                 "attempt_id": attempt_id,
                 "run_id": run_id,
-                "verification": verification,
+                "evidence_manifest_hash": evidence_hash,
+                "passed": passed,
             }
             self._event(
                 connection,
@@ -670,7 +810,20 @@ class TaskRepository:
             ).fetchone()
             if row is None:
                 return None
-            verification = json.loads(row["result_json"]).get("verification", {})
+            result = json.loads(row["result_json"])
+            manifest = result.get("evidence_manifest")
+            verification = (
+                {
+                    "summary": manifest.get("summary"),
+                    "evidence_hash": manifest.get("manifest_hash"),
+                    "checks": [
+                        item.get("check", {})
+                        for item in manifest.get("verification_commands", [])
+                    ],
+                }
+                if isinstance(manifest, dict)
+                else result.get("verification", {})
+            )
             return {
                 "summary": str(verification.get("summary") or "verification failed")[:1000],
                 "evidence_hash": str(verification.get("evidence_hash") or ""),
@@ -1247,6 +1400,7 @@ def _task_from_row(row: Any) -> TaskRecord:
         handoff=_parse_json_object(_optional(row, "handoff_json")),
         spec_revision=int(row["current_spec_revision"]),
         spec=spec,
+        evidence_manifest=_parse_json_object(_optional(row, "evidence_manifest_json")),
     )
 
 
@@ -1274,7 +1428,12 @@ TASK_SPEC_FIELDS = {
     "constraints", "deadline",
 }
 _TASK_WITH_SPEC = """
-SELECT t.*, s.spec_json AS task_spec_json, s.spec_hash AS task_spec_hash
+SELECT t.*, s.spec_json AS task_spec_json, s.spec_hash AS task_spec_hash,
+       (
+           SELECT em.manifest_json FROM evidence_manifests em
+           WHERE em.task_id = t.id
+           ORDER BY em.created_at DESC, em.rowid DESC LIMIT 1
+       ) AS evidence_manifest_json
 FROM tasks t
 JOIN task_specs s ON s.task_id = t.id
     AND s.spec_revision = t.current_spec_revision
@@ -1297,13 +1456,7 @@ def canonical_task_spec(
         raise DomainError("TaskSpec deadline requires hard_seconds") from error
     if not 1 <= hard_seconds <= MAX_HARD_DEADLINE_SECONDS:
         raise DomainError("TaskSpec deadline is outside the supported range")
-    declared_artifacts = artifacts
-    if declared_artifacts is None:
-        declared_artifacts = [
-            str(item["path"])
-            for item in verification
-            if item.get("kind") in {"file_exists", "file_contains"} and item.get("path")
-        ]
+    declared_artifacts = artifacts or []
     return {
         "objective": objective,
         "scope": list(scope or []),
@@ -1337,6 +1490,35 @@ def insert_task_spec(
 def _assert_task_spec(task: TaskRecord) -> None:
     if set(task.spec) != TASK_SPEC_FIELDS:
         raise DomainError("claim requires one complete immutable task spec")
+
+
+def _validate_evidence_manifest(
+    task: TaskRecord, evidence_manifest: dict[str, Any]
+) -> None:
+    commands = evidence_manifest.get("verification_commands")
+    artifacts = evidence_manifest.get("artifacts")
+    report = evidence_manifest.get("test_report")
+    if not isinstance(commands, list) or not isinstance(artifacts, list):
+        raise DomainError("EvidenceManifest verification/artifact records are required")
+    if [item.get("spec") for item in commands] != task.verification:
+        raise DomainError("EvidenceManifest verification contract mismatch")
+    checks_passed = bool(commands) and all(
+        item.get("exit_code") == 0
+        and isinstance(item.get("check"), dict)
+        and item["check"].get("passed") is True
+        for item in commands
+    )
+    artifact_paths = [item.get("relative_path") for item in artifacts]
+    artifact_passed = artifact_paths == task.spec["artifacts"] and all(
+        item.get("produced_by_run") is True for item in artifacts
+    )
+    if (
+        not isinstance(report, dict)
+        or bool(report.get("passed")) != checks_passed
+        or bool(evidence_manifest.get("artifact_contract_passed")) != artifact_passed
+        or bool(evidence_manifest.get("passed")) != (checks_passed and artifact_passed)
+    ):
+        raise DomainError("EvidenceManifest completion verdict is inconsistent")
 
 
 def _execution_metadata(execution: dict[str, Any]) -> dict[str, Any]:
