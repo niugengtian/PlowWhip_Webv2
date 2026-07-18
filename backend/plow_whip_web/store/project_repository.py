@@ -181,6 +181,77 @@ class ProjectRepository:
             connection.close()
         return [self.get(project_id) for project_id in ids]
 
+    def worker_detail(self, worker_id: str) -> dict[str, Any]:
+        connection = self.database.connect()
+        try:
+            worker = connection.execute(
+                """
+                SELECT w.*, r.kind role, r.status role_status,
+                       p.name project_name, p.path project_path,
+                       p.host_path project_host_path
+                FROM workers w
+                JOIN roles r ON r.id = w.role_id
+                JOIN projects p ON p.id = w.project_id
+                WHERE w.id = ?
+                """,
+                (worker_id,),
+            ).fetchone()
+            if worker is None:
+                raise NotFoundError(f"worker not found: {worker_id}")
+            job = connection.execute(
+                """
+                SELECT * FROM host_jobs WHERE worker_id = ?
+                ORDER BY created_at DESC, job_id DESC LIMIT 1
+                """,
+                (worker_id,),
+            ).fetchone()
+            task_id = worker["active_task_id"] or (job["task_id"] if job else None)
+            task = connection.execute(
+                """
+                SELECT t.id, t.title, t.objective, t.status, t.revision,
+                       t.current_spec_revision spec_revision, t.provider,
+                       t.goal_id, t.worker_id, s.spec_json
+                FROM tasks t
+                JOIN task_specs s ON s.task_id = t.id
+                    AND s.spec_revision = t.current_spec_revision
+                WHERE t.id = ?
+                """,
+                (task_id,),
+            ).fetchone() if task_id else None
+            episode = connection.execute(
+                "SELECT * FROM execution_episodes WHERE id = ?",
+                (job["episode_id"],),
+            ).fetchone() if job and job["episode_id"] else None
+            worker_view = dict(worker)
+            task_view = dict(task) if task else None
+            if task_view:
+                task_view["spec"] = json.loads(task_view.pop("spec_json"))
+            job_view = dict(job) if job else None
+            if job_view and job_view.get("result_json"):
+                job_view["result"] = json.loads(job_view.pop("result_json"))
+            episode_view = dict(episode) if episode else None
+            if episode_view and episode_view.get("checkpoint_json"):
+                episode_view["checkpoint"] = json.loads(
+                    episode_view.pop("checkpoint_json")
+                )
+            return {
+                "worker": worker_view,
+                "task": task_view,
+                "host_job": job_view,
+                "episode": episode_view,
+                "ownership": {
+                    "project_id": worker["project_id"],
+                    "project_name": worker["project_name"],
+                    "role_id": worker["role_id"],
+                    "role": worker["role"],
+                    "session_id": worker["session_id"],
+                    "external_session_id": worker["external_session_id"],
+                    "session_generation": worker["session_generation"],
+                },
+            }
+        finally:
+            connection.close()
+
     def resolve_role(self, project_id: str, kind: str) -> dict[str, str]:
         if kind not in ROLE_KINDS and kind != "butler":
             raise NotFoundError(f"role not found: {project_id}/{kind}")

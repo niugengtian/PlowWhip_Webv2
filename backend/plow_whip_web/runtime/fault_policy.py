@@ -84,6 +84,11 @@ class FaultPolicy:
             returncode = None
         status = str(snapshot.get("status") or "").strip().lower()
 
+        if failure_class == "dispatch_rejected" or status == "rejected":
+            return HostFaultDecision(
+                "needs_human", "dispatch_rejected", "host_dispatch_rejected"
+            )
+
         if failure_class == "provider_auth" or any(marker in evidence for marker in (
             "invalid api key", "authentication failed", "http 401", "unauthorized",
         )):

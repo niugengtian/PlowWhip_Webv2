@@ -17,6 +17,7 @@ from plow_whip_web.store.task_repository import (
     task_hard_deadline_seconds,
 )
 from plow_whip_web.runtime.token_ledger import TokenLedger
+from plow_whip_web.runtime.model_call_ledger import ModelCallLedger
 
 
 class ProviderPool:
@@ -28,6 +29,7 @@ class ProviderPool:
         bridge: HostBridgeClient,
         generic: GenericCommandProvider | None = None,
         token_ledger: TokenLedger | None = None,
+        model_calls: ModelCallLedger | None = None,
     ) -> None:
         self.database = database
         self.providers = providers
@@ -35,6 +37,7 @@ class ProviderPool:
         self.bridge = bridge
         self.generic = generic or GenericCommandProvider()
         self.token_ledger = token_ledger
+        self.model_calls = model_calls
 
     def require_available(self, name: str) -> dict[str, Any]:
         provider = self.providers.require(name)
@@ -187,6 +190,21 @@ class ProviderPool:
     def cancel_task_job(self, job_id: str) -> dict[str, object]:
         return self.bridge.cancel_job(job_id)
 
+    def read_task_job_output(
+        self,
+        job_id: str,
+        *,
+        stdout_offset: int,
+        stderr_offset: int,
+        limit: int,
+    ) -> dict[str, object]:
+        return self.bridge.job_output(
+            job_id,
+            stdout_offset=stdout_offset,
+            stderr_offset=stderr_offset,
+            limit=limit,
+        )
+
     def verify_host_task(
         self, task: TaskRecord, execution: ExecutionResult
     ) -> VerificationResult:
@@ -232,7 +250,32 @@ class ProviderPool:
         provider_name: str,
         project_path: str,
         instruction: str,
+        idempotency_key: str,
     ) -> dict[str, Any]:
+        connection = self.database.connect()
+        try:
+            duplicate = connection.execute(
+                """
+                SELECT * FROM convention_refinements
+                WHERE idempotency_key = ? AND status = 'completed'
+                """,
+                (idempotency_key,),
+            ).fetchone()
+        finally:
+            connection.close()
+        if duplicate is not None:
+            return {
+                "id": duplicate["id"],
+                "scope": duplicate["scope"],
+                "scope_id": duplicate["scope_id"],
+                "source_revision": duplicate["source_revision"],
+                "provider": duplicate["provider"],
+                "suggestion": duplicate["suggestion"],
+                "input_tokens": duplicate["input_tokens"],
+                "cached_input_tokens": 0,
+                "output_tokens": duplicate["output_tokens"],
+                "applied": False,
+            }
         provider = self.require_available(provider_name)
         if "refine_convention" not in provider["capabilities"]:
             raise ProviderUnavailableError(f"provider 不支持 Convention 精炼: {provider_name}")
@@ -240,34 +283,59 @@ class ProviderPool:
             "你是 Convention 编辑器。只输出精炼后的 Convention 正文，不要解释，不要代码围栏。\n\n"
             f"精炼要求：{instruction}\n\n原始 Convention：\n{content}"
         )
-        result = self.bridge.execute(
-            provider=provider, project_path=project_path, prompt=prompt,
-            session_id=None, timeout_seconds=180,
-        )
+        task = self.tasks.get(scope_id) if scope == "task" else None
+        project_id = task.project_id if task else scope_id if scope == "project" else None
+        receipt = self.model_calls.prepare(
+            idempotency_key=f"{idempotency_key}:model-call",
+            call_kind="convention_refinement",
+            provider=provider_name,
+            model=str(provider.get("model") or provider_name),
+            task=task,
+            project_id=project_id,
+        ) if self.model_calls else None
+        if receipt:
+            self.model_calls.dispatched(receipt["call_id"])
+        try:
+            result = self.bridge.execute(
+                provider=provider, project_path=project_path, prompt=prompt,
+                session_id=None, timeout_seconds=180,
+            )
+        except Exception as error:
+            if receipt:
+                self.model_calls.settle(
+                    receipt["call_id"], failed=True, error_class=type(error).__name__
+                )
+            raise
         status = "completed" if result.returncode == 0 and result.stdout.strip() else "failed"
+        suggestion = _last_text(result.stdout) if status == "completed" else None
+        if receipt:
+            self.model_calls.settle(
+                receipt["call_id"], result.as_dict(),
+                failed=status != "completed",
+                error_class=result.failure_class,
+                session_id=result.external_session_id,
+            )
         with self.database.transaction(immediate=True) as connection:
             refinement_id = str(uuid.uuid4())
             connection.execute(
                 """
                 INSERT INTO convention_refinements(
                     id, scope, scope_id, provider, source_revision,
-                    input_tokens, output_tokens, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    input_tokens, output_tokens, status, project_id, call_id,
+                    idempotency_key, suggestion, error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     refinement_id, scope, scope_id, provider_name, source_revision,
-                    result.input_tokens, result.output_tokens, status,
+                    result.input_tokens, result.output_tokens, status, project_id,
+                    receipt["call_id"] if receipt else None, idempotency_key,
+                    suggestion, result.stderr[:1000] if status != "completed" else None,
                 ),
             )
             if self.token_ledger:
-                project_id = scope_id if scope == "project" else None
-                task = None
-                if scope == "task":
-                    task = self.tasks.get(scope_id)
-                    project_id = task.project_id
                 TokenLedger.record_in_transaction(
                     connection,
-                    call_id=f"convention-refinement:{refinement_id}",
+                    call_id=receipt["call_id"] if receipt else f"convention-refinement:{refinement_id}",
                     call_kind="convention_refinement",
                     execution=result.as_dict(),
                     task=task,
@@ -276,14 +344,13 @@ class ProviderPool:
                 )
         if status != "completed":
             raise ProviderUnavailableError(result.stderr or "Convention 精炼未返回结果")
-        suggestion = _last_text(result.stdout)
         return {
             "id": refinement_id,
             "scope": scope,
             "scope_id": scope_id,
             "source_revision": source_revision,
             "provider": provider_name,
-            "suggestion": suggestion,
+            "suggestion": str(suggestion),
             "input_tokens": result.input_tokens,
             "cached_input_tokens": result.cached_input_tokens,
             "output_tokens": result.output_tokens,

@@ -149,6 +149,9 @@ class ProviderRepository:
             "credential_env": row["credential_env"],
             "revision": int(row["revision"]),
             "last_probed_at": row["last_probed_at"],
+            "model": config.get("model") or (
+                "deepseek-chat" if row["name"] == "simple-worker" else "provider-managed"
+            ),
             "readiness": readiness,
         }
 

@@ -36,7 +36,7 @@ export function startLiveRefresh(
       const next = createEventSource('/api/events/stream')
       source = next
       next.onmessage = run
-      next.addEventListener('task.updated', run)
+      next.addEventListener('aggregate.updated', run)
       next.onerror = () => {
         source?.close()
         source = null

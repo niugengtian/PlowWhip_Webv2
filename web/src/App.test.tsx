@@ -134,6 +134,37 @@ beforeEach(() => {
           command: {}, verification: [], sizing: estimate, execution_policy: {},
         }) }
       }
+      if (path === '/api/workers/worker-1') {
+        return { ok: true, json: async () => ({
+          worker: {
+            id: 'worker-1', role_id: 'role-ui', role: 'ui', provider: 'cursor',
+            session_id: 'session-local', external_session_id: 'cursor-session-7',
+            session_generation: 18, status: 'busy', active_task_id: 'child-1',
+            last_seen_at: '2026-07-17T00:05:00Z', last_error: null, released_at: null,
+          },
+          task: {
+            id: 'child-1', title: 'UI child', objective: 'real work', status: 'running',
+            revision: 7, spec_revision: 2, provider: 'cursor',
+            spec: { objective: 'real work', scope: ['ui'], acceptance: ['verified'], verification: [], artifacts: [], constraints: [], deadline: { hard_seconds: 1200 } },
+          },
+          host_job: {
+            job_id: 'host-job-1', task_id: 'child-1', status: 'running',
+            dispatch_outcome: 'accepted', reconciliation_deadline_at: '2026-07-17T00:06:00Z',
+            external_session_id: 'cursor-session-7', heartbeat_at: '2026-07-17T00:05:00Z',
+          },
+          episode: { id: 'episode-1' },
+          ownership: { session_id: 'session-local', external_session_id: 'cursor-session-7', session_generation: 18 },
+        }) }
+      }
+      if (path.startsWith('/api/workers/worker-1/stream')) {
+        return { ok: true, json: async () => ({
+          worker_id: 'worker-1', job_id: 'host-job-1', next_cursor: '9:128:0', has_more: false,
+          items: [
+            { kind: 'status', ref: 'task-event:9', text: 'task.started', state_revision: 7 },
+            { kind: 'stdout', refs: ['host-job-1/stdout.000000.log'], text: 'real progress', offset: 0, next_offset: 128 },
+          ],
+        }) }
+      }
       if (path.endsWith('/deletion-eligibility')) {
         return { ok: true, json: async () => ({ deletable: deletionAllowed, reason: deletionAllowed ? null : 'task has execution evidence' }) }
       }
@@ -218,13 +249,39 @@ test('uses EventSource refresh and closes it on unmount', async () => {
   expect(source.url).toBe('/api/events/stream')
   const before = vi.mocked(fetch).mock.calls.filter(([input]) => String(input) === '/api/tasks').length
 
-  source.listeners['task.updated']()
+  source.listeners['aggregate.updated']()
   await vi.waitFor(() => {
     expect(vi.mocked(fetch).mock.calls.filter(([input]) => String(input) === '/api/tasks').length).toBeGreaterThan(before)
   })
 
   unmount()
   expect(source.close).toHaveBeenCalledOnce()
+})
+
+test('worker click shows canonical host identity and never treats heartbeat as completion', async () => {
+  listedProjects = [{
+    ...project,
+    workers: [{
+      id: 'worker-1', role_id: 'role-ui', role: 'ui', provider: 'cursor',
+      session_id: 'session-local', external_session_id: 'cursor-session-7',
+      session_generation: 18, status: 'busy', active_task_id: 'child-1',
+      last_seen_at: '2026-07-17T00:05:00Z', last_error: null, released_at: null,
+      last_input_tokens: 10, last_cached_input_tokens: 2, last_uncached_input_tokens: 8,
+      last_output_tokens: 3, last_context_pressure_tokens: 10,
+      last_context_pressure_reason: 'usage_observed', last_context_session_generation: 18,
+      last_attribution_granularity: 'turn', last_value_classification: 'unknown',
+    }],
+  }]
+  render(<App />)
+  fireEvent.click(await screen.findByRole('button', { name: 'Worker' }))
+  fireEvent.click(await screen.findByRole('button', { name: '查看真实进展' }))
+
+  expect(await screen.findByText('host-job-1')).toBeInTheDocument()
+  expect(screen.getByText(/accepted · deadline/)).toBeInTheDocument()
+  expect(screen.getByText(/仅表示存活，不代表完成/)).toBeInTheDocument()
+  expect(screen.getByText('real progress')).toBeInTheDocument()
+  expect(screen.getByText('running')).toBeInTheDocument()
+  expect(screen.queryByText('已完成')).not.toBeInTheDocument()
 })
 
 test('falls back to one low-frequency poller without EventSource and clears it', () => {

@@ -676,7 +676,7 @@ def test_0025_upgrades_0024_and_binds_existing_host_job_to_episode() -> None:
         finally:
             connection.close()
 
-        assert Database(db_path).migrate() == [names[start]]
+        assert Database(db_path).migrate() == names[start:]
         connection = Database(db_path).connect()
         try:
             row = connection.execute(

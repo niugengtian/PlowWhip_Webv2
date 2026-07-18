@@ -132,10 +132,14 @@ def test_convention_refinement_returns_suggestion_without_overwriting() -> None:
                 "scope": "global", "scope_id": "global", "content": "必须保证质量。必须保证质量。",
                 "expected_revision": 0,
             }).json()
-            response = client.post("/api/conventions/global/global/refine", json={
-                "provider": "simple-worker", "project_id": project["id"],
-                "instruction": "去重并变成可验证约束",
-            })
+            response = client.post(
+                "/api/conventions/global/global/refine",
+                headers={"Idempotency-Key": "refine-global-test"},
+                json={
+                    "provider": "simple-worker", "project_id": project["id"],
+                    "instruction": "去重并变成可验证约束",
+                },
+            )
             assert response.status_code == 200
             suggestion = response.json()
             assert suggestion["source_revision"] == saved["revision"]

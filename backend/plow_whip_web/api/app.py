@@ -56,6 +56,7 @@ from plow_whip_web.runtime.task_service import TaskService
 from plow_whip_web.runtime.scheduler import SchedulerService
 from plow_whip_web.runtime.cron import EmbeddedCronRunner, schedule_view
 from plow_whip_web.runtime.token_ledger import TokenLedger
+from plow_whip_web.runtime.model_call_ledger import ModelCallLedger
 from plow_whip_web.runtime.context import ContextCompiler
 from plow_whip_web.runtime.journal import SessionJournal
 from plow_whip_web.runtime.connectivity import ConnectivityProbe
@@ -77,6 +78,7 @@ from plow_whip_web.providers.host_bridge import HostBridgeClient
 from plow_whip_web.providers.pool import ProviderPool
 from plow_whip_web.roles import ROLE_PROMPTS
 from plow_whip_web.maintenance import MaintenanceService
+from plow_whip_web.security import Redactor
 
 
 def create_app(settings: Settings) -> FastAPI:
@@ -90,6 +92,7 @@ def create_app(settings: Settings) -> FastAPI:
     runtime_settings = SettingsRepository(database)
     conventions = ConventionRepository(database)
     token_ledger = TokenLedger(database)
+    model_calls = ModelCallLedger(database)
     context_compiler = ContextCompiler(settings.data_dir, database, task_repository, conventions, runtime_settings)
     journal = SessionJournal(settings.data_dir, runtime_settings)
     health_repository = HealthRepository(database)
@@ -102,6 +105,7 @@ def create_app(settings: Settings) -> FastAPI:
         database, providers, task_repository,
         HostBridgeClient(settings.host_bridge_url, settings.host_bridge_token),
         token_ledger=token_ledger,
+        model_calls=model_calls,
     )
     maintenance = MaintenanceService(
         settings.data_dir, database, runtime_settings, health_repository, providers
@@ -110,6 +114,7 @@ def create_app(settings: Settings) -> FastAPI:
         task_repository, settings=runtime_settings, token_ledger=token_ledger,
         context_compiler=context_compiler, journal=journal,
         provider_pool=provider_pool, host_jobs=host_jobs, projects=project_repository,
+        model_calls=model_calls,
     )
     scheduler_repository = SchedulerRepository(database)
     scheduler_service = SchedulerService(
@@ -139,6 +144,7 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.embedded_cron_runner = embedded_cron_runner
     app.state.conventions = conventions
     app.state.token_ledger = token_ledger
+    app.state.model_calls = model_calls
     app.state.context_compiler = context_compiler
     app.state.journal = journal
     app.state.health_repository = health_repository
@@ -313,7 +319,10 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.post("/api/conventions/{scope}/{scope_id}/refine", tags=["context"])
     def refine_convention(
-        request: Request, scope: str, scope_id: str, payload: ConventionRefineRequest
+        request: Request, scope: str, scope_id: str, payload: ConventionRefineRequest,
+        idempotency_key: str = Header(
+            alias="Idempotency-Key", min_length=8, max_length=200
+        ),
     ) -> dict[str, object]:
         repository: ConventionRepository = request.app.state.conventions
         current = repository.get(scope=scope, scope_id=scope_id)
@@ -333,6 +342,7 @@ def create_app(settings: Settings) -> FastAPI:
             scope=scope, scope_id=scope_id, content=current["content"],
             source_revision=current["revision"], provider_name=payload.provider,
             project_path=project_path, instruction=payload.instruction,
+            idempotency_key=idempotency_key,
         )
 
     @app.get("/api/tasks/{task_id}/context", tags=["context"])
@@ -342,7 +352,7 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.get("/api/usage", tags=["usage"])
     def usage(request: Request) -> dict[str, object]:
-        ledger: TokenLedger = request.app.state.token_ledger
+        ledger: ModelCallLedger = request.app.state.model_calls
         return ledger.summary()
 
     @app.get("/api/system/health", tags=["system"])
@@ -375,8 +385,11 @@ def create_app(settings: Settings) -> FastAPI:
                 events = repository.list(after=cursor)
                 for event in events:
                     cursor = event["sequence"]
-                    payload = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
-                    yield f"id: {cursor}\nevent: {event['event_type']}\ndata: {payload}\n\n"
+                    payload = json.dumps(
+                        {**event, "revision": cursor},
+                        ensure_ascii=False, separators=(",", ":"),
+                    )
+                    yield f"id: {cursor}\nevent: aggregate.updated\ndata: {payload}\n\n"
                 if once or await request.is_disconnected():
                     return
                 if not events:
@@ -396,6 +409,81 @@ def create_app(settings: Settings) -> FastAPI:
         return repository.rebind_worker(
             worker_id, provider=payload.provider, reason=payload.reason
         )
+
+    @app.get("/api/workers/{worker_id}", tags=["workforce"])
+    def worker_detail(request: Request, worker_id: str) -> dict[str, object]:
+        repository: ProjectRepository = request.app.state.project_repository
+        return repository.worker_detail(worker_id)
+
+    @app.get("/api/workers/{worker_id}/stream", tags=["workforce"])
+    def worker_stream(
+        request: Request,
+        worker_id: str,
+        cursor: str = "0:0:0",
+        limit: int = 32_768,
+    ) -> dict[str, object]:
+        event_after, stdout_offset, stderr_offset = _worker_cursor(cursor)
+        projects: ProjectRepository = request.app.state.project_repository
+        detail = projects.worker_detail(worker_id)
+        task = detail.get("task")
+        job = detail.get("host_job")
+        items: list[dict[str, object]] = []
+        if isinstance(task, dict):
+            events = request.app.state.task_repository.events(
+                str(task["id"]), after=event_after
+            )[:20]
+            for event in events:
+                items.append({
+                    "kind": "status",
+                    "ref": f"task-event:{event['sequence']}",
+                    "text": Redactor.redact(
+                        f"{event['event_type']}: "
+                        f"{json.dumps(event['payload'], ensure_ascii=False)}"
+                    )[:2048],
+                    "created_at": event["created_at"],
+                    "state_revision": event["state_revision"],
+                })
+            if events:
+                event_after = int(events[-1]["sequence"])
+        output: dict[str, object] = {"chunks": [], "next_offsets": {}}
+        if isinstance(job, dict):
+            pool: ProviderPool = request.app.state.provider_pool
+            try:
+                output = pool.read_task_job_output(
+                    str(job["job_id"]),
+                    stdout_offset=stdout_offset,
+                    stderr_offset=stderr_offset,
+                    limit=min(max(limit, 1024), 65_536),
+                )
+                chunks = output.get("chunks")
+                if isinstance(chunks, list):
+                    for chunk in chunks:
+                        if not isinstance(chunk, dict):
+                            continue
+                        items.append({
+                            **chunk,
+                            "text": Redactor.redact(str(chunk.get("text") or ""))[
+                                :65_536
+                            ],
+                        })
+            except ProviderUnavailableError as error:
+                items.append({
+                    "kind": "status",
+                    "ref": f"host-job:{job['job_id']}",
+                    "text": Redactor.redact(str(error))[:1000],
+                    "state_revision": task.get("revision") if isinstance(task, dict) else 0,
+                })
+            offsets = output.get("next_offsets")
+            if isinstance(offsets, dict):
+                stdout_offset = int(offsets.get("stdout") or stdout_offset)
+                stderr_offset = int(offsets.get("stderr") or stderr_offset)
+        return {
+            "worker_id": worker_id,
+            "job_id": job.get("job_id") if isinstance(job, dict) else None,
+            "items": items,
+            "next_cursor": f"{event_after}:{stdout_offset}:{stderr_offset}",
+            "has_more": bool(output.get("has_more")),
+        }
 
     @app.get("/api/settings", response_model=RuntimeSettingsView, tags=["settings"])
     def get_settings(request: Request) -> RuntimeSettingsView:
@@ -473,15 +561,39 @@ def create_app(settings: Settings) -> FastAPI:
         projects: ProjectRepository = request.app.state.project_repository
         goals: GoalRepository = request.app.state.goal_repository
         provider_pool: ProviderPool = request.app.state.provider_pool
+        model_calls: ModelCallLedger = request.app.state.model_calls
         project = projects.get(payload.project_id)
         sizing_inputs = TaskSizingInputs(**payload.sizing_inputs.model_dump())
-        plan = plan_goal_work_items(
-            title=payload.title,
-            objective=payload.objective,
-            sizing_inputs=sizing_inputs,
-            structured_items=payload.plan_items,
-            execution_policy=project["execution_policy"],
+        route_call = model_calls.prepare(
+            idempotency_key=f"{idempotency_key}:router",
+            call_kind="router", provider="internal",
+            model="butler-v1", project_id=payload.project_id,
         )
+        plan_call = model_calls.prepare(
+            idempotency_key=f"{idempotency_key}:planner",
+            call_kind="butler_planner", provider="internal",
+            model="butler-v1", project_id=payload.project_id,
+        )
+        model_calls.dispatched(route_call["call_id"])
+        model_calls.dispatched(plan_call["call_id"])
+        try:
+            plan = plan_goal_work_items(
+                title=payload.title,
+                objective=payload.objective,
+                sizing_inputs=sizing_inputs,
+                structured_items=payload.plan_items,
+                execution_policy=project["execution_policy"],
+            )
+        except Exception as error:
+            model_calls.settle(
+                route_call["call_id"], failed=True, error_class=type(error).__name__
+            )
+            model_calls.settle(
+                plan_call["call_id"], failed=True, error_class=type(error).__name__
+            )
+            raise
+        model_calls.settle(route_call["call_id"])
+        model_calls.settle(plan_call["call_id"])
         if plan.status == "needs_planning":
             raise HTTPException(
                 status_code=400,
@@ -759,3 +871,13 @@ def _preview_to_persistence(
         "progress_extension_seconds": preview["progress_extension_seconds"],
     }
     return sizing, execution_policy
+
+
+def _worker_cursor(value: str) -> tuple[int, int, int]:
+    try:
+        parts = tuple(int(part) for part in value.split(":"))
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail="invalid worker stream cursor") from error
+    if len(parts) != 3 or any(part < 0 for part in parts):
+        raise HTTPException(status_code=400, detail="invalid worker stream cursor")
+    return parts

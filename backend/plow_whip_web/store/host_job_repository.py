@@ -15,6 +15,9 @@ from plow_whip_web.security import Redactor
 from plow_whip_web.store.database import Database
 
 
+RECONCILIATION_SECONDS = 120
+
+
 class HostJobRepository:
     """Container-side source of truth for durable Host Bridge execution."""
 
@@ -72,14 +75,16 @@ class HostJobRepository:
                 INSERT INTO host_jobs(
                     job_id, task_id, attempt_id, run_id, worker_id, provider,
                     fencing_token, session_generation, spec_revision,
-                    episode_id, episode_process_number
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    episode_id, episode_process_number, dispatch_outcome,
+                    reconciliation_deadline_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown', datetime('now', ?))
                 """,
                 (
                     job_id, task_id, attempt_id, run_id, context["worker_id"], provider,
                     context["fencing_token"], context["session_generation"],
                     context["current_spec_revision"],
                     episode["id"], episode["host_process_count"],
+                    f"+{RECONCILIATION_SECONDS} seconds",
                 ),
             )
             return dict(connection.execute(
@@ -266,19 +271,32 @@ class HostJobRepository:
         result_json = json.dumps(compact, ensure_ascii=False, sort_keys=True)
         session_id = snapshot.get("session_id") or snapshot.get("external_session_id")
         error_summary = compact.get("error_summary")
+        status = str(snapshot.get("status") or "unknown")
+        accepted = status not in {"unknown", "recovery_hold", "rejected"}
         with self.database.transaction(immediate=True) as connection:
             connection.execute(
                 """
                 UPDATE host_jobs SET status = ?, host_pid = COALESCE(?, host_pid),
                     external_session_id = COALESCE(?, external_session_id),
                     heartbeat_at = COALESCE(?, CURRENT_TIMESTAMP),
-                    finished_at = ?, result_json = ?, last_error = ?, updated_at = CURRENT_TIMESTAMP
+                    finished_at = ?, result_json = ?, last_error = ?,
+                    dispatch_outcome = CASE
+                        WHEN ? THEN 'accepted'
+                        WHEN ? = 'rejected' THEN 'rejected'
+                        ELSE dispatch_outcome
+                    END,
+                    dispatch_decided_at = CASE
+                        WHEN ? OR ? = 'rejected'
+                        THEN COALESCE(dispatch_decided_at, CURRENT_TIMESTAMP)
+                        ELSE dispatch_decided_at
+                    END,
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE job_id = ?
                 """,
                 (
-                    str(snapshot.get("status") or "unknown"), snapshot.get("pid"), session_id,
+                    status, snapshot.get("pid"), session_id,
                     snapshot.get("heartbeat_at"), snapshot.get("finished_at"), result_json,
-                    error_summary, job_id,
+                    error_summary, int(accepted), status, int(accepted), status, job_id,
                 ),
             )
             row = connection.execute(
@@ -300,6 +318,43 @@ class HostJobRepository:
                 )
             return dict(row)
 
+    def dispatch_rejected(self, job_id: str, error: str) -> dict[str, Any]:
+        with self.database.transaction(immediate=True) as connection:
+            connection.execute(
+                """
+                UPDATE host_jobs
+                SET status = 'rejected', dispatch_outcome = 'rejected',
+                    dispatch_decided_at = CURRENT_TIMESTAMP,
+                    finished_at = CURRENT_TIMESTAMP, last_error = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE job_id = ? AND consumed_at IS NULL
+                """,
+                (error[:1000], job_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM host_jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"host job not found: {job_id}")
+            return dict(row)
+
+    def reconciliation_expired(self, job_id: str) -> bool:
+        connection = self.database.connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT (dispatch_outcome = 'unknown'
+                        OR status = 'recovery_hold') AS reconciling,
+                       reconciliation_deadline_at IS NOT NULL
+                       AND CURRENT_TIMESTAMP >= reconciliation_deadline_at AS expired
+                FROM host_jobs WHERE job_id = ? AND consumed_at IS NULL
+                """,
+                (job_id,),
+            ).fetchone()
+            return bool(row and row["reconciling"] and row["expired"])
+        finally:
+            connection.close()
+
     def active(self) -> list[dict[str, Any]]:
         connection = self.database.connect()
         try:
@@ -313,17 +368,38 @@ class HostJobRepository:
         modifier = f"+{max(60, seconds)} seconds"
         with self.database.transaction(immediate=True) as connection:
             row = connection.execute(
-                "SELECT task_id, worker_id FROM host_jobs WHERE job_id = ?", (job_id,)
+                """
+                SELECT h.task_id, h.worker_id, h.status, h.dispatch_outcome,
+                       h.reconciliation_deadline_at, e.wall_deadline_at
+                FROM host_jobs h
+                LEFT JOIN execution_episodes e ON e.id = h.episode_id
+                WHERE h.job_id = ?
+                """,
+                (job_id,),
             ).fetchone()
             if row is None:
                 return
-            connection.execute(
-                "UPDATE task_leases SET expires_at = datetime('now', ?) WHERE task_id = ?",
-                (modifier, row["task_id"]),
+            cap = (
+                row["reconciliation_deadline_at"]
+                if row["dispatch_outcome"] == "unknown"
+                or row["status"] == "recovery_hold"
+                else row["wall_deadline_at"]
             )
             connection.execute(
-                "UPDATE resource_locks SET expires_at = datetime('now', ?) WHERE task_id = ?",
-                (modifier, row["task_id"]),
+                """
+                UPDATE task_leases
+                SET expires_at = MIN(datetime('now', ?), COALESCE(?, datetime('now', ?)))
+                WHERE task_id = ?
+                """,
+                (modifier, cap, modifier, row["task_id"]),
+            )
+            connection.execute(
+                """
+                UPDATE resource_locks
+                SET expires_at = MIN(datetime('now', ?), COALESCE(?, datetime('now', ?)))
+                WHERE task_id = ?
+                """,
+                (modifier, cap, modifier, row["task_id"]),
             )
             if row["worker_id"]:
                 connection.execute(
@@ -335,10 +411,18 @@ class HostJobRepository:
         with self.database.transaction(immediate=True) as connection:
             connection.execute(
                 """
-                UPDATE host_jobs SET status = 'recovery_hold', last_error = ?,
-                    updated_at = CURRENT_TIMESTAMP WHERE job_id = ? AND consumed_at IS NULL
+                UPDATE host_jobs SET
+                    reconciliation_deadline_at = CASE
+                        WHEN status != 'recovery_hold'
+                             OR reconciliation_deadline_at IS NULL
+                        THEN datetime('now', ?)
+                        ELSE reconciliation_deadline_at
+                    END,
+                    status = 'recovery_hold', last_error = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE job_id = ? AND consumed_at IS NULL
                 """,
-                (error[:1000], job_id),
+                (f"+{RECONCILIATION_SECONDS} seconds", error[:1000], job_id),
             )
             row = connection.execute(
                 "SELECT task_id, worker_id FROM host_jobs WHERE job_id = ?", (job_id,)

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from plow_whip_web.domain.model import ProviderUnavailableError
+from plow_whip_web.domain.model import HostBridgeRejectedError, ProviderUnavailableError
 from plow_whip_web.providers.generic_command import ExecutionResult
 from plow_whip_web.store.task_repository import MAX_HARD_DEADLINE_SECONDS
 from plow_whip_web.runtime.verification import VerificationResult
@@ -76,6 +76,21 @@ class HostBridgeClient:
 
     def job_status(self, job_id: str) -> dict[str, object]:
         return self._post("/v1/jobs/status", {"job_id": job_id}, timeout=10)
+
+    def job_output(
+        self,
+        job_id: str,
+        *,
+        stdout_offset: int = 0,
+        stderr_offset: int = 0,
+        limit: int = 32_768,
+    ) -> dict[str, object]:
+        return self._post("/v1/jobs/output", {
+            "job_id": job_id,
+            "stdout_offset": max(0, stdout_offset),
+            "stderr_offset": max(0, stderr_offset),
+            "limit": min(max(limit, 1024), 65_536),
+        }, timeout=10)
 
     def cancel_job(self, job_id: str) -> dict[str, object]:
         return self._post("/v1/jobs/cancel", {"job_id": job_id}, timeout=10)
@@ -169,6 +184,10 @@ class HostBridgeClient:
                 return json.loads(response.read().decode("utf-8"))
         except HTTPError as error:
             detail = error.read().decode("utf-8", errors="replace")[:1000]
+            if path == "/v1/jobs/start" and 400 <= error.code < 500:
+                raise HostBridgeRejectedError(
+                    f"Host Bridge 拒绝派发: HTTP {error.code} {detail}"
+                ) from error
             raise ProviderUnavailableError(f"Host Bridge 拒绝请求: HTTP {error.code} {detail}") from error
         except (URLError, TimeoutError) as error:
             raise ProviderUnavailableError(f"Host Bridge 不可达: {error}") from error

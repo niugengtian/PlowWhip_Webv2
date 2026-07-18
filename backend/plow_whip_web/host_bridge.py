@@ -107,6 +107,13 @@ def _handler(
                     self._send(202, jobs.start(payload))
                 elif self.path == "/v1/jobs/status":
                     self._send(200, jobs.status(str(payload["job_id"])))
+                elif self.path == "/v1/jobs/output":
+                    self._send(200, jobs.output(
+                        str(payload["job_id"]),
+                        stdout_offset=int(payload.get("stdout_offset") or 0),
+                        stderr_offset=int(payload.get("stderr_offset") or 0),
+                        limit=int(payload.get("limit") or 32_768),
+                    ))
                 elif self.path == "/v1/jobs/cancel":
                     self._send(202, jobs.cancel(str(payload["job_id"])))
                 else:
@@ -254,6 +261,53 @@ class HostJobManager:
     def status(self, job_id: str) -> dict[str, object]:
         with self._lock:
             return self._refresh(self._read(_job_id(job_id)))
+
+    def output(
+        self,
+        job_id: str,
+        *,
+        stdout_offset: int,
+        stderr_offset: int,
+        limit: int,
+    ) -> dict[str, object]:
+        job_id = _job_id(job_id)
+        bounded_limit = min(max(limit, 1024), 65_536)
+        with self._lock:
+            record = self._refresh(self._read(job_id))
+            chunks: list[dict[str, object]] = []
+            next_offsets: dict[str, int] = {}
+            per_stream = max(512, bounded_limit // 2)
+            for stream, offset in (
+                ("stdout", max(0, stdout_offset)),
+                ("stderr", max(0, stderr_offset)),
+            ):
+                data, next_offset, refs = self._read_output_range(
+                    job_id, stream, offset=offset, limit=per_stream
+                )
+                next_offsets[stream] = next_offset
+                if data:
+                    text = Redactor.redact(data.decode("utf-8", errors="replace"))
+                    chunks.append({
+                        "kind": _output_kind(stream, text),
+                        "stream": stream,
+                        "offset": offset,
+                        "next_offset": next_offset,
+                        "text": text,
+                        "refs": refs,
+                    })
+            return {
+                "job_id": job_id,
+                "status": record.get("status"),
+                "heartbeat_at": record.get("heartbeat_at"),
+                "output_ref": record.get("output_ref"),
+                "chunks": chunks,
+                "next_offsets": next_offsets,
+                "has_more": any(
+                    int(record.get("output_bytes", {}).get(stream) or 0)
+                    > next_offsets[stream]
+                    for stream in ("stdout", "stderr")
+                ),
+            }
 
     def cancel(self, job_id: str) -> dict[str, object]:
         job_id = _job_id(job_id)
@@ -584,6 +638,36 @@ class HostJobManager:
             pass
         return directory
 
+    def _read_output_range(
+        self, job_id: str, stream: str, *, offset: int, limit: int
+    ) -> tuple[bytes, int, list[str]]:
+        paths = sorted(
+            self._output_directory(job_id).glob(
+                f"{stream}.[0-9][0-9][0-9][0-9][0-9][0-9].log"
+            )
+        )
+        remaining_skip = offset
+        remaining_read = limit
+        chunks: list[bytes] = []
+        refs: list[str] = []
+        for path in paths:
+            size = path.stat().st_size
+            if remaining_skip >= size:
+                remaining_skip -= size
+                continue
+            with path.open("rb") as source:
+                source.seek(remaining_skip)
+                value = source.read(remaining_read)
+            if value:
+                chunks.append(value)
+                refs.append(f"{job_id}/{path.name}")
+                remaining_read -= len(value)
+            remaining_skip = 0
+            if remaining_read <= 0:
+                break
+        data = b"".join(chunks)
+        return data, offset + len(data), refs
+
     def _write_carry_forward(self, record: dict[str, Any]) -> None:
         job_id = _job_id(record.get("job_id"))
         input_tokens = int(record.get("input_tokens") or 0)
@@ -902,6 +986,13 @@ def _provider_failure_class(returncode: int, stdout: str, stderr: str) -> str | 
     )):
         return "provider_capacity"
     return "command_failed"
+
+
+def _output_kind(stream: str, text: str) -> str:
+    compact = text.replace(" ", "").lower()
+    if '"tool_call"' in compact or '"type":"tool' in compact:
+        return "tool"
+    return stream
 
 
 def _find_string(value: Any, keys: set[str]) -> str | None:

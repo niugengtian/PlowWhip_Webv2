@@ -31,6 +31,7 @@ from plow_whip_web.store.project_repository import ProjectRepository
 from plow_whip_web.store.task_repository import TaskRepository
 from plow_whip_web.store.settings_repository import SettingsRepository
 from plow_whip_web.runtime.token_ledger import TokenLedger
+from plow_whip_web.runtime.model_call_ledger import ModelCallLedger
 
 
 class TaskService:
@@ -47,6 +48,7 @@ class TaskService:
         provider_pool: ProviderPool | None = None,
         host_jobs: HostJobRepository | None = None,
         projects: ProjectRepository | None = None,
+        model_calls: ModelCallLedger | None = None,
     ) -> None:
         self.repository = repository
         self.provider = provider or GenericCommandProvider()
@@ -59,6 +61,7 @@ class TaskService:
         self.provider_pool = provider_pool
         self.host_jobs = host_jobs
         self.projects = projects
+        self.model_calls = model_calls
 
     def drive(
         self, task_id: str, *, expected_revision: int, idempotency_key: str
@@ -85,6 +88,7 @@ class TaskService:
             return claim.task
         assert claim.attempt_id is not None
         assert claim.run_id is not None
+        call = self._prepare_executor_call(claim.task, claim.run_id)
         baseline = self._evidence_snapshot(claim.task)
         self.repository.record_evidence_baseline(
             task_id=claim.task.id,
@@ -115,9 +119,25 @@ class TaskService:
                 snapshot = self.provider_pool.start_task_job(
                     claim.task, job_id=job["job_id"], prompt=prompt
                 )
+                if str(snapshot.get("job_id") or "") != job["job_id"]:
+                    raise HostBridgeRejectedError("Host Bridge returned a different job identity")
                 self.host_jobs.record(job["job_id"], snapshot)
+                if call:
+                    self.model_calls.dispatched(
+                        call["call_id"], host_job_id=job["job_id"],
+                        session_id=(
+                            snapshot.get("session_id")
+                            or snapshot.get("external_session_id")
+                        ),
+                    )
                 self._observe_episode(job, snapshot)
             except HostBridgeRejectedError as error:
+                self.host_jobs.dispatch_rejected(job["job_id"], str(error))
+                if call:
+                    self.model_calls.settle(
+                        call["call_id"], failed=True,
+                        error_class="dispatch_rejected",
+                    )
                 result = self._handle_host_fault(
                     claim.task,
                     job,
@@ -136,13 +156,33 @@ class TaskService:
                 # Dispatch outcome is unknown. Retain lease and reconcile by stable job_id.
                 self.host_jobs.hold(job["job_id"], str(error))
                 self.host_jobs.renew(job["job_id"])
+                if call:
+                    self.model_calls.unknown(
+                        call["call_id"], error_class="dispatch_outcome_unknown"
+                    )
             return self.repository.get(task_id)
 
         project_path = Path(claim.task.project_path).resolve()
-        execution = (
-            self.provider_pool.execute_task(claim.task, prompt=prompt)
-            if self.provider_pool else self.provider.execute(project_path, claim.task.command)
-        )
+        if call:
+            self.model_calls.dispatched(call["call_id"])
+        try:
+            execution = (
+                self.provider_pool.execute_task(claim.task, prompt=prompt)
+                if self.provider_pool else self.provider.execute(project_path, claim.task.command)
+            )
+        except Exception as error:
+            if call:
+                self.model_calls.settle(
+                    call["call_id"], failed=True, error_class=type(error).__name__
+                )
+            raise
+        if call:
+            self.model_calls.settle(
+                call["call_id"], execution.as_dict(),
+                failed=execution.returncode != 0,
+                error_class=execution.failure_class,
+                session_id=execution.external_session_id,
+            )
         return self._finish_execution(
             claim.task, claim.attempt_id, claim.run_id, execution,
             idempotency_prefix=idempotency_key,
@@ -164,9 +204,31 @@ class TaskService:
             try:
                 snapshot = self.provider_pool.poll_task_job(job_id)
                 self.host_jobs.record(job_id, snapshot)
+                if (
+                    self.model_calls
+                    and job.get("run_id")
+                    and str(snapshot.get("status") or "unknown")
+                    not in {"unknown", "recovery_hold"}
+                ):
+                    self.model_calls.dispatched(
+                        job["run_id"], host_job_id=job_id,
+                        session_id=(
+                            snapshot.get("session_id")
+                            or snapshot.get("external_session_id")
+                        ),
+                    )
             except ProviderUnavailableError as error:
                 self.host_jobs.hold(job_id, str(error))
                 self.host_jobs.renew(job_id)
+                if self.model_calls and job.get("run_id"):
+                    self.model_calls.unknown(
+                        job["run_id"], error_class="dispatch_outcome_unknown"
+                    )
+                if self.host_jobs.reconciliation_expired(job_id):
+                    task = self.repository.get(task_id)
+                    result = self._finalize_reconciliation_timeout(task, job)
+                    settled.append({"task_id": task_id, "status": result.status.value})
+                    continue
                 watch = self._observe_episode(
                     job,
                     {"status": "recovery_hold"},
@@ -177,6 +239,13 @@ class TaskService:
                 continue
             status = str(snapshot.get("status") or "unknown")
             task = self.repository.get(task_id)
+            if (
+                status in {"unknown", "recovery_hold"}
+                and self.host_jobs.reconciliation_expired(job_id)
+            ):
+                result = self._finalize_reconciliation_timeout(task, job)
+                settled.append({"task_id": task_id, "status": result.status.value})
+                continue
             decision = (
                 FaultPolicy.from_host_snapshot(snapshot)
                 if status not in {
@@ -224,6 +293,9 @@ class TaskService:
                 active += 1
                 continue
             if status == "completed":
+                self._settle_executor_call(
+                    job, snapshot, failed=int(snapshot.get("returncode") or 0) != 0
+                )
                 if task.status is TaskStatus.STOPPING:
                     result = self.repository.finalize_running_cancel(task_id, job_id=job_id)
                     self._record_host_usage(task, job, snapshot)
@@ -237,9 +309,17 @@ class TaskService:
                         continue
                     if task.status in {TaskStatus.RUNNING, TaskStatus.VERIFYING}:
                         execution = self.provider_pool.bridge.result(snapshot)
+                        verify_call = self._prepare_verifier_call(task, job["run_id"])
+                        if verify_call:
+                            self.model_calls.dispatched(verify_call["call_id"])
                         try:
                             verification = self.provider_pool.verify_host_task(task, execution)
                         except ProviderUnavailableError as error:
+                            if verify_call:
+                                self.model_calls.unknown(
+                                    verify_call["call_id"],
+                                    error_class="verification_transport_unknown",
+                                )
                             transport_watch = self._observe_episode(
                                 job,
                                 {
@@ -250,6 +330,11 @@ class TaskService:
                                 fault_class="transient_transport",
                             )
                             if transport_watch["bounded"]:
+                                if verify_call:
+                                    self.model_calls.settle(
+                                        verify_call["call_id"], failed=True,
+                                        error_class="verification_transport_timeout",
+                                    )
                                 result = self._finalize_episode_boundary(
                                     task,
                                     job,
@@ -266,6 +351,8 @@ class TaskService:
                             self.host_jobs.renew(job_id)
                             active += 1
                             continue
+                        if verify_call:
+                            self.model_calls.settle(verify_call["call_id"])
                         result = self._finish_execution(
                             task, job["attempt_id"], job["run_id"], execution,
                             idempotency_prefix=f"host-job:{job_id}",
@@ -278,6 +365,7 @@ class TaskService:
                 settled.append({"task_id": task_id, "status": result.status.value})
                 continue
             if status == "cancelled":
+                self._settle_executor_call(job, snapshot, failed=True)
                 if task.status is TaskStatus.STOPPING:
                     result = self.repository.finalize_running_cancel(task_id, job_id=job_id)
                     self._record_host_usage(task, job, snapshot)
@@ -291,6 +379,7 @@ class TaskService:
                 settled.append({"task_id": task_id, "status": result.status.value})
                 continue
             if status == "interrupted":
+                self._settle_executor_call(job, snapshot, failed=True)
                 result = self._handle_host_fault(
                     task, job, snapshot, decision=decision, watch=watch,
                 )
@@ -299,11 +388,44 @@ class TaskService:
                 continue
             self.host_jobs.hold(job_id, f"unknown host job status: {status}")
             self.host_jobs.renew(job_id)
+            if self.model_calls and job.get("run_id"):
+                self.model_calls.unknown(
+                    job["run_id"], error_class="dispatch_outcome_unknown"
+                )
             active += 1
         return {
             "checked": len(jobs), "active": active, "settled": settled,
             "burn_rate_alerts": burn_rate_alerts, "model_invoked": False,
         }
+
+    def _finalize_reconciliation_timeout(
+        self, task: TaskRecord, job: dict[str, Any]
+    ) -> TaskRecord:
+        assert self.host_jobs is not None
+        snapshot = {
+            "job_id": job["job_id"],
+            "status": "reconciliation_timeout",
+            "failure_class": "dispatch_reconciliation_timeout",
+            "error_summary": "dispatch reconciliation deadline exceeded",
+            "input_tokens": 0,
+            "output_tokens": 0,
+        }
+        checkpoint = self.host_jobs.terminate_episode(
+            job["job_id"],
+            reason="dispatch_reconciliation_deadline_exceeded",
+            snapshot=snapshot,
+            force_circuit=True,
+        )
+        self._settle_executor_call(job, snapshot, failed=True)
+        return self._finalize_host_fault(
+            task,
+            job,
+            snapshot,
+            action="needs_human",
+            failure_class="dispatch_reconciliation_timeout",
+            reason="dispatch_reconciliation_deadline_exceeded",
+            episode=checkpoint,
+        )
 
     def _handle_host_fault(
         self, task: TaskRecord, job: dict[str, Any], snapshot: dict[str, Any],
@@ -395,6 +517,7 @@ class TaskService:
         episode: dict[str, Any],
         rotate_worker_reason: str | None = None,
     ) -> TaskRecord:
+        self._settle_executor_call(job, snapshot, failed=True)
         execution = {
             "returncode": int(snapshot.get("returncode") or 0),
             "failure_class": failure_class,
@@ -445,10 +568,16 @@ class TaskService:
     def _record_host_usage(
         self, task: TaskRecord, job: dict[str, Any], snapshot: dict[str, Any]
     ) -> None:
-        if not self.token_ledger or not self.provider_pool:
+        if not self.provider_pool:
             return
         execution = self.provider_pool.bridge.result(snapshot).as_dict()
-        if int(execution["input_tokens"]) + int(execution["output_tokens"]) > 0:
+        self._settle_executor_call(
+            job, snapshot, failed=int(snapshot.get("returncode") or 0) != 0
+        )
+        if (
+            self.token_ledger
+            and int(execution["input_tokens"]) + int(execution["output_tokens"]) > 0
+        ):
             self.token_ledger.record(
                 execution,
                 call_id=job["run_id"],
@@ -457,6 +586,61 @@ class TaskService:
                 run_id=job["run_id"],
                 add_to_task=True,
             )
+
+    def _prepare_executor_call(
+        self, task: TaskRecord, run_id: str
+    ) -> dict[str, Any] | None:
+        if not self.model_calls:
+            return None
+        context = (
+            self.repository.worker_execution_context(task.worker_id)
+            if task.worker_id else {}
+        )
+        provider = (
+            self.provider_pool.providers.require(task.provider)
+            if self.provider_pool else {}
+        )
+        return self.model_calls.prepare(
+            idempotency_key=f"task-run:{run_id}",
+            call_id=run_id,
+            call_kind="executor",
+            provider=task.provider,
+            model=str(provider.get("model") or task.provider),
+            task=task,
+            session_id=context.get("external_session_id"),
+            session_generation=context.get("session_generation"),
+        )
+
+    def _prepare_verifier_call(
+        self, task: TaskRecord, run_id: str
+    ) -> dict[str, Any] | None:
+        if not self.model_calls:
+            return None
+        return self.model_calls.prepare(
+            idempotency_key=f"task-run:{run_id}:verifier",
+            call_kind="verifier",
+            provider=task.provider,
+            model="deterministic-verifier",
+            task=task,
+        )
+
+    def _settle_executor_call(
+        self, job: dict[str, Any], snapshot: dict[str, Any], *, failed: bool
+    ) -> None:
+        if not self.model_calls or not job.get("run_id"):
+            return
+        execution = self.provider_pool.bridge.result(snapshot).as_dict() if self.provider_pool else {}
+        self.model_calls.settle(
+            job["run_id"], execution, failed=failed,
+            error_class=(
+                str(snapshot.get("failure_class"))
+                if snapshot.get("failure_class") else None
+            ),
+            session_id=(
+                snapshot.get("session_id")
+                or snapshot.get("external_session_id")
+            ),
+        )
 
     def control(
         self, task_id: str, *, action: str, reason: str,
@@ -504,9 +688,23 @@ class TaskService:
         )
         # quality_profile is deprecated compatibility data. Legacy rows and new
         # tasks intentionally share this single deterministic verification path.
-        verification = verification or self.verifier.verify(
-            project_path, execution, task.verification
-        )
+        if verification is None:
+            verify_call = self._prepare_verifier_call(task, run_id)
+            if verify_call:
+                self.model_calls.dispatched(verify_call["call_id"])
+            try:
+                verification = self.verifier.verify(
+                    project_path, execution, task.verification
+                )
+            except Exception as error:
+                if verify_call:
+                    self.model_calls.settle(
+                        verify_call["call_id"], failed=True,
+                        error_class=type(error).__name__,
+                    )
+                raise
+            if verify_call:
+                self.model_calls.settle(verify_call["call_id"])
         baseline = self.repository.evidence_baseline(run_id)
         manifest = build_evidence_manifest(
             task=task,

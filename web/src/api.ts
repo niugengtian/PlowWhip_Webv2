@@ -152,6 +152,29 @@ export type Worker = {
   last_attribution_granularity: string
   last_value_classification: string
 }
+export type WorkerDetail = {
+  worker: Worker & Record<string, unknown>
+  task: (Pick<Task, 'id' | 'title' | 'objective' | 'status' | 'revision' | 'spec_revision' | 'provider' | 'spec'> & Record<string, unknown>) | null
+  host_job: ({
+    job_id: string
+    task_id: string
+    status: string
+    dispatch_outcome: 'accepted' | 'rejected' | 'unknown'
+    reconciliation_deadline_at: string | null
+    external_session_id: string | null
+    heartbeat_at: string | null
+    result?: Record<string, unknown>
+  } & Record<string, unknown>) | null
+  episode: Record<string, unknown> | null
+  ownership: Record<string, unknown>
+}
+export type WorkerStream = {
+  worker_id: string
+  job_id: string | null
+  items: { kind: 'stdout' | 'stderr' | 'tool' | 'status'; ref?: string; refs?: string[]; text: string; created_at?: string; state_revision?: number; offset?: number; next_offset?: number }[]
+  next_cursor: string
+  has_more: boolean
+}
 export type Project = {
   id: string
   name: string
@@ -212,9 +235,14 @@ export type Usage = {
   output_tokens: number
   total_tokens: number
   total_formula: string
-  projects: { project_id: string | null; input_tokens: number; cached_input_tokens: number; uncached_input_tokens: number; output_tokens: number; tokens: number }[]
-  tasks: { task_id: string; input_tokens: number; cached_input_tokens: number; uncached_input_tokens: number; output_tokens: number; tokens: number }[]
-  calls: { call_id: string; call_kind: 'task_execution' | 'convention_refinement'; task_id: string | null; worker_id: string | null; provider: string; session_generation: number | null; input_tokens: number; cached_input_tokens: number; uncached_input_tokens: number; output_tokens: number; attribution_granularity: string; value_classification: string; rotation_reason: string | null; created_at: string }[]
+  projects: { project_id: string | null; input_tokens: number; cached_input_tokens: number; uncached_input_tokens: number; output_tokens: number; tokens: number; calls: number }[]
+  tasks: { task_id: string | null; input_tokens: number; cached_input_tokens: number; uncached_input_tokens: number; output_tokens: number; tokens: number; calls: number }[]
+  workers: { worker_id: string | null; tokens: number; calls: number }[]
+  providers: { provider: string; tokens: number; calls: number }[]
+  models: { model: string; tokens: number; calls: number }[]
+  call_kinds: { call_kind: string; tokens: number; calls: number }[]
+  sessions: { session_id: string | null; tokens: number; calls: number }[]
+  calls: { call_id: string; call_kind: 'executor' | 'butler_planner' | 'router' | 'verifier' | 'convention_refinement'; status: string; task_id: string | null; worker_id: string | null; provider: string; model: string; session_id: string | null; session_generation: number | null; input_tokens: number; cached_input_tokens: number; uncached_input_tokens: number; output_tokens: number; total_tokens: number; error_class: string | null; created_at: string }[]
 }
 export type RuntimeHealth = {
   connectivity: string
@@ -237,6 +265,7 @@ export type Provider = {
   capabilities: string[]; reason: string | null; adapter: 'codex' | 'cursor' | 'json-worker' | 'generic-command';
   transport: 'host-bridge' | 'container'; executable: string | null; enabled: boolean;
   credential_env: string | null; revision: number; last_probed_at: string | null
+  model?: string
   credential_slot_count?: number | null
   readiness?: {
     installed: boolean
@@ -314,6 +343,7 @@ export const api = {
   refineConvention: (convention: Convention, provider: string, projectId: string | null) =>
     request<ConventionSuggestion>(`/api/conventions/${convention.scope}/${convention.scope_id}/refine`, {
       method: 'POST',
+      idempotencyKey: crypto.randomUUID(),
       body: JSON.stringify({ provider, project_id: projectId }),
     }),
   usage: () => request<Usage>('/api/usage'),
@@ -334,6 +364,9 @@ export const api = {
     request<Worker>(`/api/workers/${workerId}/rebind`, {
       method: 'POST', body: JSON.stringify({ provider, reason: 'operator_rebind' }),
     }),
+  workerDetail: (workerId: string) => request<WorkerDetail>(`/api/workers/${workerId}`),
+  workerStream: (workerId: string, cursor = '0:0:0') =>
+    request<WorkerStream>(`/api/workers/${workerId}/stream?cursor=${encodeURIComponent(cursor)}`),
   tasks: () => request<Task[]>('/api/tasks'),
   estimateTask: (payload: TaskSizingInputs) =>
     request<TaskSizingEstimate>('/api/tasks/estimate', {

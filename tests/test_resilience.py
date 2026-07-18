@@ -60,11 +60,15 @@ def test_pause_resume_needs_human_outbox_and_cancel() -> None:
             )
             assert human.json()["status"] == "needs_human"
             outbox = client.get("/api/outbox").json()
-            assert outbox[0]["event_type"] == "task.needs_human"
-            assert outbox[0]["payload"]["reason"] == "credential required"
+            needs_human = next(
+                item for item in outbox if item["event_type"] == "task.needs_human"
+            )
+            assert needs_human["payload"]["reason"] == "credential required"
             stream = client.get("/api/events/stream?once=true")
             assert stream.status_code == 200
-            assert "event: task.needs_human" in stream.text
+            assert "event: aggregate.updated" in stream.text
+            assert '"event_type":"task.needs_human"' in stream.text
+            assert '"revision":' in stream.text
             assert client.post(f"/api/outbox/{outbox[0]['sequence']}/ack").json()["acknowledged"] is True
             cancelled = client.post(
                 f"/api/tasks/{task.id}/control", headers={"Idempotency-Key": "control-cancel"},
