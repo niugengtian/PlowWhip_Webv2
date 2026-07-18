@@ -259,7 +259,9 @@ class SimpleWorker:
                 "You are plow-whip simple-worker, a bounded low-cost implementation worker. "
                 "Work only through the provided project tools. Never read secrets, escape the "
                 "project, or manage Git branches, commits, pushes, resets, or checkouts. Inspect "
-                "before editing and run relevant checks. If work is architectural or ambiguous, "
+                "before editing and run relevant checks. For a trivial read-only or answer-only "
+                "task, do not call tools: return the completed JSON directly. If work is "
+                "architectural or ambiguous, "
                 "return JSON {\"status\":\"needs_planner\",\"reason\":\"...\"}. When finished, "
                 "return JSON {\"status\":\"completed\",\"summary\":\"...\","
                 "\"verify_commands\":[\"...\"]}."
@@ -467,6 +469,14 @@ def main() -> None:
 def _final_payload(content: str) -> dict[str, Any] | None:
     candidates = [content.strip()]
     candidates.extend(re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.I | re.S))
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", content):
+        try:
+            value, _end = decoder.raw_decode(content, match.start())
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            candidates.append(json.dumps(value, ensure_ascii=False))
     for candidate in reversed(candidates):
         try:
             value = json.loads(candidate)

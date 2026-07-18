@@ -92,3 +92,6 @@ def test_final_payload_accepts_plain_or_fenced_json() -> None:
     assert _final_payload('```json\n{"status":"needs_planner","reason":"large"}\n```')[
         "status"
     ] == "needs_planner"
+    assert _final_payload(
+        'Finished without changes.\n{"status":"completed","summary":"READY"}'
+    )["summary"] == "READY"

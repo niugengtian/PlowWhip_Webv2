@@ -400,3 +400,59 @@ def test_provider_pool_passes_execution_policy_hard_deadline_to_host() -> None:
         )
         pool.start_task_job(legacy_claim.task, job_id="job-legacy", prompt="work")
         assert bridge.last_timeout == 240
+
+
+def test_recent_execution_health_requires_a_successful_terminal_host_job() -> None:
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        project_path = root / "project"
+        project_path.mkdir()
+        app = create_app(Settings(
+            data_dir=root / "runtime",
+            host_bridge_token="test-token-is-long-enough-123",
+        ))
+        project = app.state.project_repository.create(
+            name="readiness", path=str(project_path), host_path=str(project_path)
+        )
+        role_id = app.state.project_repository.resolve_role(
+            project["id"], "fullstack"
+        )["role_id"]
+        task = app.state.task_repository.create(
+            title="cursor readiness",
+            objective="prove one real execution",
+            project_path=str(project_path),
+            project_id=project["id"],
+            role_id=role_id,
+            provider="cursor",
+            command={"argv": None, "timeout_seconds": 60},
+            verification=[{"kind": "exit_code", "expected": 0}],
+            max_attempts=1,
+            idempotency_key="cursor-readiness-task",
+        )
+        claim = app.state.task_repository.claim(
+            task.id,
+            expected_revision=task.revision,
+            idempotency_key="cursor-readiness-claim",
+        )
+        assert claim.attempt_id is not None
+        assert claim.run_id is not None
+        job = app.state.host_jobs.prepare(
+            task_id=task.id,
+            attempt_id=claim.attempt_id,
+            run_id=claim.run_id,
+            provider="cursor",
+        )
+
+        assert app.state.provider_pool._recent_execution_health("cursor") == "unknown"
+
+        app.state.host_jobs.record(job["job_id"], {
+            "job_id": job["job_id"],
+            "status": "completed",
+            "returncode": 0,
+            "stdout": "fixture complete",
+            "stderr": "",
+            "input_tokens": 1,
+            "output_tokens": 1,
+        })
+
+        assert app.state.provider_pool._recent_execution_health("cursor") == "healthy"

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -108,8 +109,12 @@ class ProviderPool:
         try:
             rows = connection.execute(
                 """
-                SELECT last_error, result_json FROM host_jobs
+                SELECT status, last_error, result_json FROM host_jobs
                 WHERE provider = ?
+                  AND status IN (
+                      'completed', 'failed', 'cancelled', 'interrupted',
+                      'rejected', 'fault_finalized', 'reconciliation_timeout'
+                  )
                 ORDER BY updated_at DESC LIMIT 5
                 """,
                 (provider_name,),
@@ -129,7 +134,14 @@ class ProviderPool:
             return "tooling_broken"
         if abort_hits == 1:
             return "degraded"
-        return "healthy"
+        latest = rows[0]
+        try:
+            result = json.loads(latest["result_json"] or "{}")
+        except json.JSONDecodeError:
+            result = {}
+        if latest["status"] == "completed" and result.get("returncode") == 0:
+            return "healthy"
+        return "unhealthy"
 
     def probe_all(self) -> list[dict[str, Any]]:
         names = [item["name"] for item in self.providers.list() if item["enabled"]]
