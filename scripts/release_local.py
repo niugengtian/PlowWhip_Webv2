@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import plistlib
@@ -28,6 +29,7 @@ REQUIRED_VOLUMES = {
     "plow-whip-web-v2-data": "/data",
     "plow-whip-web-v2-projects": "/projects",
 }
+MIGRATION_DIR = ROOT / "backend" / "plow_whip_web" / "store" / "migrations"
 
 
 class ReleaseError(RuntimeError):
@@ -149,6 +151,19 @@ def _control_plane_ids() -> list[str]:
     return [line for line in result.stdout.splitlines() if line]
 
 
+def _schema_contract() -> dict[str, object]:
+    manifest = [
+        (migration.name, hashlib.sha256(migration.read_bytes()).hexdigest())
+        for migration in sorted(MIGRATION_DIR.glob("*.sql"))
+    ]
+    payload = "\n".join(f"{name}:{checksum}" for name, checksum in manifest)
+    return {
+        "migration_count": len(manifest),
+        "schema_head": manifest[-1][0] if manifest else None,
+        "schema_checksum": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+    }
+
+
 def verify_runtime(expected_sha: str) -> dict[str, object]:
     expected_sha = _validate_sha(expected_sha)
     container_ids = _control_plane_ids()
@@ -181,14 +196,13 @@ def verify_runtime(expected_sha: str) -> dict[str, object]:
         raise ReleaseError(f"runtime image revision mismatch: {revision!r}")
     health = _get_json(f"{CONTROL_URL}/health")
     database = health.get("database", {})
+    expected_database = _schema_contract()
     if (
         health.get("status") != "ok"
         or database.get("journal_mode") != "wal"
-        or database.get("migration_count") != len(list(
-            (ROOT / "backend" / "plow_whip_web" / "store" / "migrations").glob("*.sql")
-        ))
+        or any(database.get(key) != value for key, value in expected_database.items())
     ):
-        raise ReleaseError("HTTP health, WAL, or migration count check failed")
+        raise ReleaseError("HTTP health, WAL, or schema contract check failed")
     return {
         "container_id": container_ids[0],
         "image_id": container["Image"],
@@ -198,6 +212,8 @@ def verify_runtime(expected_sha: str) -> dict[str, object]:
         "database": {
             "journal_mode": database["journal_mode"],
             "migration_count": database["migration_count"],
+            "schema_head": database["schema_head"],
+            "schema_checksum": database["schema_checksum"],
         },
         "volumes": sorted(REQUIRED_VOLUMES),
     }

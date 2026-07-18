@@ -5,6 +5,8 @@ import sqlite3
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import pytest
+
 from plow_whip_web.store import database as database_module
 from plow_whip_web.store.database import Database
 
@@ -23,7 +25,32 @@ def test_migrations_are_idempotent() -> None:
         assert applied_migrations == migration_names
         assert len(applied_migrations) == len(set(applied_migrations))
         assert database.migrate() == []
-        assert database.health()["migration_count"] == len(migration_names)
+        assert database.health() == {
+            "status": "ok",
+            "journal_mode": "wal",
+            **database_module.migration_contract(),
+        }
+        connection = database.connect()
+        try:
+            recorded = connection.execute(
+                "SELECT version, checksum FROM schema_migrations ORDER BY version"
+            ).fetchall()
+        finally:
+            connection.close()
+        assert [tuple(row) for row in recorded] == database_module.migration_manifest()
+
+
+def test_migration_checksum_drift_is_rejected() -> None:
+    with TemporaryDirectory() as directory:
+        database = Database(Path(directory) / "drift.sqlite3")
+        database.migrate()
+        with database.transaction(immediate=True) as connection:
+            connection.execute(
+                "UPDATE schema_migrations SET checksum = ? WHERE version = ?",
+                ("0" * 64, _migration_names()[0]),
+            )
+        with pytest.raises(RuntimeError, match="migration checksum mismatch"):
+            database.migrate()
 
 
 def test_upgrade_migration_scrubs_legacy_sqlite_bodies_once() -> None:
@@ -133,9 +160,10 @@ def test_0021_upgrades_0019_database_and_removes_reservations() -> None:
         db_path = Path(directory) / "upgrade-0019.sqlite3"
         migration_dir = Path(database_module.__file__).with_name("migrations")
         migrations = sorted(migration_dir.glob("*.sql"))
-        assert [item.name for item in migrations[-2:]] == [
+        assert [item.name for item in migrations[-3:]] == [
             "0020_provider_context_pressure.sql",
             "0021_remove_token_budget.sql",
+            "0022_task_spec_continuity.sql",
         ]
         connection = sqlite3.connect(db_path)
         try:
@@ -147,7 +175,7 @@ def test_0021_upgrades_0019_database_and_removes_reservations() -> None:
                 )
                 """
             )
-            for migration in migrations[:-2]:
+            for migration in migrations[:-3]:
                 for statement in database_module._split_statements(
                     migration.read_text(encoding="utf-8")
                 ):
@@ -184,6 +212,7 @@ def test_0021_upgrades_0019_database_and_removes_reservations() -> None:
         assert database.migrate() == [
             "0020_provider_context_pressure.sql",
             "0021_remove_token_budget.sql",
+            "0022_task_spec_continuity.sql",
         ]
         assert database.migrate() == []
         connection = database.connect()
@@ -228,3 +257,68 @@ def test_0021_upgrades_0019_database_and_removes_reservations() -> None:
             "0018_p0_correction.sql",
             "0019_backend_correction.sql",
         }
+
+
+def test_0022_upgrades_0021_and_preserves_terminal_task() -> None:
+    with TemporaryDirectory() as directory:
+        db_path = Path(directory) / "upgrade-0021.sqlite3"
+        migration_dir = Path(database_module.__file__).with_name("migrations")
+        migrations = sorted(migration_dir.glob("*.sql"))
+        assert migrations[-1].name == "0022_task_spec_continuity.sql"
+        connection = sqlite3.connect(db_path)
+        try:
+            connection.execute(
+                """
+                CREATE TABLE schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            for migration in migrations[:-1]:
+                for statement in database_module._split_statements(
+                    migration.read_text(encoding="utf-8")
+                ):
+                    connection.execute(statement)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version) VALUES (?)",
+                    (migration.name,),
+                )
+            connection.execute(
+                """
+                INSERT INTO tasks(
+                    id, title, objective, project_path, status, command_json,
+                    verification_json, max_attempts, token_budget, sizing_json
+                ) VALUES (
+                    'failed-task', 'failed', 'do not rerun', '/tmp',
+                    'terminal_failed', '{"timeout_seconds":321}',
+                    '[{"kind":"file_exists","path":"evidence.txt"}]',
+                    1, 0, '{"status":"legacy_fallback"}'
+                )
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        database = Database(db_path)
+        assert database.migrate() == ["0022_task_spec_continuity.sql"]
+        connection = database.connect()
+        try:
+            task = connection.execute(
+                "SELECT status, current_spec_revision FROM tasks WHERE id = 'failed-task'"
+            ).fetchone()
+            spec = connection.execute(
+                "SELECT spec_json, spec_hash FROM task_specs WHERE task_id = 'failed-task'"
+            ).fetchone()
+            with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+                connection.execute(
+                    "UPDATE task_specs SET spec_json = '{}' WHERE task_id = 'failed-task'"
+                )
+        finally:
+            connection.close()
+        payload = json.loads(spec["spec_json"])
+        assert tuple(task) == ("terminal_failed", 1)
+        assert payload["objective"] == "do not rerun"
+        assert payload["artifacts"] == ["evidence.txt"]
+        assert payload["deadline"] == {"hard_seconds": 321}

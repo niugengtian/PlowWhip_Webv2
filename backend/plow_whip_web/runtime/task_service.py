@@ -90,6 +90,7 @@ class TaskService:
             self.journal.append(claim.task.worker_id, {
                 "event": "task.started", "task_id": task_id,
                 "context_hash": context["content_hash"] if context else None,
+                "spec_revision": claim.task.spec_revision,
             })
         prompt = context["content"] if context else claim.task.objective
         if (

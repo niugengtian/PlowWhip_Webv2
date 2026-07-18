@@ -76,6 +76,12 @@ class TaskSizingEstimateResponse(BaseModel):
     bootstrap_version: str
 
 
+class TaskDeadline(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    hard_seconds: Annotated[int, Field(ge=1, le=4800)]
+
+
 class TaskCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -101,6 +107,11 @@ class TaskCreate(BaseModel):
     quality_profile: Literal["fast", "balanced", "strict", "deterministic"] = "deterministic"
     command: CommandSpec
     verification: Annotated[list[VerificationSpec], Field(min_length=1, max_length=32)]
+    scope: Annotated[list[str], Field(max_length=64)] = Field(default_factory=list)
+    acceptance: Annotated[list[str], Field(max_length=64)] = Field(default_factory=list)
+    artifacts: Annotated[list[str] | None, Field(max_length=64)] = None
+    constraints: Annotated[list[str], Field(max_length=64)] = Field(default_factory=list)
+    deadline: TaskDeadline | None = None
     max_attempts: Annotated[int | None, Field(ge=1, le=10)] = None
     sizing_inputs: TaskSizingEstimateRequest | None = None
 
@@ -128,6 +139,18 @@ class TaskCreate(BaseModel):
         if self.provider == "generic-command" and not self.command.argv:
             raise ValueError("generic-command requires command.argv")
         return self
+
+    @field_validator("artifacts")
+    @classmethod
+    def artifact_paths_must_be_safe(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        if any(
+            not item or Path(item).is_absolute() or ".." in Path(item).parts
+            for item in value
+        ):
+            raise ValueError("artifacts require safe relative paths")
+        return value
 
 
 class ExpectedRevision(BaseModel):
@@ -170,6 +193,8 @@ class TaskView(BaseModel):
     ordinal: int | None = None
     blocked_reason: str | None = None
     handoff: dict[str, Any] | None = None
+    spec_revision: int
+    spec: dict[str, Any]
 
     @classmethod
     def from_record(cls, record: TaskRecord) -> "TaskView":

@@ -119,6 +119,7 @@ def test_verify_runtime_requires_image_revision_and_named_volumes() -> None:
         subprocess.CompletedProcess([], 0, json.dumps([container]), ""),
         subprocess.CompletedProcess([], 0, json.dumps([image]), ""),
     ]
+    schema = release_local._schema_contract()
     with (
         patch.object(release_local, "_control_plane_ids", return_value=["container"]),
         patch.object(release_local, "_run", side_effect=inspect_results),
@@ -127,7 +128,7 @@ def test_verify_runtime_requires_image_revision_and_named_volumes() -> None:
             "_get_json",
             return_value={
                 "status": "ok",
-                "database": {"journal_mode": "wal", "migration_count": 21},
+                "database": {"journal_mode": "wal", **schema},
             },
         ),
     ):
@@ -139,6 +140,47 @@ def test_verify_runtime_requires_image_revision_and_named_volumes() -> None:
         "plow-whip-web-v2-data",
         "plow-whip-web-v2-projects",
     ]
+    assert result["database"]["schema_head"] == "0022_task_spec_continuity.sql"
+
+
+def test_verify_runtime_rejects_stale_schema_head() -> None:
+    expected = "e" * 40
+    container = {
+        "State": {"Running": True, "Health": {"Status": "healthy"}},
+        "RestartCount": 0,
+        "Image": "sha256:image",
+        "Mounts": [
+            {"Type": "volume", "Name": name, "Destination": destination}
+            for name, destination in release_local.REQUIRED_VOLUMES.items()
+        ],
+    }
+    image = {"Config": {"Labels": {release_local.RELEASE_LABEL: expected}}}
+    schema = release_local._schema_contract()
+    with (
+        patch.object(release_local, "_control_plane_ids", return_value=["container"]),
+        patch.object(
+            release_local,
+            "_run",
+            side_effect=[
+                subprocess.CompletedProcess([], 0, json.dumps([container]), ""),
+                subprocess.CompletedProcess([], 0, json.dumps([image]), ""),
+            ],
+        ),
+        patch.object(
+            release_local,
+            "_get_json",
+            return_value={
+                "status": "ok",
+                "database": {
+                    "journal_mode": "wal",
+                    **schema,
+                    "schema_head": "0021_remove_token_budget.sql",
+                },
+            },
+        ),
+    ):
+        with pytest.raises(release_local.ReleaseError, match="schema contract"):
+            release_local.verify_runtime(expected)
 
 
 def test_verify_runtime_rejects_stale_image_revision() -> None:

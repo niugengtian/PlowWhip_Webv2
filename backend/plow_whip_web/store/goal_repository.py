@@ -13,6 +13,7 @@ from plow_whip_web.runtime.orchestration import (
 )
 from plow_whip_web.runtime.sizing import TaskSizingInputs, estimate_task_sizing
 from plow_whip_web.store.database import Database
+from plow_whip_web.store.task_repository import canonical_task_spec, insert_task_spec
 
 
 def _preview_to_persistence(preview: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -173,6 +174,23 @@ class GoalRepository:
                 "UPDATE goals SET parent_task_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (parent_task_id, goal_id),
             )
+            insert_task_spec(
+                connection,
+                parent_task_id,
+                canonical_task_spec(
+                    objective=objective,
+                    scope=["coordination"],
+                    acceptance=["all_work_items_verified"],
+                    verification=[],
+                    artifacts=[],
+                    constraints=[
+                        f"network:{network_requirement}",
+                        f"provider:{parent_provider}",
+                    ],
+                    deadline={"hard_seconds": parent_policy["hard_deadline_seconds"]},
+                ),
+                revision=1,
+            )
 
             ordinal_to_task: dict[int, str] = {}
             impl_count = sum(1 for item in plan.items if item.kind == "implementation")
@@ -250,6 +268,25 @@ class GoalRepository:
                         item.ordinal,
                         None if ready else f"waiting_on:{','.join(depends_ids)}",
                     ),
+                )
+                insert_task_spec(
+                    connection,
+                    task_id,
+                    canonical_task_spec(
+                        objective=item.objective,
+                        scope=[item.role, item.kind],
+                        acceptance=list(item.acceptance),
+                        verification=child_verification,
+                        artifacts=list(item.artifacts) or None,
+                        constraints=[
+                            f"network:{network_requirement}",
+                            f"provider:{item_provider}",
+                        ],
+                        deadline={
+                            "hard_seconds": execution_policy["hard_deadline_seconds"]
+                        },
+                    ),
+                    revision=1,
                 )
 
             connection.execute(

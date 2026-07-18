@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from dataclasses import dataclass
@@ -31,12 +32,10 @@ def task_sizing_status(task: TaskRecord) -> str:
 
 
 def task_hard_deadline_seconds(task: TaskRecord) -> int:
-    if task_sizing_status(task) == "estimated":
-        if task.execution_policy is None:
-            raise DomainError("estimated task is missing execution_policy")
-        deadline = int(task.execution_policy["hard_deadline_seconds"])
-    else:
-        deadline = int(task.command.get("timeout_seconds", LEGACY_DEFAULT_TIMEOUT_SECONDS))
+    deadline = int(
+        task.spec.get("deadline", {}).get("hard_seconds")
+        or task.command.get("timeout_seconds", LEGACY_DEFAULT_TIMEOUT_SECONDS)
+    )
     return min(max(deadline, 10), MAX_HARD_DEADLINE_SECONDS)
 
 
@@ -74,6 +73,11 @@ class TaskRepository:
         quality_profile: str = "deterministic",
         sizing: dict[str, Any] | None = None,
         execution_policy: dict[str, Any] | None = None,
+        scope: list[str] | None = None,
+        acceptance: list[str] | None = None,
+        artifacts: list[str] | None = None,
+        constraints: list[str] | None = None,
+        deadline: dict[str, Any] | None = None,
     ) -> TaskRecord:
         if sizing is None:
             if execution_policy is not None:
@@ -81,6 +85,20 @@ class TaskRepository:
             sizing = {"status": "legacy_fallback"}
         if execution_policy is not None and execution_policy.get("max_attempts") is not None:
             max_attempts = int(execution_policy["max_attempts"])
+        spec = canonical_task_spec(
+            objective=objective,
+            scope=scope,
+            acceptance=acceptance,
+            verification=verification,
+            artifacts=artifacts,
+            constraints=constraints,
+            deadline=deadline or {
+                "hard_seconds": (
+                    execution_policy.get("hard_deadline_seconds")
+                    if execution_policy else command.get("timeout_seconds", LEGACY_DEFAULT_TIMEOUT_SECONDS)
+                )
+            },
+        )
         with self.database.transaction(immediate=True) as connection:
             duplicate = connection.execute(
                 "SELECT task_id FROM task_events WHERE idempotency_key = ?",
@@ -117,6 +135,7 @@ class TaskRepository:
                     _dump(execution_policy) if execution_policy is not None else None,
                 ),
             )
+            spec_hash = insert_task_spec(connection, task_id, spec, revision=1)
             self._event(
                 connection,
                 task_id=task_id,
@@ -128,9 +147,10 @@ class TaskRepository:
                     "size_class": sizing.get("size_class"),
                     "bootstrap_version": sizing.get("bootstrap_version"),
                     "hard_deadline_seconds": (
-                        execution_policy.get("hard_deadline_seconds")
-                        if execution_policy else None
+                        spec["deadline"]["hard_seconds"]
                     ),
+                    "spec_revision": 1,
+                    "spec_hash": spec_hash,
                 },
                 revision=0,
                 idempotency_key=idempotency_key,
@@ -148,7 +168,8 @@ class TaskRepository:
         connection = self.database.connect()
         try:
             rows = connection.execute(
-                "SELECT * FROM tasks ORDER BY created_at DESC, id DESC LIMIT ?", (limit,)
+                f"{_TASK_WITH_SPEC} ORDER BY t.created_at DESC, t.id DESC LIMIT ?",
+                (limit,),
             ).fetchall()
             return [_task_from_row(row) for row in rows]
         finally:
@@ -159,10 +180,14 @@ class TaskRepository:
         try:
             rows = connection.execute(
                 """
-                SELECT * FROM tasks WHERE status = 'ready'
-                AND (next_eligible_at IS NULL OR next_eligible_at <= CURRENT_TIMESTAMP)
-                AND COALESCE(work_item_kind, '') != 'coordination'
-                ORDER BY created_at, id LIMIT ?
+                SELECT t.*, s.spec_json AS task_spec_json, s.spec_hash AS task_spec_hash
+                FROM tasks t
+                JOIN task_specs s ON s.task_id = t.id
+                    AND s.spec_revision = t.current_spec_revision
+                WHERE t.status = 'ready'
+                AND (t.next_eligible_at IS NULL OR t.next_eligible_at <= CURRENT_TIMESTAMP)
+                AND COALESCE(t.work_item_kind, '') != 'coordination'
+                ORDER BY t.created_at, t.id LIMIT ?
                 """,
                 (limit,),
             ).fetchall()
@@ -244,6 +269,7 @@ class TaskRepository:
                 raise InvalidTransitionError(f"terminal task cannot run: {task.status}")
             if task.status is not TaskStatus.READY:
                 raise InvalidTransitionError(f"task is not ready: {task.status}")
+            _assert_task_spec(task)
             if task.attempts_used >= _authoritative_max_attempts(task):
                 raise InvalidTransitionError("task attempt budget exhausted")
             limits = dict(DEFAULT_SETTINGS)
@@ -280,15 +306,20 @@ class TaskRepository:
             if cursor.rowcount != 1:
                 raise RevisionConflictError("task changed while claiming")
             connection.execute(
-                "INSERT INTO task_attempts(id, task_id, attempt_number, status) VALUES (?, ?, ?, 'running')",
-                (attempt_id, task.id, attempt_number),
+                """
+                INSERT INTO task_attempts(
+                    id, task_id, attempt_number, status, spec_revision
+                ) VALUES (?, ?, ?, 'running', ?)
+                """,
+                (attempt_id, task.id, attempt_number, task.spec_revision),
             )
             connection.execute(
                 """
-                INSERT INTO task_runs(id, task_id, attempt_id, run_type, provider, status)
-                VALUES (?, ?, ?, 'execute', ?, 'running')
+                INSERT INTO task_runs(
+                    id, task_id, attempt_id, run_type, provider, status, spec_revision
+                ) VALUES (?, ?, ?, 'execute', ?, 'running', ?)
                 """,
-                (run_id, task.id, attempt_id, task.provider),
+                (run_id, task.id, attempt_id, task.provider, task.spec_revision),
             )
             self._event(
                 connection,
@@ -297,6 +328,7 @@ class TaskRepository:
                 payload={
                     "attempt_id": attempt_id, "run_id": run_id, "attempt_number": attempt_number,
                     "worker_id": worker_id, "lease_token": lease_token, "fencing_token": fencing_token,
+                    "spec_revision": task.spec_revision,
                 },
                 revision=next_revision,
                 idempotency_key=idempotency_key,
@@ -927,7 +959,9 @@ class TaskRepository:
             return self._get_with_connection(connection, task.id)
 
     def _get_with_connection(self, connection: Any, task_id: str) -> TaskRecord:
-        row = connection.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        row = connection.execute(
+            f"{_TASK_WITH_SPEC} WHERE t.id = ?", (task_id,)
+        ).fetchone()
         if row is None:
             raise NotFoundError(f"task not found: {task_id}")
         return _task_from_row(row)
@@ -952,6 +986,13 @@ class TaskRepository:
 
 
 def _task_from_row(row: Any) -> TaskRecord:
+    spec_json = _optional(row, "task_spec_json")
+    spec_hash = _optional(row, "task_spec_hash")
+    if not spec_json or hashlib.sha256(spec_json.encode("utf-8")).hexdigest() != spec_hash:
+        raise DomainError("immutable task spec is missing or corrupt")
+    spec = json.loads(spec_json)
+    if set(spec) != TASK_SPEC_FIELDS:
+        raise DomainError("immutable task spec has an invalid shape")
     execution_policy = (
         json.loads(row["execution_budget_json"])
         if row["execution_budget_json"] else None
@@ -972,7 +1013,7 @@ def _task_from_row(row: Any) -> TaskRecord:
     return TaskRecord(
         id=row["id"],
         title=row["title"],
-        objective=row["objective"],
+        objective=str(spec["objective"]),
         project_path=row["project_path"],
         project_id=row["project_id"],
         role_id=row["role_id"],
@@ -988,7 +1029,7 @@ def _task_from_row(row: Any) -> TaskRecord:
         status=TaskStatus(row["status"]),
         revision=row["revision"],
         command=json.loads(row["command_json"]),
-        verification=json.loads(row["verification_json"]),
+        verification=list(spec["verification"]),
         max_attempts=max_attempts,
         attempts_used=row["attempts_used"],
         tokens_used=row["tokens_used"],
@@ -1008,6 +1049,8 @@ def _task_from_row(row: Any) -> TaskRecord:
         ordinal=_optional(row, "ordinal"),
         blocked_reason=_optional(row, "blocked_reason"),
         handoff=_parse_json_object(_optional(row, "handoff_json")),
+        spec_revision=int(row["current_spec_revision"]),
+        spec=spec,
     )
 
 
@@ -1028,6 +1071,76 @@ def _parse_json_object(raw: Any) -> dict[str, Any] | None:
     if not raw:
         return None
     return json.loads(raw)
+
+
+TASK_SPEC_FIELDS = {
+    "objective", "scope", "acceptance", "verification", "artifacts",
+    "constraints", "deadline",
+}
+_TASK_WITH_SPEC = """
+SELECT t.*, s.spec_json AS task_spec_json, s.spec_hash AS task_spec_hash
+FROM tasks t
+JOIN task_specs s ON s.task_id = t.id
+    AND s.spec_revision = t.current_spec_revision
+"""
+
+
+def canonical_task_spec(
+    *,
+    objective: str,
+    verification: list[dict[str, Any]],
+    deadline: dict[str, Any],
+    scope: list[str] | None = None,
+    acceptance: list[str] | None = None,
+    artifacts: list[str] | None = None,
+    constraints: list[str] | None = None,
+) -> dict[str, Any]:
+    try:
+        hard_seconds = int(deadline["hard_seconds"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise DomainError("TaskSpec deadline requires hard_seconds") from error
+    if not 1 <= hard_seconds <= MAX_HARD_DEADLINE_SECONDS:
+        raise DomainError("TaskSpec deadline is outside the supported range")
+    declared_artifacts = artifacts
+    if declared_artifacts is None:
+        declared_artifacts = [
+            str(item["path"])
+            for item in verification
+            if item.get("kind") in {"file_exists", "file_contains"} and item.get("path")
+        ]
+    return {
+        "objective": objective,
+        "scope": list(scope or []),
+        "acceptance": list(acceptance or []),
+        "verification": verification,
+        "artifacts": list(dict.fromkeys(declared_artifacts)),
+        "constraints": list(constraints or []),
+        "deadline": {"hard_seconds": hard_seconds},
+    }
+
+
+def insert_task_spec(
+    connection: Any,
+    task_id: str,
+    spec: dict[str, Any],
+    *,
+    revision: int,
+) -> str:
+    spec_json = _dump(spec)
+    digest = hashlib.sha256(spec_json.encode("utf-8")).hexdigest()
+    connection.execute(
+        """
+        INSERT INTO task_specs(task_id, spec_revision, spec_json, spec_hash)
+        VALUES (?, ?, ?, ?)
+        """,
+        (task_id, revision, spec_json, digest),
+    )
+    return digest
+
+
+def _assert_task_spec(task: TaskRecord) -> None:
+    if set(task.spec) != TASK_SPEC_FIELDS:
+        raise DomainError("claim requires one complete immutable task spec")
 
 
 def _execution_metadata(execution: dict[str, Any]) -> dict[str, Any]:

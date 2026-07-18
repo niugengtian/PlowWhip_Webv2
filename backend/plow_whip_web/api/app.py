@@ -567,6 +567,11 @@ def create_app(settings: Settings) -> FastAPI:
             "verification": [
                 item.model_dump(exclude_none=True) for item in payload.verification
             ],
+            "scope": payload.scope,
+            "acceptance": payload.acceptance,
+            "artifacts": payload.artifacts,
+            "constraints": payload.constraints,
+            "deadline": payload.deadline.model_dump() if payload.deadline else None,
             "max_attempts": (
                 payload.max_attempts
                 if payload.max_attempts is not None
@@ -642,11 +647,7 @@ def create_app(settings: Settings) -> FastAPI:
     def task_artifacts(request: Request, task_id: str) -> list[TaskArtifactView]:
         repository: TaskRepository = request.app.state.task_repository
         task = repository.get(task_id)
-        paths = list(dict.fromkeys(
-            str(spec["path"])
-            for spec in task.verification
-            if spec.get("kind") in {"file_exists", "file_contains"} and spec.get("path")
-        ))
+        paths = [str(path) for path in task.spec["artifacts"]]
         if not paths:
             return []
         project_path = _task_host_path(request, task.project_id, task.project_path)
@@ -662,11 +663,7 @@ def create_app(settings: Settings) -> FastAPI:
     ) -> dict[str, object]:
         repository: TaskRepository = request.app.state.task_repository
         task = repository.get(task_id)
-        declared = {
-            str(spec["path"])
-            for spec in task.verification
-            if spec.get("kind") in {"file_exists", "file_contains"} and spec.get("path")
-        }
+        declared = {str(path) for path in task.spec["artifacts"]}
         if payload.relative_path not in declared:
             raise PolicyViolationError("只能打开任务已声明验证的产物")
         project_path = _task_host_path(request, task.project_id, task.project_path)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
@@ -61,6 +61,8 @@ class TaskRecord:
     ordinal: int | None = None
     blocked_reason: str | None = None
     handoff: dict[str, Any] | None = None
+    spec_revision: int = 1
+    spec: dict[str, Any] = field(default_factory=dict)
 
 
 class DomainError(RuntimeError):

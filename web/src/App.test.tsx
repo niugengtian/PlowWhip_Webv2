@@ -58,6 +58,12 @@ function taskWithQualityProfile(qualityProfile: string, index: number) {
     status: 'completed', revision: 0, max_attempts: 3, attempts_used: 1, tokens_used: 100,
     last_evidence_hash: null, last_error: null, created_at: '2026-07-17T00:00:00Z', updated_at: '2026-07-17T00:00:00Z',
     command: {}, verification: [], sizing: estimate, execution_policy: {},
+    spec_revision: 1,
+    spec: {
+      objective: '兼容旧任务', scope: ['backend'], acceptance: ['verified'],
+      verification: [], artifacts: ['result.txt'], constraints: ['bounded'],
+      deadline: { hard_seconds: 1200 },
+    },
   }
 }
 
@@ -154,6 +160,16 @@ test('shows the approved product priority', () => {
   expect(
     screen.getByText('保障质量并消除无价值循环，同时保留高价值上下文。'),
   ).toBeInTheDocument()
+})
+
+test('shows the immutable TaskSpec revision and fields', async () => {
+  listedTasks = [taskWithQualityProfile('deterministic', 7)]
+  render(<App />)
+  fireEvent.click(await screen.findByRole('button', { name: '任务' }))
+  expect(await screen.findByText('TaskSpec r1 · cursor · 已完成')).toBeInTheDocument()
+  fireEvent.click(screen.getByText('legacy-deterministic').closest('button')!)
+  expect(await screen.findByText('backend')).toBeInTheDocument()
+  expect(screen.getByText('1200s')).toBeInTheDocument()
 })
 
 test('uses EventSource refresh and closes it on unmount', async () => {

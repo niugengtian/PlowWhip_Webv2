@@ -26,27 +26,39 @@ class HostJobRepository:
                 return dict(existing)
             context = connection.execute(
                 """
-                SELECT t.worker_id, l.fencing_token, w.session_generation
+                SELECT t.worker_id, t.current_spec_revision, l.fencing_token,
+                       w.session_generation, a.spec_revision AS attempt_spec_revision,
+                       r.spec_revision AS run_spec_revision
                 FROM tasks t
                 LEFT JOIN task_leases l ON l.task_id = t.id
                 LEFT JOIN workers w ON w.id = t.worker_id
+                JOIN task_attempts a ON a.id = ? AND a.task_id = t.id
+                JOIN task_runs r ON r.id = ? AND r.attempt_id = a.id
                 WHERE t.id = ?
                 """,
-                (task_id,),
+                (attempt_id, run_id, task_id),
             ).fetchone()
             if context is None:
                 raise ValueError(f"task not found: {task_id}")
+            revisions = {
+                int(context["current_spec_revision"]),
+                int(context["attempt_spec_revision"]),
+                int(context["run_spec_revision"]),
+            }
+            if len(revisions) != 1:
+                raise ValueError("Host Job TaskSpec revision mismatch")
             job_id = str(uuid.uuid4())
             connection.execute(
                 """
                 INSERT INTO host_jobs(
                     job_id, task_id, attempt_id, run_id, worker_id, provider,
-                    fencing_token, session_generation
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    fencing_token, session_generation, spec_revision
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id, task_id, attempt_id, run_id, context["worker_id"], provider,
                     context["fencing_token"], context["session_generation"],
+                    context["current_spec_revision"],
                 ),
             )
             return dict(connection.execute(

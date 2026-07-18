@@ -16,6 +16,7 @@ def _migration_names() -> list[str]:
 
 
 def test_health_reports_wal_and_migration() -> None:
+    contract = database_module.migration_contract()
     with TemporaryDirectory() as directory:
         app = create_app(Settings(data_dir=Path(directory)))
         with TestClient(app) as client:
@@ -26,6 +27,8 @@ def test_health_reports_wal_and_migration() -> None:
     assert payload["status"] == "ok"
     assert payload["database"]["journal_mode"] == "wal"
     assert payload["database"]["migration_count"] == len(_migration_names())
+    assert payload["database"]["schema_head"] == contract["schema_head"]
+    assert payload["database"]["schema_checksum"] == contract["schema_checksum"]
 
 
 def test_capabilities_are_zero_token_and_desktop_free() -> None:

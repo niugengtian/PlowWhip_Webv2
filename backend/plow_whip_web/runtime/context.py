@@ -33,8 +33,16 @@ class ContextCompiler:
     def compile(self, task_id: str) -> dict[str, Any]:
         task = self.tasks.get(task_id)
         role = self._role(task.role_id)
+        spec = json.dumps(
+            task.spec, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        spec_section = f"## Immutable TaskSpec\nRevision: {task.spec_revision}\n{spec}"
         sections: list[tuple[str, int, int]] = [
-            ("## Objective\n" + task.objective, 3, 512),
+            (
+                spec_section,
+                7,
+                len(spec_section.encode("utf-8")),
+            ),
             ("## Role\n" + ROLE_PROMPTS.get(role, ROLE_PROMPTS["fullstack"]), 2, 384),
         ]
         if task.last_error == "external_execution_interrupted":
@@ -92,7 +100,7 @@ class ContextCompiler:
                     floor,
                 ))
         protected = [
-            f"## Boundaries\nProject path: {task.project_path}\nTask id: {task.id}\nWorker id: {task.worker_id or 'pending'}",
+            f"## Boundaries\nProject path: {task.project_path}\nTask id: {task.id}\nWorker id: {task.worker_id or 'pending'}\nTaskSpec revision: {task.spec_revision}",
             "## Completion rule\nOnly verification evidence can move this task to completed.",
         ]
         max_bytes = self.settings.get()["values"]["context_max_bytes"]
@@ -122,6 +130,7 @@ class ContextCompiler:
             "task_id": task.id, "role": role, "content": content, "content_hash": digest,
             "byte_size": len(content.encode("utf-8")), "max_bytes": max_bytes,
             "relative_path": str(relative), "model_invoked": False,
+            "spec_revision": task.spec_revision,
         }
 
     def _role(self, role_id: str | None) -> str:

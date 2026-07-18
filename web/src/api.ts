@@ -77,6 +77,16 @@ export type Task = {
   ordinal?: number | null
   blocked_reason?: string | null
   handoff?: Record<string, unknown> | null
+  spec_revision: number
+  spec: {
+    objective: string
+    scope: string[]
+    acceptance: string[]
+    verification: { kind: string; path?: string; contains?: string; expected?: number }[]
+    artifacts: string[]
+    constraints: string[]
+    deadline: Record<string, number>
+  }
 }
 
 export type Goal = {
