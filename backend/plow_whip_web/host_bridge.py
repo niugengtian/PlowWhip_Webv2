@@ -30,6 +30,7 @@ MAX_BODY_BYTES = 1_048_576
 MAX_OUTPUT_BYTES = 262_144
 MAX_OUTPUT_TAIL_BYTES = 16_384
 MAX_ARTIFACT_HASH_BYTES = 67_108_864
+PROBE_TIMEOUT_SECONDS = 15
 SUPPORTED_ADAPTERS = {"codex", "cursor", "json-worker"}
 _LOCAL_PROCESSES: dict[tuple[str, str], subprocess.Popen[str]] = {}
 _LOCAL_PROCESSES_LOCK = threading.Lock()
@@ -719,7 +720,7 @@ def probe(payload: dict[str, Any]) -> dict[str, object]:
     try:
         completed = subprocess.run(
             _version_argv(adapter, executable), capture_output=True, text=True,
-            timeout=8, check=False, env=_safe_environment(),
+            timeout=PROBE_TIMEOUT_SECONDS, check=False, env=_safe_environment(),
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         return {"available": False, "detail": Redactor.redact(str(error))[:500]}
@@ -931,7 +932,10 @@ def _execution_argv(
             "--resume", session_id, prompt,
         ]
     assert session_id is not None
-    return [executable, "--project", str(project), "--session", session_id, "--json"]
+    return [
+        *_json_worker_argv(executable),
+        "--project", str(project), "--session", session_id, "--json",
+    ]
 
 
 def _cursor_create_chat(executable: str, project: Path) -> str:
@@ -1048,8 +1052,14 @@ def _version_argv(adapter: str, executable: str) -> list[str]:
     if adapter == "cursor":
         return [executable, "agent", "--version"]
     if adapter == "json-worker":
-        return [executable, "--probe"]
+        return [*_json_worker_argv(executable), "--probe"]
     return [executable, "--version"]
+
+
+def _json_worker_argv(executable: str) -> list[str]:
+    if Path(executable).name == "simple-worker":
+        return [sys.executable, str(Path(__file__).with_name("simple_worker.py"))]
+    return [executable]
 
 
 def _safe_environment() -> dict[str, str]:

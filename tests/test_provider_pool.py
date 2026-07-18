@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -15,6 +16,7 @@ from plow_whip_web.host_bridge import (
     _resolve_executable,
     _safe_environment,
     _version_argv,
+    probe,
 )
 from plow_whip_web.providers.generic_command import ExecutionResult
 from plow_whip_web.providers.host_bridge import HostBridgeClient
@@ -170,9 +172,21 @@ def test_host_bridge_argv_is_fixed_and_stream_parser_keeps_session_and_usage() -
         1, "", "Selected model is at capacity"
     ) == "provider_capacity"
     assert _provider_failure_class(1, "", "application assertion failed") == "command_failed"
-    assert _version_argv("json-worker", "/bin/simple-worker") == [
-        "/bin/simple-worker", "--probe",
-    ]
+    simple_version = _version_argv("json-worker", "/bin/simple-worker")
+    assert simple_version[0] == sys.executable
+    assert simple_version[1].endswith("/plow_whip_web/simple_worker.py")
+    assert simple_version[2:] == ["--probe"]
+
+
+def test_host_bridge_probe_has_a_bounded_cli_startup_window() -> None:
+    with patch("plow_whip_web.host_bridge.subprocess.run") as run:
+        run.return_value.returncode = 0
+        run.return_value.stdout = "cursor-agent 1.0\n"
+        run.return_value.stderr = ""
+        result = probe({"adapter": "cursor", "executable": "/bin/echo"})
+
+    assert result == {"available": True, "detail": "cursor-agent 1.0"}
+    assert run.call_args.kwargs["timeout"] == 15
 
 
 def test_host_bridge_passes_only_declared_deepseek_credentials(monkeypatch) -> None:

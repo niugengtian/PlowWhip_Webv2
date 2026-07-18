@@ -23,7 +23,7 @@ class HostBridgeClient:
         payload = self._post("/v1/probe", {
             "adapter": provider["adapter"],
             "executable": provider.get("executable"),
-        }, timeout=10)
+        }, timeout=20)
         return bool(payload.get("available")), str(payload.get("detail", "无探测详情"))
 
     def execute(
