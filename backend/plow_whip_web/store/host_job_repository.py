@@ -39,12 +39,13 @@ class HostJobRepository:
             context = connection.execute(
                 """
                 SELECT t.worker_id, t.current_spec_revision, l.fencing_token,
-                       w.session_generation, a.spec_revision AS attempt_spec_revision,
+                       ts.session_generation, a.spec_revision AS attempt_spec_revision,
                        r.spec_revision AS run_spec_revision,
                        s.spec_json
                 FROM tasks t
                 LEFT JOIN task_leases l ON l.task_id = t.id
                 LEFT JOIN workers w ON w.id = t.worker_id
+                JOIN task_sessions ts ON ts.task_id = t.id
                 JOIN task_attempts a ON a.id = ? AND a.task_id = t.id
                 JOIN task_runs r ON r.id = ? AND r.attempt_id = a.id
                 JOIN task_specs s ON s.task_id = t.id
@@ -316,6 +317,20 @@ class HostJobRepository:
                     """,
                     (
                         session_id, error_summary, row["worker_id"],
+                        row["session_generation"],
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE task_sessions
+                    SET external_session_id = COALESCE(?, external_session_id),
+                        worker_id = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE task_id = ? AND session_generation IS ?
+                    """,
+                    (
+                        session_id,
+                        row["worker_id"],
+                        row["task_id"],
                         row["session_generation"],
                     ),
                 )

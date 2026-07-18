@@ -222,6 +222,10 @@ class ProjectRepository:
                 "SELECT * FROM execution_episodes WHERE id = ?",
                 (job["episode_id"],),
             ).fetchone() if job and job["episode_id"] else None
+            task_session = connection.execute(
+                "SELECT * FROM task_sessions WHERE task_id = ?",
+                (task_id,),
+            ).fetchone() if task_id else None
             worker_view = dict(worker)
             task_view = dict(task) if task else None
             if task_view:
@@ -239,14 +243,23 @@ class ProjectRepository:
                 "task": task_view,
                 "host_job": job_view,
                 "episode": episode_view,
+                "task_session": dict(task_session) if task_session else None,
                 "ownership": {
                     "project_id": worker["project_id"],
                     "project_name": worker["project_name"],
                     "role_id": worker["role_id"],
                     "role": worker["role"],
                     "session_id": worker["session_id"],
-                    "external_session_id": worker["external_session_id"],
-                    "session_generation": worker["session_generation"],
+                    "external_session_id": (
+                        task_session["external_session_id"]
+                        if task_session else worker["external_session_id"]
+                    ),
+                    "session_generation": (
+                        task_session["session_generation"]
+                        if task_session else worker["session_generation"]
+                    ),
+                    "session_scope": "task_role" if task_session else "worker_legacy",
+                    "task_id": task_id,
                 },
             }
         finally:

@@ -109,9 +109,9 @@ Web v2 将它升级为 Context Compiler：从 Goal、当前 Step、Artifact、Ev
 旧 plow-whip 把 logical owner、executor、driver 分开，是非常好的抽象。新版保留 Project 内的长期 Role，并把它限制在清晰边界内：
 
 - Role 是稳定职责，例如 `pm/backend/frontend/qa/devops`，由项目自行定义；
-- 每个 Role 同时绑定一个 active Worker Session；CLI Provider 负责提供和恢复这个打工仔；
-- Worker Session 在同一 Project 内跨 Task 顺序工作，并按阈值轮转；同一个打工仔同时只能执行一个 Task；
-- Project 完成、取消或归档后释放全部 Worker Session，不把打工仔跨项目复用；
+- 每个 Role 同时绑定一个 active 逻辑 Worker；CLI Provider 为当前 Task 提供或恢复物理 Session；
+- 逻辑 Worker 在同一 Project 内跨 Task 顺序工作；物理 Session 不跨 Task，同一 Worker 同时只能执行一个 Task；
+- Task 终态封存自己的 Session；Project 完成、取消或归档后释放全部逻辑 Worker，不跨项目复用；
 - `plan/execute/verify/review` 是 Run Type，`coding/research/data/security` 是 Capability；
 - Provider/Model/CLI Provider 是执行资源，Role、Session 和模型都不能直接修改 Task 真源；
 - 不强制某一套角色，也不因为角色存在就自动增加规划、审查或讨论步骤。
@@ -272,7 +272,7 @@ plow-whip 的 Goal / Role Binding / Context / Memory / Rotation / Budget / Verif
 
 ### 4.1 无角色转述
 
-所有 Role/CLI Run 都直接读取同一份 Context Capsule。长期 Session 只用于在同一 Role 内保持执行连续性，不允许把完整 Session 历史转交给其他 Role，也不存在“规划角色把用户要求复述给审核角色，再由审核角色复述给执行角色”。
+所有 Role/CLI Run 都直接读取同一份 Context Capsule。物理 Session 只在同一 `project + role + Task` 内用于重试或续接；换 Task 即创建新 Session，不把旧 Session 历史转交给同角色的下一 Task 或其他 Role。项目与角色只保留逻辑 Worker、职责和队列，不存在“规划角色把用户要求复述给审核角色，再由审核角色复述给执行角色”。
 
 ### 4.2 Context Capsule
 
@@ -503,13 +503,13 @@ Tick 是可重复调用且幂等的。它先获取全局调度锁，扫描所有
 准确关系是：
 
 ```text
-CLI Provider（打工仔提供者）
-  → CLI Session（具体打工仔）
-    → Project Role（该打工仔在项目中的岗位）
-      → Task Queue（在项目生命周期内顺序领取工作）
+CLI Provider（执行提供者）
+  → Project Role Worker（项目内逻辑岗位）
+    → Task Queue（按项目与角色顺序领取）
+      → Task Session（该 Task 的物理 CLI 会话）
 ```
 
-绑定主键是 `(project_id, role_id)`，而不是 Task ID。Project 启动时只以 0 Token 方式给 Role 指定 CLI Provider，不发送“入职 Prompt”来强行创建 Session。该 Role 第一次领取真实 Task、进入显式 Model Run 时，Provider 才创建 CLI Session 并返回 Session ID；这个 Session 随后在同一个 Project 内跨多个 Task 顺序工作。Task 只通过 `active_task_id` 和 Execution Lease 临时占用该打工仔。
+逻辑 Worker 的绑定主键是 `(project_id, role_id)`；物理 Provider Session 的身份必须同时匹配 `(project_id, role_id, task_id, session_generation)`。Project 启动时只以 0 Token 方式给 Role 指定 CLI Provider，不发送“入职 Prompt”提前创建 Session。Task 第一次进入显式 Model Run 时才创建 Session；同一 Task 的重试或续接可以 Resume，下一 Task 必须从空 Session 开始。
 
 绑定状态：
 
@@ -523,21 +523,21 @@ unassigned → hiring → ready → working → ready
 
 硬约束：
 
-1. 一个 Project Role 同时只有一个 active Worker Session、一个 Session ID 和一个 `generation`；
+1. 一个 Project Role 同时只有一个 active 逻辑 Worker；每个 Task 只有一个 active 物理 Session 和一个 Task `session_generation`；
 2. 一个打工仔同时只能持有一个 Task Execution Lease；Role 的 Task Queue 必须串行消费；
-3. Task 完成只释放 Task Lease，打工仔回到 `ready`，继续服务同一 Project；
+3. Task 完成释放 Task Lease 并封存该 Task Session；逻辑 Worker 回到 `ready`，下一 Task 创建自己的新 Session；
 4. Project `completed/cancelled/archived` 时必须释放全部 Worker：终止进程、撤销租约、清除临时 Secret、解除 active binding，并把 Session 引用转入只读 Archive；
-5. Project 暂停时 Worker 进入 idle/ready，保留 Session Binding，不继续领取 Task；
+5. Project 暂停时 Worker 进入 idle/ready，不继续领取 Task；只允许保留未终态 Task 自己的可恢复 Session Binding；
 6. Project 完成后再次 Reopen 必须创建新 generation 的 Worker，默认不得恢复已经 released 的旧 Session；
-7. Task 转交其他 Role 时释放旧 Task Lease，但不解雇两个 Role 各自的 Worker；
+7. Task 转交其他 Role 时释放旧 Task Lease 并创建匹配新 Role 的 Task Session；不删除两个 Role 的逻辑 Worker；
 8. Session ID、PID、最后事件时间和 Resume 能力由 Python Adapter 捕获，不能依赖模型主动上报；
 9. Session 丢失时只能用 Recovery Capsule 雇用 replacement Worker，不能假装恢复原打工仔；
 10. Worker 轮转、CLI Provider 切换和 Role Handoff 都不能重置 Task 的 Attempt、Token 或成本预算；
 11. 绑定通过 revision/CAS 更新，旧 generation 返回的结果一律作为 stale result 拒绝；
-12. Worker Session 是项目劳动力，不是业务真源；数据库中的 Task/Event/Artifact/Evidence 才能决定进度和完成。
+12. Worker 是项目逻辑劳动力，Task Session 只是执行载体，两者都不是业务真源；数据库中的 Task/Event/Artifact/Evidence 才能决定进度和完成。
 13. 为 Role 指定 CLI Provider 是 0 Token 配置操作；创建 Session 必须绑定第一个真实、可计费的 Model Run，禁止用空任务或探活 Prompt 提前烧 Token。
 
-Worker Release Barrier 固定执行：冻结 Project 派发 → 撤销全部 Task/Worker Lease → 对存活进程发送 TERM → 在有界宽限期后发送 KILL → 清除短期 Secret 与临时授权 → Archive Session 引用和最终 Carry Forward → CAS 清空 active Worker Binding。部分 CLI 不支持删除服务端 Session 时，“释放”至少意味着本地永久失效、不可再 Resume、不能领取新 Task。除轮转或不可恢复故障外，Worker 默认一直服务到 Project 终态。
+Task Session Release Barrier 固定执行：冻结该 Task 派发 → 撤销 Lease → 对存活进程发送 TERM → 在有界宽限期后发送 KILL → 清除短期 Secret 与临时授权 → Archive Session 引用和结构化 checkpoint → CAS 清空 active Task Session Binding。部分 CLI 不支持删除服务端 Session 时，“释放”至少意味着本地永久失效、不可再被其他 Task Resume。逻辑 Worker 可以服务到 Project 终态，但物理 Session 不能跨 Task。
 
 CLI Provider Adapter 统一提供：
 
@@ -565,7 +565,7 @@ supports_resume()
 - `memory/DECISIONS.md`、`CHANGELOG.md`、`CURRENT_STATUS.md`、`NEXT_ACTION.md`、`ROADMAP.md`；
 - CLI Session 的估算 Token、Turn 数、文件字节数和最后活动时间。
 
-默认保留旧版经过验证的基线：Session 软轮转约 3000 Token、硬轮转约 4000 Token、文件安全阈值 16384 bytes、Carry Forward 最多 300 Token；全部可以在 Settings 覆盖。
+Context、checkpoint、handoff、观察尾部、文件轮转、同类失败和无进展阈值在 Settings 中统一分组并可覆盖。优先级为人工指定的 Task+角色特例 > Project > Global；提交时必须展示生效来源，无法保留强制 Context 的组合直接拒绝，观察/轮转或 checkpoint/handoff/Context 的可疑组合明确告警。不存在固定 8 KiB 的全局不变量。
 
 轮转协议必须原子化：
 
@@ -861,17 +861,24 @@ max_concurrency, health_status, circuit_state, enabled
 ### RoleWorker
 
 ```text
-id, project_id, role_id, cli_provider_id, session_id,
-generation, lifecycle_status, active_task_id, worker_pid, resume_supported,
+id, project_id, role_id, cli_provider_id,
+lifecycle_status, active_task_id,
 estimated_tokens, turn_count, last_event_at, revision
 ```
 
 对未释放记录执行 `UNIQUE(project_id, role_id)`；同一岗位只能有一个 active 打工仔。
 
-### SessionArchive
+### TaskSession
 
 ```text
-id, role_worker_id, session_id, generation, reason,
+task_id, project_id, role_id, role_worker_id, provider,
+external_session_id, generation, replacement_reason, updated_at
+```
+
+### TaskSessionArchive
+
+```text
+id, task_id, role_worker_id, external_session_id, generation, reason,
 carry_forward_ref, transcript_ref, sha256,
 started_at, released_at
 ```
@@ -1065,7 +1072,10 @@ GET    /api/providers
 POST   /api/providers
 POST   /api/providers/{id}/probe
 GET    /api/settings
-PATCH  /api/settings
+PUT    /api/settings
+GET    /api/settings/effective?project_id=&task_id=&role_id=
+GET    /api/settings/overrides/{project|task_role}/{scope_id}
+PUT    /api/settings/overrides/{project|task_role}/{scope_id}
 GET    /api/system/capabilities
 GET    /api/system/scheduler
 GET    /api/system/scheduler/runs

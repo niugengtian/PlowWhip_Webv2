@@ -127,14 +127,6 @@ class ModelCallLedger:
             input_tokens, max(0, int(usage.get("cached_input_tokens") or 0))
         )
         output_tokens = max(0, int(usage.get("output_tokens") or 0))
-        normalized = {
-            "input_tokens": input_tokens,
-            "cached_input_tokens": cached_input_tokens,
-            "uncached_input_tokens": input_tokens - cached_input_tokens,
-            "output_tokens": output_tokens,
-            "total_tokens": input_tokens + output_tokens,
-            "source": str(usage.get("usage_source") or "provider_normalized"),
-        }
         with self.database.transaction(immediate=True) as connection:
             row = connection.execute(
                 "SELECT * FROM model_calls WHERE call_id = ?", (call_id,)
@@ -143,11 +135,41 @@ class ModelCallLedger:
                 raise ValueError(f"model call receipt not found: {call_id}")
             if row["status"] in {"completed", "failed"}:
                 return dict(row)
+            resolved_session_id = session_id or row["session_id"]
+            previous = self._previous_snapshot(
+                connection,
+                row,
+                session_id=resolved_session_id,
+            )
+            delta_input = _counter_delta(input_tokens, previous, "raw_input_tokens")
+            delta_cached = min(
+                delta_input,
+                _counter_delta(
+                    cached_input_tokens, previous, "raw_cached_input_tokens"
+                ),
+            )
+            delta_output = _counter_delta(
+                output_tokens, previous, "raw_output_tokens"
+            )
+            normalized = {
+                "input_tokens": delta_input,
+                "cached_input_tokens": delta_cached,
+                "uncached_input_tokens": delta_input - delta_cached,
+                "output_tokens": delta_output,
+                "total_tokens": delta_input + delta_output,
+                "raw_input_tokens": input_tokens,
+                "raw_cached_input_tokens": cached_input_tokens,
+                "raw_output_tokens": output_tokens,
+                "source": "provider_cumulative_delta",
+                "baseline_call_id": previous["call_id"] if previous else None,
+            }
             connection.execute(
                 """
                 UPDATE model_calls
                 SET status = ?, input_tokens = ?, cached_input_tokens = ?,
-                    output_tokens = ?, normalized_usage_json = ?,
+                    output_tokens = ?, raw_input_tokens = ?,
+                    raw_cached_input_tokens = ?, raw_output_tokens = ?,
+                    usage_semantics = 'delta', normalized_usage_json = ?,
                     error_class = ?, session_id = COALESCE(?, session_id),
                     dispatched_at = COALESCE(dispatched_at, CURRENT_TIMESTAMP),
                     settled_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
@@ -155,6 +177,9 @@ class ModelCallLedger:
                 """,
                 (
                     "failed" if failed else "completed",
+                    delta_input,
+                    delta_cached,
+                    delta_output,
                     input_tokens,
                     cached_input_tokens,
                     output_tokens,
@@ -170,6 +195,57 @@ class ModelCallLedger:
                 ).fetchone()
             )
 
+    @staticmethod
+    def _previous_snapshot(
+        connection: Any,
+        row: Any,
+        *,
+        session_id: str | None,
+    ) -> Any | None:
+        if session_id:
+            return connection.execute(
+                """
+                SELECT call_id, raw_input_tokens, raw_cached_input_tokens,
+                       raw_output_tokens
+                FROM model_calls
+                WHERE call_id != ? AND provider = ? AND session_id = ?
+                  AND (? IS NULL OR task_id = ?)
+                  AND (? IS NULL OR session_generation IS ?)
+                  AND status IN ('completed', 'failed')
+                  AND usage_semantics != 'unresolved_snapshot'
+                ORDER BY settled_at DESC, created_at DESC, rowid DESC LIMIT 1
+                """,
+                (
+                    row["call_id"],
+                    row["provider"],
+                    session_id,
+                    row["task_id"],
+                    row["task_id"],
+                    row["session_generation"],
+                    row["session_generation"],
+                ),
+            ).fetchone()
+        if row["task_id"] and row["session_generation"] is not None:
+            return connection.execute(
+                """
+                SELECT call_id, raw_input_tokens, raw_cached_input_tokens,
+                       raw_output_tokens
+                FROM model_calls
+                WHERE call_id != ? AND provider = ? AND task_id = ?
+                  AND session_generation IS ?
+                  AND status IN ('completed', 'failed')
+                  AND usage_semantics != 'unresolved_snapshot'
+                ORDER BY settled_at DESC, created_at DESC, rowid DESC LIMIT 1
+                """,
+                (
+                    row["call_id"],
+                    row["provider"],
+                    row["task_id"],
+                    row["session_generation"],
+                ),
+            ).fetchone()
+        return None
+
     def summary(self) -> dict[str, Any]:
         connection = self.database.connect()
         try:
@@ -181,6 +257,27 @@ class ModelCallLedger:
                 FROM model_calls
                 """
             ).fetchone()
+            raw = connection.execute(
+                """
+                SELECT COALESCE(SUM(raw_input_tokens), 0) input_tokens,
+                       COALESCE(SUM(raw_cached_input_tokens), 0) cached_input_tokens,
+                       COALESCE(SUM(raw_output_tokens), 0) output_tokens
+                FROM model_calls
+                """
+            ).fetchone()
+            quality_rows = connection.execute(
+                """
+                SELECT usage_semantics, COUNT(*) calls,
+                       COALESCE(SUM(input_tokens + output_tokens), 0) tokens
+                FROM model_calls
+                GROUP BY usage_semantics ORDER BY usage_semantics
+                """
+            ).fetchall()
+            usage_quality = [dict(row) for row in quality_rows]
+            has_legacy_inference = any(
+                row["usage_semantics"] == "legacy_inferred_delta"
+                for row in quality_rows
+            )
             calls = [
                 self._view(row)
                 for row in connection.execute(
@@ -210,6 +307,19 @@ class ModelCallLedger:
                 "total_tokens": int(total["input_tokens"])
                 + int(total["output_tokens"]),
                 "total_formula": "input_tokens + output_tokens",
+                "usage_semantics": (
+                    "mixed_exact_and_legacy_inferred_delta"
+                    if has_legacy_inference
+                    else "physical_session_delta"
+                ),
+                "usage_quality": usage_quality,
+                "raw_snapshot_totals": {
+                    "input_tokens": int(raw["input_tokens"]),
+                    "cached_input_tokens": int(raw["cached_input_tokens"]),
+                    "output_tokens": int(raw["output_tokens"]),
+                    "total_tokens": int(raw["input_tokens"])
+                    + int(raw["output_tokens"]),
+                },
                 **dimensions,
                 "calls": calls,
             }
@@ -271,3 +381,10 @@ class ModelCallLedger:
         )
         item["normalized_usage"] = json.loads(item.pop("normalized_usage_json"))
         return item
+
+
+def _counter_delta(current: int, previous: Any | None, field: str) -> int:
+    if previous is None:
+        return current
+    baseline = max(0, int(previous[field] or 0))
+    return current - baseline if current >= baseline else current

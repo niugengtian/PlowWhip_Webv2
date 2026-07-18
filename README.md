@@ -75,6 +75,8 @@ py scripts\release_local.py deploy --expected-sha $sha
 - 控制面板 Settings → Crontab 管理支持启停、标准五段表达式、时区、错过执行策略和立即 Tick。
 - 只有一个全局计划扫描所有项目/角色/Worker/Task；数据库租约与 fencing token 防止重复调度和脑裂。
 - `max_parallel_workers` 同时约束跨 Tick 已在途任务和手工派发；Token 只写入消费账本，不参与任务准入、调度、熔断、续跑或终态。
+- 逻辑 Worker 绑定 `project + role`，物理 Codex/Cursor Session 绑定 `project + role + Task`；同 Task 重试可续接，换 Task 不继承旧聊天或工具历史。
+- Settings 将 Context、checkpoint、handoff、观察尾部、文件轮转、同类失败和无进展阈值放在一起；Task+角色特例 > Project > Global，提交时显示来源并校验冲突。
 - 控制路径只做 SQLite 扫描、网络探测和状态判断，模型调用数与 Token 消费均为 0。
 - **主流程是唯一常驻管家入口**：fresh project 只创建 Butler 和 ProjectExecutionPolicy。XS 路由到 simple-worker，S/M 路由到单个 ephemeral fullstack，L/XL 拆成最多 6 个有界 capability 里程碑；每个 Task 自带 verification Gate，临时 Worker 在证据终态后释放。遗留 coordination parent 只做迁移收敛，不再为新目标创建。
 

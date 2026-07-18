@@ -25,7 +25,7 @@ Python, Node, SQLite runtime and the scheduler are image internals. Source-mode 
 5. A goal completes only when every implementation item has a passing immutable
    `EvidenceManifest`; a writable verification Worker is not treated as independent proof.
 
-Provider session rotation reasons visible in Worker status are limited to explicit operator rotate/rebind and bounded consecutive no-progress/tool-abort recovery. The local Journal byte threshold rotates only `events.current.jsonl`; it does not discard the Provider session. Provider capacity does not rotate a session. Token usage never rotates a session.
+The Worker is the logical `project + role` owner. A physical Provider session is scoped to `project + role + Task`; a new Task starts without the previous Task's session, while retries inside the same Task may resume. Replacement archives and increments the Task session generation after bounded no-progress/tool-abort recovery. The local Journal byte threshold rotates only `events.current.jsonl`; it does not silently reuse or discard a Task session. Provider capacity and Token usage alone never rotate a session.
 
 ## Scheduler
 
@@ -37,7 +37,7 @@ docker compose exec control-plane python -m plow_whip_web --data-dir /data sched
 
 `max_parallel_workers` includes work already running from prior ticks and manual drives. A Tick result reports `active` and `available_slots`; `selected: 0` with no error is expected when existing Host Jobs occupy every slot.
 
-Token usage is accounting only. `/api/usage` lists task execution and Convention refinement calls; `cached_input_tokens` is already included in `input_tokens`, so total is `input + output`, never `input + cached + output`. No Token total can block dispatch, change a Task/Goal status, rotate a Worker, or create a human gate.
+Token usage is accounting only. `/api/usage` preserves Provider cumulative snapshots as raw evidence and aggregates normalized physical-session deltas; migrated records without a physical session id are labeled `legacy_inferred_delta`. `cached_input_tokens` is already included in `input_tokens`, so total is `input + output`, never `input + cached + output`. No Token total can block dispatch, change a Task/Goal status, rotate a Worker, or create a human gate.
 
 `provider_capacity` means the Provider explicitly reported capacity, rate-limit, HTTP 429, or overload. FaultPolicy defers it with backoff while retaining the external session; repeated no-progress reaches `max_no_progress`. Do not manually rotate a session for one capacity response.
 

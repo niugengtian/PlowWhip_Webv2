@@ -31,9 +31,29 @@ class TokenLedger:
             input_tokens, max(0, int(execution.get("cached_input_tokens", 0)))
         )
         output_tokens = max(0, int(execution.get("output_tokens", 0)))
+        normalized_call = connection.execute(
+            """
+            SELECT input_tokens, cached_input_tokens, output_tokens
+            FROM model_calls
+            WHERE call_id = ? AND status IN ('completed', 'failed')
+            """,
+            (call_id,),
+        ).fetchone()
+        if normalized_call is not None:
+            input_tokens = int(normalized_call["input_tokens"])
+            cached_input_tokens = int(normalized_call["cached_input_tokens"])
+            output_tokens = int(normalized_call["output_tokens"])
         resolved_worker_id = worker_id or (task.worker_id if task else None)
         generation = None
-        if resolved_worker_id:
+        if task is not None:
+            task_session = connection.execute(
+                "SELECT session_generation FROM task_sessions WHERE task_id = ?",
+                (task.id,),
+            ).fetchone()
+            generation = (
+                task_session["session_generation"] if task_session else None
+            )
+        elif resolved_worker_id:
             worker = connection.execute(
                 "SELECT session_generation FROM workers WHERE id = ?",
                 (resolved_worker_id,),

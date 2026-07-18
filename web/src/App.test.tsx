@@ -100,6 +100,10 @@ beforeEach(() => {
           max_no_progress: 3,
           context_max_bytes: 32768,
           rotation_max_bytes: 262144,
+          checkpoint_max_bytes: 4096,
+          handoff_max_bytes: 2048,
+          observation_tail_lines: 20,
+          observation_max_bytes: 8192,
         },
       }
       const scheduler = {
@@ -276,7 +280,7 @@ test('worker click shows canonical host identity and never treats heartbeat as c
   }]
   render(<App />)
   fireEvent.click(await screen.findByRole('button', { name: 'Worker' }))
-  fireEvent.click(await screen.findByRole('button', { name: '查看真实进展' }))
+  fireEvent.click(await screen.findByRole('button', { name: '查看 Task Session' }))
 
   expect(await screen.findByText('host-job-1')).toBeInTheDocument()
   expect(screen.getByText(/accepted · deadline/)).toBeInTheDocument()
@@ -388,7 +392,7 @@ test('keeps task and goal selection mutually exclusive and shows layered goal ru
 
   expect(screen.getByRole('heading', { name: 'Release Goal' })).toBeInTheDocument()
   expect(screen.getByText('GoalSpec / Butler aggregate')).toBeInTheDocument()
-  for (const label of ['角色 / Provider', '依赖', '阻塞原因', 'Worker session', 'Generation', 'Rotation reason', 'Last context pressure', 'Pressure trigger', 'Sizing', 'Execution', 'Attempt / progress', 'Verification', 'Output ref', 'Segments / bytes / offset', 'Cached 计入 Total', 'Token control']) {
+  for (const label of ['角色 / Provider', '依赖', '阻塞原因', 'Task session', 'Generation', 'Session scope', 'Replacement reason', 'Last context pressure', 'Pressure trigger', 'Sizing', 'Execution', 'Attempt / progress', 'Verification', 'Output ref', 'Segments / bytes / offset', 'Cached 计入 Total', 'Token control']) {
     expect(screen.getByText(label)).toBeInTheDocument()
   }
   expect(screen.getByText('cursor-session-7')).toBeInTheDocument()
@@ -628,6 +632,8 @@ test('submits a goal through the primary PM entry', async () => {
             max_parallel_workers: 4, auto_dispatch: true,
             max_same_failure: 3, max_no_progress: 3,
             context_max_bytes: 32768, rotation_max_bytes: 262144,
+            checkpoint_max_bytes: 4096, handoff_max_bytes: 2048,
+            observation_tail_lines: 20, observation_max_bytes: 8192,
           },
         }) : path === '/api/scheduler/status' ? ({
           runtime: { fencing_token: 0, last_tick_at: null, last_result: null, last_error: null, runner_id: null, runner_started_at: null, runner_heartbeat_at: null, runner_stopped_at: null, runner_error: null },

@@ -370,10 +370,23 @@ class RuntimeSettingsValues(BaseModel):
     max_no_progress: Annotated[int, Field(ge=1, le=20)] = 3
     context_max_bytes: Annotated[int, Field(ge=4096, le=1_048_576)] = 32_768
     rotation_max_bytes: Annotated[int, Field(ge=16_384, le=16_777_216)] = 262_144
+    checkpoint_max_bytes: Annotated[int, Field(ge=512, le=262_144)] = 4_096
+    handoff_max_bytes: Annotated[int, Field(ge=256, le=131_072)] = 2_048
+    observation_tail_lines: Annotated[int, Field(ge=1, le=500)] = 20
+    observation_max_bytes: Annotated[int, Field(ge=1024, le=262_144)] = 8_192
     @model_validator(mode="after")
     def lease_must_exceed_interval(self) -> "RuntimeSettingsValues":
         if self.scheduler_lease_seconds < self.scheduler_interval_seconds * 2:
             raise ValueError("scheduler lease must be at least twice the interval")
+        if (
+            self.checkpoint_max_bytes
+            + self.handoff_max_bytes
+            + 2048
+            > self.context_max_bytes
+        ):
+            raise ValueError(
+                "checkpoint + handoff + mandatory reserve exceeds context limit"
+            )
         return self
 
     @field_validator("cron_expression")
@@ -390,12 +403,20 @@ class RuntimeSettingsValues(BaseModel):
 class RuntimeSettingsView(BaseModel):
     revision: int
     values: RuntimeSettingsValues
+    sources: dict[str, str] = Field(default_factory=dict)
+    warnings: list[str] = Field(default_factory=list)
+    override_revisions: dict[str, int] = Field(default_factory=dict)
     updated_at: str | None
 
 
 class RuntimeSettingsUpdate(BaseModel):
     expected_revision: Annotated[int, Field(ge=0)]
     values: RuntimeSettingsValues
+
+
+class RuntimeSettingsOverrideUpdate(BaseModel):
+    expected_revision: Annotated[int, Field(ge=0)]
+    values: dict[str, Annotated[int, Field(ge=1)]]
 
 
 class ConventionPut(BaseModel):

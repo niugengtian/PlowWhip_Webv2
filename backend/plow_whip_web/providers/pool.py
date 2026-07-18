@@ -154,7 +154,7 @@ class ProviderPool:
             return self.generic.execute(Path(task.project_path), task.command)
         if not task.worker_id:
             raise ProviderUnavailableError("CLI Worker 尚未绑定")
-        worker = self.tasks.worker_execution_context(task.worker_id)
+        worker = self.tasks.worker_execution_context(task.worker_id, task_id=task.id)
         try:
             result = self.bridge.execute(
                 provider=provider,
@@ -172,6 +172,7 @@ class ProviderPool:
             task.worker_id,
             external_session_id=result.external_session_id,
             error=result.stderr[:1000] if result.returncode else None,
+            task_id=task.id,
         )
         return result
 
@@ -186,7 +187,7 @@ class ProviderPool:
             raise ProviderUnavailableError(f"provider 不使用 Host Job: {task.provider}")
         if not task.worker_id:
             raise ProviderUnavailableError("CLI Worker 尚未绑定")
-        worker = self.tasks.worker_execution_context(task.worker_id)
+        worker = self.tasks.worker_execution_context(task.worker_id, task_id=task.id)
         return self.bridge.start_job(
             job_id=job_id,
             provider=provider,
@@ -209,12 +210,14 @@ class ProviderPool:
         stdout_offset: int,
         stderr_offset: int,
         limit: int,
+        tail_lines: int = 20,
     ) -> dict[str, object]:
         return self.bridge.job_output(
             job_id,
             stdout_offset=stdout_offset,
             stderr_offset=stderr_offset,
             limit=limit,
+            tail_lines=tail_lines,
         )
 
     def verify_host_task(
@@ -222,7 +225,7 @@ class ProviderPool:
     ) -> VerificationResult:
         if not task.worker_id:
             raise ProviderUnavailableError("CLI Worker 尚未绑定")
-        worker = self.tasks.worker_execution_context(task.worker_id)
+        worker = self.tasks.worker_execution_context(task.worker_id, task_id=task.id)
         return self.bridge.verify(
             project_path=worker["host_path"],
             execution=execution,
@@ -239,7 +242,7 @@ class ProviderPool:
     ) -> dict[str, Any]:
         if not task.worker_id:
             raise ProviderUnavailableError("CLI Worker 尚未绑定")
-        worker = self.tasks.worker_execution_context(task.worker_id)
+        worker = self.tasks.worker_execution_context(task.worker_id, task_id=task.id)
         snapshot = getattr(self.bridge, "snapshot_evidence", None)
         if snapshot is None:
             return snapshot_environment(Path(task.project_path), paths)

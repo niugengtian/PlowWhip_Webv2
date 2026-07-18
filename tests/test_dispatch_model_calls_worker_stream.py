@@ -26,6 +26,7 @@ class BridgeFixture:
         self.unknown = unknown
         self.rejected = rejected
         self.snapshots: dict[str, dict[str, object]] = {}
+        self.last_output_request: dict[str, object] = {}
 
     def probe(self, _provider: dict[str, object]) -> tuple[bool, str]:
         return True, "available"
@@ -48,7 +49,8 @@ class BridgeFixture:
             raise ProviderUnavailableError("bridge unavailable during reconciliation")
         return self.snapshots[job_id]
 
-    def job_output(self, job_id: str, **_kwargs: object) -> dict[str, object]:
+    def job_output(self, job_id: str, **kwargs: object) -> dict[str, object]:
+        self.last_output_request = kwargs
         return {
             "job_id": job_id,
             "chunks": [{
@@ -358,7 +360,7 @@ def test_accepted_job_recovery_hold_deadline_is_not_extended() -> None:
 
 def test_worker_detail_exposes_identity_and_bounded_redacted_cursor_stream() -> None:
     with TemporaryDirectory() as directory:
-        app, _bridge, running, job = _host_runtime(Path(directory))
+        app, bridge, running, job = _host_runtime(Path(directory))
         assert running.worker_id
         with TestClient(app) as client:
             detail = client.get(f"/api/workers/{running.worker_id}").json()
@@ -373,6 +375,12 @@ def test_worker_detail_exposes_identity_and_bounded_redacted_cursor_stream() -> 
         assert detail["ownership"]["external_session_id"] == "canonical-session"
         assert stream["job_id"] == job["job_id"]
         assert stream["next_cursor"].count(":") == 2
+        assert bridge.last_output_request == {
+            "stdout_offset": -1,
+            "stderr_offset": -1,
+            "limit": 4096,
+            "tail_lines": 20,
+        }
         text = "\n".join(item["text"] for item in stream["items"])
         assert "secret-value" not in text
         assert "[REDACTED]" in text

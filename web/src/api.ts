@@ -200,8 +200,30 @@ export type RuntimeSettingsValues = {
   max_no_progress: number
   context_max_bytes: number
   rotation_max_bytes: number
+  checkpoint_max_bytes: number
+  handoff_max_bytes: number
+  observation_tail_lines: number
+  observation_max_bytes: number
 }
-export type RuntimeSettings = { revision: number; values: RuntimeSettingsValues; updated_at: string | null }
+export type RuntimeSettings = {
+  revision: number
+  values: RuntimeSettingsValues
+  sources: Record<string, string>
+  warnings: string[]
+  override_revisions?: Record<string, number>
+  updated_at: string | null
+}
+export type RuntimeSettingsOverride = {
+  scope: 'project' | 'task_role'
+  scope_id: string
+  revision: number
+  values: Partial<Pick<RuntimeSettingsValues,
+    'max_same_failure' | 'max_no_progress' | 'context_max_bytes' |
+    'rotation_max_bytes' | 'checkpoint_max_bytes' | 'handoff_max_bytes' |
+    'observation_tail_lines' | 'observation_max_bytes'>>
+  updated_at: string | null
+  effective?: RuntimeSettings
+}
 export type SchedulerStatus = {
   runtime: {
     fencing_token: number
@@ -235,6 +257,18 @@ export type Usage = {
   output_tokens: number
   total_tokens: number
   total_formula: string
+  usage_semantics?: string
+  usage_quality?: {
+    usage_semantics: 'delta' | 'legacy_inferred_delta' | 'unresolved_snapshot'
+    calls: number
+    tokens: number
+  }[]
+  raw_snapshot_totals?: {
+    input_tokens: number
+    cached_input_tokens: number
+    output_tokens: number
+    total_tokens: number
+  }
   projects: { project_id: string | null; input_tokens: number; cached_input_tokens: number; uncached_input_tokens: number; output_tokens: number; tokens: number; calls: number }[]
   tasks: { task_id: string | null; input_tokens: number; cached_input_tokens: number; uncached_input_tokens: number; output_tokens: number; tokens: number; calls: number }[]
   workers: { worker_id: string | null; tokens: number; calls: number }[]
@@ -352,6 +386,23 @@ export const api = {
     request<RuntimeSettings>('/api/settings', {
       method: 'PUT',
       body: JSON.stringify({ expected_revision: settings.revision, values: settings.values }),
+    }),
+  effectiveSettings: (projectId?: string, taskId?: string, roleId?: string) => {
+    const params = new URLSearchParams()
+    if (projectId) params.set('project_id', projectId)
+    if (taskId) params.set('task_id', taskId)
+    if (roleId) params.set('role_id', roleId)
+    return request<RuntimeSettings>(`/api/settings/effective?${params.toString()}`)
+  },
+  settingsOverride: (scope: 'project' | 'task_role', scopeId: string) =>
+    request<RuntimeSettingsOverride>(`/api/settings/overrides/${scope}/${scopeId}`),
+  updateSettingsOverride: (override: RuntimeSettingsOverride) =>
+    request<RuntimeSettingsOverride>(`/api/settings/overrides/${override.scope}/${override.scope_id}`, {
+      method: 'PUT',
+      body: JSON.stringify({
+        expected_revision: override.revision,
+        values: override.values,
+      }),
     }),
   schedulerStatus: () => request<SchedulerStatus>('/api/scheduler/status'),
   schedulerTick: () => request<Record<string, unknown>>('/api/scheduler/tick', { method: 'POST' }),

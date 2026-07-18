@@ -20,7 +20,7 @@ from plow_whip_web.domain.model import (
 )
 from plow_whip_web.store.database import Database
 from plow_whip_web.store.project_repository import rotate_worker_in_transaction
-from plow_whip_web.store.settings_repository import DEFAULT_SETTINGS
+from plow_whip_web.store.settings_repository import resolve_effective_settings
 from plow_whip_web.runtime.evidence import manifest_hash
 from plow_whip_web.runtime.token_ledger import TokenLedger
 
@@ -336,27 +336,55 @@ class TaskRepository:
         finally:
             connection.close()
 
-    def worker_execution_context(self, worker_id: str) -> dict[str, Any]:
-        connection = self.database.connect()
-        try:
+    def worker_execution_context(
+        self, worker_id: str, *, task_id: str | None = None
+    ) -> dict[str, Any]:
+        with self.database.transaction(immediate=task_id is not None) as connection:
+            if task_id is not None:
+                connection.execute(
+                    """
+                    INSERT INTO task_sessions(
+                        task_id, project_id, role_id, worker_id, provider
+                    )
+                    SELECT id, project_id, role_id, ?, provider
+                    FROM tasks WHERE id = ? AND worker_id = ?
+                    ON CONFLICT(task_id) DO UPDATE SET
+                        worker_id = excluded.worker_id,
+                        role_id = excluded.role_id,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (worker_id, task_id, worker_id),
+                )
             row = connection.execute(
                 """
-                SELECT w.external_session_id, w.provider, w.session_generation,
+                SELECT
+                       CASE WHEN ? IS NULL THEN w.external_session_id
+                            ELSE ts.external_session_id END external_session_id,
+                       w.provider,
+                       CASE WHEN ? IS NULL THEN w.session_generation
+                            ELSE ts.session_generation END session_generation,
                        p.path project_path,
                        COALESCE(p.host_path, p.path) host_path
-                FROM workers w JOIN projects p ON p.id = w.project_id
+                FROM workers w
+                JOIN projects p ON p.id = w.project_id
+                LEFT JOIN task_sessions ts ON ts.task_id = ?
                 WHERE w.id = ?
                 """,
-                (worker_id,),
+                (task_id, task_id, task_id, worker_id),
             ).fetchone()
             if row is None:
                 raise NotFoundError(f"worker not found: {worker_id}")
+            if task_id is not None and row["session_generation"] is None:
+                raise NotFoundError(f"task session not found: {task_id}")
             return dict(row)
-        finally:
-            connection.close()
 
     def record_worker_result(
-        self, worker_id: str, *, external_session_id: str | None, error: str | None
+        self,
+        worker_id: str,
+        *,
+        external_session_id: str | None,
+        error: str | None,
+        task_id: str | None = None,
     ) -> None:
         with self.database.transaction(immediate=True) as connection:
             connection.execute(
@@ -367,6 +395,16 @@ class TaskRepository:
                 """,
                 (external_session_id, error, worker_id),
             )
+            if task_id is not None:
+                connection.execute(
+                    """
+                    UPDATE task_sessions
+                    SET external_session_id = COALESCE(?, external_session_id),
+                        worker_id = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE task_id = ?
+                    """,
+                    (external_session_id, worker_id, task_id),
+                )
 
     def events(self, task_id: str, *, after: int = 0) -> list[dict[str, Any]]:
         connection = self.database.connect()
@@ -388,6 +426,34 @@ class TaskRepository:
                     "created_at": row["created_at"],
                 }
                 for row in rows
+            ]
+        finally:
+            connection.close()
+
+    def latest_events(
+        self, task_id: str, *, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        connection = self.database.connect()
+        try:
+            self._get_with_connection(connection, task_id)
+            rows = connection.execute(
+                """
+                SELECT sequence, event_type, payload_json, state_revision, created_at
+                FROM task_events
+                WHERE task_id = ?
+                ORDER BY sequence DESC LIMIT ?
+                """,
+                (task_id, min(max(limit, 1), 100)),
+            ).fetchall()
+            return [
+                {
+                    "sequence": row["sequence"],
+                    "event_type": row["event_type"],
+                    "payload": json.loads(row["payload_json"]),
+                    "state_revision": row["state_revision"],
+                    "created_at": row["created_at"],
+                }
+                for row in reversed(rows)
             ]
         finally:
             connection.close()
@@ -414,12 +480,12 @@ class TaskRepository:
             _assert_task_spec(task)
             if task.attempts_used >= _authoritative_max_attempts(task):
                 raise InvalidTransitionError("task attempt budget exhausted")
-            limits = dict(DEFAULT_SETTINGS)
-            settings = connection.execute(
-                "SELECT settings_json FROM system_settings WHERE id = 1"
-            ).fetchone()
-            if settings:
-                limits.update(json.loads(settings["settings_json"]))
+            limits, _, _ = resolve_effective_settings(
+                connection,
+                project_id=task.project_id,
+                task_id=task.id,
+                role_id=task.role_id,
+            )
             if self._in_flight_count(connection) >= int(limits["max_parallel_workers"]):
                 raise ResourceBusyError("global parallel worker limit reached")
             worker_id, lease_token, fencing_token = self._acquire_worker_and_lock(connection, task)
@@ -447,6 +513,20 @@ class TaskRepository:
             )
             if cursor.rowcount != 1:
                 raise RevisionConflictError("task changed while claiming")
+            connection.execute(
+                """
+                INSERT INTO task_sessions(
+                    task_id, project_id, role_id, worker_id, provider
+                )
+                SELECT id, project_id, role_id, ?, provider
+                FROM tasks WHERE id = ?
+                ON CONFLICT(task_id) DO UPDATE SET
+                    worker_id = excluded.worker_id,
+                    role_id = excluded.role_id,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (worker_id, task.id),
+            )
             connection.execute(
                 """
                 INSERT INTO task_attempts(
@@ -937,8 +1017,27 @@ class TaskRepository:
                     """,
                     (retained_session_id, reason[:1000], task.worker_id),
                 )
+            connection.execute(
+                """
+                UPDATE task_sessions
+                SET external_session_id = COALESCE(?, external_session_id),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE task_id = ?
+                """,
+                (retained_session_id, task.id),
+            )
             self._release_worker_and_lock(connection, task.id, task.worker_id)
             if rotate_worker_reason and task.worker_id:
+                _rotate_task_session(
+                    connection,
+                    task.id,
+                    reason=rotate_worker_reason,
+                    trigger_key=(
+                        f"execution-episode:{episode['episode_id']}:task-session"
+                        if episode and episode.get("episode_id")
+                        else f"host-job:{job_id}:task-session"
+                    ),
+                )
                 rotate_worker_in_transaction(
                     connection,
                     task.worker_id,
@@ -1832,6 +1931,53 @@ def _record_worker_context_pressure(
             str(execution.get("value_classification") or "unknown"),
             worker_id,
         ),
+    )
+
+
+def _rotate_task_session(
+    connection: Any,
+    task_id: str,
+    *,
+    reason: str,
+    trigger_key: str,
+) -> None:
+    current = connection.execute(
+        "SELECT * FROM task_sessions WHERE task_id = ?", (task_id,)
+    ).fetchone()
+    if current is None or connection.execute(
+        "SELECT 1 FROM task_session_archives WHERE trigger_key = ?",
+        (trigger_key,),
+    ).fetchone():
+        return
+    connection.execute(
+        """
+        INSERT INTO task_session_archives(
+            task_id, project_id, role_id, worker_id, provider,
+            external_session_id, session_generation, reason, trigger_key
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            task_id,
+            current["project_id"],
+            current["role_id"],
+            current["worker_id"],
+            current["provider"],
+            current["external_session_id"],
+            current["session_generation"],
+            reason,
+            trigger_key,
+        ),
+    )
+    connection.execute(
+        """
+        UPDATE task_sessions
+        SET external_session_id = NULL,
+            session_generation = session_generation + 1,
+            replacement_reason = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE task_id = ?
+        """,
+        (reason, task_id),
     )
 
 

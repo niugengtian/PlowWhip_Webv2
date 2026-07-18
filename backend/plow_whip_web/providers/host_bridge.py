@@ -84,12 +84,14 @@ class HostBridgeClient:
         stdout_offset: int = 0,
         stderr_offset: int = 0,
         limit: int = 32_768,
+        tail_lines: int = 20,
     ) -> dict[str, object]:
         return self._post("/v1/jobs/output", {
             "job_id": job_id,
-            "stdout_offset": max(0, stdout_offset),
-            "stderr_offset": max(0, stderr_offset),
-            "limit": min(max(limit, 1024), 65_536),
+            "stdout_offset": stdout_offset,
+            "stderr_offset": stderr_offset,
+            "limit": min(max(limit, 1024), 262_144),
+            "tail_lines": min(max(tail_lines, 1), 500),
         }, timeout=10)
 
     def cancel_job(self, job_id: str) -> dict[str, object]:

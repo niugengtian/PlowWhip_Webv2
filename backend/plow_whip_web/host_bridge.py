@@ -114,6 +114,7 @@ def _handler(
                         stdout_offset=int(payload.get("stdout_offset") or 0),
                         stderr_offset=int(payload.get("stderr_offset") or 0),
                         limit=int(payload.get("limit") or 32_768),
+                        tail_lines=int(payload.get("tail_lines") or 20),
                     ))
                 elif self.path == "/v1/jobs/cancel":
                     self._send(202, jobs.cancel(str(payload["job_id"])))
@@ -270,18 +271,27 @@ class HostJobManager:
         stdout_offset: int,
         stderr_offset: int,
         limit: int,
+        tail_lines: int = 20,
     ) -> dict[str, object]:
         job_id = _job_id(job_id)
-        bounded_limit = min(max(limit, 1024), 65_536)
+        bounded_limit = min(max(limit, 1024), 262_144)
+        bounded_lines = min(max(tail_lines, 1), 500)
         with self._lock:
             record = self._refresh(self._read(job_id))
             chunks: list[dict[str, object]] = []
             next_offsets: dict[str, int] = {}
             per_stream = max(512, bounded_limit // 2)
             for stream, offset in (
-                ("stdout", max(0, stdout_offset)),
-                ("stderr", max(0, stderr_offset)),
+                ("stdout", stdout_offset),
+                ("stderr", stderr_offset),
             ):
+                if offset < 0:
+                    offset = self._tail_offset(
+                        job_id,
+                        stream,
+                        max_bytes=per_stream,
+                        max_lines=bounded_lines,
+                    )
                 data, next_offset, refs = self._read_output_range(
                     job_id, stream, offset=offset, limit=per_stream
                 )
@@ -309,6 +319,31 @@ class HostJobManager:
                     for stream in ("stdout", "stderr")
                 ),
             }
+
+    def _tail_offset(
+        self,
+        job_id: str,
+        stream: str,
+        *,
+        max_bytes: int,
+        max_lines: int,
+    ) -> int:
+        paths = sorted(
+            self._output_directory(job_id).glob(
+                f"{stream}.[0-9][0-9][0-9][0-9][0-9][0-9].log"
+            )
+        )
+        total = sum(path.stat().st_size for path in paths)
+        start = max(0, total - max_bytes)
+        data, _, _ = self._read_output_range(
+            job_id, stream, offset=start, limit=max_bytes
+        )
+        if not data:
+            return total
+        lines = data.splitlines(keepends=True)
+        if len(lines) <= max_lines:
+            return start
+        return total - sum(len(line) for line in lines[-max_lines:])
 
     def cancel(self, job_id: str) -> dict[str, object]:
         job_id = _job_id(job_id)

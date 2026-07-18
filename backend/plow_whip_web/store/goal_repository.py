@@ -720,11 +720,15 @@ class GoalRepository:
                    w.last_cached_input_tokens, w.last_output_tokens,
                    w.last_uncached_input_tokens, w.last_context_pressure_tokens,
                    w.last_context_pressure_reason, w.last_attribution_granularity,
-                   w.last_value_classification
+                   w.last_value_classification,
+                   ts.external_session_id AS task_external_session_id,
+                   ts.session_generation AS task_session_generation,
+                   ts.replacement_reason AS task_session_replacement_reason
             FROM tasks t
             JOIN task_specs s ON s.task_id = t.id
                 AND s.spec_revision = t.current_spec_revision
             LEFT JOIN workers w ON w.id = t.worker_id
+            LEFT JOIN task_sessions ts ON ts.task_id = t.id
             WHERE t.goal_id = ? AND COALESCE(t.work_item_kind, '') != 'coordination'
             ORDER BY t.ordinal, t.created_at, t.id
             """,
@@ -827,9 +831,25 @@ class GoalRepository:
                         if task["evidence_manifest_json"] else None
                     ),
                     "session_id": worker["session_id"] if worker else None,
-                    "external_session_id": worker["external_session_id"] if worker else None,
-                    "session_generation": worker["session_generation"] if worker else None,
-                    "rotation_reason": rotation["reason"] if rotation else None,
+                    "external_session_id": (
+                        task["task_external_session_id"]
+                        if task["task_session_generation"] is not None
+                        else worker["external_session_id"] if worker else None
+                    ),
+                    "session_generation": (
+                        task["task_session_generation"]
+                        if task["task_session_generation"] is not None
+                        else worker["session_generation"] if worker else None
+                    ),
+                    "session_scope": (
+                        "task_role"
+                        if task["task_session_generation"] is not None
+                        else "worker_legacy"
+                    ),
+                    "rotation_reason": (
+                        task["task_session_replacement_reason"]
+                        or (rotation["reason"] if rotation else None)
+                    ),
                     "input_tokens": worker["last_input_tokens"] if worker else 0,
                     "cached_input_tokens": (
                         worker["last_cached_input_tokens"] if worker else 0

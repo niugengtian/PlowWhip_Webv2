@@ -577,7 +577,10 @@ class TaskService:
         fault_class: str | None = None,
     ) -> dict[str, Any]:
         assert self.host_jobs is not None
-        limits = self.settings.get()["values"] if self.settings else {}
+        limits = (
+            self.settings.effective(task_id=str(job["task_id"]))["values"]
+            if self.settings else {}
+        )
         return self.host_jobs.observe_episode(
             job["job_id"],
             snapshot,
@@ -614,7 +617,7 @@ class TaskService:
         if not self.model_calls:
             return None
         context = (
-            self.repository.worker_execution_context(task.worker_id)
+            self.repository.worker_execution_context(task.worker_id, task_id=task.id)
             if task.worker_id else {}
         )
         provider = (
@@ -738,7 +741,14 @@ class TaskService:
             execution=execution,
             verification=verification,
         )
-        limits = self.settings.get()["values"] if self.settings else {}
+        limits = (
+            self.settings.effective(
+                project_id=task.project_id,
+                task_id=task.id,
+                role_id=task.role_id,
+            )["values"]
+            if self.settings else {}
+        )
         completed = self.repository.finish(
             task.id, expected_revision=verifying.revision,
             attempt_id=attempt_id, run_id=run_id,
@@ -768,7 +778,7 @@ class TaskService:
             if provider["transport"] == "host-bridge":
                 if task.worker_id:
                     worker_context = self.repository.worker_execution_context(
-                        task.worker_id
+                        task.worker_id, task_id=task.id
                     )
                 snapshot = self.provider_pool.snapshot_task_evidence(task, paths=paths)
             else:
@@ -804,7 +814,11 @@ class TaskService:
         settings_repository = self.journal.settings if self.journal else self.settings
         if settings_repository is None:
             return
-        settings = settings_repository.get()["values"]
+        settings = settings_repository.effective(
+            project_id=task.project_id,
+            task_id=task.id,
+            role_id=task.role_id,
+        )["values"]
         maximum = int(settings["rotation_max_bytes"])
         persisted = self.journal.current_bytes(worker["id"]) if self.journal else 0
         if persisted >= maximum and self.journal:

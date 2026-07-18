@@ -204,6 +204,49 @@ def test_host_job_output_rotates_redacted_segments_and_survives_restart() -> Non
         assert carry["output_segments"] == completed["output_segments"]
 
 
+def test_host_job_initial_observation_reads_only_configured_tail() -> None:
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        executable = root / "tail-codex"
+        executable.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "sys.stdin.read()\n"
+            "for index in range(100):\n"
+            "    print(f'line-{index:03d}', flush=True)\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o700)
+        manager = HostJobManager(root / "jobs", (root,))
+        job_id = str(uuid.uuid4())
+        manager.start({
+            "job_id": job_id,
+            "adapter": "codex",
+            "executable": str(executable),
+            "project_path": str(root),
+            "prompt": "emit bounded lines",
+            "timeout_seconds": 10,
+        })
+        _wait_status(manager, job_id, {"completed"})
+
+        observed = manager.output(
+            job_id,
+            stdout_offset=-1,
+            stderr_offset=-1,
+            limit=8192,
+            tail_lines=20,
+        )
+        stdout = next(
+            chunk["text"]
+            for chunk in observed["chunks"]
+            if chunk["stream"] == "stdout"
+        )
+        assert "line-079" not in stdout
+        assert stdout.splitlines() == [
+            f"line-{index:03d}" for index in range(80, 100)
+        ]
+
+
 def test_host_job_timeout_writes_deterministic_carry_forward() -> None:
     class TimedOutProcess:
         pid = 424242

@@ -24,6 +24,7 @@ from plow_whip_web.api.schemas import (
     PermissionGrantCreate,
     RestoreRequest,
     RuntimeSettingsUpdate,
+    RuntimeSettingsOverrideUpdate,
     RuntimeSettingsView,
     RotateWorkerRequest,
     RebindWorkerRequest,
@@ -420,18 +421,38 @@ def create_app(settings: Settings) -> FastAPI:
         request: Request,
         worker_id: str,
         cursor: str = "0:0:0",
-        limit: int = 32_768,
+        limit: int | None = None,
     ) -> dict[str, object]:
+        initial_snapshot = cursor == "0:0:0"
         event_after, stdout_offset, stderr_offset = _worker_cursor(cursor)
         projects: ProjectRepository = request.app.state.project_repository
         detail = projects.worker_detail(worker_id)
         task = detail.get("task")
         job = detail.get("host_job")
+        runtime: SettingsRepository = request.app.state.runtime_settings
+        effective = runtime.effective(
+            project_id=str(detail["ownership"]["project_id"]),
+            task_id=str(task["id"]) if isinstance(task, dict) else None,
+            role_id=str(detail["ownership"]["role_id"]),
+        )
+        observation_limit = min(
+            max(
+                int(limit or effective["values"]["observation_max_bytes"]),
+                1024,
+            ),
+            262_144,
+        )
         items: list[dict[str, object]] = []
         if isinstance(task, dict):
-            events = request.app.state.task_repository.events(
-                str(task["id"]), after=event_after
-            )[:20]
+            events = (
+                request.app.state.task_repository.latest_events(
+                    str(task["id"]), limit=20
+                )
+                if initial_snapshot
+                else request.app.state.task_repository.events(
+                    str(task["id"]), after=event_after
+                )[:20]
+            )
             for event in events:
                 items.append({
                     "kind": "status",
@@ -451,9 +472,10 @@ def create_app(settings: Settings) -> FastAPI:
             try:
                 output = pool.read_task_job_output(
                     str(job["job_id"]),
-                    stdout_offset=stdout_offset,
-                    stderr_offset=stderr_offset,
-                    limit=min(max(limit, 1024), 65_536),
+                    stdout_offset=-1 if initial_snapshot else stdout_offset,
+                    stderr_offset=-1 if initial_snapshot else stderr_offset,
+                    limit=observation_limit,
+                    tail_lines=int(effective["values"]["observation_tail_lines"]),
                 )
                 chunks = output.get("chunks")
                 if isinstance(chunks, list):
@@ -463,7 +485,7 @@ def create_app(settings: Settings) -> FastAPI:
                         items.append({
                             **chunk,
                             "text": Redactor.redact(str(chunk.get("text") or ""))[
-                                :65_536
+                                :observation_limit
                             ],
                         })
             except ProviderUnavailableError as error:
@@ -495,6 +517,40 @@ def create_app(settings: Settings) -> FastAPI:
         repository: SettingsRepository = request.app.state.runtime_settings
         updated = repository.update(payload.values.model_dump(), expected_revision=payload.expected_revision)
         return RuntimeSettingsView(**updated)
+
+    @app.get("/api/settings/effective", tags=["settings"])
+    def get_effective_settings(
+        request: Request,
+        project_id: str | None = None,
+        task_id: str | None = None,
+        role_id: str | None = None,
+    ) -> dict[str, object]:
+        repository: SettingsRepository = request.app.state.runtime_settings
+        return repository.effective(
+            project_id=project_id, task_id=task_id, role_id=role_id
+        )
+
+    @app.get("/api/settings/overrides/{scope}/{scope_id}", tags=["settings"])
+    def get_settings_override(
+        request: Request, scope: str, scope_id: str
+    ) -> dict[str, object]:
+        repository: SettingsRepository = request.app.state.runtime_settings
+        return repository.get_override(scope=scope, scope_id=scope_id)
+
+    @app.put("/api/settings/overrides/{scope}/{scope_id}", tags=["settings"])
+    def update_settings_override(
+        request: Request,
+        scope: str,
+        scope_id: str,
+        payload: RuntimeSettingsOverrideUpdate,
+    ) -> dict[str, object]:
+        repository: SettingsRepository = request.app.state.runtime_settings
+        return repository.update_override(
+            scope=scope,
+            scope_id=scope_id,
+            values=payload.values,
+            expected_revision=payload.expected_revision,
+        )
 
     @app.get("/api/scheduler/status", tags=["scheduler"])
     def scheduler_status(request: Request) -> dict[str, object]:

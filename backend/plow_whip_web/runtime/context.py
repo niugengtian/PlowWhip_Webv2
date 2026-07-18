@@ -32,6 +32,13 @@ class ContextCompiler:
 
     def compile(self, task_id: str) -> dict[str, Any]:
         task = self.tasks.get(task_id)
+        project = self._project(task.project_id)
+        effective_settings = self.settings.effective(
+            project_id=task.project_id,
+            task_id=task.id,
+            role_id=task.role_id,
+        )
+        limits = effective_settings["values"]
         role = self._role(task.role_id)
         spec = json.dumps(
             task.spec, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -62,18 +69,19 @@ class ContextCompiler:
                     "as canonical; do not replay completed work."
                 ),
             }.get(action, "Inspect the checkpoint before continuing.")
-            payload = _fit_utf8(
-                json.dumps(
-                    checkpoint, ensure_ascii=False, sort_keys=True,
-                    separators=(",", ":"),
-                ),
-                4096,
+            payload = json.dumps(
+                checkpoint, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
             )
-            sections.append((
+            checkpoint_section = _fit_utf8(
                 "## ExecutionEpisode checkpoint\n"
                 f"Recovery action: {action}\n{instruction}\n{payload}",
+                int(limits["checkpoint_max_bytes"]),
+            )
+            sections.append((
+                checkpoint_section,
                 6,
-                768,
+                min(768, int(limits["checkpoint_max_bytes"])),
             ))
         if task.last_error == "external_execution_interrupted":
             sections.append(
@@ -87,35 +95,38 @@ class ContextCompiler:
             )
         failure_delta = self.tasks.last_failure_delta(task.id)
         if failure_delta:
-            evidence = _fit_utf8(
-                json.dumps(
-                    failure_delta, ensure_ascii=False, sort_keys=True,
-                    separators=(",", ":"),
-                ),
-                4096,
+            evidence = json.dumps(
+                failure_delta, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
             )
-            sections.append((
+            evidence_section = _fit_utf8(
                 "## Previous verification Evidence Delta\n"
                 "Fix only the failed checks below. Preserve all already-passing work "
-                "and re-run the deterministic verification after the repair.\n" + evidence,
-                6,
-                768,
-            ))
-        if task.handoff:
-            handoff = _fit_utf8(
-                json.dumps(
-                    task.handoff, ensure_ascii=False, sort_keys=True,
-                    separators=(",", ":"),
-                ),
-                2048,
+                "and re-run the deterministic verification after the repair.\n"
+                + evidence,
+                int(limits["checkpoint_max_bytes"]),
             )
             sections.append((
+                evidence_section,
+                6,
+                min(768, int(limits["checkpoint_max_bytes"])),
+            ))
+        if task.handoff:
+            handoff = json.dumps(
+                task.handoff, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            )
+            handoff_section = _fit_utf8(
                 "## Role Handoff\n"
                 "Structured pointers from the previous work item only. Do not assume "
                 "cross-role chat history exists; inspect the listed artifact paths.\n"
                 + handoff,
+                int(limits["handoff_max_bytes"]),
+            )
+            sections.append((
+                handoff_section,
                 5,
-                512,
+                min(512, int(limits["handoff_max_bytes"])),
             ))
         for convention in self.conventions.resolve(project_id=task.project_id, task_id=task.id):
             if convention["content"]:
@@ -130,10 +141,11 @@ class ContextCompiler:
                     floor,
                 ))
         protected = [
-            f"## Boundaries\nProject path: {task.project_path}\nTask id: {task.id}\nWorker id: {task.worker_id or 'pending'}\nTaskSpec revision: {task.spec_revision}",
+            f"## Project\nName: {project['name']}\nPath: {task.project_path}",
+            f"## Boundaries\nProject id: {task.project_id or 'unbound'}\nRole id: {task.role_id or 'unbound'}\nTask id: {task.id}\nWorker id: {task.worker_id or 'pending'}\nTaskSpec revision: {task.spec_revision}",
             "## Completion rule\nOnly verification evidence can move this task to completed.",
         ]
-        max_bytes = self.settings.get()["values"]["context_max_bytes"]
+        max_bytes = int(limits["context_max_bytes"])
         content = _fit_sections(sections, protected, max_bytes)
         digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
         relative = Path("contexts") / task.id / f"{digest}.md"
@@ -161,6 +173,7 @@ class ContextCompiler:
             "byte_size": len(content.encode("utf-8")), "max_bytes": max_bytes,
             "relative_path": str(relative), "model_invoked": False,
             "spec_revision": task.spec_revision,
+            "settings_sources": effective_settings["sources"],
         }
 
     def _role(self, role_id: str | None) -> str:
@@ -170,6 +183,18 @@ class ContextCompiler:
         try:
             row = connection.execute("SELECT kind FROM roles WHERE id = ?", (role_id,)).fetchone()
             return row["kind"] if row else "fullstack"
+        finally:
+            connection.close()
+
+    def _project(self, project_id: str | None) -> dict[str, str]:
+        if project_id is None:
+            return {"name": "unbound"}
+        connection = self.database.connect()
+        try:
+            row = connection.execute(
+                "SELECT name FROM projects WHERE id = ?", (project_id,)
+            ).fetchone()
+            return {"name": str(row["name"])} if row else {"name": "unbound"}
         finally:
             connection.close()
 
