@@ -32,6 +32,20 @@ Backend 默认监听 `127.0.0.1:8742`，Frontend 开发服务器默认监听 `12
 
 ## Docker 一键运行（推荐）
 
+需要统一管理 GitHub 最新 `main`、Docker 镜像/container 和 macOS Host Bridge 时，
+可使用本机功能脚本集：
+
+```bash
+./scripts/plow-whip-web init
+./scripts/plow-whip-web rebuild
+./scripts/plow-whip-web status
+./scripts/plow-whip-web stop all
+./scripts/plow-whip-web install-cli  # 之后可直接运行 plow-whip-web -h / -v / -man
+```
+
+它还提供 `configure`、`start`、`restart` 和安全的 `uninstall`。完整参数与数据保留
+规则见 [本机功能脚本集](docs/OPS_TOOLKIT.zh-CN.md)。
+
 宿主机只需要 Docker；Python、Node 构建环境、SQLite 运行库、Web 服务和零 Token Cron engine 都在镜像内。macOS/Linux 使用 Bash，Windows 使用 PowerShell：
 
 ```bash
