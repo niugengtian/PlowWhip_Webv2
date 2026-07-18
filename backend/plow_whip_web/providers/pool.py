@@ -14,8 +14,8 @@ from plow_whip_web.store.provider_repository import ProviderRepository
 from plow_whip_web.store.task_repository import (
     TaskRepository,
     task_hard_deadline_seconds,
-    task_host_reserved_tokens,
 )
+from plow_whip_web.runtime.token_ledger import TokenLedger
 
 
 class ProviderPool:
@@ -26,12 +26,14 @@ class ProviderPool:
         tasks: TaskRepository,
         bridge: HostBridgeClient,
         generic: GenericCommandProvider | None = None,
+        token_ledger: TokenLedger | None = None,
     ) -> None:
         self.database = database
         self.providers = providers
         self.tasks = tasks
         self.bridge = bridge
         self.generic = generic or GenericCommandProvider()
+        self.token_ledger = token_ledger
 
     def require_available(self, name: str) -> dict[str, Any]:
         provider = self.providers.require(name)
@@ -246,6 +248,21 @@ class ProviderPool:
                     result.input_tokens, result.output_tokens, status,
                 ),
             )
+            if self.token_ledger:
+                project_id = scope_id if scope == "project" else None
+                task = None
+                if scope == "task":
+                    task = self.tasks.get(scope_id)
+                    project_id = task.project_id
+                TokenLedger.record_in_transaction(
+                    connection,
+                    call_id=f"convention-refinement:{refinement_id}",
+                    call_kind="convention_refinement",
+                    execution=result.as_dict(),
+                    task=task,
+                    project_id=project_id,
+                    provider=provider_name,
+                )
         if status != "completed":
             raise ProviderUnavailableError(result.stderr or "Convention 精炼未返回结果")
         suggestion = _last_text(result.stdout)

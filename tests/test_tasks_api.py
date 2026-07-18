@@ -134,7 +134,6 @@ def test_task_artifacts_point_to_host_project_and_open_only_declared_files() -> 
             command={"argv": ["cursor"], "timeout_seconds": 60},
             verification=[{"kind": "file_exists", "path": "报告.md"}],
             max_attempts=1,
-            token_budget=100,
             idempotency_key="artifact-index-create",
         )
 

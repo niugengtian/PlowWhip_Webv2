@@ -127,7 +127,7 @@ def test_verify_runtime_requires_image_revision_and_named_volumes() -> None:
             "_get_json",
             return_value={
                 "status": "ok",
-                "database": {"journal_mode": "wal", "migration_count": 20},
+                "database": {"journal_mode": "wal", "migration_count": 21},
             },
         ),
     ):

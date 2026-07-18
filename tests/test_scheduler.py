@@ -102,7 +102,7 @@ def test_tick_scans_all_projects_and_uses_zero_control_tokens() -> None:
                 project_id=project["id"], role_id=binding["role_id"], resource_key=f"repo:{index}",
                 command={"argv": [sys.executable, "-c", f"from pathlib import Path; Path('done').write_text('{index}')"]},
                 verification=[{"kind": "file_exists", "path": "done"}],
-                max_attempts=1, token_budget=100, idempotency_key=f"scheduled-{index}",
+                max_attempts=1, idempotency_key=f"scheduled-{index}",
             )
             task_ids.append(task.id)
 

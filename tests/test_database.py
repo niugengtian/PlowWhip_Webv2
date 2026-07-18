@@ -128,12 +128,15 @@ def test_upgrade_migration_scrubs_legacy_sqlite_bodies_once() -> None:
         assert max_attempts == 4
 
 
-def test_0020_upgrades_0019_database_with_safe_metadata_defaults() -> None:
+def test_0021_upgrades_0019_database_and_removes_reservations() -> None:
     with TemporaryDirectory() as directory:
         db_path = Path(directory) / "upgrade-0019.sqlite3"
         migration_dir = Path(database_module.__file__).with_name("migrations")
         migrations = sorted(migration_dir.glob("*.sql"))
-        assert migrations[-1].name == "0020_provider_context_pressure.sql"
+        assert [item.name for item in migrations[-2:]] == [
+            "0020_provider_context_pressure.sql",
+            "0021_remove_token_budget.sql",
+        ]
         connection = sqlite3.connect(db_path)
         try:
             connection.execute(
@@ -144,7 +147,7 @@ def test_0020_upgrades_0019_database_with_safe_metadata_defaults() -> None:
                 )
                 """
             )
-            for migration in migrations[:-1]:
+            for migration in migrations[:-2]:
                 for statement in database_module._split_statements(
                     migration.read_text(encoding="utf-8")
                 ):
@@ -178,7 +181,10 @@ def test_0020_upgrades_0019_database_with_safe_metadata_defaults() -> None:
             connection.close()
 
         database = Database(db_path)
-        assert database.migrate() == ["0020_provider_context_pressure.sql"]
+        assert database.migrate() == [
+            "0020_provider_context_pressure.sql",
+            "0021_remove_token_budget.sql",
+        ]
         assert database.migrate() == []
         connection = database.connect()
         try:
@@ -209,10 +215,14 @@ def test_0020_upgrades_0019_database_with_safe_metadata_defaults() -> None:
                     """
                 )
             }
+            reservations = connection.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'token_reservations'"
+            ).fetchone()[0]
         finally:
             connection.close()
         assert tuple(usage) == (0, "turn", "unknown", None)
         assert tuple(worker) == (0, 0, 0, 0, None)
+        assert reservations == 0
         assert versions == {
             "0017_goal_orchestration.sql",
             "0018_p0_correction.sql",

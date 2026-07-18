@@ -26,23 +26,17 @@ export type TaskSizingInputs = {
   gate_dependency: boolean
 }
 
-type TokenEstimateBand = { min: number; max: number; p90: number }
-
 export type TaskSizingEstimate = {
   status: 'estimated' | 'needs_planning'
   missing_gates: ('artifact' | 'boundary' | 'verification' | 'dependency' | 'independent_review_orchestration')[]
   size_class: 'XS' | 'S' | 'M' | 'L' | 'XL' | null
   rationale: string[]
-  estimated_input_tokens: TokenEstimateBand | null
-  estimated_output_tokens: TokenEstimateBand | null
   soft_deadline_seconds: number | null
   hard_deadline_seconds: number | null
   max_turns: number | null
   max_attempts: number | null
   verification_timeout_seconds: number | null
   progress_extension_seconds: number | null
-  total_token_hard_cap: number | null
-  reserved_tokens: number | null
   model_invoked: false
   bootstrap_version: string
 }
@@ -67,7 +61,6 @@ export type Task = {
   revision: number
   max_attempts: number
   attempts_used: number
-  token_budget: number
   tokens_used: number
   last_evidence_hash: string | null
   last_error: string | null
@@ -76,9 +69,7 @@ export type Task = {
   command: Record<string, unknown>
   verification: { kind: string; path?: string; contains?: string; expected?: number }[]
   sizing: Record<string, unknown>
-  execution_budget: Record<string, unknown> | null
-  manual_override: boolean
-  override_reason: string | null
+  execution_policy: Record<string, unknown> | null
   goal_id?: string | null
   parent_task_id?: string | null
   depends_on?: string[] | null
@@ -137,12 +128,6 @@ export type Worker = {
   last_context_session_generation: number | null
   last_attribution_granularity: string
   last_value_classification: string
-  last_context_guard_decision: string | null
-  last_context_guard_reason: string | null
-  last_guard_estimated_new_tokens: number
-  last_guard_carry_in_cached_tokens: number
-  last_guard_hard_cap: number
-  last_guard_relation: string
 }
 export type Project = {
   id: string
@@ -164,8 +149,6 @@ export type RuntimeSettingsValues = {
   cron_misfire_policy: 'catch_up_once' | 'skip'
   max_parallel_workers: number
   auto_dispatch: boolean
-  task_default_token_budget: number
-  global_daily_token_budget: number
   max_same_failure: number
   max_no_progress: number
   context_max_bytes: number
@@ -205,11 +188,9 @@ export type Usage = {
   output_tokens: number
   total_tokens: number
   total_formula: string
-  hard_cap_enforcement: 'settlement_gate'
-  control_tokens: number
   projects: { project_id: string | null; input_tokens: number; cached_input_tokens: number; uncached_input_tokens: number; output_tokens: number; tokens: number }[]
   tasks: { task_id: string; input_tokens: number; cached_input_tokens: number; uncached_input_tokens: number; output_tokens: number; tokens: number }[]
-  calls: { call_id: string; task_id: string | null; worker_id: string | null; provider: string; session_generation: number | null; input_tokens: number; cached_input_tokens: number; uncached_input_tokens: number; output_tokens: number; attribution_granularity: string; value_classification: string; rotation_reason: string | null; created_at: string }[]
+  calls: { call_id: string; call_kind: 'task_execution' | 'convention_refinement'; task_id: string | null; worker_id: string | null; provider: string; session_generation: number | null; input_tokens: number; cached_input_tokens: number; uncached_input_tokens: number; output_tokens: number; attribution_granularity: string; value_classification: string; rotation_reason: string | null; created_at: string }[]
 }
 export type RuntimeHealth = {
   connectivity: string

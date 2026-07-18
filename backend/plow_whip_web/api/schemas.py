@@ -42,12 +42,6 @@ class VerificationSpec(BaseModel):
         return self
 
 
-class TokenEstimateBand(BaseModel):
-    min: int
-    max: int
-    p90: int
-
-
 class TaskSizingEstimateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -72,21 +66,19 @@ class TaskSizingEstimateResponse(BaseModel):
     missing_gates: list[str]
     size_class: Literal["XS", "S", "M", "L", "XL"] | None
     rationale: list[str]
-    estimated_input_tokens: TokenEstimateBand | None
-    estimated_output_tokens: TokenEstimateBand | None
     soft_deadline_seconds: int | None
     hard_deadline_seconds: int | None
     max_turns: int | None
     max_attempts: int | None
     verification_timeout_seconds: int | None
     progress_extension_seconds: int | None
-    total_token_hard_cap: int | None
-    reserved_tokens: int | None
     model_invoked: Literal[False] = False
     bootstrap_version: str
 
 
 class TaskCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     title: Annotated[str, Field(min_length=1, max_length=200)]
     objective: Annotated[str, Field(min_length=1, max_length=4000)]
     project_path: str | None = None
@@ -110,9 +102,7 @@ class TaskCreate(BaseModel):
     command: CommandSpec
     verification: Annotated[list[VerificationSpec], Field(min_length=1, max_length=32)]
     max_attempts: Annotated[int | None, Field(ge=1, le=10)] = None
-    token_budget: Annotated[int | None, Field(ge=0)] = None
     sizing_inputs: TaskSizingEstimateRequest | None = None
-    manual_override_reason: Annotated[str | None, Field(min_length=1, max_length=500)] = None
 
     @field_validator("quality_profile")
     @classmethod
@@ -166,17 +156,13 @@ class TaskView(BaseModel):
     verification: list[dict[str, object]]
     max_attempts: int
     attempts_used: int
-    token_budget: int
     tokens_used: int
     last_evidence_hash: str | None
     last_error: str | None
     created_at: str
     updated_at: str
     sizing: dict[str, Any]
-    execution_budget: dict[str, Any] | None
-    manual_override: bool
-    override_reason: str | None
-    budget_overrun_evidence: dict[str, Any] | None
+    execution_policy: dict[str, Any] | None
     goal_id: str | None = None
     parent_task_id: str | None = None
     depends_on: list[str] | None = None
@@ -291,9 +277,6 @@ class RuntimeSettingsValues(BaseModel):
     cron_misfire_policy: Literal["catch_up_once", "skip"] = "catch_up_once"
     max_parallel_workers: Annotated[int, Field(ge=1, le=64)] = 4
     auto_dispatch: bool = True
-    task_default_token_budget: Annotated[int, Field(ge=0, le=100_000_000)] = 50_000
-    global_daily_token_budget: Annotated[int, Field(ge=0, le=1_000_000_000)] = 500_000
-    convention_refinement_token_budget: Annotated[int, Field(ge=1, le=100_000_000)] = 10_000
     max_same_failure: Annotated[int, Field(ge=1, le=20)] = 2
     max_no_progress: Annotated[int, Field(ge=1, le=20)] = 3
     context_max_bytes: Annotated[int, Field(ge=4096, le=1_048_576)] = 32_768

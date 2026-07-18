@@ -315,7 +315,7 @@ class HostJobManager:
             else:
                 returncode = int(process.returncode or 0)
                 status = "completed"
-                failure = (
+                failure = None if returncode == 0 else (
                     record.get("detected_failure_class")
                     or _provider_failure_class(
                         returncode,

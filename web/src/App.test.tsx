@@ -21,11 +21,8 @@ const provider = {
 const estimate = {
   status: 'estimated', missing_gates: [], size_class: 'M',
   rationale: ['estimated_verification_seconds=180 (+6)', 'complexity_score=68', 'size_class=M'],
-  estimated_input_tokens: { min: 45_000, max: 150_000, p90: 112_500 },
-  estimated_output_tokens: { min: 15_000, max: 50_000, p90: 37_500 },
   soft_deadline_seconds: 480, hard_deadline_seconds: 1200, max_turns: 40, max_attempts: 3,
   verification_timeout_seconds: 300, progress_extension_seconds: 120,
-  total_token_hard_cap: 225_000, reserved_tokens: 150_000,
   model_invoked: false, bootstrap_version: 'sprint10-v1',
 }
 let estimateFails = false
@@ -58,9 +55,9 @@ function taskWithQualityProfile(qualityProfile: string, index: number) {
     project_path: project.path, project_id: project.id, role_id: null, worker_id: null,
     resource_key: null, network_requirement: 'none', same_failure_count: 0, no_progress_count: 0,
     last_failure_fingerprint: null, next_eligible_at: null, provider: 'cursor', quality_profile: qualityProfile,
-    status: 'completed', revision: 0, max_attempts: 3, attempts_used: 1, token_budget: 225_000, tokens_used: 100,
+    status: 'completed', revision: 0, max_attempts: 3, attempts_used: 1, tokens_used: 100,
     last_evidence_hash: null, last_error: null, created_at: '2026-07-17T00:00:00Z', updated_at: '2026-07-17T00:00:00Z',
-    command: {}, verification: [], sizing: estimate, execution_budget: {}, manual_override: false, override_reason: null,
+    command: {}, verification: [], sizing: estimate, execution_policy: {},
   }
 }
 
@@ -89,8 +86,6 @@ beforeEach(() => {
           cron_misfire_policy: 'catch_up_once',
           max_parallel_workers: 4,
           auto_dispatch: true,
-          task_default_token_budget: 50000,
-          global_daily_token_budget: 500000,
           max_same_failure: 3,
           max_no_progress: 3,
           context_max_bytes: 32768,
@@ -113,10 +108,8 @@ beforeEach(() => {
         if (payload.independent_review_required) missing.push('independent_review_orchestration')
         return { ok: true, json: async () => missing.length ? ({
           ...estimate, status: 'needs_planning', missing_gates: missing, size_class: null,
-          estimated_input_tokens: null, estimated_output_tokens: null,
           soft_deadline_seconds: null, hard_deadline_seconds: null, max_turns: null,
           max_attempts: null, verification_timeout_seconds: null, progress_extension_seconds: null,
-          total_token_hard_cap: null, reserved_tokens: null,
         }) : estimate }
       }
       if (path === '/api/tasks' && init?.method === 'POST') {
@@ -127,9 +120,9 @@ beforeEach(() => {
           project_path: project.path, project_id: project.id, role_id: null, worker_id: null,
           resource_key: null, network_requirement: 'none', same_failure_count: 0, no_progress_count: 0,
           last_failure_fingerprint: null, next_eligible_at: null, provider: 'cursor', quality_profile: 'deterministic',
-          status: 'ready', revision: 0, max_attempts: 3, attempts_used: 0, token_budget: 225_000, tokens_used: 0,
+          status: 'ready', revision: 0, max_attempts: 3, attempts_used: 0, tokens_used: 0,
           last_evidence_hash: null, last_error: null, created_at: '2026-07-17T00:00:00Z', updated_at: '2026-07-17T00:00:00Z',
-          command: {}, verification: [], sizing: estimate, execution_budget: {}, manual_override: false, override_reason: null,
+          command: {}, verification: [], sizing: estimate, execution_policy: {},
         }) }
       }
       return {
@@ -230,7 +223,7 @@ test('keeps task and goal selection mutually exclusive and shows layered goal ru
     id: 'child-1', title: 'UI child', worker_id: 'worker-1', work_item_kind: 'ui',
     provider: 'cursor', depends_on: ['child-0'], blocked_reason: 'waiting for backend',
     status: 'running', attempts_used: 1, max_attempts: 3, tokens_used: 184_000,
-    token_budget: 225_000, input_tokens: 120_000, cached_input_tokens: 96_000,
+    input_tokens: 120_000, cached_input_tokens: 96_000,
     output_tokens: 64_000, total_tokens: 184_000,
     output_ref: 'sessions/ui/current.jsonl', output_segments: 3, output_bytes: 8192,
     output_offset: 4096, last_evidence_hash: null,
@@ -245,7 +238,7 @@ test('keeps task and goal selection mutually exclusive and shows layered goal ru
       id: 'child-1', ordinal: 2, title: 'UI child', work_item_kind: 'ui', provider: 'cursor',
       depends_on: ['child-0'], status: 'running', blocked_reason: 'waiting for backend',
       sizing: { size_class: 'M', status: 'estimated' },
-      execution_budget: { total_token_hard_cap: 225_000, hard_deadline_seconds: 1200 },
+      execution_policy: { hard_deadline_seconds: 1200 },
       verification: [{ kind: 'file_exists', path: 'result.txt' }],
     }],
   }]
@@ -269,7 +262,7 @@ test('keeps task and goal selection mutually exclusive and shows layered goal ru
 
   expect(screen.getByRole('heading', { name: 'Release Goal' })).toBeInTheDocument()
   expect(screen.getByText('结构化/确定性计划，模型 PM 尚未实现')).toBeInTheDocument()
-  for (const label of ['角色 / Provider', '依赖', '阻塞原因', 'Worker session', 'Generation', 'Rotation reason', 'Last context pressure', 'Pressure trigger', 'Sizing', 'Budget', 'Attempt / progress', 'Verification', 'Output ref', 'Segments / bytes / offset', 'Cached 计入 Total', 'Hard cap']) {
+  for (const label of ['角色 / Provider', '依赖', '阻塞原因', 'Worker session', 'Generation', 'Rotation reason', 'Last context pressure', 'Pressure trigger', 'Sizing', 'Execution', 'Attempt / progress', 'Verification', 'Output ref', 'Segments / bytes / offset', 'Cached 计入 Total', 'Token control']) {
     expect(screen.getByText(label)).toBeInTheDocument()
   }
   expect(screen.getByText('cursor-session-7')).toBeInTheDocument()
@@ -278,7 +271,7 @@ test('keeps task and goal selection mutually exclusive and shows layered goal ru
   expect(screen.getByText('sessions/ui/current.jsonl')).toBeInTheDocument()
   expect(screen.getByText('3 / 8192 / 4096')).toBeInTheDocument()
   expect(screen.getByText('是，已包含在 Input 中，不重复相加')).toBeInTheDocument()
-  expect(screen.getByText('结算硬门；派发前执行 context-pressure guard')).toBeInTheDocument()
+  expect(screen.getByText('仅计量；不参与准入、调度、熔断或终态')).toBeInTheDocument()
   expect(screen.getByText(/turn \/ unknown/)).toBeInTheDocument()
   expect(screen.getByText(/Uncached 不等于新工作或有价值/)).toBeInTheDocument()
 })
@@ -389,7 +382,7 @@ test('shows provider readiness layers and does not hide unhealthy execution behi
   expect(screen.getByText('env DEEPSEEK_API_KEY_SLOTS · slots 3')).toBeInTheDocument()
 })
 
-test('opens task creation and completes a 0 Token preflight with dynamic budget facts', async () => {
+test('opens task creation and completes a 0 Token preflight with execution facts', async () => {
   await openTaskDrawer()
   expect(screen.queryByLabelText('质量档位')).not.toBeInTheDocument()
   expect(screen.queryByText('快速')).not.toBeInTheDocument()
@@ -398,9 +391,6 @@ test('opens task creation and completes a 0 Token preflight with dynamic budget 
   fireEvent.click(screen.getByRole('button', { name: '执行 0 Token 预判' }))
 
   expect(await screen.findByText('服务端 Tier M')).toBeInTheDocument()
-  expect(screen.getByText('45,000–150,000 · p90 112,500')).toBeInTheDocument()
-  expect(screen.getByText('15,000–50,000 · p90 37,500')).toBeInTheDocument()
-  expect(screen.getByText('225,000')).toBeInTheDocument()
   expect(screen.getByText('480s')).toBeInTheDocument()
   expect(screen.getByText('1200s')).toBeInTheDocument()
   expect(screen.getByText('3')).toBeInTheDocument()
@@ -499,8 +489,8 @@ test('submits a goal through the primary PM entry', async () => {
           revision: 0, updated_at: null, values: {
             scheduler_interval_seconds: 30, scheduler_lease_seconds: 90, cron_enabled: true,
             cron_expression: '*/1 * * * *', cron_timezone: 'Asia/Shanghai', cron_misfire_policy: 'catch_up_once',
-            max_parallel_workers: 4, auto_dispatch: true, task_default_token_budget: 50000,
-            global_daily_token_budget: 500000, max_same_failure: 3, max_no_progress: 3,
+            max_parallel_workers: 4, auto_dispatch: true,
+            max_same_failure: 3, max_no_progress: 3,
             context_max_bytes: 32768, rotation_max_bytes: 262144,
           },
         }) : path === '/api/scheduler/status' ? ({

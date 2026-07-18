@@ -80,7 +80,6 @@ def _runtime(key: str):
         command={"argv": [sys.executable, "-c", "pass"], "timeout_seconds": 60},
         verification=[{"kind": "exit_code", "expected": 0}],
         max_attempts=2,
-        token_budget=100,
         idempotency_key=key,
     )
     running = app.state.task_service.drive(
@@ -183,10 +182,6 @@ def test_socket_hang_up_replays_to_ready_without_spending_attempt() -> None:
         events = app.state.task_repository.events(running.id)
         connection = app.state.database.connect()
         try:
-            reservation = connection.execute(
-                "SELECT status, actual_tokens FROM token_reservations WHERE run_id = ?",
-                (job["run_id"],),
-            ).fetchone()
             worker = connection.execute(
                 "SELECT external_session_id, last_error FROM workers WHERE id = ?",
                 (running.worker_id,),
@@ -212,7 +207,6 @@ def test_socket_hang_up_replays_to_ready_without_spending_attempt() -> None:
         assert recovered.last_error == "transient_provider_transport"
         assert recovered.next_eligible_at is not None
         assert bridge.verify_calls == 0
-        assert (reservation["status"], reservation["actual_tokens"]) == ("released", None)
         assert worker["external_session_id"] == "confirmed-session"
         assert worker["last_error"] == "transient_provider_transport"
         assert counts[1:] == (0, 0, 0)
@@ -302,8 +296,8 @@ def test_capacity_text_overrides_command_failed_and_retains_session() -> None:
         directory.cleanup()
 
 
-def test_real_hard_cap_breach_rotates_once_across_reconcile_replay() -> None:
-    directory, app, bridge, running, job = _runtime("hard-cap-rotate")
+def test_large_token_usage_completes_without_rotation_across_reconcile_replay() -> None:
+    directory, app, bridge, running, job = _runtime("large-token-usage")
     try:
         bridge.snapshots[job["job_id"]] = {
             **bridge.snapshots[job["job_id"]],
@@ -317,7 +311,7 @@ def test_real_hard_cap_breach_rotates_once_across_reconcile_replay() -> None:
             "output_tokens": 1,
         }
         app.state.task_service.reconcile_host_jobs()
-        failed = app.state.task_repository.get(running.id)
+        completed = app.state.task_repository.get(running.id)
 
         with app.state.database.transaction(immediate=True) as connection:
             connection.execute(
@@ -347,17 +341,14 @@ def test_real_hard_cap_breach_rotates_once_across_reconcile_replay() -> None:
             ).fetchall()
         finally:
             connection.close()
-        assert failed.status.value == "terminal_failed"
-        assert failed.last_error == "budget_exceeded"
-        assert worker["session_generation"] == 2
-        assert worker["external_session_id"] is None
-        assert [(row["reason"], row["trigger_key"]) for row in archives] == [
-            ("budget_exceeded", f"budget-exceeded:{job['run_id']}")
-        ]
+        assert completed.status.value == "completed"
+        assert completed.last_error is None
+        assert completed.tokens_used == 121
+        assert worker["session_generation"] == 1
+        assert archives == []
         assert [tuple(row) for row in usage] == [
             (
-                120, 100, 1, "turn", "unknown",
-                "budget_exceeded", 1,
+                120, 100, 1, "turn", "unknown", None, 1,
             )
         ]
     finally:
@@ -409,57 +400,6 @@ def test_provider_capacity_defers_boundedly_without_rotating_session() -> None:
         assert worker["session_generation"] == 1
         assert worker["external_session_id"] == "confirmed-session"
         assert archives == 0
-    finally:
-        directory.cleanup()
-
-
-def test_budget_exceeded_settlement_rotates_once_across_reconcile_replay() -> None:
-    directory, app, bridge, running, job = _runtime("budget-rotate-once")
-    try:
-        bridge.snapshots[job["job_id"]] = {
-            **bridge.snapshots[job["job_id"]],
-            "status": "completed",
-            "returncode": 0,
-            "failure_class": None,
-            "stderr": "",
-            "session_id": "oversized-session",
-            "input_tokens": 120,
-            "cached_input_tokens": 100,
-            "output_tokens": 0,
-        }
-        app.state.task_service.reconcile_host_jobs()
-        failed = app.state.task_repository.get(running.id)
-        assert failed.status.value == "terminal_failed"
-        assert failed.last_error == "budget_exceeded"
-
-        with app.state.database.transaction(immediate=True) as connection:
-            connection.execute(
-                "UPDATE host_jobs SET consumed_at = NULL WHERE job_id = ?",
-                (job["job_id"],),
-            )
-        app.state.task_service.reconcile_host_jobs()
-
-        worker = app.state.project_repository.get(failed.project_id)["workers"][0]
-        connection = app.state.database.connect()
-        try:
-            archives = connection.execute(
-                """
-                SELECT reason, COUNT(*) count
-                FROM worker_session_archives WHERE worker_id = ?
-                GROUP BY reason
-                """,
-                (running.worker_id,),
-            ).fetchall()
-        finally:
-            connection.close()
-        assert worker["session_generation"] == 2
-        assert worker["external_session_id"] is None
-        assert worker["last_input_tokens"] == 120
-        assert worker["last_cached_input_tokens"] == 100
-        assert worker["last_context_pressure_reason"] == "budget_exceeded"
-        assert [(row["reason"], row["count"]) for row in archives] == [
-            ("budget_exceeded", 1)
-        ]
     finally:
         directory.cleanup()
 
@@ -558,10 +498,6 @@ def test_nonzero_transient_tokens_are_settled_exactly_once() -> None:
         recovered = app.state.task_repository.get(running.id)
         connection = app.state.database.connect()
         try:
-            reservation = connection.execute(
-                "SELECT status, actual_tokens FROM token_reservations WHERE run_id = ?",
-                (job["run_id"],),
-            ).fetchone()
             usage = connection.execute(
                 "SELECT input_tokens, output_tokens FROM token_usage WHERE run_id = ?",
                 (job["run_id"],),
@@ -572,7 +508,6 @@ def test_nonzero_transient_tokens_are_settled_exactly_once() -> None:
         assert recovered.status.value == "ready"
         assert recovered.attempts_used == 0
         assert recovered.tokens_used == 10
-        assert (reservation["status"], reservation["actual_tokens"]) == ("settled", 10)
         assert [(row["input_tokens"], row["output_tokens"]) for row in usage] == [(7, 3)]
     finally:
         directory.cleanup()

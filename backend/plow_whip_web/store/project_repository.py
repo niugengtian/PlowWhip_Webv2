@@ -69,10 +69,6 @@ def _worker_view(connection: Any, worker_id: str) -> dict[str, Any]:
                w.last_context_pressure_tokens,
                w.last_context_pressure_reason, w.last_context_session_generation,
                w.last_attribution_granularity, w.last_value_classification,
-               w.last_context_guard_decision, w.last_context_guard_reason,
-               w.last_guard_estimated_new_tokens,
-               w.last_guard_carry_in_cached_tokens, w.last_guard_hard_cap,
-               w.last_guard_relation,
                (
                    SELECT a.reason FROM worker_session_archives a
                    WHERE a.worker_id = w.id
@@ -142,10 +138,6 @@ class ProjectRepository:
                        w.last_context_pressure_tokens,
                        w.last_context_pressure_reason, w.last_context_session_generation,
                        w.last_attribution_granularity, w.last_value_classification,
-                       w.last_context_guard_decision, w.last_context_guard_reason,
-                       w.last_guard_estimated_new_tokens,
-                       w.last_guard_carry_in_cached_tokens, w.last_guard_hard_cap,
-                       w.last_guard_relation,
                        (
                            SELECT a.reason FROM worker_session_archives a
                            WHERE a.worker_id = w.id

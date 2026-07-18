@@ -1,5 +1,7 @@
 # Codex P1 优化结果
 
+> 历史实现记录：Token reservation/预算门已由 `0021_remove_token_budget.sql` 废止。当前只保留幂等 Token 消费账本与统计。
+
 日期：2026-07-17
 
 ## 工作树边界

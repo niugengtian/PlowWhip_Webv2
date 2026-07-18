@@ -157,8 +157,8 @@ def test_goal_to_auto_advance_e2e_with_real_http() -> None:
             ]
             assert children[0]["status"] == "ready"
             assert all(item["status"] == "paused" for item in children[1:])
-            assert all(item["execution_budget"] is not None for item in children)
-            assert children[0]["token_budget"] != 50_000 or children[0]["sizing"]["status"] == "estimated"
+            assert all(item["execution_policy"] is not None for item in children)
+            assert children[0]["sizing"]["status"] == "estimated"
 
             # Provider not ready path uses host provider separately; generic-command is always local.
             first_tick = client.post("/api/scheduler/tick")

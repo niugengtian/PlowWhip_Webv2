@@ -63,7 +63,7 @@ class MaintenanceService:
             tasks = [dict(row) for row in connection.execute(
                 """
                 SELECT id, title, objective, project_id, role_id, worker_id, status, revision,
-                       attempts_used, max_attempts, token_budget, tokens_used, provider,
+                       attempts_used, max_attempts, tokens_used, provider,
                        quality_profile, created_at, updated_at
                 FROM tasks ORDER BY id
                 """

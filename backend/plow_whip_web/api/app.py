@@ -51,7 +51,7 @@ from plow_whip_web.domain.model import (
 from plow_whip_web.runtime.task_service import TaskService
 from plow_whip_web.runtime.scheduler import SchedulerService
 from plow_whip_web.runtime.cron import EmbeddedCronRunner, schedule_view
-from plow_whip_web.runtime.budget import BudgetManager
+from plow_whip_web.runtime.token_ledger import TokenLedger
 from plow_whip_web.runtime.context import ContextCompiler
 from plow_whip_web.runtime.journal import SessionJournal
 from plow_whip_web.runtime.connectivity import ConnectivityProbe
@@ -85,7 +85,7 @@ def create_app(settings: Settings) -> FastAPI:
     project_repository = ProjectRepository(database)
     runtime_settings = SettingsRepository(database)
     conventions = ConventionRepository(database)
-    budget = BudgetManager(database, runtime_settings)
+    token_ledger = TokenLedger(database)
     context_compiler = ContextCompiler(settings.data_dir, database, task_repository, conventions, runtime_settings)
     journal = SessionJournal(settings.data_dir, runtime_settings)
     health_repository = HealthRepository(database)
@@ -97,12 +97,14 @@ def create_app(settings: Settings) -> FastAPI:
     provider_pool = ProviderPool(
         database, providers, task_repository,
         HostBridgeClient(settings.host_bridge_url, settings.host_bridge_token),
+        token_ledger=token_ledger,
     )
     maintenance = MaintenanceService(
         settings.data_dir, database, runtime_settings, health_repository, providers
     )
     task_service = TaskService(
-        task_repository, budget=budget, context_compiler=context_compiler, journal=journal,
+        task_repository, settings=runtime_settings, token_ledger=token_ledger,
+        context_compiler=context_compiler, journal=journal,
         provider_pool=provider_pool, host_jobs=host_jobs, projects=project_repository,
     )
     scheduler_repository = SchedulerRepository(database)
@@ -132,7 +134,7 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.scheduler_service = scheduler_service
     app.state.embedded_cron_runner = embedded_cron_runner
     app.state.conventions = conventions
-    app.state.budget = budget
+    app.state.token_ledger = token_ledger
     app.state.context_compiler = context_compiler
     app.state.journal = journal
     app.state.health_repository = health_repository
@@ -336,8 +338,8 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.get("/api/usage", tags=["usage"])
     def usage(request: Request) -> dict[str, object]:
-        manager: BudgetManager = request.app.state.budget
-        return manager.summary()
+        ledger: TokenLedger = request.app.state.token_ledger
+        return ledger.summary()
 
     @app.get("/api/system/health", tags=["system"])
     def runtime_health(request: Request) -> dict[str, object]:
@@ -548,7 +550,6 @@ def create_app(settings: Settings) -> FastAPI:
         idempotency_key: str = Header(alias="Idempotency-Key", min_length=8, max_length=200),
     ) -> TaskView:
         repository: TaskRepository = request.app.state.task_repository
-        settings_repo: SettingsRepository = request.app.state.runtime_settings
         project_path = payload.project_path
         role_id = None
         if payload.project_id:
@@ -593,52 +594,9 @@ def create_app(settings: Settings) -> FastAPI:
                         "missing_gates": preview["missing_gates"],
                     },
                 )
-            sizing, execution_budget = _preview_to_persistence(preview)
-            estimated_hard_cap = int(execution_budget["total_token_hard_cap"])
-            reserved_tokens = int(execution_budget["reserved_tokens"])
-            if payload.token_budget is not None and payload.token_budget != estimated_hard_cap:
-                reason = (payload.manual_override_reason or "").strip()
-                if not reason:
-                    raise HTTPException(
-                        status_code=400,
-                        detail={
-                            "message": (
-                                "token_budget differs from estimated hard cap; "
-                                "manual_override_reason is required"
-                            ),
-                            "code": "manual_override_required",
-                            "total_token_hard_cap": estimated_hard_cap,
-                        },
-                    )
-                if payload.token_budget < reserved_tokens:
-                    raise HTTPException(
-                        status_code=400,
-                        detail={
-                            "message": (
-                                "token_budget cannot be below reserved_tokens"
-                            ),
-                            "code": "token_budget_below_reserved",
-                            "token_budget": payload.token_budget,
-                            "reserved_tokens": reserved_tokens,
-                        },
-                    )
-                execution_budget["estimated_total_token_hard_cap"] = estimated_hard_cap
-                execution_budget["total_token_hard_cap"] = payload.token_budget
-                create_kwargs["token_budget"] = payload.token_budget
-                create_kwargs["manual_override"] = True
-                create_kwargs["override_reason"] = reason
-            else:
-                create_kwargs["token_budget"] = estimated_hard_cap
-                create_kwargs["manual_override"] = False
-                create_kwargs["override_reason"] = None
+            sizing, execution_policy = _preview_to_persistence(preview)
             create_kwargs["sizing"] = sizing
-            create_kwargs["execution_budget"] = execution_budget
-        else:
-            default_budget = settings_repo.get()["values"]["task_default_token_budget"]
-            create_kwargs["token_budget"] = (
-                payload.token_budget
-                if payload.token_budget is not None else default_budget
-            )
+            create_kwargs["execution_policy"] = execution_policy
 
         provider_pool: ProviderPool = request.app.state.provider_pool
         provider_pool.require_ready(payload.provider)
@@ -758,18 +716,14 @@ def _preview_to_persistence(
         "status": preview["status"],
         "size_class": preview["size_class"],
         "rationale": preview["rationale"],
-        "estimated_input_tokens": preview["estimated_input_tokens"],
-        "estimated_output_tokens": preview["estimated_output_tokens"],
         "bootstrap_version": preview["bootstrap_version"],
     }
-    execution_budget = {
+    execution_policy = {
         "soft_deadline_seconds": preview["soft_deadline_seconds"],
         "hard_deadline_seconds": preview["hard_deadline_seconds"],
         "max_turns": preview["max_turns"],
         "max_attempts": preview["max_attempts"],
         "verification_timeout_seconds": preview["verification_timeout_seconds"],
         "progress_extension_seconds": preview["progress_extension_seconds"],
-        "total_token_hard_cap": preview["total_token_hard_cap"],
-        "reserved_tokens": preview["reserved_tokens"],
     }
-    return sizing, execution_budget
+    return sizing, execution_policy

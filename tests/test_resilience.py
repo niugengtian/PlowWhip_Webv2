@@ -32,7 +32,7 @@ def _task(app, path: Path, *, key: str, network: str = "none", attempts: int = 1
     return app.state.task_repository.create(
         title=key, objective=key, project_path=str(path), command={"argv": [sys.executable, "-c", code]},
         verification=[{"kind": "file_contains", "path": "result.txt", "contains": expected}],
-        max_attempts=attempts, token_budget=0, idempotency_key=key, network_requirement=network,
+        max_attempts=attempts, idempotency_key=key, network_requirement=network,
     )
 
 
@@ -158,7 +158,7 @@ def test_stale_running_task_and_worker_are_reconciled_once() -> None:
         task = app.state.task_repository.create(
             title="recover", objective="recover", project_path=str(project_path), project_id=project["id"],
             role_id=role["role_id"], command={"argv": [sys.executable, "-c", "pass"]},
-            verification=[{"kind": "exit_code", "expected": 0}], max_attempts=2, token_budget=0,
+            verification=[{"kind": "exit_code", "expected": 0}], max_attempts=2,
             idempotency_key="recover-create",
         )
         claim = app.state.task_repository.claim(task.id, expected_revision=0, idempotency_key="recover-claim")
@@ -186,7 +186,7 @@ def test_one_hundred_fault_injection_policy_cases_are_bounded(case: int) -> None
     classes = [
         "timeout", "command_failed", "verification_failed", "no_progress",
         "database_locked", "domestic_unavailable", "overseas_unavailable", "offline",
-        "provider_auth", "permission_denied", "budget_exceeded", "unknown",
+        "provider_auth", "permission_denied", "unknown",
     ]
     failure = classes[case % len(classes)]
     occurrences = case % 5 + 1
@@ -195,6 +195,6 @@ def test_one_hundred_fault_injection_policy_cases_are_bounded(case: int) -> None
     assert decision in {"defer", "needs_human", "terminal_failed", "retry_backoff"}
     if failure in {"database_locked", "domestic_unavailable", "overseas_unavailable", "offline"}:
         assert decision == "defer"
-    if failure in {"provider_auth", "permission_denied", "budget_exceeded"}:
+    if failure in {"provider_auth", "permission_denied"}:
         assert decision == "needs_human"
     assert FaultPolicy.model_invoked is False

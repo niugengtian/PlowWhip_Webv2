@@ -19,7 +19,6 @@ from typing import Iterator
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BRANCH = "codex/sprint-9-execution-continuity"
 PROJECT = "plow-whip-web-v2"
 SERVICE = "control-plane"
 BRIDGE_LABEL = "com.plow-whip-web.host-bridge"
@@ -109,8 +108,11 @@ def verify_source(expected_sha: str) -> None:
         raise ReleaseError(f"HEAD mismatch: expected {expected_sha}, got {head}")
     if _run(["git", "status", "--porcelain"]).stdout.strip():
         raise ReleaseError("working tree must be clean before a release build")
+    branch = _run(["git", "branch", "--show-current"]).stdout.strip()
+    if not branch:
+        raise ReleaseError("release requires a named Git branch")
     remote = _run(
-        ["git", "ls-remote", "origin", f"refs/heads/{BRANCH}"]
+        ["git", "ls-remote", "origin", f"refs/heads/{branch}"]
     ).stdout.split()
     if not remote or remote[0] != expected_sha:
         actual = remote[0] if remote else "missing"
@@ -182,7 +184,9 @@ def verify_runtime(expected_sha: str) -> dict[str, object]:
     if (
         health.get("status") != "ok"
         or database.get("journal_mode") != "wal"
-        or database.get("migration_count") != 20
+        or database.get("migration_count") != len(list(
+            (ROOT / "backend" / "plow_whip_web" / "store" / "migrations").glob("*.sql")
+        ))
     ):
         raise ReleaseError("HTTP health, WAL, or migration count check failed")
     return {

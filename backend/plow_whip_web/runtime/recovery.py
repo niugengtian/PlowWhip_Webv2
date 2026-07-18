@@ -50,14 +50,6 @@ class RecoveryService:
                 )
                 connection.execute(
                     """
-                    UPDATE token_reservations
-                    SET status = 'released', settled_at = CURRENT_TIMESTAMP
-                    WHERE task_id = ? AND status = 'active'
-                    """,
-                    (task["id"],),
-                )
-                connection.execute(
-                    """
                     INSERT INTO task_events(task_id, event_type, payload_json, state_revision, idempotency_key)
                     VALUES (?, 'task.recovered', ?, ?, ?)
                     """,

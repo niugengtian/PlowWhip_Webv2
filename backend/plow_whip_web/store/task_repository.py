@@ -8,7 +8,6 @@ from typing import Any
 from plow_whip_web.domain.model import (
     DomainError,
     InvalidTransitionError,
-    BudgetExceededError,
     NotFoundError,
     ProviderUnavailableError,
     RevisionConflictError,
@@ -19,8 +18,7 @@ from plow_whip_web.domain.model import (
 )
 from plow_whip_web.store.database import Database
 from plow_whip_web.store.settings_repository import DEFAULT_SETTINGS
-from plow_whip_web.store.project_repository import rotate_worker_in_transaction
-from plow_whip_web.runtime.budget import BudgetManager
+from plow_whip_web.runtime.token_ledger import TokenLedger
 
 # XL bootstrap tier hard deadline; single safety cap for Host dispatch and leases.
 MAX_HARD_DEADLINE_SECONDS = 4800
@@ -34,9 +32,9 @@ def task_sizing_status(task: TaskRecord) -> str:
 
 def task_hard_deadline_seconds(task: TaskRecord) -> int:
     if task_sizing_status(task) == "estimated":
-        if task.execution_budget is None:
-            raise DomainError("estimated task is missing execution_budget")
-        deadline = int(task.execution_budget["hard_deadline_seconds"])
+        if task.execution_policy is None:
+            raise DomainError("estimated task is missing execution_policy")
+        deadline = int(task.execution_policy["hard_deadline_seconds"])
     else:
         deadline = int(task.command.get("timeout_seconds", LEGACY_DEFAULT_TIMEOUT_SECONDS))
     return min(max(deadline, 10), MAX_HARD_DEADLINE_SECONDS)
@@ -44,22 +42,6 @@ def task_hard_deadline_seconds(task: TaskRecord) -> int:
 
 def task_lease_seconds(task: TaskRecord) -> int:
     return max(300, task_hard_deadline_seconds(task) + EXECUTION_DEADLINE_GRACE_SECONDS)
-
-
-def task_host_reserved_tokens(task: TaskRecord, *, remaining: int) -> int:
-    if task_sizing_status(task) == "estimated":
-        if task.execution_budget is None:
-            raise DomainError("estimated task is missing execution_budget")
-        return int(task.execution_budget["reserved_tokens"])
-    return remaining
-
-
-def task_token_hard_cap(task: TaskRecord) -> int:
-    if task_sizing_status(task) == "estimated":
-        if task.execution_budget is None:
-            raise DomainError("estimated task is missing execution_budget")
-        return int(task.execution_budget["total_token_hard_cap"])
-    return int(task.token_budget)
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,7 +65,6 @@ class TaskRepository:
         command: dict[str, Any],
         verification: list[dict[str, Any]],
         max_attempts: int,
-        token_budget: int,
         idempotency_key: str,
         project_id: str | None = None,
         role_id: str | None = None,
@@ -92,22 +73,14 @@ class TaskRepository:
         provider: str = "generic-command",
         quality_profile: str = "deterministic",
         sizing: dict[str, Any] | None = None,
-        execution_budget: dict[str, Any] | None = None,
-        manual_override: bool = False,
-        override_reason: str | None = None,
-        budget_overrun_evidence: dict[str, Any] | None = None,
+        execution_policy: dict[str, Any] | None = None,
     ) -> TaskRecord:
-        if manual_override and not (override_reason or "").strip():
-            raise DomainError("manual_override requires a non-empty override_reason")
-        if not manual_override and override_reason is not None:
-            raise DomainError("override_reason is only allowed with manual_override")
         if sizing is None:
-            if execution_budget is not None:
-                raise DomainError("execution_budget requires an explicit sizing record")
+            if execution_policy is not None:
+                raise DomainError("execution_policy requires an explicit sizing record")
             sizing = {"status": "legacy_fallback"}
-        # Single source of truth: execution_budget.max_attempts overrides column input.
-        if execution_budget is not None and execution_budget.get("max_attempts") is not None:
-            max_attempts = int(execution_budget["max_attempts"])
+        if execution_policy is not None and execution_policy.get("max_attempts") is not None:
+            max_attempts = int(execution_policy["max_attempts"])
         with self.database.transaction(immediate=True) as connection:
             duplicate = connection.execute(
                 "SELECT task_id FROM task_events WHERE idempotency_key = ?",
@@ -122,9 +95,8 @@ class TaskRepository:
                     id, title, objective, project_path, status, revision,
                     command_json, verification_json, max_attempts, token_budget,
                     project_id, role_id, resource_key, network_requirement, provider, quality_profile,
-                    sizing_json, execution_budget_json, manual_override, override_reason,
-                    budget_overrun_evidence_json
-                ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    sizing_json, execution_budget_json
+                ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -135,7 +107,6 @@ class TaskRepository:
                     _dump(command),
                     _dump(verification),
                     max_attempts,
-                    token_budget,
                     project_id,
                     role_id,
                     resource_key,
@@ -143,10 +114,7 @@ class TaskRepository:
                     provider,
                     quality_profile,
                     _dump(sizing),
-                    _dump(execution_budget) if execution_budget is not None else None,
-                    1 if manual_override else 0,
-                    override_reason,
-                    _dump(budget_overrun_evidence) if budget_overrun_evidence is not None else None,
+                    _dump(execution_policy) if execution_policy is not None else None,
                 ),
             )
             self._event(
@@ -159,15 +127,10 @@ class TaskRepository:
                     "sizing_status": str(sizing.get("status") or "legacy_fallback"),
                     "size_class": sizing.get("size_class"),
                     "bootstrap_version": sizing.get("bootstrap_version"),
-                    "total_token_hard_cap": (
-                        execution_budget.get("total_token_hard_cap")
-                        if execution_budget else None
-                    ),
                     "hard_deadline_seconds": (
-                        execution_budget.get("hard_deadline_seconds")
-                        if execution_budget else None
+                        execution_policy.get("hard_deadline_seconds")
+                        if execution_policy else None
                     ),
-                    "manual_override": manual_override,
                 },
                 revision=0,
                 idempotency_key=idempotency_key,
@@ -264,7 +227,6 @@ class TaskRepository:
 
     def claim(
         self, task_id: str, *, expected_revision: int, idempotency_key: str,
-        reserved_tokens: int = 0,
     ) -> ClaimResult:
         with self.database.transaction(immediate=True) as connection:
             duplicate = connection.execute(
@@ -328,13 +290,6 @@ class TaskRepository:
                 """,
                 (run_id, task.id, attempt_id, task.provider),
             )
-            if reserved_tokens:
-                BudgetManager.reserve_in_transaction(
-                    connection, call_id=run_id, call_kind="task_execution",
-                    idempotency_key=f"task-run:{run_id}", provider=task.provider,
-                    reserved_tokens=reserved_tokens, task=task,
-                    worker_id=worker_id, run_id=run_id,
-                )
             self._event(
                 connection,
                 task_id=task.id,
@@ -408,7 +363,6 @@ class TaskRepository:
         verification: dict[str, Any],
         idempotency_key: str,
         max_same_failure: int = 2,
-        budget_overrun_evidence: dict[str, Any] | None = None,
     ) -> TaskRecord:
         passed = bool(verification["passed"])
         with self.database.transaction(immediate=True) as connection:
@@ -429,17 +383,6 @@ class TaskRepository:
                 execution.get("output_tokens", 0)
             )
             actual_tokens = task.tokens_used + token_delta
-            sizing_status = task.sizing.get("status")
-            if sizing_status not in {"estimated", "legacy_fallback"}:
-                raise DomainError("task has no authoritative token hard cap")
-            token_hard_cap = task_token_hard_cap(task)
-            over_cap = actual_tokens > token_hard_cap
-            if over_cap:
-                budget_reason = "budget_exceeded"
-            elif not over_cap and budget_overrun_evidence is not None:
-                budget_reason = "invalid_budget_overrun_evidence"
-            else:
-                budget_reason = None
             fingerprint = verification.get(
                 "failure_fingerprint", verification["evidence_hash"]
             )
@@ -450,34 +393,27 @@ class TaskRepository:
             # a second decision signal. The evidence fingerprint is authoritative.
             no_progress_count = 0
             can_retry = (
-                budget_reason is None
-                and not passed
+                not passed
                 and task.attempts_used < _authoritative_max_attempts(task)
                 and same_failure_count <= max_same_failure
             )
-            target = TaskStatus.TERMINAL_FAILED if over_cap else (
-                TaskStatus.NEEDS_HUMAN if budget_reason else (
-                TaskStatus.COMPLETED if passed else (
+            target = TaskStatus.COMPLETED if passed else (
                 TaskStatus.READY if can_retry else TaskStatus.TERMINAL_FAILED
-                )
-            ))
+            )
             next_revision = task.revision + 1
-            BudgetManager.settle_in_transaction(
+            TokenLedger.record_in_transaction(
                 connection,
                 call_id=run_id,
-                execution={
-                    **execution,
-                    "rotation_reason": "budget_exceeded" if over_cap else None,
-                },
+                execution=execution,
                 task=task,
                 provider=task.provider,
+                run_id=run_id,
             )
             connection.execute(
                 """
                 UPDATE tasks SET status = ?, revision = ?, tokens_used = ?,
                     last_evidence_hash = ?, last_error = ?, same_failure_count = ?,
                     no_progress_count = ?, last_failure_fingerprint = ?,
-                    budget_overrun_evidence_json = ?,
                     next_eligible_at = CASE WHEN ? THEN datetime('now', ?) ELSE NULL END,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ? AND revision = ?
@@ -487,12 +423,10 @@ class TaskRepository:
                     next_revision,
                     actual_tokens,
                     verification["evidence_hash"],
-                    budget_reason or (None if passed else verification["summary"]),
+                    None if passed else verification["summary"],
                     same_failure_count,
                     no_progress_count,
                     None if passed else fingerprint,
-                    _dump(budget_overrun_evidence)
-                    if over_cap and budget_overrun_evidence is not None else None,
                     1 if can_retry else 0,
                     f"+{min(300, 2 ** task.attempts_used)} seconds",
                     task.id,
@@ -504,20 +438,10 @@ class TaskRepository:
                 connection,
                 task.worker_id,
                 execution,
-                reason=(
-                    "budget_exceeded"
-                    if over_cap else _context_pressure_reason(connection, execution)
-                ),
+                reason=_context_pressure_reason(connection, execution),
             )
-            if over_cap and task.worker_id:
-                rotate_worker_in_transaction(
-                    connection,
-                    task.worker_id,
-                    reason="budget_exceeded",
-                    trigger_key=f"budget-exceeded:{run_id}",
-                )
             run_status = "completed" if target is TaskStatus.COMPLETED else (
-                "needs_human" if target is TaskStatus.NEEDS_HUMAN else "failed"
+                "failed"
             )
             connection.execute(
                 "UPDATE task_attempts SET status = ?, finished_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -527,12 +451,6 @@ class TaskRepository:
                 "execution": _execution_metadata(execution),
                 "verification": verification,
             }
-            if budget_reason:
-                result["budget"] = {
-                    "reason": budget_reason,
-                    "actual_tokens": actual_tokens,
-                    "total_token_hard_cap": token_hard_cap,
-                }
             connection.execute(
                 """
                 UPDATE task_runs SET status = ?, input_tokens = ?,
@@ -556,50 +474,16 @@ class TaskRepository:
                 "run_id": run_id,
                 "verification": verification,
             }
-            if budget_reason:
-                event_payload.update({
-                    "reason": budget_reason,
-                    "actual_tokens": actual_tokens,
-                    "total_token_hard_cap": token_hard_cap,
-                })
-                if over_cap:
-                    event_payload["budget_overrun_evidence_recorded"] = (
-                        budget_overrun_evidence is not None
-                    )
             self._event(
                 connection,
                 task_id=task.id,
                 event_type="task.completed" if target is TaskStatus.COMPLETED else (
-                    "task.retry_scheduled" if can_retry else (
-                        "task.needs_human"
-                        if target is TaskStatus.NEEDS_HUMAN
-                        else "task.terminal_failed"
-                    )
+                    "task.retry_scheduled" if can_retry else "task.terminal_failed"
                 ),
                 payload=event_payload,
                 revision=next_revision,
                 idempotency_key=idempotency_key,
             )
-            if target is TaskStatus.NEEDS_HUMAN:
-                reason = budget_reason or (
-                    "repeated_verification_evidence"
-                    if same_failure_count >= max_same_failure
-                    else "attempt_budget_exhausted"
-                )
-                connection.execute(
-                    """
-                    INSERT INTO outbox_events(topic, aggregate_id, event_type, payload_json)
-                    VALUES ('task', ?, 'task.needs_human', ?)
-                    """,
-                    (task.id, _dump({
-                        "task_id": task.id, "reason": reason,
-                        "evidence_hash": verification["evidence_hash"],
-                        "failed_checks": [
-                            check for check in verification.get("checks", [])
-                            if not check.get("passed")
-                        ],
-                    })),
-                )
             return self._get_with_connection(connection, task.id)
 
     def last_failure_delta(self, task_id: str) -> dict[str, Any] | None:
@@ -677,45 +561,26 @@ class TaskRepository:
             token_total = int(execution.get("input_tokens", 0)) + int(
                 execution.get("output_tokens", 0)
             )
-            budget_exceeded = (
-                token_total > 0
-                and task.tokens_used + token_total > task_token_hard_cap(task)
-            )
-            if budget_exceeded:
-                action = "needs_human"
-                failure_class = reason = "budget_exceeded"
             target = (
-                TaskStatus.TERMINAL_FAILED
-                if budget_exceeded else (
-                    TaskStatus.NEEDS_HUMAN
-                    if action == "needs_human" else TaskStatus.READY
-                )
+                TaskStatus.NEEDS_HUMAN
+                if action == "needs_human" else TaskStatus.READY
             )
             revision = task.revision + 1
             if token_total:
-                BudgetManager.settle_in_transaction(
+                TokenLedger.record_in_transaction(
                     connection,
                     call_id=run_id,
-                    execution={
-                        **execution,
-                        "rotation_reason": (
-                            "budget_exceeded" if budget_exceeded else None
-                        ),
-                    },
+                    execution=execution,
                     task=task,
                     provider=task.provider,
+                    run_id=run_id,
                     add_to_task=True,
                 )
-            else:
-                BudgetManager.release_in_transaction(connection, run_id)
             backoff = f"+{2 ** min(8, max(1, task.attempts_used))} seconds"
             connection.execute(
                 """
                 UPDATE tasks SET status = ?, revision = ?,
-                    attempts_used = CASE
-                        WHEN ? THEN attempts_used
-                        ELSE MAX(0, attempts_used - 1)
-                    END,
+                    attempts_used = MAX(0, attempts_used - 1),
                     worker_id = NULL,
                     last_error = ?,
                     next_eligible_at = CASE
@@ -726,7 +591,7 @@ class TaskRepository:
                     updated_at = CURRENT_TIMESTAMP WHERE id = ?
                 """,
                 (
-                    target.value, revision, 1 if budget_exceeded else 0, reason[:1000],
+                    target.value, revision, reason[:1000],
                     action, backoff, action, task.id,
                 ),
             )
@@ -750,26 +615,13 @@ class TaskRepository:
                 connection,
                 task.worker_id,
                 execution,
-                reason=(
-                    "budget_exceeded"
-                    if budget_exceeded
-                    else _context_pressure_reason(connection, execution)
-                ),
+                reason=_context_pressure_reason(connection, execution),
             )
-            if budget_exceeded and task.worker_id:
-                rotate_worker_in_transaction(
-                    connection,
-                    task.worker_id,
-                    reason="budget_exceeded",
-                    trigger_key=f"budget-exceeded:{run_id}",
-                )
             run_status = {
                 "defer": "deferred",
                 "resume": "interrupted",
                 "needs_human": "needs_human",
             }[action]
-            if budget_exceeded:
-                run_status = "failed"
             connection.execute(
                 "UPDATE task_attempts SET status = ?, finished_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (run_status, attempt_id),
@@ -824,7 +676,7 @@ class TaskRepository:
                     "failure_class": failure_class,
                     "reason": reason,
                     "tokens": token_total,
-                    "session_retained": bool(retained_session_id) and not budget_exceeded,
+                    "session_retained": bool(retained_session_id),
                 },
                 revision=revision, idempotency_key=idempotency_key,
             )
@@ -1100,13 +952,23 @@ class TaskRepository:
 
 
 def _task_from_row(row: Any) -> TaskRecord:
-    execution_budget = (
+    execution_policy = (
         json.loads(row["execution_budget_json"])
         if row["execution_budget_json"] else None
     )
+    if execution_policy is not None:
+        execution_policy = {
+            key: value
+            for key, value in execution_policy.items()
+            if key not in {
+                "reserved_tokens",
+                "total_token_hard_cap",
+                "estimated_total_token_hard_cap",
+            }
+        }
     max_attempts = int(row["max_attempts"])
-    if execution_budget is not None and execution_budget.get("max_attempts") is not None:
-        max_attempts = int(execution_budget["max_attempts"])
+    if execution_policy is not None and execution_policy.get("max_attempts") is not None:
+        max_attempts = int(execution_policy["max_attempts"])
     return TaskRecord(
         id=row["id"],
         title=row["title"],
@@ -1129,7 +991,6 @@ def _task_from_row(row: Any) -> TaskRecord:
         verification=json.loads(row["verification_json"]),
         max_attempts=max_attempts,
         attempts_used=row["attempts_used"],
-        token_budget=row["token_budget"],
         tokens_used=row["tokens_used"],
         last_evidence_hash=row["last_evidence_hash"],
         last_error=row["last_error"],
@@ -1139,13 +1000,7 @@ def _task_from_row(row: Any) -> TaskRecord:
             json.loads(row["sizing_json"]) if row["sizing_json"]
             else {"status": "legacy_fallback"}
         ),
-        execution_budget=execution_budget,
-        manual_override=bool(row["manual_override"]),
-        override_reason=row["override_reason"],
-        budget_overrun_evidence=(
-            json.loads(row["budget_overrun_evidence_json"])
-            if row["budget_overrun_evidence_json"] else None
-        ),
+        execution_policy=execution_policy,
         goal_id=_optional(row, "goal_id"),
         parent_task_id=_optional(row, "parent_task_id"),
         depends_on=json.loads(_optional(row, "depends_on_json") or "[]"),
@@ -1157,8 +1012,8 @@ def _task_from_row(row: Any) -> TaskRecord:
 
 
 def _authoritative_max_attempts(task: TaskRecord) -> int:
-    if task.execution_budget and task.execution_budget.get("max_attempts") is not None:
-        return int(task.execution_budget["max_attempts"])
+    if task.execution_policy and task.execution_policy.get("max_attempts") is not None:
+        return int(task.execution_policy["max_attempts"])
     return int(task.max_attempts)
 
 

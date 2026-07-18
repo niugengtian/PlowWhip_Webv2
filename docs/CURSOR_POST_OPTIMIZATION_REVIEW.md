@@ -1,5 +1,7 @@
 # Cursor 第 3 代独立审查报告（Codex P1 优化后）
 
+> 历史审查记录：本文审查的 Token reservation/预算门已由 `0021_remove_token_budget.sql` 废止。当前只保留消费计量，外部网络与环境故障策略仍独立生效。
+
 审查日期：2026-07-17  
 审查基线：分支 `codex/sprint-9-execution-continuity`，未提交工作树（含 `0014_token_reservations.sql` 及关联运行时改动）  
 对照文档：`报告.md`（优化前独立审查）、`docs/CODEX_OPTIMIZATION_RESULT.md`（实现方自证）  

@@ -133,7 +133,7 @@ def test_worker_and_resource_leases_prevent_brain_split() -> None:
                 project_id=project["id"], role_id=role_id, resource_key=resource,
                 command={"argv": [sys.executable, "-c", "pass"]},
                 verification=[{"kind": "exit_code", "expected": 0}],
-                max_attempts=1, token_budget=0, idempotency_key=key,
+                max_attempts=1, idempotency_key=key,
             )
 
         first = create(project_a, role_a, "lease-first", "port:3000")
@@ -163,7 +163,7 @@ def test_two_projects_execute_in_parallel() -> None:
                 project_id=project["id"], role_id=role_id, resource_key=f"repo:{index}",
                 command={"argv": [sys.executable, "-c", "import time; time.sleep(.05)"]},
                 verification=[{"kind": "exit_code", "expected": 0}],
-                max_attempts=1, token_budget=0, idempotency_key=f"parallel-{index}",
+                max_attempts=1, idempotency_key=f"parallel-{index}",
             ))
         service = TaskService(repository)
         with ThreadPoolExecutor(max_workers=2) as pool:

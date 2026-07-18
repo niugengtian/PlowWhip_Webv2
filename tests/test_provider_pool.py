@@ -91,7 +91,7 @@ def test_worker_binding_uses_task_provider_and_can_rebind_when_idle() -> None:
             project_id=project["id"], role_id=role_id, provider="codex",
             command={"argv": [sys.executable, "-c", "pass"]},
             verification=[{"kind": "exit_code", "expected": 0}],
-            max_attempts=1, token_budget=100, idempotency_key="provider-binding",
+            max_attempts=1, idempotency_key="provider-binding",
         )
         claim = app.state.task_repository.claim(
             task.id, expected_revision=0, idempotency_key="provider-binding-claim"
@@ -202,7 +202,7 @@ def test_convention_output_extracts_nested_cli_agent_message() -> None:
     assert _last_text(output) == "# 精炼结果\n\n- 必须附验证证据。"
 
 
-def _estimated_execution_budget(size_class: str) -> dict[str, object]:
+def _estimated_execution_policy(size_class: str) -> dict[str, object]:
     preview = estimate_task_sizing(TaskSizingInputs(
         layers_touched=2 if size_class == "M" else 6,
         components_touched=3 if size_class == "M" else 8,
@@ -228,8 +228,6 @@ def _estimated_execution_budget(size_class: str) -> dict[str, object]:
         "max_attempts": preview["max_attempts"],
         "verification_timeout_seconds": preview["verification_timeout_seconds"],
         "progress_extension_seconds": preview["progress_extension_seconds"],
-        "total_token_hard_cap": preview["total_token_hard_cap"],
-        "reserved_tokens": preview["reserved_tokens"],
     }
 
 
@@ -254,31 +252,29 @@ def _estimated_sizing(size_class: str) -> dict[str, object]:
         "status": preview["status"],
         "size_class": preview["size_class"],
         "rationale": preview["rationale"],
-        "estimated_input_tokens": preview["estimated_input_tokens"],
-        "estimated_output_tokens": preview["estimated_output_tokens"],
         "bootstrap_version": preview["bootstrap_version"],
     }
 
 
-def test_execution_deadline_helpers_use_budget_or_legacy_command() -> None:
+def test_execution_deadline_helpers_use_policy_or_legacy_command() -> None:
     with TemporaryDirectory() as directory:
         root = Path(directory)
         project_path = root / "project"
         project_path.mkdir()
         app = create_app(Settings(data_dir=root / "runtime"))
-        execution_budget = _estimated_execution_budget("M")
+        execution_policy = _estimated_execution_policy("M")
         estimated = app.state.task_repository.create(
             title="estimated-m", objective="work", project_path=str(project_path),
             command={"argv": [sys.executable, "-c", "pass"], "timeout_seconds": 60},
             verification=[{"kind": "exit_code", "expected": 0}],
-            max_attempts=3, token_budget=225_000, idempotency_key="estimated-m",
-            sizing=_estimated_sizing("M"), execution_budget=execution_budget,
+            max_attempts=3, idempotency_key="estimated-m",
+            sizing=_estimated_sizing("M"), execution_policy=execution_policy,
         )
         legacy = app.state.task_repository.create(
             title="legacy", objective="work", project_path=str(project_path),
             command={"argv": [sys.executable, "-c", "pass"], "timeout_seconds": 180},
             verification=[{"kind": "exit_code", "expected": 0}],
-            max_attempts=1, token_budget=100, idempotency_key="legacy-timeout",
+            max_attempts=1, idempotency_key="legacy-timeout",
         )
 
         assert task_hard_deadline_seconds(estimated) == 1200
@@ -304,7 +300,7 @@ class CapturingBridge:
         return {"job_id": _kwargs["job_id"], "status": "running", "pid": 1}
 
 
-def test_provider_pool_passes_execution_budget_hard_deadline_to_host() -> None:
+def test_provider_pool_passes_execution_policy_hard_deadline_to_host() -> None:
     with TemporaryDirectory() as directory:
         root = Path(directory)
         project_path = root / "project"
@@ -316,18 +312,17 @@ def test_provider_pool_passes_execution_budget_hard_deadline_to_host() -> None:
             name="alpha", path=str(project_path), host_path=str(project_path)
         )
         role_id = app.state.project_repository.resolve_role(project["id"], "fullstack")["role_id"]
-        execution_budget = _estimated_execution_budget("M")
+        execution_policy = _estimated_execution_policy("M")
         task = app.state.task_repository.create(
             title="host-m", objective="work", project_path=str(project_path),
             project_id=project["id"], role_id=role_id, provider="codex",
             command={"argv": [sys.executable, "-c", "pass"], "timeout_seconds": 60},
             verification=[{"kind": "exit_code", "expected": 0}],
-            max_attempts=3, token_budget=225_000, idempotency_key="host-m",
-            sizing=_estimated_sizing("M"), execution_budget=execution_budget,
+            max_attempts=3, idempotency_key="host-m",
+            sizing=_estimated_sizing("M"), execution_policy=execution_policy,
         )
         claim = app.state.task_repository.claim(
             task.id, expected_revision=0, idempotency_key="host-m-claim",
-            reserved_tokens=execution_budget["reserved_tokens"],
         )
         bridge = CapturingBridge()
         pool = ProviderPool(
@@ -350,8 +345,8 @@ def test_provider_pool_passes_execution_budget_hard_deadline_to_host() -> None:
             connection.close()
 
         for size_class, hard_deadline in (("L", 2400), ("XL", 4800)):
-            budget = {
-                **_estimated_execution_budget("M"),
+            policy = {
+                **_estimated_execution_policy("M"),
                 "hard_deadline_seconds": hard_deadline,
                 "soft_deadline_seconds": hard_deadline // 2,
             }
@@ -365,14 +360,12 @@ def test_provider_pool_passes_execution_budget_hard_deadline_to_host() -> None:
                 project_id=project["id"], role_id=role_id, provider="codex",
                 command={"argv": [sys.executable, "-c", "pass"], "timeout_seconds": 60},
                 verification=[{"kind": "exit_code", "expected": 0}],
-                max_attempts=3, token_budget=int(budget["total_token_hard_cap"]),
-                idempotency_key=f"host-{size_class.lower()}",
-                sizing=sizing, execution_budget=budget,
+                max_attempts=3, idempotency_key=f"host-{size_class.lower()}",
+                sizing=sizing, execution_policy=policy,
             )
             sized_claim = app.state.task_repository.claim(
                 sized.id, expected_revision=0,
                 idempotency_key=f"host-{size_class.lower()}-claim",
-                reserved_tokens=budget["reserved_tokens"],
             )
             pool.start_task_job(
                 sized_claim.task, job_id=f"job-{size_class.lower()}", prompt="work",
@@ -396,11 +389,10 @@ def test_provider_pool_passes_execution_budget_hard_deadline_to_host() -> None:
             project_id=project["id"], role_id=role_id, provider="codex",
             command={"argv": [sys.executable, "-c", "pass"], "timeout_seconds": 240},
             verification=[{"kind": "exit_code", "expected": 0}],
-            max_attempts=1, token_budget=100, idempotency_key="host-legacy",
+            max_attempts=1, idempotency_key="host-legacy",
         )
         legacy_claim = app.state.task_repository.claim(
             legacy.id, expected_revision=0, idempotency_key="host-legacy-claim",
-            reserved_tokens=100,
         )
         pool.start_task_job(legacy_claim.task, job_id="job-legacy", prompt="work")
         assert bridge.last_timeout == 240

@@ -21,35 +21,28 @@ def _preview_to_persistence(preview: dict[str, Any]) -> tuple[dict[str, Any], di
         "missing_gates": list(preview["missing_gates"]),
         "size_class": preview["size_class"],
         "rationale": list(preview["rationale"]),
-        "estimated_input_tokens": preview["estimated_input_tokens"],
-        "estimated_output_tokens": preview["estimated_output_tokens"],
         "soft_deadline_seconds": preview["soft_deadline_seconds"],
         "hard_deadline_seconds": preview["hard_deadline_seconds"],
         "max_turns": preview["max_turns"],
         "max_attempts": preview["max_attempts"],
         "verification_timeout_seconds": preview["verification_timeout_seconds"],
         "progress_extension_seconds": preview["progress_extension_seconds"],
-        "total_token_hard_cap": preview["total_token_hard_cap"],
-        "reserved_tokens": preview["reserved_tokens"],
         "model_invoked": False,
         "bootstrap_version": preview["bootstrap_version"],
     }
-    execution_budget = {
-        "reserved_tokens": preview["reserved_tokens"],
+    execution_policy = {
         "soft_deadline_seconds": preview["soft_deadline_seconds"],
         "hard_deadline_seconds": preview["hard_deadline_seconds"],
         "max_attempts": preview["max_attempts"],
-        "total_token_hard_cap": preview["total_token_hard_cap"],
         "verification_timeout_seconds": preview["verification_timeout_seconds"],
         "progress_extension_seconds": preview["progress_extension_seconds"],
     }
-    return sizing, execution_budget
+    return sizing, execution_policy
 
 
-def resolve_max_attempts(execution_budget: dict[str, Any] | None, fallback: int) -> int:
-    """Single source of truth: execution_budget.max_attempts when present."""
-    if execution_budget is not None and execution_budget.get("max_attempts") is not None:
-        return int(execution_budget["max_attempts"])
+def resolve_max_attempts(execution_policy: dict[str, Any] | None, fallback: int) -> int:
+    if execution_policy is not None and execution_policy.get("max_attempts") is not None:
+        return int(execution_policy["max_attempts"])
     return int(fallback)
 
 
@@ -99,7 +92,7 @@ class GoalRepository:
 
             goal_id = str(uuid.uuid4())
             parent_task_id = str(uuid.uuid4())
-            # Coordination parent is bookkeeping-only; keep a small estimated budget.
+            # Coordination parent is bookkeeping-only; sizing supplies execution timing.
             parent_preview = estimate_task_sizing(
                 TaskSizingInputs(
                     layers_touched=1,
@@ -118,8 +111,8 @@ class GoalRepository:
                     gate_dependency=True,
                 )
             )
-            parent_sizing, parent_budget = _preview_to_persistence(parent_preview)
-            parent_attempts = resolve_max_attempts(parent_budget, 1)
+            parent_sizing, parent_policy = _preview_to_persistence(parent_preview)
+            parent_attempts = resolve_max_attempts(parent_policy, 1)
             parent_provider = role_providers["coordination"]
 
             connection.execute(
@@ -149,7 +142,7 @@ class GoalRepository:
                     manual_override, goal_id, parent_task_id, depends_on_json,
                     work_item_kind, ordinal, blocked_reason
                 ) VALUES (
-                    ?, ?, ?, ?, 'paused', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, 'paused', 0, ?, ?, ?, 0, ?, ?, ?, ?, ?,
                     'deterministic', ?, ?, 0, ?, NULL, '[]',
                     'coordination', 0, 'waiting_children'
                 )
@@ -166,14 +159,13 @@ class GoalRepository:
                     ),
                     json.dumps([], ensure_ascii=False),
                     parent_attempts,
-                    int(parent_budget["total_token_hard_cap"]),
                     project_id,
                     role_ids["coordination"],
                     f"goal:{goal_id}",
                     network_requirement,
                     parent_provider,
                     json.dumps(parent_sizing, ensure_ascii=False, sort_keys=True),
-                    json.dumps(parent_budget, ensure_ascii=False, sort_keys=True),
+                    json.dumps(parent_policy, ensure_ascii=False, sort_keys=True),
                     goal_id,
                 ),
             )
@@ -204,9 +196,8 @@ class GoalRepository:
                         f"child work item {item.ordinal} sizing needs_planning: "
                         f"{preview['missing_gates']}"
                     )
-                sizing, execution_budget = _preview_to_persistence(preview)
-                max_attempts = resolve_max_attempts(execution_budget, 1)
-                token_budget = int(execution_budget["total_token_hard_cap"])
+                sizing, execution_policy = _preview_to_persistence(preview)
+                max_attempts = resolve_max_attempts(execution_policy, 1)
                 item_provider = role_providers[item.role]
                 child_command, child_verification = _child_command_and_verification(
                     item=item,
@@ -214,7 +205,7 @@ class GoalRepository:
                     shared_verification=verification,
                     impl_count=impl_count,
                 )
-                timeout = int(execution_budget["hard_deadline_seconds"])
+                timeout = int(execution_policy["hard_deadline_seconds"])
                 child_command = {
                     **child_command,
                     "timeout_seconds": min(
@@ -232,7 +223,7 @@ class GoalRepository:
                         manual_override, goal_id, parent_task_id, depends_on_json,
                         work_item_kind, ordinal, blocked_reason
                     ) VALUES (
-                        ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, 0, ?, ?, ?, 0, ?, ?, ?, ?, ?,
                         'deterministic', ?, ?, 0, ?, ?, ?, ?, ?, ?
                     )
                     """,
@@ -245,14 +236,13 @@ class GoalRepository:
                         json.dumps(child_command, ensure_ascii=False, sort_keys=True),
                         json.dumps(child_verification, ensure_ascii=False, sort_keys=True),
                         max_attempts,
-                        token_budget,
                         project_id,
                         role_ids[item.role],
                         f"goal:{goal_id}:item:{item.ordinal}",
                         network_requirement,
                         item_provider,
                         json.dumps(sizing, ensure_ascii=False, sort_keys=True),
-                        json.dumps(execution_budget, ensure_ascii=False, sort_keys=True),
+                        json.dumps(execution_policy, ensure_ascii=False, sort_keys=True),
                         goal_id,
                         parent_task_id,
                         json.dumps(depends_ids, ensure_ascii=False),
@@ -493,17 +483,14 @@ class GoalRepository:
                    t.work_item_kind, t.ordinal, t.depends_on_json, t.blocked_reason,
                    t.parent_task_id, t.revision, t.provider, t.created_at, t.updated_at,
                    t.last_error, t.last_evidence_hash, t.attempts_used, t.max_attempts,
-                   t.token_budget, t.tokens_used, t.sizing_json, t.execution_budget_json,
+                   t.tokens_used, t.sizing_json, t.execution_budget_json,
                    t.handoff_json, t.command_json, t.verification_json,
                    w.session_id, w.external_session_id, w.session_generation, w.last_error
                      AS worker_last_error, w.last_input_tokens,
                    w.last_cached_input_tokens, w.last_output_tokens,
                    w.last_uncached_input_tokens, w.last_context_pressure_tokens,
                    w.last_context_pressure_reason, w.last_attribution_granularity,
-                   w.last_value_classification, w.last_context_guard_decision,
-                   w.last_context_guard_reason, w.last_guard_estimated_new_tokens,
-                   w.last_guard_carry_in_cached_tokens, w.last_guard_hard_cap,
-                   w.last_guard_relation
+                   w.last_value_classification
             FROM tasks t
             LEFT JOIN workers w ON w.id = t.worker_id
             WHERE t.goal_id = ?
@@ -522,10 +509,7 @@ class GoalRepository:
                        last_cached_input_tokens, last_output_tokens,
                        last_uncached_input_tokens, last_context_pressure_tokens,
                        last_context_pressure_reason, last_attribution_granularity,
-                       last_value_classification, last_context_guard_decision,
-                       last_context_guard_reason, last_guard_estimated_new_tokens,
-                       last_guard_carry_in_cached_tokens, last_guard_hard_cap,
-                       last_guard_relation
+                       last_value_classification
                 FROM workers
                 WHERE project_id = ? AND released_at IS NULL
                 """,
@@ -550,12 +534,6 @@ class GoalRepository:
                     "last_context_pressure_reason": task["last_context_pressure_reason"],
                     "last_attribution_granularity": task["last_attribution_granularity"],
                     "last_value_classification": task["last_value_classification"],
-                    "last_context_guard_decision": task["last_context_guard_decision"],
-                    "last_context_guard_reason": task["last_context_guard_reason"],
-                    "last_guard_estimated_new_tokens": task["last_guard_estimated_new_tokens"],
-                    "last_guard_carry_in_cached_tokens": task["last_guard_carry_in_cached_tokens"],
-                    "last_guard_hard_cap": task["last_guard_hard_cap"],
-                    "last_guard_relation": task["last_guard_relation"],
                 }
             elif task["role_id"] in role_workers:
                 bound = role_workers[task["role_id"]]
@@ -573,12 +551,6 @@ class GoalRepository:
                     "last_context_pressure_reason": bound["last_context_pressure_reason"],
                     "last_attribution_granularity": bound["last_attribution_granularity"],
                     "last_value_classification": bound["last_value_classification"],
-                    "last_context_guard_decision": bound["last_context_guard_decision"],
-                    "last_context_guard_reason": bound["last_context_guard_reason"],
-                    "last_guard_estimated_new_tokens": bound["last_guard_estimated_new_tokens"],
-                    "last_guard_carry_in_cached_tokens": bound["last_guard_carry_in_cached_tokens"],
-                    "last_guard_hard_cap": bound["last_guard_hard_cap"],
-                    "last_guard_relation": bound["last_guard_relation"],
                 }
             rotation = connection.execute(
                 """
@@ -610,13 +582,9 @@ class GoalRepository:
                     "last_evidence_hash": task["last_evidence_hash"],
                     "attempts_used": task["attempts_used"],
                     "max_attempts": task["max_attempts"],
-                    "token_budget": task["token_budget"],
                     "tokens_used": task["tokens_used"],
                     "sizing": json.loads(task["sizing_json"]) if task["sizing_json"] else {},
-                    "execution_budget": (
-                        json.loads(task["execution_budget_json"])
-                        if task["execution_budget_json"] else None
-                    ),
+                    "execution_policy": _execution_policy(task["execution_budget_json"]),
                     "handoff": json.loads(task["handoff_json"]) if task["handoff_json"] else None,
                     "command": json.loads(task["command_json"]) if task["command_json"] else {},
                     "verification": (
@@ -648,25 +616,10 @@ class GoalRepository:
                     "last_context_pressure_reason": (
                         worker["last_context_pressure_reason"] if worker else None
                     ),
-                    "context_guard_decision": (
-                        worker["last_context_guard_decision"] if worker else None
-                    ),
-                    "context_guard_reason": (
-                        worker["last_context_guard_reason"] if worker else None
-                    ),
-                    "guard_estimated_new_tokens": (
-                        worker["last_guard_estimated_new_tokens"] if worker else 0
-                    ),
-                    "guard_carry_in_cached_tokens": (
-                        worker["last_guard_carry_in_cached_tokens"] if worker else 0
-                    ),
-                    "guard_hard_cap": worker["last_guard_hard_cap"] if worker else 0,
-                    "guard_relation": worker["last_guard_relation"] if worker else "unknown",
                     "progress": {
                         "attempts_used": task["attempts_used"],
                         "max_attempts": task["max_attempts"],
                         "tokens_used": task["tokens_used"],
-                        "token_budget": task["token_budget"],
                         "status": task["status"],
                     },
                 }
@@ -687,6 +640,20 @@ class GoalRepository:
             "updated_at": row["updated_at"],
             "work_items": work_items,
         }
+
+
+def _execution_policy(raw: str | None) -> dict[str, Any] | None:
+    if not raw:
+        return None
+    return {
+        key: value
+        for key, value in json.loads(raw).items()
+        if key not in {
+            "reserved_tokens",
+            "total_token_hard_cap",
+            "estimated_total_token_hard_cap",
+        }
+    }
 
 
 def _child_command_and_verification(

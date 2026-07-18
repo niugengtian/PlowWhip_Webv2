@@ -15,12 +15,8 @@ from plow_whip_web.domain.model import (
 from plow_whip_web.providers.generic_command import ExecutionResult, GenericCommandProvider
 from plow_whip_web.providers.pool import ProviderPool
 from plow_whip_web.store.task_repository import (
-    task_host_reserved_tokens,
     task_lease_seconds,
-    task_sizing_status,
-    task_token_hard_cap,
 )
-from plow_whip_web.runtime.budget import BudgetManager
 from plow_whip_web.runtime.context import ContextCompiler
 from plow_whip_web.runtime.fault_policy import FaultPolicy
 from plow_whip_web.runtime.journal import SessionJournal
@@ -31,6 +27,8 @@ from plow_whip_web.store.project_repository import (
     ProjectRepository,
 )
 from plow_whip_web.store.task_repository import TaskRepository
+from plow_whip_web.store.settings_repository import SettingsRepository
+from plow_whip_web.runtime.token_ledger import TokenLedger
 
 NO_PROGRESS_ROTATION_THRESHOLD = 2
 
@@ -41,7 +39,8 @@ class TaskService:
         repository: TaskRepository,
         provider: GenericCommandProvider | None = None,
         verifier: VerificationEngine | None = None,
-        budget: BudgetManager | None = None,
+        settings: SettingsRepository | None = None,
+        token_ledger: TokenLedger | None = None,
         context_compiler: ContextCompiler | None = None,
         journal: SessionJournal | None = None,
         command_policy: CommandPolicy | None = None,
@@ -52,7 +51,8 @@ class TaskService:
         self.repository = repository
         self.provider = provider or GenericCommandProvider()
         self.verifier = verifier or VerificationEngine()
-        self.budget = budget
+        self.settings = settings
+        self.token_ledger = token_ledger
         self.context_compiler = context_compiler
         self.journal = journal
         self.command_policy = command_policy or CommandPolicy()
@@ -76,31 +76,10 @@ class TaskService:
             )
         if pending.provider == self.provider.name:
             self.command_policy.validate(Path(pending.project_path), pending.command)
-        host_model = bool(
-            provider_config and provider_config["transport"] == "host-bridge"
-        )
-        estimate = (
-            self.provider.estimate_tokens(pending.command)
-            if pending.provider == self.provider.name else 0
-        )
-        reserved_tokens = 0
-        if self.budget:
-            self.budget.ensure(pending, estimate)
-            if host_model:
-                if task_sizing_status(pending) == "estimated":
-                    remaining = pending.token_budget - pending.tokens_used
-                    reserved_tokens = task_host_reserved_tokens(
-                        pending, remaining=remaining,
-                    )
-                else:
-                    reserved_tokens = self.budget.host_reservation(pending)
-        self._evaluate_context_guard(
-            pending, reserved_tokens=reserved_tokens if host_model else 0
-        )
+        self._rotate_local_journal(pending)
         claim = self.repository.claim(
             task_id, expected_revision=expected_revision,
             idempotency_key=f"{idempotency_key}:claim",
-            reserved_tokens=reserved_tokens,
         )
         if not claim.claimed:
             return claim.task
@@ -207,7 +186,7 @@ class TaskService:
             if status == "completed":
                 if task.status is TaskStatus.STOPPING:
                     result = self.repository.finalize_running_cancel(task_id, job_id=job_id)
-                    self._settle_host_reservation(task, job, snapshot)
+                    self._record_host_usage(task, job, snapshot)
                 else:
                     result = self._handle_host_fault(task, job, snapshot)
                     if result is not None:
@@ -229,20 +208,13 @@ class TaskService:
                         )
                     else:
                         result = task
-                        if self.budget and task.status in {
-                            TaskStatus.COMPLETED, TaskStatus.TERMINAL_FAILED,
-                        }:
-                            self.budget.record(
-                                task, self.provider_pool.bridge.result(snapshot).as_dict(),
-                                provider=task.provider, run_id=job["run_id"],
-                            )
                 self.host_jobs.consume(job_id)
                 settled.append({"task_id": task_id, "status": result.status.value})
                 continue
             if status == "cancelled":
                 if task.status is TaskStatus.STOPPING:
                     result = self.repository.finalize_running_cancel(task_id, job_id=job_id)
-                    self._settle_host_reservation(task, job, snapshot)
+                    self._record_host_usage(task, job, snapshot)
                     self.host_jobs.consume(job_id)
                 else:
                     result = self._handle_host_fault(task, job, snapshot)
@@ -269,10 +241,7 @@ class TaskService:
         if decision.action == "verify":
             return None
         if decision.failure_class == "provider_capacity" and self.host_jobs:
-            limits = (
-                self.budget.settings.get()["values"]
-                if self.budget else {"max_no_progress": 3}
-            )
+            limits = self.settings.get()["values"] if self.settings else {"max_no_progress": 3}
             threshold = int(limits["max_no_progress"])
             occurrences = 1 + self.host_jobs.consecutive_faults(
                 job.get("worker_id") or task.worker_id,
@@ -339,19 +308,21 @@ class TaskService:
                     pass
         return result
 
-    def _settle_host_reservation(
+    def _record_host_usage(
         self, task: TaskRecord, job: dict[str, Any], snapshot: dict[str, Any]
     ) -> None:
-        if not self.budget or not self.provider_pool:
+        if not self.token_ledger or not self.provider_pool:
             return
         execution = self.provider_pool.bridge.result(snapshot).as_dict()
         if int(execution["input_tokens"]) + int(execution["output_tokens"]) > 0:
-            self.budget.record(
-                task, execution, provider=task.provider, run_id=job["run_id"],
+            self.token_ledger.record(
+                execution,
+                call_id=job["run_id"],
+                task=task,
+                provider=task.provider,
+                run_id=job["run_id"],
                 add_to_task=True,
             )
-        else:
-            self.budget.release(job["run_id"])
 
     def control(
         self, task_id: str, *, action: str, reason: str,
@@ -410,7 +381,7 @@ class TaskService:
             ),
             "summary": verification.summary,
         }
-        limits = self.budget.settings.get()["values"] if self.budget else {}
+        limits = self.settings.get()["values"] if self.settings else {}
         completed = self.repository.finish(
             task.id, expected_revision=verifying.revision,
             attempt_id=attempt_id, run_id=run_id,
@@ -419,10 +390,6 @@ class TaskService:
             max_same_failure=limits.get("max_same_failure", 3),
         )
         execution_payload = execution.as_dict()
-        if self.budget:
-            self.budget.record(
-                completed, execution_payload, provider=completed.provider, run_id=run_id
-            )
         if self.journal:
             self.journal.append(completed.worker_id, {
                 "event": "task.finished", "task_id": task.id,
@@ -434,9 +401,7 @@ class TaskService:
             })
         return completed
 
-    def _evaluate_context_guard(
-        self, task: TaskRecord, *, reserved_tokens: int
-    ) -> None:
+    def _rotate_local_journal(self, task: TaskRecord) -> None:
         if not self.projects or not task.project_id or not task.role_id:
             return
         connection = self.repository.database.connect()
@@ -455,11 +420,7 @@ class TaskService:
             connection.close()
         if worker is None or worker["status"] != "idle":
             return
-        settings_repository = (
-            self.journal.settings if self.journal else (
-                self.budget.settings if self.budget else None
-            )
-        )
+        settings_repository = self.journal.settings if self.journal else self.settings
         if settings_repository is None:
             return
         settings = settings_repository.get()["values"]
@@ -468,27 +429,6 @@ class TaskService:
         if persisted >= maximum and self.journal:
             # File Journal rotation is independent from Provider session rotation.
             self.journal.rotate_current(worker["id"])
-        generation = int(worker["session_generation"])
-        same_generation = worker["last_context_session_generation"] == generation
-        carry_in = int(worker["last_cached_input_tokens"] or 0) if same_generation else 0
-        hard_cap = task_token_hard_cap(task)
-        with self.repository.database.transaction(immediate=True) as connection:
-            connection.execute(
-                """
-                UPDATE workers SET last_context_guard_decision = ?,
-                    last_context_guard_reason = ?,
-                    last_guard_estimated_new_tokens = ?,
-                    last_guard_carry_in_cached_tokens = ?,
-                    last_guard_hard_cap = ?, last_guard_relation = 'unknown',
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ? AND session_generation = ?
-                """,
-                (
-                    "reuse", "turn_attribution_unknown_no_rotation",
-                    reserved_tokens, carry_in, hard_cap,
-                    worker["id"], generation,
-                ),
-            )
 
 
 def _failure_fingerprint(

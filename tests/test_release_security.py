@@ -68,7 +68,7 @@ def test_cross_project_absolute_argument_is_rejected_before_claim() -> None:
             title="escape", objective="must be denied", project_path=str(project),
             command={"argv": [sys.executable, str(outside)]},
             verification=[{"kind": "exit_code", "expected": 0}], max_attempts=1,
-            token_budget=0, idempotency_key="escape-create",
+            idempotency_key="escape-create",
         )
         with TestClient(app) as client:
             response = client.post(
@@ -214,7 +214,7 @@ def test_legacy_quality_profiles_use_one_deterministic_execute(quality: str) -> 
                     project_path=str(project),
                     command=_payload(project)["command"],
                     verification=_payload(project)["verification"],
-                    max_attempts=1, token_budget=0,
+                    max_attempts=1,
                     idempotency_key=f"stored-quality-create-{quality}",
                     quality_profile=quality,
                 )

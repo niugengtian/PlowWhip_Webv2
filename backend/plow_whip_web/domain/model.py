@@ -47,17 +47,13 @@ class TaskRecord:
     verification: list[dict[str, Any]]
     max_attempts: int
     attempts_used: int
-    token_budget: int
     tokens_used: int
     last_evidence_hash: str | None
     last_error: str | None
     created_at: str
     updated_at: str
     sizing: dict[str, Any]
-    execution_budget: dict[str, Any] | None
-    manual_override: bool
-    override_reason: str | None
-    budget_overrun_evidence: dict[str, Any] | None
+    execution_policy: dict[str, Any] | None
     goal_id: str | None = None
     parent_task_id: str | None = None
     depends_on: list[str] | None = None
@@ -100,8 +96,4 @@ class HostBridgeOutcomeUnknownError(ProviderUnavailableError):
 
 
 class PolicyViolationError(DomainError):
-    pass
-
-
-class BudgetExceededError(DomainError):
     pass
