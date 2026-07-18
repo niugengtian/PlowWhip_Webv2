@@ -259,6 +259,7 @@ test('uses EventSource refresh and closes it on unmount', async () => {
 })
 
 test('worker click shows canonical host identity and never treats heartbeat as completion', async () => {
+  const interval = vi.spyOn(window, 'setInterval')
   listedProjects = [{
     ...project,
     workers: [{
@@ -282,6 +283,7 @@ test('worker click shows canonical host identity and never treats heartbeat as c
   expect(screen.getByText('real progress')).toBeInTheDocument()
   expect(screen.getByText('running')).toBeInTheDocument()
   expect(screen.queryByText('已完成')).not.toBeInTheDocument()
+  expect(interval).toHaveBeenCalledWith(expect.any(Function), 1500)
 })
 
 test('falls back to one low-frequency poller without EventSource and clears it', () => {
