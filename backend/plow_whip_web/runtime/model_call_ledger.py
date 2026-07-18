@@ -52,6 +52,20 @@ class ModelCallLedger:
                 if existing["call_kind"] != call_kind or existing["provider"] != provider:
                     raise ValueError("model call idempotency key metadata mismatch")
                 return dict(existing)
+            if call_id is not None:
+                existing = connection.execute(
+                    "SELECT * FROM model_calls WHERE call_id = ?",
+                    (resolved_call_id,),
+                ).fetchone()
+                if existing is not None:
+                    expected_task_id = task.id if task else None
+                    if (
+                        existing["call_kind"] != call_kind
+                        or existing["provider"] != provider
+                        or existing["task_id"] != expected_task_id
+                    ):
+                        raise ValueError("model call identity metadata mismatch")
+                    return dict(existing)
             connection.execute(
                 """
                 INSERT INTO model_calls(

@@ -16,6 +16,7 @@ from plow_whip_web.runtime.host_reconciliation import (
     reconciliation_deadline_modifier,
     requires_reconciliation,
 )
+from plow_whip_web.runtime.verification import VerificationEngine
 
 
 class BridgeFixture:
@@ -72,6 +73,14 @@ class BridgeFixture:
             cached_input_tokens=3,
             output_tokens=5,
             external_session_id="refine-session",
+        )
+
+    def verify(
+        self, *, project_path: str, execution: ExecutionResult,
+        verification: list[dict[str, object]],
+    ):
+        return VerificationEngine().verify(
+            Path(project_path), execution, verification
         )
 
     result = staticmethod(HostBridgeClient.result)
@@ -185,6 +194,55 @@ def test_rejected_dispatch_is_terminal_fact_not_unknown() -> None:
             assert tuple(call) == ("failed", "dispatch_rejected")
         finally:
             connection.close()
+
+
+def test_reconciliation_recreates_missing_executor_receipt_from_host_job() -> None:
+    with TemporaryDirectory() as directory:
+        app, bridge, running, job = _host_runtime(Path(directory))
+        connection = app.state.database.connect()
+        try:
+            connection.execute(
+                "DELETE FROM model_calls WHERE call_id = ?",
+                (job["run_id"],),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        bridge.snapshots[job["job_id"]] = {
+            **bridge.snapshots[job["job_id"]],
+            "status": "completed",
+            "returncode": 0,
+            "input_tokens": 23,
+            "cached_input_tokens": 17,
+            "output_tokens": 5,
+        }
+
+        result = app.state.task_service.reconcile_host_jobs()
+
+        assert result["settled"] == [{
+            "task_id": running.id,
+            "status": "completed",
+        }]
+        connection = app.state.database.connect()
+        try:
+            call = connection.execute(
+                """
+                SELECT idempotency_key, host_job_id, status, input_tokens,
+                       cached_input_tokens, output_tokens
+                FROM model_calls WHERE call_id = ?
+                """,
+                (job["run_id"],),
+            ).fetchone()
+        finally:
+            connection.close()
+        assert tuple(call) == (
+            f"task-run:{job['run_id']}",
+            job["job_id"],
+            "completed",
+            23,
+            17,
+            5,
+        )
 
 
 def test_accepted_job_recovery_hold_deadline_is_not_extended() -> None:

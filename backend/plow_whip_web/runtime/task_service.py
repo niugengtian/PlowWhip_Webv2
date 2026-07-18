@@ -201,6 +201,9 @@ class TaskService:
         for job in jobs:
             job_id = job["job_id"]
             task_id = job["task_id"]
+            task = self.repository.get(task_id)
+            if self.model_calls and job.get("run_id"):
+                self._prepare_executor_call(task, job["run_id"])
             try:
                 snapshot = self.provider_pool.poll_task_job(job_id)
                 self.host_jobs.record(job_id, snapshot)
@@ -225,7 +228,6 @@ class TaskService:
                         job["run_id"], error_class="dispatch_outcome_unknown"
                     )
                 if self.host_jobs.reconciliation_expired(job_id):
-                    task = self.repository.get(task_id)
                     result = self._finalize_reconciliation_timeout(task, job)
                     settled.append({"task_id": task_id, "status": result.status.value})
                     continue
@@ -238,7 +240,6 @@ class TaskService:
                 active += 1
                 continue
             status = str(snapshot.get("status") or "unknown")
-            task = self.repository.get(task_id)
             if (
                 status in {"unknown", "recovery_hold"}
                 and self.host_jobs.reconciliation_expired(job_id)
