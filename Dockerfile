@@ -9,9 +9,6 @@ RUN pnpm run build
 
 FROM python:3.13-slim AS runtime
 
-ARG PLOW_WHIP_RELEASE_SHA=unknown
-LABEL org.opencontainers.image.revision="${PLOW_WHIP_RELEASE_SHA}"
-
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PLOW_WHIP_EMBEDDED_CRON=1 \
@@ -24,11 +21,16 @@ RUN apt-get update \
     && groupadd --system plowwhip \
     && useradd --system --gid plowwhip --home-dir /app --shell /usr/sbin/nologin plowwhip
 
+ARG PLOW_WHIP_RELEASE_SHA=unknown
+ARG PLOW_WHIP_PYPI_INDEX_URL=https://pypi.org/simple
+LABEL org.opencontainers.image.revision="${PLOW_WHIP_RELEASE_SHA}"
+
 WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY backend/ ./backend/
 COPY --from=web-build /build/web/dist/ ./backend/plow_whip_web/static/
-RUN python -m pip install --no-cache-dir . \
+RUN python -m pip install --no-cache-dir \
+        --index-url "${PLOW_WHIP_PYPI_INDEX_URL}" . \
     && mkdir -p /data /projects \
     && chown -R plowwhip:plowwhip /app /data /projects
 

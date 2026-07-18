@@ -6,6 +6,7 @@ services:
       context: .
       args:
         PLOW_WHIP_RELEASE_SHA: "${PLOW_WHIP_RELEASE_SHA:-unknown}"
+        PLOW_WHIP_PYPI_INDEX_URL: "${PLOW_WHIP_PYPI_INDEX_URL:-https://pypi.org/simple}"
     image: plow-whip-web-v2:local
     restart: unless-stopped
     init: true
