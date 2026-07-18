@@ -64,21 +64,30 @@ INSERT INTO model_calls(
     created_at, dispatched_at, settled_at, updated_at
 )
 SELECT
-    call_id, 'legacy-model-call:' || call_id, project_id, task_id, worker_id,
-    provider, provider,
+    legacy.call_id, 'legacy-model-call:' || legacy.call_id,
+    CASE WHEN EXISTS (
+        SELECT 1 FROM projects WHERE projects.id = legacy.project_id
+    ) THEN legacy.project_id ELSE NULL END,
+    CASE WHEN EXISTS (
+        SELECT 1 FROM tasks WHERE tasks.id = legacy.task_id
+    ) THEN legacy.task_id ELSE NULL END,
+    CASE WHEN EXISTS (
+        SELECT 1 FROM workers WHERE workers.id = legacy.worker_id
+    ) THEN legacy.worker_id ELSE NULL END,
+    legacy.provider, legacy.provider,
     CASE WHEN call_kind = 'convention_refinement'
          THEN 'convention_refinement' ELSE 'executor' END,
-    session_generation, 'completed', input_tokens, cached_input_tokens,
-    output_tokens,
+    legacy.session_generation, 'completed', legacy.input_tokens,
+    legacy.cached_input_tokens, legacy.output_tokens,
     json_object(
-        'input_tokens', input_tokens,
-        'cached_input_tokens', cached_input_tokens,
-        'output_tokens', output_tokens,
-        'total_tokens', input_tokens + output_tokens,
+        'input_tokens', legacy.input_tokens,
+        'cached_input_tokens', legacy.cached_input_tokens,
+        'output_tokens', legacy.output_tokens,
+        'total_tokens', legacy.input_tokens + legacy.output_tokens,
         'source', 'legacy_token_usage'
     ),
-    created_at, created_at, created_at, created_at
-FROM token_usage;
+    legacy.created_at, legacy.created_at, legacy.created_at, legacy.created_at
+FROM token_usage AS legacy;
 
 CREATE INDEX idx_model_calls_project_time
 ON model_calls(project_id, created_at DESC);

@@ -698,3 +698,83 @@ def test_0025_upgrades_0024_and_binds_existing_host_job_to_episode() -> None:
         assert row["status"] == "active"
         assert row["host_process_count"] == 1
         assert row["deadline_seconds"] in {320, 321}
+
+
+def test_0026_preserves_legacy_usage_with_released_optional_ownership() -> None:
+    with TemporaryDirectory() as directory:
+        db_path = Path(directory) / "upgrade-0025-orphan-ownership.sqlite3"
+        migration_dir = Path(database_module.__file__).with_name("migrations")
+        migrations = sorted(migration_dir.glob("*.sql"))
+        names = [item.name for item in migrations]
+        start = names.index("0026_dispatch_model_calls_worker_stream.sql")
+        connection = Database(db_path).connect()
+        try:
+            connection.execute(
+                """
+                CREATE TABLE schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            for migration in migrations[:start]:
+                for statement in database_module._split_statements(
+                    migration.read_text(encoding="utf-8")
+                ):
+                    connection.execute(statement)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version) VALUES (?)",
+                    (migration.name,),
+                )
+            connection.execute(
+                """
+                INSERT INTO tasks(
+                    id, title, objective, project_path, status, command_json,
+                    verification_json, max_attempts, token_budget, provider,
+                    quality_profile, current_spec_revision
+                ) VALUES (
+                    'usage-task', 'usage', 'preserve accounting', '/projects/usage',
+                    'completed', '{}', '[]', 1, 0, 'codex',
+                    'deterministic', 1
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO token_usage(
+                    task_id, project_id, worker_id, input_tokens,
+                    cached_input_tokens, output_tokens, provider, call_id,
+                    session_generation
+                ) VALUES (
+                    'usage-task', 'released-project', 'released-worker', 17,
+                    11, 5, 'codex', 'legacy-released-ownership', 3
+                )
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        assert Database(db_path).migrate() == names[start:]
+        connection = Database(db_path).connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT task_id, project_id, worker_id, input_tokens,
+                       cached_input_tokens, output_tokens, session_generation
+                FROM model_calls
+                WHERE call_id = 'legacy-released-ownership'
+                """
+            ).fetchone()
+        finally:
+            connection.close()
+
+        assert dict(row) == {
+            "task_id": "usage-task",
+            "project_id": None,
+            "worker_id": None,
+            "input_tokens": 17,
+            "cached_input_tokens": 11,
+            "output_tokens": 5,
+            "session_generation": 3,
+        }
