@@ -83,6 +83,10 @@ class InvalidTransitionError(DomainError):
     pass
 
 
+class EvidenceBaselineMissingError(DomainError):
+    """A run predates its required execution-before evidence snapshot."""
+
+
 class ResourceBusyError(DomainError):
     pass
 

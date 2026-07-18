@@ -8,6 +8,7 @@ from typing import Any
 
 from plow_whip_web.domain.model import (
     DomainError,
+    EvidenceBaselineMissingError,
     InvalidTransitionError,
     NotFoundError,
     ProviderUnavailableError,
@@ -587,7 +588,7 @@ class TaskRepository:
                 (run_id,),
             ).fetchone()
             if row is None:
-                raise DomainError("run evidence baseline is missing")
+                raise EvidenceBaselineMissingError("run evidence baseline is missing")
             if hashlib.sha256(row["baseline_json"].encode("utf-8")).hexdigest() != row[
                 "baseline_hash"
             ]:

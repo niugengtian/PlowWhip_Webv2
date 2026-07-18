@@ -245,6 +245,82 @@ def test_reconciliation_recreates_missing_executor_receipt_from_host_job() -> No
         )
 
 
+def test_missing_pre_execution_baseline_reschedules_a_fresh_run() -> None:
+    with TemporaryDirectory() as directory:
+        app, bridge, running, job = _host_runtime(Path(directory))
+        connection = app.state.database.connect()
+        try:
+            connection.execute(
+                "INSERT INTO task_deletion_permits(task_id) VALUES (?)",
+                (running.id,),
+            )
+            connection.execute(
+                "DELETE FROM run_evidence_baselines WHERE run_id = ?",
+                (job["run_id"],),
+            )
+            connection.execute(
+                "DELETE FROM task_deletion_permits WHERE task_id = ?",
+                (running.id,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        bridge.snapshots[job["job_id"]] = {
+            **bridge.snapshots[job["job_id"]],
+            "status": "completed",
+            "returncode": 0,
+            "input_tokens": 31,
+            "cached_input_tokens": 29,
+            "output_tokens": 7,
+        }
+
+        result = app.state.task_service.reconcile_host_jobs()
+        rescheduled = app.state.task_repository.get(running.id)
+
+        assert result["settled"] == [{
+            "task_id": running.id,
+            "status": "ready",
+        }]
+        assert rescheduled.status.value == "ready"
+        assert rescheduled.attempts_used == 0
+        assert rescheduled.last_error == "evidence_baseline_missing_requires_fresh_run"
+        assert app.state.host_jobs.active() == []
+
+        next_run = app.state.task_service.drive(
+            rescheduled.id,
+            expected_revision=rescheduled.revision,
+            idempotency_key="fresh-run-after-missing-baseline",
+        )
+        assert next_run.status.value == "running"
+        connection = app.state.database.connect()
+        try:
+            jobs = connection.execute(
+                "SELECT run_id FROM host_jobs WHERE task_id = ?",
+                (running.id,),
+            ).fetchall()
+            fresh_run_id = next(
+                item["run_id"]
+                for item in jobs
+                if item["run_id"] != job["run_id"]
+            )
+            baseline = connection.execute(
+                "SELECT run_id FROM run_evidence_baselines WHERE run_id = ?",
+                (fresh_run_id,),
+            ).fetchone()
+            usage = connection.execute(
+                """
+                SELECT input_tokens, cached_input_tokens, output_tokens
+                FROM token_usage WHERE call_id = ?
+                """,
+                (job["run_id"],),
+            ).fetchone()
+        finally:
+            connection.close()
+        assert len(jobs) == 2
+        assert baseline["run_id"] == fresh_run_id
+        assert tuple(usage) == (31, 29, 7)
+
+
 def test_accepted_job_recovery_hold_deadline_is_not_extended() -> None:
     with TemporaryDirectory() as directory:
         app, bridge, running, job = _host_runtime(Path(directory))

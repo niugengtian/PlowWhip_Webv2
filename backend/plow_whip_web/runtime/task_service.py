@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from plow_whip_web.domain.model import (
+    EvidenceBaselineMissingError,
     HostBridgeRejectedError,
     InvalidTransitionError,
     ProviderUnavailableError,
@@ -354,12 +355,31 @@ class TaskService:
                             continue
                         if verify_call:
                             self.model_calls.settle(verify_call["call_id"])
-                        result = self._finish_execution(
-                            task, job["attempt_id"], job["run_id"], execution,
-                            idempotency_prefix=f"host-job:{job_id}",
-                            verification=verification,
-                        )
-                        self.host_jobs.complete_episode(job_id)
+                        try:
+                            result = self._finish_execution(
+                                task, job["attempt_id"], job["run_id"], execution,
+                                idempotency_prefix=f"host-job:{job_id}",
+                                verification=verification,
+                            )
+                            self.host_jobs.complete_episode(job_id)
+                        except EvidenceBaselineMissingError:
+                            checkpoint = self.host_jobs.terminate_episode(
+                                job_id,
+                                reason="evidence_baseline_missing_requires_fresh_run",
+                                snapshot={
+                                    **snapshot,
+                                    "failure_class": "evidence_baseline_missing",
+                                },
+                            )
+                            result = self._finalize_host_fault(
+                                task,
+                                job,
+                                snapshot,
+                                action="resume",
+                                failure_class="evidence_baseline_missing",
+                                reason="evidence_baseline_missing_requires_fresh_run",
+                                episode=checkpoint,
+                            )
                     else:
                         result = task
                 self.host_jobs.consume(job_id)
