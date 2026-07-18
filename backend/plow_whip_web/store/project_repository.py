@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import uuid
 from pathlib import Path
 from typing import Any
 
 from plow_whip_web.domain.model import InvalidTransitionError, NotFoundError
-from plow_whip_web.roles import DEFAULT_PROJECT_ROLES
+from plow_whip_web.roles import DEFAULT_PROJECT_ROLES, ROLE_KINDS
+from plow_whip_web.runtime.butler import project_execution_policy
 from plow_whip_web.store.database import Database
 
 
@@ -86,13 +88,23 @@ class ProjectRepository:
     def __init__(self, database: Database) -> None:
         self.database = database
 
-    def create(self, *, name: str, path: str, host_path: str | None = None) -> dict[str, Any]:
+    def create(
+        self, *, name: str, path: str, host_path: str | None = None,
+        execution_policy: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         project_id = str(uuid.uuid4())
         resolved = str(Path(path).expanduser().resolve())
+        policy = project_execution_policy(execution_policy)
         with self.database.transaction(immediate=True) as connection:
             connection.execute(
-                "INSERT INTO projects(id, name, path, host_path) VALUES (?, ?, ?, ?)",
-                (project_id, name, resolved, host_path),
+                """
+                INSERT INTO projects(id, name, path, host_path, execution_policy_json)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    project_id, name, resolved, host_path,
+                    json.dumps(policy, ensure_ascii=False, sort_keys=True),
+                ),
             )
             for kind in DEFAULT_ROLES:
                 connection.execute(
@@ -151,6 +163,7 @@ class ProjectRepository:
             return {
                 "id": row["id"], "name": row["name"], "path": row["path"],
                 "host_path": row["host_path"],
+                "execution_policy": json.loads(row["execution_policy_json"]),
                 "status": row["status"], "created_at": row["created_at"],
                 "roles": [dict(item) for item in roles],
                 "workers": [dict(item) for item in workers],
@@ -169,23 +182,44 @@ class ProjectRepository:
         return [self.get(project_id) for project_id in ids]
 
     def resolve_role(self, project_id: str, kind: str) -> dict[str, str]:
-        connection = self.database.connect()
-        try:
+        if kind not in ROLE_KINDS and kind != "butler":
+            raise NotFoundError(f"role not found: {project_id}/{kind}")
+        with self.database.transaction(immediate=True) as connection:
             row = connection.execute(
                 """
-                SELECT p.path project_path, p.host_path, p.status project_status, r.id role_id
+                SELECT p.path project_path, p.host_path, p.status project_status,
+                       r.id role_id, r.status role_status
                 FROM projects p JOIN roles r ON r.project_id = p.id
                 WHERE p.id = ? AND r.kind = ?
                 """,
                 (project_id, kind),
             ).fetchone()
-            if row is None:
-                raise NotFoundError(f"role not found: {project_id}/{kind}")
+            if row is None or row["role_status"] != "available":
+                project = connection.execute(
+                    "SELECT path, host_path, status FROM projects WHERE id = ?",
+                    (project_id,),
+                ).fetchone()
+                if project is None:
+                    raise NotFoundError(f"project not found: {project_id}")
+                if project["status"] != "active":
+                    raise InvalidTransitionError("project is not active")
+                role_id = str(uuid.uuid4())
+                connection.execute(
+                    """
+                    INSERT INTO roles(id, project_id, kind, status)
+                    VALUES (?, ?, ?, 'ephemeral')
+                    """,
+                    (role_id, project_id, f"{kind}:manual:{role_id}"),
+                )
+                return {
+                    "project_path": project["path"],
+                    "host_path": project["host_path"],
+                    "project_status": project["status"],
+                    "role_id": role_id,
+                }
             if row["project_status"] != "active":
                 raise InvalidTransitionError("project is not active")
             return dict(row)
-        finally:
-            connection.close()
 
     def release(self, project_id: str) -> dict[str, Any]:
         with self.database.transaction(immediate=True) as connection:

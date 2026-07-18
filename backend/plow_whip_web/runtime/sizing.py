@@ -106,8 +106,8 @@ def estimate_task_sizing(inputs: TaskSizingInputs) -> dict[str, Any]:
         )
         if not ready
     ]
-    if inputs.independent_review_required:
-        missing_gates.append("independent_review_orchestration")
+    # A task-local verification Gate is authoritative. A separate reviewer is
+    # optional context, never a dispatch dependency.
     if missing_gates:
         return _needs_planning(missing_gates)
 

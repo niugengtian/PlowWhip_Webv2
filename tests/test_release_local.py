@@ -140,7 +140,7 @@ def test_verify_runtime_requires_image_revision_and_named_volumes() -> None:
         "plow-whip-web-v2-data",
         "plow-whip-web-v2-projects",
     ]
-    assert result["database"]["schema_head"] == "0022_task_spec_continuity.sql"
+    assert result["database"]["schema_head"] == "0023_butler_execution_policy.sql"
 
 
 def test_verify_runtime_rejects_stale_schema_head() -> None:

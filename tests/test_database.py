@@ -9,6 +9,7 @@ import pytest
 
 from plow_whip_web.store import database as database_module
 from plow_whip_web.store.database import Database
+from plow_whip_web.store.task_repository import TaskRepository
 
 
 def _migration_names() -> list[str]:
@@ -160,10 +161,11 @@ def test_0021_upgrades_0019_database_and_removes_reservations() -> None:
         db_path = Path(directory) / "upgrade-0019.sqlite3"
         migration_dir = Path(database_module.__file__).with_name("migrations")
         migrations = sorted(migration_dir.glob("*.sql"))
-        assert [item.name for item in migrations[-3:]] == [
+        assert [item.name for item in migrations[-4:]] == [
             "0020_provider_context_pressure.sql",
             "0021_remove_token_budget.sql",
             "0022_task_spec_continuity.sql",
+            "0023_butler_execution_policy.sql",
         ]
         connection = sqlite3.connect(db_path)
         try:
@@ -175,7 +177,7 @@ def test_0021_upgrades_0019_database_and_removes_reservations() -> None:
                 )
                 """
             )
-            for migration in migrations[:-3]:
+            for migration in migrations[:-4]:
                 for statement in database_module._split_statements(
                     migration.read_text(encoding="utf-8")
                 ):
@@ -213,6 +215,7 @@ def test_0021_upgrades_0019_database_and_removes_reservations() -> None:
             "0020_provider_context_pressure.sql",
             "0021_remove_token_budget.sql",
             "0022_task_spec_continuity.sql",
+            "0023_butler_execution_policy.sql",
         ]
         assert database.migrate() == []
         connection = database.connect()
@@ -264,7 +267,10 @@ def test_0022_upgrades_0021_and_preserves_terminal_task() -> None:
         db_path = Path(directory) / "upgrade-0021.sqlite3"
         migration_dir = Path(database_module.__file__).with_name("migrations")
         migrations = sorted(migration_dir.glob("*.sql"))
-        assert migrations[-1].name == "0022_task_spec_continuity.sql"
+        assert [item.name for item in migrations[-2:]] == [
+            "0022_task_spec_continuity.sql",
+            "0023_butler_execution_policy.sql",
+        ]
         connection = sqlite3.connect(db_path)
         try:
             connection.execute(
@@ -275,7 +281,7 @@ def test_0022_upgrades_0021_and_preserves_terminal_task() -> None:
                 )
                 """
             )
-            for migration in migrations[:-1]:
+            for migration in migrations[:-2]:
                 for statement in database_module._split_statements(
                     migration.read_text(encoding="utf-8")
                 ):
@@ -302,7 +308,10 @@ def test_0022_upgrades_0021_and_preserves_terminal_task() -> None:
             connection.close()
 
         database = Database(db_path)
-        assert database.migrate() == ["0022_task_spec_continuity.sql"]
+        assert database.migrate() == [
+            "0022_task_spec_continuity.sql",
+            "0023_butler_execution_policy.sql",
+        ]
         connection = database.connect()
         try:
             task = connection.execute(
@@ -322,3 +331,141 @@ def test_0022_upgrades_0021_and_preserves_terminal_task() -> None:
         assert payload["objective"] == "do not rerun"
         assert payload["artifacts"] == ["evidence.txt"]
         assert payload["deadline"] == {"hard_seconds": 321}
+
+
+def test_0023_retires_legacy_coordination_parent_without_failing_goal() -> None:
+    with TemporaryDirectory() as directory:
+        db_path = Path(directory) / "upgrade-0022.sqlite3"
+        migration_dir = Path(database_module.__file__).with_name("migrations")
+        migrations = sorted(migration_dir.glob("*.sql"))
+        connection = Database(db_path).connect()
+        try:
+            connection.execute(
+                """
+                CREATE TABLE schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            for migration in migrations[:-1]:
+                for statement in database_module._split_statements(
+                    migration.read_text(encoding="utf-8")
+                ):
+                    connection.execute(statement)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version) VALUES (?)",
+                    (migration.name,),
+                )
+            connection.execute(
+                "INSERT INTO projects(id, name, path) VALUES ('p', 'legacy', '/projects/p')"
+            )
+            connection.execute(
+                "INSERT INTO roles(id, project_id, kind) VALUES ('r', 'p', 'coordination')"
+            )
+            connection.execute(
+                "INSERT INTO roles(id, project_id, kind) VALUES ('rb', 'p', 'backend')"
+            )
+            connection.execute(
+                "INSERT INTO roles(id, project_id, kind) VALUES ('rf', 'p', 'fullstack')"
+            )
+            connection.executemany(
+                """
+                INSERT INTO workers(
+                    id, project_id, role_id, provider, session_id,
+                    status, active_task_id
+                ) VALUES (?, 'p', ?, 'codex', ?, ?, ?)
+                """,
+                [
+                    ("wc", "r", "session-c", "idle", None),
+                    ("wb", "rb", "session-b", "idle", None),
+                    ("wf", "rf", "session-f", "busy", "child"),
+                ],
+            )
+            connection.execute(
+                """
+                INSERT INTO goals(
+                    id, title, objective, project_id, provider, status,
+                    plan_json, parent_task_id
+                ) VALUES ('g', 'same title', 'ship', 'p', 'codex', 'running', '{}', NULL)
+                """
+            )
+            base = """
+                INSERT INTO tasks(
+                    id, title, objective, project_path, status, revision,
+                    command_json, verification_json, max_attempts, token_budget,
+                    project_id, role_id, provider, quality_profile, goal_id,
+                    parent_task_id, depends_on_json, work_item_kind, ordinal
+                ) VALUES (?, 'same title', 'ship', '/projects/p', ?, 0,
+                    '{}', '[]', 1, 0, 'p', 'r', 'codex', 'deterministic',
+                    'g', ?, '[]', ?, ?)
+            """
+            connection.execute(base, ("parent", "paused", None, "coordination", 0))
+            connection.execute(base, ("child", "paused", "parent", "implementation", 1))
+            connection.execute(
+                "UPDATE tasks SET role_id = 'rf', worker_id = 'wf' WHERE id = 'child'"
+            )
+            connection.execute(
+                "UPDATE goals SET parent_task_id = 'parent' WHERE id = 'g'"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        assert Database(db_path).migrate() == ["0023_butler_execution_policy.sql"]
+        connection = Database(db_path).connect()
+        try:
+            parent = connection.execute(
+                "SELECT status, blocked_reason FROM tasks WHERE id = 'parent'"
+            ).fetchone()
+            goal = connection.execute(
+                "SELECT status, parent_task_id FROM goals WHERE id = 'g'"
+            ).fetchone()
+            child = connection.execute(
+                "SELECT status, parent_task_id FROM tasks WHERE id = 'child'"
+            ).fetchone()
+            roles = connection.execute(
+                "SELECT kind, status FROM roles ORDER BY kind"
+            ).fetchall()
+            workers = connection.execute(
+                "SELECT id, status, active_task_id, released_at FROM workers ORDER BY id"
+            ).fetchall()
+        finally:
+            connection.close()
+        assert tuple(parent) == ("cancelled", "retired_to_goal_aggregate")
+        assert tuple(goal) == ("running", None)
+        assert tuple(child) == ("paused", None)
+        assert [tuple(row) for row in roles] == [
+            ("backend", "released"),
+            ("butler", "available"),
+            ("coordination", "released"),
+            ("fullstack", "draining"),
+        ]
+        assert [tuple(row)[:3] for row in workers] == [
+            ("wb", "released", None),
+            ("wc", "released", None),
+            ("wf", "busy", "child"),
+        ]
+        assert workers[0]["released_at"] and workers[1]["released_at"]
+        assert workers[2]["released_at"] is None
+
+        database = Database(db_path)
+        with database.transaction(immediate=True) as connection:
+            connection.execute("UPDATE tasks SET status = 'completed' WHERE id = 'child'")
+            TaskRepository._release_worker_and_lock(
+                connection, "child", "wf"
+            )
+        connection = database.connect()
+        try:
+            drained = connection.execute(
+                """
+                SELECT w.status, w.released_at, r.status role_status
+                FROM workers w JOIN roles r ON r.id = w.role_id
+                WHERE w.id = 'wf'
+                """
+            ).fetchone()
+        finally:
+            connection.close()
+        assert tuple(drained)[0] == "released"
+        assert drained["released_at"] is not None
+        assert drained["role_status"] == "released"

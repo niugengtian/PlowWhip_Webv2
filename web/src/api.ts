@@ -114,6 +114,16 @@ export type TaskArtifact = {
   actions: ('finder' | 'cursor')[]
 }
 
+export type TaskDeletionEligibility = { deletable: boolean; reason: string | null }
+export type TaskDeletion = {
+  task_id: string
+  title: string
+  reason: string
+  deleted_revision: number
+  idempotency_key: string
+  deleted_at: string
+}
+
 export type Role = { id: string; kind: string; status: string }
 export type Worker = {
   id: string
@@ -144,6 +154,7 @@ export type Project = {
   name: string
   path: string
   host_path: string | null
+  execution_policy: Record<string, unknown>
   status: string
   created_at: string
   roles: Role[]
@@ -328,6 +339,14 @@ export const api = {
   taskEvents: (taskId: string) => request<TaskEvent[]>(`/api/tasks/${taskId}/events`),
   taskArtifacts: (taskId: string) =>
     request<TaskArtifact[]>(`/api/tasks/${taskId}/artifacts`),
+  taskDeletionEligibility: (taskId: string) =>
+    request<TaskDeletionEligibility>(`/api/tasks/${taskId}/deletion-eligibility`),
+  deleteTask: (task: Task, reason: string) =>
+    request<TaskDeletion>(`/api/tasks/${task.id}`, {
+      method: 'DELETE',
+      idempotencyKey: crypto.randomUUID(),
+      body: JSON.stringify({ expected_revision: task.revision, reason }),
+    }),
   openTaskArtifact: (
     taskId: string, relativePath: string, action: 'finder' | 'cursor',
   ) => request<Record<string, unknown>>(`/api/tasks/${taskId}/artifacts/open`, {

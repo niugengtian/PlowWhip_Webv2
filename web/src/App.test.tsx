@@ -32,6 +32,8 @@ let listedTasks: Record<string, unknown>[] = []
 let listedGoals: Record<string, unknown>[] = []
 let listedProviders: Record<string, unknown>[] = []
 let listedProjects: Record<string, unknown>[] = []
+let deletionAllowed = false
+let deleteRequests = 0
 
 class FakeEventSource {
   static instances: FakeEventSource[] = []
@@ -75,6 +77,8 @@ beforeEach(() => {
   listedGoals = []
   listedProviders = [provider]
   listedProjects = [project]
+  deletionAllowed = false
+  deleteRequests = 0
   FakeEventSource.instances = []
   vi.stubGlobal(
     'fetch',
@@ -111,7 +115,6 @@ beforeEach(() => {
         if (estimateFails) return { ok: false, status: 503, json: async () => ({ detail: '预判服务暂不可用' }) }
         const gateKeys = ['gate_artifact', 'gate_boundary', 'gate_verification', 'gate_dependency']
         const missing = gateKeys.filter((key) => !payload[key]).map((key) => key.replace('gate_', ''))
-        if (payload.independent_review_required) missing.push('independent_review_orchestration')
         return { ok: true, json: async () => missing.length ? ({
           ...estimate, status: 'needs_planning', missing_gates: missing, size_class: null,
           soft_deadline_seconds: null, hard_deadline_seconds: null, max_turns: null,
@@ -129,6 +132,18 @@ beforeEach(() => {
           status: 'ready', revision: 0, max_attempts: 3, attempts_used: 0, tokens_used: 0,
           last_evidence_hash: null, last_error: null, created_at: '2026-07-17T00:00:00Z', updated_at: '2026-07-17T00:00:00Z',
           command: {}, verification: [], sizing: estimate, execution_policy: {},
+        }) }
+      }
+      if (path.endsWith('/deletion-eligibility')) {
+        return { ok: true, json: async () => ({ deletable: deletionAllowed, reason: deletionAllowed ? null : 'task has execution evidence' }) }
+      }
+      if (path.startsWith('/api/tasks/') && init?.method === 'DELETE') {
+        deleteRequests += 1
+        const payload = JSON.parse(String(init.body)) as { expected_revision: number; reason: string }
+        return { ok: true, json: async () => ({
+          task_id: path.split('/').at(-1), title: 'deletable-task', reason: payload.reason,
+          deleted_revision: payload.expected_revision, idempotency_key: 'delete-ui',
+          deleted_at: '2026-07-18T00:00:00Z',
         }) }
       }
       return {
@@ -170,6 +185,29 @@ test('shows the immutable TaskSpec revision and fields', async () => {
   fireEvent.click(screen.getByText('legacy-deterministic').closest('button')!)
   expect(await screen.findByText('backend')).toBeInTheDocument()
   expect(screen.getByText('1200s')).toBeInTheDocument()
+})
+
+test('requires explicit permanent-delete confirmation and honors cancel/success', async () => {
+  listedTasks = [{
+    ...taskWithQualityProfile('deterministic', 8),
+    title: 'deletable-task', status: 'ready', attempts_used: 0, tokens_used: 0,
+  }]
+  deletionAllowed = true
+  const confirm = vi.spyOn(window, 'confirm')
+    .mockReturnValueOnce(false)
+    .mockReturnValueOnce(true)
+  render(<App />)
+  fireEvent.click(await screen.findByRole('button', { name: '任务' }))
+  fireEvent.click(await screen.findByText('deletable-task'))
+  const button = await screen.findByRole('button', { name: '永久删除' })
+
+  fireEvent.click(button)
+  expect(confirm).toHaveBeenCalledWith(expect.stringContaining('永久删除、不可恢复'))
+  expect(deleteRequests).toBe(0)
+
+  fireEvent.click(button)
+  expect(await screen.findByText('任务已永久删除')).toBeInTheDocument()
+  expect(deleteRequests).toBe(1)
 })
 
 test('uses EventSource refresh and closes it on unmount', async () => {
@@ -277,7 +315,7 @@ test('keeps task and goal selection mutually exclusive and shows layered goal ru
   fireEvent.click(screen.getByRole('button', { name: /Release Goal/ }))
 
   expect(screen.getByRole('heading', { name: 'Release Goal' })).toBeInTheDocument()
-  expect(screen.getByText('结构化/确定性计划，模型 PM 尚未实现')).toBeInTheDocument()
+  expect(screen.getByText('Goal / Butler aggregate')).toBeInTheDocument()
   for (const label of ['角色 / Provider', '依赖', '阻塞原因', 'Worker session', 'Generation', 'Rotation reason', 'Last context pressure', 'Pressure trigger', 'Sizing', 'Execution', 'Attempt / progress', 'Verification', 'Output ref', 'Segments / bytes / offset', 'Cached 计入 Total', 'Token control']) {
     expect(screen.getByText(label)).toBeInTheDocument()
   }
@@ -452,15 +490,15 @@ test('sends the exact preflight sizing inputs when creating a task', async () =>
   expect(createPayloads[0].command).not.toHaveProperty('timeout_seconds')
 })
 
-test('independent review triggers its planning gate and cannot be created', async () => {
+test('independent review preference does not create a reviewer dispatch gate', async () => {
   await openTaskDrawer()
-  expect(screen.getByText(/当前尚无独立 reviewer 编排，因此任务不能入队/)).toBeInTheDocument()
-  fireEvent.click(screen.getByLabelText('要求独立复审（当前不可入队）'))
+  expect(screen.getByText(/任务自己的 verification Gate 才是终态依据/)).toBeInTheDocument()
+  fireEvent.click(screen.getByLabelText('附加独立复审偏好（不阻塞）'))
   fireEvent.click(screen.getByRole('button', { name: '执行 0 Token 预判' }))
 
-  expect(await screen.findByText('暂不可入队：先补齐计划')).toBeInTheDocument()
-  expect(screen.getByText(/尚无独立 reviewer 编排，要求独立复审的任务当前不能入队/)).toBeInTheDocument()
-  expect(screen.getByRole('button', { name: '检查 Provider 并加入任务队列' })).toBeDisabled()
+  expect(await screen.findByText('服务端 Tier M')).toBeInTheDocument()
+  expect(screen.queryByText('暂不可入队：先补齐计划')).not.toBeInTheDocument()
+  expect(screen.getByRole('button', { name: '检查 Provider 并加入任务队列' })).toBeEnabled()
   expect(createPayloads).toHaveLength(0)
 })
 

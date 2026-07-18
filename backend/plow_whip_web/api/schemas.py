@@ -7,6 +7,7 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from plow_whip_web.runtime.cron import CronExpression, validate_timezone
+from plow_whip_web.runtime.butler import project_execution_policy
 
 from plow_whip_web.domain.model import TaskRecord, TaskStatus
 
@@ -157,6 +158,24 @@ class ExpectedRevision(BaseModel):
     expected_revision: Annotated[int, Field(ge=0)]
 
 
+class TaskDeleteRequest(ExpectedRevision):
+    reason: Annotated[str, Field(min_length=1, max_length=500)]
+
+
+class TaskDeletionEligibilityView(BaseModel):
+    deletable: bool
+    reason: str | None
+
+
+class TaskDeletionView(BaseModel):
+    task_id: str
+    title: str
+    reason: str
+    deleted_revision: int
+    idempotency_key: str
+    deleted_at: str
+
+
 class TaskView(BaseModel):
     id: str
     title: str
@@ -208,9 +227,6 @@ class GoalCreate(BaseModel):
     objective: Annotated[str, Field(min_length=1, max_length=4000)]
     project_id: str
     provider: Annotated[str, Field(pattern=r"^[a-z][a-z0-9-]{1,63}$")] = "generic-command"
-    role_providers: dict[
-        str, Annotated[str, Field(pattern=r"^[a-z][a-z0-9-]{1,63}$")]
-    ] = Field(default_factory=dict)
     network_requirement: Literal["none", "any", "domestic", "overseas"] = "none"
     verification: Annotated[list[VerificationSpec], Field(min_length=1, max_length=32)]
     sizing_inputs: TaskSizingEstimateRequest
@@ -262,6 +278,14 @@ class ProjectCreate(BaseModel):
     name: Annotated[str, Field(min_length=1, max_length=120)]
     path: str
     host_path: str | None = None
+    execution_policy: dict[str, Any] | None = None
+
+    @field_validator("execution_policy")
+    @classmethod
+    def execution_policy_must_match_butler_contract(
+        cls, value: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        return project_execution_policy(value) if value is not None else None
 
     @field_validator("path")
     @classmethod
@@ -287,6 +311,7 @@ class ProjectView(BaseModel):
     name: str
     path: str
     host_path: str | None
+    execution_policy: dict[str, Any]
     status: str
     created_at: str
     roles: list[dict[str, Any]]

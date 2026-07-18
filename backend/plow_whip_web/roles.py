@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 
-# Capability catalog: coordination/PM, backend, frontend, UI, devops, verification.
-# fullstack/web3 remain as legacy aliases for existing project bindings.
+# Butler is the only permanent entry for fresh projects. The other prompts remain
+# for old projects and task-local capability workers.
 ROLE_PROMPTS: dict[str, str] = {
+    "butler": (
+        "你是项目唯一常驻管家入口。按 ProjectExecutionPolicy 路由任务，"
+        "只创建有界临时 Worker，并以验证证据决定终态。"
+    ),
     "coordination": (
         "你是项目协调角色（PM）。拆解可验证交付，维护依赖、风险、验收证据；"
         "不得以叙述代替完成。"
@@ -44,5 +48,5 @@ CAPABILITY_ROLE_KINDS: tuple[str, ...] = (
 LEGACY_ROLE_KINDS: tuple[str, ...] = ("fullstack", "web3")
 ROLE_KINDS: tuple[str, ...] = CAPABILITY_ROLE_KINDS + LEGACY_ROLE_KINDS
 
-# New projects get the capability catalog plus legacy aliases for binding continuity.
-DEFAULT_PROJECT_ROLES: tuple[str, ...] = ROLE_KINDS
+# Existing role kinds remain readable; fresh projects only materialize the Butler.
+DEFAULT_PROJECT_ROLES: tuple[str, ...] = ("butler",)

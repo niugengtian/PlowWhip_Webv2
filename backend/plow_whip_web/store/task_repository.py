@@ -164,11 +164,149 @@ class TaskRepository:
         finally:
             connection.close()
 
+    def deletion_eligibility(self, task_id: str) -> dict[str, Any]:
+        connection = self.database.connect()
+        try:
+            task = connection.execute(
+                """
+                SELECT id, title, status, revision, attempts_used,
+                       last_evidence_hash, work_item_kind, goal_id
+                FROM tasks WHERE id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if task is None:
+                raise NotFoundError(f"task not found: {task_id}")
+            return self._deletion_eligibility(connection, task)
+        finally:
+            connection.close()
+
+    def delete(
+        self,
+        task_id: str,
+        *,
+        expected_revision: int,
+        reason: str,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        with self.database.transaction(immediate=True) as connection:
+            duplicate = connection.execute(
+                """
+                SELECT * FROM task_deletion_tombstones
+                WHERE idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+            if duplicate:
+                if duplicate["task_id"] != task_id:
+                    raise RevisionConflictError("idempotency key belongs to another task")
+                return dict(duplicate)
+
+            task = connection.execute(
+                """
+                SELECT id, title, status, revision, attempts_used, role_id,
+                       last_evidence_hash, work_item_kind, goal_id
+                FROM tasks WHERE id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if task is None:
+                raise NotFoundError(f"task not found: {task_id}")
+            if int(task["revision"]) != expected_revision:
+                raise RevisionConflictError(
+                    f"expected revision {expected_revision}, current revision {task['revision']}"
+                )
+            eligibility = self._deletion_eligibility(connection, task)
+            if not eligibility["deletable"]:
+                raise InvalidTransitionError(str(eligibility["reason"]))
+
+            legacy_parent = task["work_item_kind"] == "coordination"
+            if legacy_parent:
+                connection.execute(
+                    "UPDATE goals SET parent_task_id = NULL WHERE parent_task_id = ?",
+                    (task_id,),
+                )
+                connection.execute(
+                    "UPDATE tasks SET parent_task_id = NULL WHERE parent_task_id = ?",
+                    (task_id,),
+                )
+
+            connection.execute(
+                """
+                INSERT INTO task_deletion_tombstones(
+                    task_id, title, reason, deleted_revision, idempotency_key
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (task_id, task["title"], reason, task["revision"], idempotency_key),
+            )
+            connection.execute(
+                "INSERT INTO task_deletion_permits(task_id) VALUES (?)", (task_id,)
+            )
+            connection.execute("DELETE FROM task_specs WHERE task_id = ?", (task_id,))
+            connection.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+            connection.execute(
+                "DELETE FROM task_deletion_permits WHERE task_id = ?", (task_id,)
+            )
+            if task["role_id"]:
+                connection.execute(
+                    """
+                    DELETE FROM roles WHERE id = ? AND status = 'ephemeral'
+                      AND NOT EXISTS (SELECT 1 FROM tasks WHERE role_id = ?)
+                      AND NOT EXISTS (SELECT 1 FROM workers WHERE role_id = ?)
+                    """,
+                    (task["role_id"], task["role_id"], task["role_id"]),
+                )
+            deleted = connection.execute(
+                "SELECT * FROM task_deletion_tombstones WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            assert deleted is not None
+            return dict(deleted)
+
+    @staticmethod
+    def _deletion_eligibility(connection: Any, task: Any) -> dict[str, Any]:
+        if task["status"] in {"running", "verifying", "stopping"}:
+            return {"deletable": False, "reason": "active task cannot be deleted"}
+        if int(task["attempts_used"]) != 0 or task["last_evidence_hash"]:
+            return {"deletable": False, "reason": "task has execution evidence"}
+        if task["goal_id"] and task["work_item_kind"] != "coordination":
+            return {"deletable": False, "reason": "goal work items belong to the Goal aggregate"}
+        evidence = connection.execute(
+            """
+            SELECT
+              (SELECT COUNT(*) FROM task_attempts WHERE task_id = ?) attempts,
+              (SELECT COUNT(*) FROM task_runs WHERE task_id = ?) runs,
+              (SELECT COUNT(*) FROM host_jobs WHERE task_id = ?) host_jobs,
+              (SELECT COUNT(*) FROM context_packs WHERE task_id = ?) context_packs,
+              (SELECT COUNT(*) FROM token_usage WHERE task_id = ?) usage
+            """,
+            (task["id"],) * 5,
+        ).fetchone()
+        if evidence is not None and any(int(evidence[key]) for key in evidence.keys()):
+            return {"deletable": False, "reason": "task has persisted execution evidence"}
+
+        dependent = connection.execute(
+            """
+            SELECT id FROM tasks
+            WHERE id != ? AND (
+                parent_task_id = ? OR EXISTS (
+                    SELECT 1 FROM json_each(COALESCE(depends_on_json, '[]'))
+                    WHERE json_each.value = ?
+                )
+            ) LIMIT 1
+            """,
+            (task["id"], task["id"], task["id"]),
+        ).fetchone()
+        if dependent and task["work_item_kind"] != "coordination":
+            return {"deletable": False, "reason": "task has dependent work items"}
+        return {"deletable": True, "reason": None}
+
     def list(self, *, limit: int = 100) -> list[TaskRecord]:
         connection = self.database.connect()
         try:
             rows = connection.execute(
-                f"{_TASK_WITH_SPEC} ORDER BY t.created_at DESC, t.id DESC LIMIT ?",
+                f"""{_TASK_WITH_SPEC}
+                WHERE COALESCE(t.work_item_kind, '') != 'coordination'
+                ORDER BY t.created_at DESC, t.id DESC LIMIT ?""",
                 (limit,),
             ).fetchall()
             return [_task_from_row(row) for row in rows]
@@ -850,8 +988,19 @@ class TaskRepository:
             return None, None, None
         connection.execute("DELETE FROM resource_locks WHERE expires_at <= CURRENT_TIMESTAMP")
         connection.execute("DELETE FROM task_leases WHERE expires_at <= CURRENT_TIMESTAMP")
+        role = connection.execute(
+            "SELECT status FROM roles WHERE id = ?", (task.role_id,)
+        ).fetchone()
+        if role is None or role["status"] == "released" or (
+            role["status"] == "draining" and task.worker_id is None
+        ):
+            raise ProviderUnavailableError("legacy role worker is retired")
         worker = connection.execute(
-            "SELECT * FROM workers WHERE project_id = ? AND role_id = ?",
+            """
+            SELECT w.*, r.status role_status FROM workers w
+            JOIN roles r ON r.id = w.role_id
+            WHERE w.project_id = ? AND w.role_id = ? AND w.released_at IS NULL
+            """,
             (task.project_id, task.role_id),
         ).fetchone()
         if worker is None:
@@ -865,6 +1014,10 @@ class TaskRepository:
             )
         else:
             worker_id = worker["id"]
+            if worker["role_status"] == "released" or (
+                worker["role_status"] == "draining" and task.worker_id != worker_id
+            ):
+                raise ProviderUnavailableError("legacy role worker is retired")
             if worker["provider"] != task.provider:
                 raise ProviderUnavailableError(
                     f"角色已绑定 {worker['provider']}，请轮转会话后再切换到 {task.provider}"
@@ -913,10 +1066,53 @@ class TaskRepository:
         connection.execute("DELETE FROM resource_locks WHERE task_id = ?", (task_id,))
         connection.execute("DELETE FROM task_leases WHERE task_id = ?", (task_id,))
         if worker_id:
-            connection.execute(
-                "UPDATE workers SET status = 'idle', active_task_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND active_task_id = ?",
+            lifecycle = connection.execute(
+                """
+                SELECT t.status task_status, r.status role_status, w.project_id,
+                       w.role_id, w.session_id, w.session_generation
+                FROM tasks t
+                JOIN workers w ON w.id = ?
+                JOIN roles r ON r.id = w.role_id
+                WHERE t.id = ?
+                """,
                 (worker_id, task_id),
-            )
+            ).fetchone()
+            if lifecycle and lifecycle["role_status"] in {"ephemeral", "draining"} and lifecycle[
+                "task_status"
+            ] in {"completed", "terminal_failed", "cancelled"}:
+                connection.execute(
+                    """
+                    INSERT INTO worker_session_archives(
+                        worker_id, project_id, role_id, session_id,
+                        session_generation, reason
+                    ) VALUES (?, ?, ?, ?, ?, 'task_terminal')
+                    """,
+                    (
+                        worker_id, lifecycle["project_id"], lifecycle["role_id"],
+                        lifecycle["session_id"], lifecycle["session_generation"],
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE workers SET status = 'released', active_task_id = NULL,
+                        released_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND active_task_id = ?
+                    """,
+                    (worker_id, task_id),
+                )
+                connection.execute(
+                    "UPDATE roles SET status = 'released' WHERE id = ?",
+                    (lifecycle["role_id"],),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE workers SET status = 'idle', active_task_id = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND active_task_id = ?
+                    """,
+                    (worker_id, task_id),
+                )
 
     def _transition(
         self,

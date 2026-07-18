@@ -58,24 +58,16 @@ class GoalRepository:
         objective: str,
         project_id: str,
         project_path: str,
-        role_providers: dict[str, str],
+        provider: str,
         plan: GoalPlan,
         sizing_inputs: dict[str, Any],
         verification: list[dict[str, Any]],
-        role_ids: dict[str, str],
         idempotency_key: str,
         network_requirement: str = "none",
         command: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if plan.status != "planned" or not plan.items:
             raise DomainError("goal plan is not dispatchable")
-        missing_providers = sorted(
-            ({"coordination"} | {item.role for item in plan.items}) - set(role_providers)
-        )
-        if missing_providers:
-            raise DomainError(
-                f"missing role provider decision: {', '.join(missing_providers)}"
-            )
         command = command or {"argv": None, "timeout_seconds": 60, "output_limit_bytes": 131_072}
         base_inputs = TaskSizingInputs(**sizing_inputs)
 
@@ -92,30 +84,6 @@ class GoalRepository:
                 return self._get_with_connection(connection, str(payload["goal_id"]))
 
             goal_id = str(uuid.uuid4())
-            parent_task_id = str(uuid.uuid4())
-            # Coordination parent is bookkeeping-only; sizing supplies execution timing.
-            parent_preview = estimate_task_sizing(
-                TaskSizingInputs(
-                    layers_touched=1,
-                    components_touched=1,
-                    estimated_files_changed=1,
-                    has_migration=False,
-                    has_deploy=False,
-                    verification_commands_count=1,
-                    estimated_verification_seconds=60,
-                    external_dependencies_count=0,
-                    risk_level="low",
-                    independent_review_required=False,
-                    gate_artifact=True,
-                    gate_boundary=True,
-                    gate_verification=True,
-                    gate_dependency=True,
-                )
-            )
-            parent_sizing, parent_policy = _preview_to_persistence(parent_preview)
-            parent_attempts = resolve_max_attempts(parent_policy, 1)
-            parent_provider = role_providers["coordination"]
-
             connection.execute(
                 """
                 INSERT INTO goals(
@@ -128,74 +96,17 @@ class GoalRepository:
                     title,
                     objective,
                     project_id,
-                    parent_provider,
+                    provider,
                     json.dumps(plan_to_dict(plan), ensure_ascii=False, sort_keys=True),
                     json.dumps(sizing_inputs, ensure_ascii=False, sort_keys=True),
                 ),
             )
-            connection.execute(
-                """
-                INSERT INTO tasks(
-                    id, title, objective, project_path, status, revision,
-                    command_json, verification_json, max_attempts, token_budget,
-                    project_id, role_id, resource_key, network_requirement, provider,
-                    quality_profile, sizing_json, execution_budget_json,
-                    manual_override, goal_id, parent_task_id, depends_on_json,
-                    work_item_kind, ordinal, blocked_reason
-                ) VALUES (
-                    ?, ?, ?, ?, 'paused', 0, ?, ?, ?, 0, ?, ?, ?, ?, ?,
-                    'deterministic', ?, ?, 0, ?, NULL, '[]',
-                    'coordination', 0, 'waiting_children'
-                )
-                """,
-                (
-                    parent_task_id,
-                    title,
-                    objective,
-                    project_path,
-                    json.dumps(
-                        {"argv": None, "timeout_seconds": 60, "output_limit_bytes": 131_072},
-                        ensure_ascii=False,
-                        sort_keys=True,
-                    ),
-                    json.dumps([], ensure_ascii=False),
-                    parent_attempts,
-                    project_id,
-                    role_ids["coordination"],
-                    f"goal:{goal_id}",
-                    network_requirement,
-                    parent_provider,
-                    json.dumps(parent_sizing, ensure_ascii=False, sort_keys=True),
-                    json.dumps(parent_policy, ensure_ascii=False, sort_keys=True),
-                    goal_id,
-                ),
-            )
-            connection.execute(
-                "UPDATE goals SET parent_task_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (parent_task_id, goal_id),
-            )
-            insert_task_spec(
-                connection,
-                parent_task_id,
-                canonical_task_spec(
-                    objective=objective,
-                    scope=["coordination"],
-                    acceptance=["all_work_items_verified"],
-                    verification=[],
-                    artifacts=[],
-                    constraints=[
-                        f"network:{network_requirement}",
-                        f"provider:{parent_provider}",
-                    ],
-                    deadline={"hard_seconds": parent_policy["hard_deadline_seconds"]},
-                ),
-                revision=1,
-            )
 
             ordinal_to_task: dict[int, str] = {}
-            impl_count = sum(1 for item in plan.items if item.kind == "implementation")
+            first_task_id: str | None = None
             for item in plan.items:
                 task_id = str(uuid.uuid4())
+                first_task_id = first_task_id or task_id
                 ordinal_to_task[item.ordinal] = task_id
                 depends_ids = [
                     ordinal_to_task[dep]
@@ -216,12 +127,18 @@ class GoalRepository:
                     )
                 sizing, execution_policy = _preview_to_persistence(preview)
                 max_attempts = resolve_max_attempts(execution_policy, 1)
-                item_provider = role_providers[item.role]
+                role_id = str(uuid.uuid4())
+                connection.execute(
+                    """
+                    INSERT INTO roles(id, project_id, kind, status)
+                    VALUES (?, ?, ?, 'ephemeral')
+                    """,
+                    (role_id, project_id, f"{item.role}:{goal_id}:{item.ordinal}"),
+                )
                 child_command, child_verification = _child_command_and_verification(
                     item=item,
                     shared_command=command,
                     shared_verification=verification,
-                    impl_count=impl_count,
                 )
                 timeout = int(execution_policy["hard_deadline_seconds"])
                 child_command = {
@@ -255,14 +172,14 @@ class GoalRepository:
                         json.dumps(child_verification, ensure_ascii=False, sort_keys=True),
                         max_attempts,
                         project_id,
-                        role_ids[item.role],
+                        role_id,
                         f"goal:{goal_id}:item:{item.ordinal}",
                         network_requirement,
-                        item_provider,
+                        provider,
                         json.dumps(sizing, ensure_ascii=False, sort_keys=True),
                         json.dumps(execution_policy, ensure_ascii=False, sort_keys=True),
                         goal_id,
-                        parent_task_id,
+                        None,
                         json.dumps(depends_ids, ensure_ascii=False),
                         item.kind,
                         item.ordinal,
@@ -280,7 +197,8 @@ class GoalRepository:
                         artifacts=list(item.artifacts) or None,
                         constraints=[
                             f"network:{network_requirement}",
-                            f"provider:{item_provider}",
+                            f"provider:{provider}",
+                            "worker_lifecycle:ephemeral",
                         ],
                         deadline={
                             "hard_seconds": execution_policy["hard_deadline_seconds"]
@@ -296,7 +214,7 @@ class GoalRepository:
                 ) VALUES (?, 'goal.created', ?, 0, ?)
                 """,
                 (
-                    parent_task_id,
+                    first_task_id,
                     json.dumps(
                         {
                             "goal_id": goal_id,
@@ -304,7 +222,8 @@ class GoalRepository:
                             "rationale": list(plan.rationale),
                             "model_invoked": False,
                             "model_pm_implemented": False,
-                            "role_providers": role_providers,
+                            "route": plan.route,
+                            "provider": provider,
                         },
                         ensure_ascii=False,
                         sort_keys=True,
@@ -407,59 +326,51 @@ class GoalRepository:
                 )
                 unblocked.append(row["id"])
 
-            parents = connection.execute(
-                """
-                SELECT id, goal_id, revision FROM tasks
-                WHERE work_item_kind = 'coordination' AND status = 'paused'
-                  AND goal_id IS NOT NULL
-                """
+            goals = connection.execute(
+                "SELECT id FROM goals WHERE status = 'running'"
             ).fetchall()
-            for parent in parents:
+            for goal in goals:
                 children = connection.execute(
                     """
-                    SELECT id, status, work_item_kind FROM tasks
-                    WHERE parent_task_id = ? AND work_item_kind IN (
-                        'implementation', 'verification'
-                    )
+                    SELECT id, status, revision, last_evidence_hash FROM tasks
+                    WHERE goal_id = ?
+                      AND work_item_kind IN ('implementation', 'verification')
+                    ORDER BY ordinal, created_at, id
                     """,
-                    (parent["id"],),
+                    (goal["id"],),
                 ).fetchall()
                 if not children:
                     continue
                 statuses = {row["status"] for row in children}
                 if TaskStatus.NEEDS_HUMAN.value in statuses:
-                    self._settle_parent(
-                        connection, parent, goal_status="needs_human",
-                        task_status=TaskStatus.NEEDS_HUMAN,
-                        reason="child_needs_human",
+                    self._settle_goal(
+                        connection, goal["id"], children[-1],
+                        status="needs_human", reason="child_needs_human",
                     )
                     blocked_goals.append(
-                        {"goal_id": parent["goal_id"], "reason": "child_needs_human"}
+                        {"goal_id": goal["id"], "reason": "child_needs_human"}
                     )
                     continue
                 if TaskStatus.TERMINAL_FAILED.value in statuses or TaskStatus.CANCELLED.value in statuses:
-                    self._settle_parent(
-                        connection, parent, goal_status="terminal_failed",
-                        task_status=TaskStatus.TERMINAL_FAILED,
-                        reason="child_terminal_failed",
+                    self._settle_goal(
+                        connection, goal["id"], children[-1],
+                        status="terminal_failed", reason="child_terminal_failed",
                     )
                     blocked_goals.append(
-                        {"goal_id": parent["goal_id"], "reason": "child_terminal_failed"}
+                        {"goal_id": goal["id"], "reason": "child_terminal_failed"}
                     )
                     continue
-                has_verification = any(
-                    row["work_item_kind"] == "verification" for row in children
-                )
                 all_done = all(
-                    row["status"] == TaskStatus.COMPLETED.value for row in children
+                    row["status"] == TaskStatus.COMPLETED.value
+                    and row["last_evidence_hash"]
+                    for row in children
                 )
-                if all_done and has_verification:
-                    self._settle_parent(
-                        connection, parent, goal_status="completed",
-                        task_status=TaskStatus.COMPLETED,
-                        reason="children_verified",
+                if all_done:
+                    self._settle_goal(
+                        connection, goal["id"], children[-1],
+                        status="completed", reason="task_gates_verified",
                     )
-                    completed_goals.append(parent["goal_id"])
+                    completed_goals.append(goal["id"])
         return {
             "unblocked": unblocked,
             "completed_goals": completed_goals,
@@ -468,28 +379,17 @@ class GoalRepository:
         }
 
     @staticmethod
-    def _settle_parent(
+    def _settle_goal(
         connection: Any,
-        parent: Any,
+        goal_id: str,
+        event_task: Any,
         *,
-        goal_status: str,
-        task_status: TaskStatus,
+        status: str,
         reason: str,
     ) -> None:
-        next_revision = int(parent["revision"]) + 1
         connection.execute(
-            """
-            UPDATE tasks SET status = ?, revision = ?, blocked_reason = NULL,
-                last_error = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE id = ? AND revision = ?
-            """,
-            (task_status.value, next_revision, reason, parent["id"], parent["revision"]),
-        )
-        connection.execute(
-            """
-            UPDATE goals SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
-            """,
-            (goal_status, parent["goal_id"]),
+            "UPDATE goals SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (status, goal_id),
         )
         connection.execute(
             """
@@ -498,15 +398,15 @@ class GoalRepository:
             ) VALUES (?, ?, ?, ?, ?)
             """,
             (
-                parent["id"],
-                f"goal.{goal_status}",
+                event_task["id"],
+                f"goal.{status}",
                 json.dumps(
-                    {"goal_id": parent["goal_id"], "reason": reason},
+                    {"goal_id": goal_id, "reason": reason},
                     ensure_ascii=False,
                     sort_keys=True,
                 ),
-                next_revision,
-                f"goal-settle:{parent['goal_id']}:{goal_status}:{next_revision}",
+                event_task["revision"],
+                f"goal-settle:{goal_id}:{status}",
             ),
         )
 
@@ -530,9 +430,8 @@ class GoalRepository:
                    w.last_value_classification
             FROM tasks t
             LEFT JOIN workers w ON w.id = t.worker_id
-            WHERE t.goal_id = ?
-            ORDER BY CASE WHEN t.work_item_kind = 'coordination' THEN -1 ELSE t.ordinal END,
-                     t.ordinal, t.created_at, t.id
+            WHERE t.goal_id = ? AND COALESCE(t.work_item_kind, '') != 'coordination'
+            ORDER BY t.ordinal, t.created_at, t.id
             """,
             (goal_id,),
         ).fetchall()
@@ -698,35 +597,9 @@ def _child_command_and_verification(
     item: PlannedWorkItem,
     shared_command: dict[str, Any],
     shared_verification: list[dict[str, Any]],
-    impl_count: int,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Each child gets its own acceptance surface; verification aggregates priors."""
-    if item.kind == "verification":
-        return dict(shared_command), list(shared_verification)
-
-    # Implementation: prefer artifact acceptance when declared; else exit_code.
-    if item.artifacts:
-        artifact = item.artifacts[0]
-        verification: list[dict[str, Any]] = [
-            {"kind": "exit_code", "expected": 0},
-            {"kind": "file_exists", "path": artifact},
-        ]
-    else:
-        verification = [{"kind": "exit_code", "expected": 0}]
-
-    # When a shared diagnostic argv is provided (tests / operator override), reuse it
-    # for the first implementation slice only; later slices stay argv-null for CLI roles.
-    if shared_command.get("argv") and (impl_count <= 1 or item.ordinal == 1):
-        return dict(shared_command), (
-            list(shared_verification)
-            if shared_verification and impl_count <= 1
-            else verification
-        )
-    return {
-        "argv": None,
-        "timeout_seconds": int(shared_command.get("timeout_seconds") or 60),
-        "output_limit_bytes": int(shared_command.get("output_limit_bytes") or 131_072),
-    }, verification
+    """Every routed task carries the caller's deterministic verification Gate."""
+    return dict(shared_command), list(shared_verification)
 
 
 def _handoff_from_completed(connection: Any, task_id: str) -> dict[str, Any] | None:

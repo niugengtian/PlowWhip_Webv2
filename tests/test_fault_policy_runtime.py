@@ -345,7 +345,7 @@ def test_large_token_usage_completes_without_rotation_across_reconcile_replay() 
         assert completed.last_error is None
         assert completed.tokens_used == 121
         assert worker["session_generation"] == 1
-        assert archives == []
+        assert [row for row in archives if row["reason"] != "task_terminal"] == []
         assert [tuple(row) for row in usage] == [
             (
                 120, 100, 1, "turn", "unknown", None, 1,

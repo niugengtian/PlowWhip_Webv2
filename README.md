@@ -62,7 +62,7 @@ py scripts\release_local.py deploy --expected-sha $sha
 - 只有一个全局计划扫描所有项目/角色/Worker/Task；数据库租约与 fencing token 防止重复调度和脑裂。
 - `max_parallel_workers` 同时约束跨 Tick 已在途任务和手工派发；Token 只写入消费账本，不参与任务准入、调度、熔断、续跑或终态。
 - 控制路径只做 SQLite 扫描、网络探测和状态判断，模型调用数与 Token 消费均为 0。
-- **主流程是提交目标**：PM（coordination）0 Token 确定性拆分为有序角色工作项；Scheduler 按依赖自动派发、同角色稳定会话续接，父目标仅在全部实现项与独立 verification 项通过后完成。诊断用的单任务创建仍保留，但不是主入口。
+- **主流程是唯一常驻管家入口**：fresh project 只创建 Butler 和 ProjectExecutionPolicy。XS 路由到 simple-worker，S/M 路由到单个 ephemeral fullstack，L/XL 拆成最多 6 个有界 capability 里程碑；每个 Task 自带 verification Gate，临时 Worker 在证据终态后释放。遗留 coordination parent 只做迁移收敛，不再为新目标创建。
 
 ## 本机 CLI Worker Pool
 

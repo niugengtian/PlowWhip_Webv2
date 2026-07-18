@@ -29,6 +29,9 @@ from plow_whip_web.api.schemas import (
     RebindWorkerRequest,
     TaskCreate,
     TaskControl,
+    TaskDeleteRequest,
+    TaskDeletionEligibilityView,
+    TaskDeletionView,
     TaskEventView,
     TaskArtifactView,
     TaskSizingEstimateRequest,
@@ -432,7 +435,8 @@ def create_app(settings: Settings) -> FastAPI:
     def create_project(request: Request, payload: ProjectCreate) -> ProjectView:
         repository: ProjectRepository = request.app.state.project_repository
         return ProjectView(**repository.create(
-            name=payload.name, path=payload.path, host_path=payload.host_path
+            name=payload.name, path=payload.path, host_path=payload.host_path,
+            execution_policy=payload.execution_policy,
         ))
 
     @app.get("/api/projects", response_model=list[ProjectView], tags=["projects"])
@@ -469,27 +473,13 @@ def create_app(settings: Settings) -> FastAPI:
         goals: GoalRepository = request.app.state.goal_repository
         provider_pool: ProviderPool = request.app.state.provider_pool
         project = projects.get(payload.project_id)
-        role_ids = {role["kind"]: role["id"] for role in project["roles"]}
-        required_roles = {
-            "coordination", "backend", "frontend", "ui", "devops_sre", "verification",
-            "fullstack", "web3",
-        }
-        missing = sorted(kind for kind in required_roles if kind not in role_ids)
-        if missing:
-            raise NotFoundError(
-                f"role catalog incomplete for {payload.project_id}: {', '.join(missing)}"
-            )
-        unknown_provider_roles = sorted(set(payload.role_providers) - set(role_ids))
-        if unknown_provider_roles:
-            raise DomainError(
-                f"unknown role provider decision: {', '.join(unknown_provider_roles)}"
-            )
         sizing_inputs = TaskSizingInputs(**payload.sizing_inputs.model_dump())
         plan = plan_goal_work_items(
             title=payload.title,
             objective=payload.objective,
             sizing_inputs=sizing_inputs,
             structured_items=payload.plan_items,
+            execution_policy=project["execution_policy"],
         )
         if plan.status == "needs_planning":
             raise HTTPException(
@@ -500,29 +490,17 @@ def create_app(settings: Settings) -> FastAPI:
                     "missing_gates": list(plan.missing_gates),
                 },
             )
-        bindings = projects.role_provider_bindings(payload.project_id)
-        role_providers: dict[str, str] = {"coordination": bindings.get("coordination", payload.provider)}
-        for item in plan.items:
-            selected = bindings.get(item.role) or payload.role_providers.get(item.role)
-            if selected is None:
-                raise DomainError(
-                    f"explicit provider decision required for unbound role: {item.role}"
-                )
-            role_providers[item.role] = selected
-        # Live 0-Token probe per distinct provider before atomic create.
-        for provider_name in sorted(set(role_providers.values())):
-            provider_pool.require_ready(provider_name)
-        binding = projects.resolve_role(payload.project_id, "coordination")
+        # One task-level Provider decision; no role catalog or per-role binding gate.
+        provider_pool.require_ready(payload.provider)
         record = goals.create_with_plan(
             title=payload.title,
             objective=payload.objective,
             project_id=payload.project_id,
-            project_path=binding["project_path"],
-            role_providers=role_providers,
+            project_path=project["path"],
+            provider=payload.provider,
             plan=plan,
             sizing_inputs=payload.sizing_inputs.model_dump(),
             verification=[item.model_dump(exclude_none=True) for item in payload.verification],
-            role_ids=role_ids,
             idempotency_key=idempotency_key,
             network_requirement=payload.network_requirement,
             command=(
@@ -617,6 +595,34 @@ def create_app(settings: Settings) -> FastAPI:
     def get_task(request: Request, task_id: str) -> TaskView:
         repository: TaskRepository = request.app.state.task_repository
         return TaskView.from_record(repository.get(task_id))
+
+    @app.get(
+        "/api/tasks/{task_id}/deletion-eligibility",
+        response_model=TaskDeletionEligibilityView,
+        tags=["tasks"],
+    )
+    def task_deletion_eligibility(
+        request: Request, task_id: str
+    ) -> TaskDeletionEligibilityView:
+        repository: TaskRepository = request.app.state.task_repository
+        return TaskDeletionEligibilityView(**repository.deletion_eligibility(task_id))
+
+    @app.delete(
+        "/api/tasks/{task_id}", response_model=TaskDeletionView, tags=["tasks"]
+    )
+    def delete_task(
+        request: Request,
+        task_id: str,
+        payload: TaskDeleteRequest,
+        idempotency_key: str = Header(alias="Idempotency-Key", min_length=8, max_length=200),
+    ) -> TaskDeletionView:
+        repository: TaskRepository = request.app.state.task_repository
+        return TaskDeletionView(**repository.delete(
+            task_id,
+            expected_revision=payload.expected_revision,
+            reason=payload.reason,
+            idempotency_key=idempotency_key,
+        ))
 
     @app.post("/api/tasks/{task_id}/drive", response_model=TaskView, tags=["tasks"])
     def drive_task(

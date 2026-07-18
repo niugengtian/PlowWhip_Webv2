@@ -53,7 +53,7 @@ def _drive(client: TestClient, task: dict[str, object], key: str) -> dict[str, o
     return response.json()
 
 
-def test_role_worker_session_is_reused_then_released() -> None:
+def test_manual_task_workers_are_ephemeral_and_released_per_terminal() -> None:
     with TemporaryDirectory() as directory:
         root = Path(directory)
         project_path = root / "project"
@@ -64,26 +64,24 @@ def test_role_worker_session_is_reused_then_released() -> None:
             first = _drive(client, _task(client, project["id"], "create-alpha-1", "one.txt"), "drive-alpha-1")
             first_worker = first["worker_id"]
             workforce_after_first = client.get(f"/api/projects/{project['id']}").json()["workers"]
-            first_session = workforce_after_first[0]["session_id"]
+            assert workforce_after_first[0]["status"] == "released"
 
             second = _drive(client, _task(client, project["id"], "create-alpha-2", "two.txt"), "drive-alpha-2")
             workforce_after_second = client.get(f"/api/projects/{project['id']}").json()["workers"]
 
-            assert second["worker_id"] == first_worker
-            assert workforce_after_second[0]["session_id"] == first_session
-            assert workforce_after_second[0]["status"] == "idle"
+            assert second["worker_id"] != first_worker
+            assert len(workforce_after_second) == 2
+            assert all(worker["status"] == "released" for worker in workforce_after_second)
 
             rotated = client.post(
                 f"/api/workers/{first_worker}/rotate", json={"reason": "context_limit"}
             )
-            assert rotated.status_code == 200
-            assert rotated.json()["session_generation"] == 2
-            assert rotated.json()["session_id"] != first_session
+            assert rotated.status_code == 409
 
             released = client.post(f"/api/projects/{project['id']}/release")
             assert released.status_code == 200
             assert released.json()["status"] == "completed"
-            assert released.json()["workers"][0]["status"] == "released"
+            assert all(worker["status"] == "released" for worker in released.json()["workers"])
 
         connection = app.state.database.connect()
         try:

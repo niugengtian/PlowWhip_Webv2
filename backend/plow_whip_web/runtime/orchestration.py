@@ -4,7 +4,8 @@ from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 from plow_whip_web.domain.model import DomainError
-from plow_whip_web.roles import ROLE_KINDS
+from plow_whip_web.runtime.butler import route_goal
+from plow_whip_web.runtime.execution_policy import ExecutionRoute
 from plow_whip_web.runtime.sizing import TaskSizingInputs, estimate_task_sizing
 
 
@@ -34,6 +35,7 @@ class GoalPlan:
     missing_gates: tuple[str, ...]
     rationale: tuple[str, ...]
     items: tuple[PlannedWorkItem, ...]
+    route: ExecutionRoute | None = None
     model_invoked: Literal[False] = False
     model_pm_implemented: Literal[False] = False
 
@@ -44,8 +46,9 @@ def plan_goal_work_items(
     objective: str,
     sizing_inputs: TaskSizingInputs,
     structured_items: list[dict[str, Any]] | None = None,
+    execution_policy: dict[str, Any] | None = None,
 ) -> GoalPlan:
-    """Validate a structured plan, or build a deterministic default (no keyword roles)."""
+    """Route through the project policy; no PM/reviewer or per-role decisions."""
     gate_inputs = replace(sizing_inputs, independent_review_required=False)
     preview = estimate_task_sizing(gate_inputs)
     if preview["status"] == "needs_planning":
@@ -56,23 +59,34 @@ def plan_goal_work_items(
             items=(),
         )
 
+    decision = route_goal(str(preview["size_class"]), execution_policy)
+    policy, route = decision.policy, decision.route
     if structured_items is not None:
-        items = _parse_structured_items(structured_items)
+        items = _parse_structured_items(structured_items, route=route)
+        if route != "capability-milestones" and len(items) != 1:
+            raise DomainError(f"{route} requires exactly one ephemeral work item")
+        if len(items) > int(policy["max_milestones"]):
+            raise DomainError("structured plan exceeds bounded milestone limit")
         rationale = (
-            "structured plan accepted",
-            "deterministic layer validates schema/capability/deps/budget/safety only",
-            "model_pm_implemented=false",
+            "bounded milestone input accepted",
+            f"project_execution_route={route}",
         )
     else:
-        items = _default_items(title=title, objective=objective, sizing_inputs=sizing_inputs)
+        items = _default_items(
+            title=title,
+            objective=objective,
+            sizing_inputs=sizing_inputs,
+            route=route,
+            max_milestones=int(policy["max_milestones"]),
+        )
         rationale = list(preview["rationale"]) + [
-            "default deterministic template (no keyword role routing)",
-            "model_pm_implemented=false",
+            f"project_execution_route={route}",
+            "butler_aggregate_is_coordination_source",
         ]
 
     validated = validate_goal_plan(
         items,
-        available_roles=set(ROLE_KINDS),
+        available_roles={"simple-worker", "fullstack", "capability"},
         sizing_preview=preview,
     )
     return GoalPlan(
@@ -80,6 +94,7 @@ def plan_goal_work_items(
         missing_gates=(),
         rationale=tuple(rationale) + validated["rationale"],
         items=tuple(validated["items"]),
+        route=route,
     )
 
 
@@ -101,16 +116,11 @@ def validate_goal_plan(
         raise DomainError("goal plan ordinals must be contiguous from 1")
 
     seen: set[int] = set()
-    has_verification = False
     for item in items:
         if item.role not in available_roles:
             raise DomainError(f"unknown or unavailable role capability: {item.role}")
-        if item.kind not in {"implementation", "verification"}:
+        if item.kind != "implementation":
             raise DomainError(f"invalid work item kind: {item.kind}")
-        if item.kind == "verification":
-            has_verification = True
-            if item.role != "verification":
-                raise DomainError("verification work items must use verification role")
         if not item.title.strip() or not item.objective.strip():
             raise DomainError("work item title/objective required")
         for dep in item.depends_on_ordinals:
@@ -120,18 +130,13 @@ def validate_goal_plan(
                 raise DomainError("dependencies must refer to earlier ordinals")
         seen.add(item.ordinal)
 
-    if not has_verification:
-        raise DomainError("goal plan must end with an independent verification work item")
-    if items[-1].kind != "verification":
-        raise DomainError("final work item must be verification")
-
     return {
         "items": items,
         "rationale": (
             "schema_ok",
             "capability_ok",
             "dependency_ok",
-            "verification_ok",
+            "task_local_verification_gate_ok",
         ),
     }
 
@@ -154,15 +159,14 @@ def child_sizing_inputs(
             independent_review_required=False,
             risk_level="low" if base.risk_level == "low" else "medium",
         )
-    # Split complexity across implementation slices without keyword routing.
-    share = max(1, total_items - 1)
+    share = max(1, total_items)
     return replace(
         base,
         layers_touched=max(1, (base.layers_touched + share - 1) // share),
         components_touched=max(1, (base.components_touched + share - 1) // share),
         estimated_files_changed=max(1, (base.estimated_files_changed + share - 1) // share),
-        has_deploy=base.has_deploy and item.role == "devops_sre",
-        has_migration=base.has_migration and item.role in {"backend", "fullstack", "devops_sre"},
+        has_deploy=base.has_deploy,
+        has_migration=base.has_migration,
         independent_review_required=False,
     )
 
@@ -174,6 +178,7 @@ def plan_to_dict(plan: GoalPlan) -> dict[str, Any]:
         "rationale": list(plan.rationale),
         "model_invoked": False,
         "model_pm_implemented": MODEL_PM_IMPLEMENTED,
+        "route": plan.route,
         "items": [
             {
                 "ordinal": item.ordinal,
@@ -195,167 +200,49 @@ def _default_items(
     title: str,
     objective: str,
     sizing_inputs: TaskSizingInputs,
+    route: ExecutionRoute,
+    max_milestones: int,
 ) -> list[PlannedWorkItem]:
-    """Deterministic template from sizing flags only — no title/objective keyword routing."""
-    items: list[PlannedWorkItem] = []
-    next_ordinal = 1
-    previous: list[int] = []
+    if route == "simple-worker":
+        count, role = 1, "simple-worker"
+    elif route == "ephemeral-fullstack":
+        count, role = 1, "fullstack"
+    else:
+        count = min(max_milestones, max(2, (sizing_inputs.components_touched + 1) // 2))
+        role = "capability"
 
-    def _add(
-        role: RoleKind,
-        kind: WorkItemKind,
-        item_title: str,
-        item_objective: str,
-        *,
-        acceptance: tuple[str, ...] = (),
-        artifacts: tuple[str, ...] = (),
-    ) -> None:
-        nonlocal next_ordinal, previous
-        depends = tuple(previous[-1:]) if previous else ()
-        items.append(
-            PlannedWorkItem(
-                ordinal=next_ordinal,
-                role=role,
-                kind=kind,
-                title=item_title,
-                objective=item_objective,
-                depends_on_ordinals=depends,
-                acceptance=acceptance,
-                artifacts=artifacts,
-            )
-        )
-        previous.append(next_ordinal)
-        next_ordinal += 1
-
+    constraints = []
+    if sizing_inputs.has_migration:
+        constraints.append("migration safety and schema evidence")
     if sizing_inputs.has_deploy:
-        _add(
-            "devops_sre",
-            "implementation",
-            f"{title} · 部署与切换",
-            (
-                f"{objective}\n\n"
-                "Role slice: DevOps/SRE. Prepare rollback-safe deploy/switch steps, "
-                "observability checks, and leave verification commands for the next item."
-            ),
-            acceptance=("deploy_plan_present", "rollback_note_present"),
-        )
-
-    layers = max(1, int(sizing_inputs.layers_touched))
-    if layers >= 3:
-        _add(
-            "backend",
-            "implementation",
-            f"{title} · 后端切片",
-            (
-                f"{objective}\n\n"
-                "Role slice: backend. Deliver API/data/service changes with tests and "
-                "evidence paths for downstream UI/frontend and verification."
-            ),
-            acceptance=("backend_tests_green",),
-            artifacts=("backend-done.txt",),
-        )
-        _add(
-            "frontend",
-            "implementation",
-            f"{title} · 前端切片",
-            (
-                f"{objective}\n\n"
-                "Role slice: frontend. Wire UI to backend contracts; keep change surface "
-                "minimal and leave verification hooks."
-            ),
-            acceptance=("frontend_smoke_ok",),
-            artifacts=("frontend-done.txt",),
-        )
-        if sizing_inputs.components_touched >= 4:
-            _add(
-                "ui",
-                "implementation",
-                f"{title} · UI 切片",
-                (
-                    f"{objective}\n\n"
-                    "Role slice: UI. Improve accessibility and interaction clarity without "
-                    "expanding product scope."
-                ),
-                acceptance=("ui_checklist_ok",),
-            )
-    elif not any(item.kind == "implementation" for item in items):
-        _add(
-            "backend",
-            "implementation",
-            f"{title} · 实现切片",
-            (
-                f"{objective}\n\n"
-                "Role slice: backend. Deliver the minimal reliable change, keep file "
-                "boundaries tight, and prepare deterministic verification evidence."
-            ),
-            acceptance=("implementation_done",),
-            artifacts=("goal-done.txt",),
-        )
-
-    if sizing_inputs.has_migration and items:
-        last_impl = next(
-            item for item in reversed(items) if item.kind == "implementation"
-        )
-        items[items.index(last_impl)] = PlannedWorkItem(
-            ordinal=last_impl.ordinal,
-            role=last_impl.role,
-            kind=last_impl.kind,
-            title=last_impl.title,
+        constraints.append("rollback-safe deploy evidence")
+    suffix = f" Include {', '.join(constraints)}." if constraints else ""
+    return [
+        PlannedWorkItem(
+            ordinal=index,
+            role=role,
+            kind="implementation",
+            title=(title if count == 1 else f"{title} · 有界里程碑 {index}/{count}"),
             objective=(
-                last_impl.objective
-                + "\n\nInclude migration safety: forward migration, rollback note, "
-                "and schema verification evidence."
+                f"{objective}\n\nExecution route: {route}. "
+                f"Complete bounded milestone {index}/{count}; its verification Gate "
+                f"must pass before termination.{suffix}"
             ),
-            depends_on_ordinals=last_impl.depends_on_ordinals,
-            acceptance=last_impl.acceptance + ("migration_safe",),
-            artifacts=last_impl.artifacts,
+            depends_on_ordinals=((index - 1,) if index > 1 else ()),
+            acceptance=("task_verification_gate_passed",),
         )
-
-    prior_artifacts = tuple(
-        path for item in items for path in item.artifacts
-    )
-    _add(
-        "verification",
-        "verification",
-        f"{title} · 独立验收",
-        (
-            f"{objective}\n\n"
-            "Role slice: independent verification. Reproduce acceptance criteria, "
-            "run declared verification commands against prior artifacts, and refuse "
-            "completion without evidence. Do not implement new product features."
-        ),
-        acceptance=("acceptance_reproduced", "prior_artifacts_verified"),
-        artifacts=prior_artifacts,
-    )
-
-    if len(items) > 7:
-        kept = items[:6] + [items[-1]]
-        renumbered: list[PlannedWorkItem] = []
-        for index, item in enumerate(kept, start=1):
-            depends = (index - 1,) if index > 1 else ()
-            renumbered.append(
-                PlannedWorkItem(
-                    ordinal=index,
-                    role=item.role,
-                    kind=item.kind,
-                    title=item.title,
-                    objective=item.objective,
-                    depends_on_ordinals=depends,
-                    acceptance=item.acceptance,
-                    artifacts=item.artifacts,
-                )
-            )
-        items = renumbered
-
-    return items
+        for index in range(1, count + 1)
+    ]
 
 
-def _parse_structured_items(raw_items: list[dict[str, Any]]) -> list[PlannedWorkItem]:
+def _parse_structured_items(
+    raw_items: list[dict[str, Any]], *, route: ExecutionRoute
+) -> list[PlannedWorkItem]:
     items: list[PlannedWorkItem] = []
     for raw in raw_items:
         kind = str(raw.get("kind") or "")
-        if kind not in {"implementation", "verification"}:
-            raise DomainError(f"invalid structured plan kind: {kind}")
+        if kind != "implementation":
+            raise DomainError("verification is a task-local Gate, not a reviewer work item")
         depends = raw.get("depends_on_ordinals") or []
         if not isinstance(depends, list):
             raise DomainError("depends_on_ordinals must be a list")
@@ -366,12 +253,17 @@ def _parse_structured_items(raw_items: list[dict[str, Any]]) -> list[PlannedWork
         items.append(
             PlannedWorkItem(
                 ordinal=int(raw["ordinal"]),
-                role=str(raw["role"]),
+                role=(
+                    "capability"
+                    if route == "capability-milestones"
+                    else "simple-worker" if route == "simple-worker" else "fullstack"
+                ),
                 kind=kind,  # type: ignore[arg-type]
                 title=str(raw["title"]),
                 objective=str(raw["objective"]),
                 depends_on_ordinals=tuple(int(dep) for dep in depends),
-                acceptance=tuple(str(item) for item in acceptance),
+                acceptance=tuple(str(item) for item in acceptance)
+                + ("task_verification_gate_passed",),
                 artifacts=tuple(str(item) for item in artifacts),
             )
         )
