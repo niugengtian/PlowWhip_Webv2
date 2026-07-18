@@ -1,0 +1,186 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-07-18T11:56:27Z",
+  "task_id": "7784bb1b-9983-490d-b1d4-f8a6c2cac93e",
+  "worker_id": "c1be8992-d999-40bf-b432-3ba62e1a8906",
+  "role": "independent_verification",
+  "decision": "release_rejected",
+  "success_marker_written": false,
+  "source": {
+    "branch": "codex/p0-butler-control-plane",
+    "head_sha": "57d7eac74dc79a9cee8815ab49b243f70cfccc60",
+    "remote_sha": "57d7eac74dc79a9cee8815ab49b243f70cfccc60",
+    "head_matches_remote": true,
+    "worktree_was_clean_before_failure_record": true,
+    "git_diff_check": "passed"
+  },
+  "handoff_provenance": {
+    "artifact_path": "backend/plow_whip_web/runtime/host_reconciliation.py",
+    "declared_sha256": "c407c1283a1003b4dbdb520006f9b0b9b7d05bca4f196fd705466b9206e33598",
+    "observed_sha256": "be4be3b37f04417ae48aecf4c9c182d3514a21bb67cf4689ce90212d37ee55b3",
+    "matches": false
+  },
+  "p0_gates": {
+    "P0-1": {
+      "status": "passed",
+      "evidence": {
+        "fresh_migrations_applied": 26,
+        "second_fresh_application_applied": 0,
+        "upgrade_from": "0025_execution_episodes.sql",
+        "upgrade_applied": [
+          "0026_dispatch_model_calls_worker_stream.sql"
+        ],
+        "schema_head": "0026_dispatch_model_calls_worker_stream.sql",
+        "schema_checksum": "78c9958c02efe591e228e21f7db660bce3299f3b46f456e2095199d0abbd702d",
+        "recorded_checksums_match_manifest": true,
+        "checksum_drift_rejected": true
+      }
+    },
+    "P0-2": {
+      "status": "passed_in_targeted_tests",
+      "evidence": [
+        "fresh project has one permanent butler",
+        "XS routes to simple-worker",
+        "M routes to one ephemeral fullstack",
+        "L routes to bounded capability milestones",
+        "no new permanent coordination, PM, or reviewer pool"
+      ]
+    },
+    "P0-3": {
+      "status": "passed_in_targeted_tests",
+      "evidence": [
+        "immutable bound EvidenceManifest persisted",
+        "pre-existing unchanged artifact rejected as current-run provenance"
+      ]
+    },
+    "P0-4": {
+      "status": "passed_in_targeted_tests",
+      "evidence": "large usage completes from evidence and is recorded exactly once"
+    },
+    "P0-5": {
+      "status": "passed_in_targeted_tests",
+      "evidence": "ExecutionEpisode recovery, wall deadline, no-progress, transport, capacity, and fault convergence tests passed"
+    },
+    "P0-6": {
+      "status": "passed_in_targeted_tests",
+      "evidence": [
+        "Goal reducer amendment, resume, dependency, restart, and idempotency tests passed",
+        "Host dispatch accepted, rejected, and unknown tests passed"
+      ]
+    },
+    "P0-7": {
+      "status": "passed_in_targeted_tests",
+      "evidence": [
+        "all component call receipts and usage dimensions tested",
+        "Worker stream redaction, bounds, cursor, and reconnect tested"
+      ]
+    }
+  },
+  "quality_gates": {
+    "p0_targeted_backend": {
+      "status": "passed",
+      "tests": 56
+    },
+    "backend_full": {
+      "status": "passed",
+      "tests": 160,
+      "duration_seconds": 87.08
+    },
+    "frontend_test": {
+      "status": "passed",
+      "tests": 23
+    },
+    "frontend_typecheck": {
+      "status": "passed"
+    },
+    "frontend_lint": {
+      "status": "passed"
+    },
+    "frontend_build": {
+      "status": "passed"
+    }
+  },
+  "docker_and_runtime": {
+    "candidate_image": "plow-whip-web-v2:p0-verify-57d7eac",
+    "candidate_build": {
+      "status": "failed",
+      "buildkit_error": "failed to update builder last activity time: operation not permitted",
+      "classic_builder": "made no layer or image progress and was terminated after more than two minutes",
+      "candidate_image_exists": false
+    },
+    "current_container": {
+      "container_id": "c2c0232ef43b1a9ef65e2e4b82a574279539124ef20a5aa99c2610aa777c0230",
+      "image_id": "sha256:138652dae09a2c414ef0a97bef254fad5d2feecf7251e9bc30f7b587ced49857",
+      "running": false,
+      "status": "exited",
+      "health": "unhealthy",
+      "exit_code": 137,
+      "oom_killed": false,
+      "restart_count": 0,
+      "image_revision": "bc0f7a312b9a9f2edd9939a52db7b671fb455b0d",
+      "last_observed_migration_count": 21,
+      "expected_image_revision": "57d7eac74dc79a9cee8815ab49b243f70cfccc60",
+      "expected_migration_count": 26,
+      "source_matches_candidate": false
+    },
+    "container_to_bridge": {
+      "status": "failed_no_running_control_plane_container",
+      "host_local_bridge_listener": true,
+      "host_local_codex_available": true,
+      "detail": "codex-cli 0.145.0-alpha.18",
+      "previous_old_runtime_probe_http_status": 200
+    },
+    "candidate_bridge_contract": {
+      "status": "failed",
+      "endpoint": "/v1/evidence/snapshot",
+      "http_status": 404,
+      "detail": "not found"
+    }
+  },
+  "real_codex_fixture": {
+    "direct_host_bridge": {
+      "status": "passed",
+      "job_id": "7729e2d5-dce4-44dc-bdc5-3540d4141652",
+      "start_http_status": 202,
+      "terminal_status": "completed",
+      "returncode": 0,
+      "marker_seen": true,
+      "session_id_present": true,
+      "input_tokens": 19647,
+      "cached_input_tokens": 11008,
+      "output_tokens": 11
+    },
+    "candidate_control_plane_e2e": {
+      "status": "failed_before_host_dispatch",
+      "http_status": 409,
+      "reason": "candidate Evidence baseline requires /v1/evidence/snapshot, but the running Host Bridge returns 404",
+      "accepted_or_queued_not_counted_as_completion": true
+    }
+  },
+  "release_blockers": [
+    {
+      "code": "handoff_evidence_hash_mismatch",
+      "severity": "release_blocking"
+    },
+    {
+      "code": "candidate_docker_image_not_built",
+      "severity": "release_blocking"
+    },
+    {
+      "code": "runtime_sha_and_migration_head_mismatch",
+      "severity": "release_blocking"
+    },
+    {
+      "code": "control_plane_container_exited_137",
+      "severity": "release_blocking"
+    },
+    {
+      "code": "host_bridge_api_older_than_candidate_contract",
+      "severity": "release_blocking"
+    },
+    {
+      "code": "candidate_real_codex_e2e_not_completed",
+      "severity": "release_blocking"
+    }
+  ]
+}
