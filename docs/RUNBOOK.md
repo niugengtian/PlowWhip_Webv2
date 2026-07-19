@@ -12,14 +12,14 @@ a clean worktree and exact local/remote branch SHA, passes that SHA into the ima
 revision label, preserves named volumes, and rejects a non-unique or unhealthy
 control-plane. Read-only monitors must never run Compose.
 
-Open `http://127.0.0.1:8742`. Register projects, save Convention and Settings, then enter through **全局管家** or **提交目标**. The Global Butler shows canonical status and takes the operator directly to the isolated Project Butler. The Project Butler asks for one missing field at a time, presents the 95%-confidence proposal for human confirmation, then creates the role DAG. Manual single-task create remains available under “诊断任务” for debugging only. The built frontend is served by FastAPI.
+Open `http://127.0.0.1:8742`. Register projects, save Convention and Settings, then enter through **全局管家** or **与项目管家对话**. The Global Butler shows canonical status and takes the operator directly to the isolated Project Butler. The project chat persists every turn, can be resumed after closing the page, asks for one missing field at a time, and presents the 95% structural-completeness proposal for human confirmation before creating the role DAG. Manual single-task create remains available under “诊断任务” for debugging only. The built frontend is served by FastAPI.
 
 Python, Node, SQLite runtime and the scheduler are image internals. Source-mode commands remain available to contributors, but they are not production prerequisites.
 
 ## Goal flow
 
 1. Start a project-scoped intake (`POST /api/projects/{project_id}/butler/conversations`), or route through `POST /api/butlers/global/route`.
-2. Answer only `expected_field`; do not batch answers behind the active question. At 95% confidence, review objective, boundaries, acceptance, sizing, Provider choices, and the proposal hash.
+2. Reply through the conversation `/messages` endpoint; the server owns the one active `expected_field`. At 95% structural completeness, review objective, boundaries, acceptance, sizing, Provider choices, and the proposal hash. To change the proposal, send another message with the selected proposal field before confirming.
 3. Confirm the current proposal as a human. Confirmation probes every selected default/role Provider before writing the Goal; a stale revision or hash is rejected.
 4. Inspect the returned Goal plan: semantic role, Provider, ordinal, depends_on, sizing/execution_policy. Independent L/XL work items are all ready; only declared dependencies wait.
 5. Let Cron/Tick auto-dispatch ready children, or run a manual zero-token tick.

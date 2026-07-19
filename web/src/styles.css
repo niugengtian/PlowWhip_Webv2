@@ -227,6 +227,49 @@ textarea { min-height: 84px; resize: vertical; line-height: 1.5; }
 .drawer-head h1 { margin: 4px 0 0; font-size: 1.1rem; }
 .drawer-head button { padding: 7px; }
 .drawer form > .full { margin-top: 17px; }
+.butler-dialog { display: flex; width: min(880px, 100%); overflow: hidden; flex-direction: column; padding: 0; }
+.butler-dialog .drawer-head { padding: 18px; }
+.butler-project-bar { display: flex; align-items: flex-end; gap: 10px; border-bottom: 1px solid var(--line); padding: 12px 18px; }
+.butler-project-bar label, .butler-welcome label { display: grid; flex: 1; gap: 6px; color: #7182a8; font-size: .67rem; }
+.butler-project-bar select, .butler-welcome select { width: 100%; border: 1px solid var(--line); border-radius: 5px; padding: 8px; background: #101521; color: var(--text); }
+.butler-error { border-bottom: 1px solid rgba(255,82,112,.3); padding: 9px 18px; background: rgba(255,82,112,.08); color: #ff9cad; font-size: .72rem; }
+.butler-layout { display: grid; min-height: 0; flex: 1; grid-template-columns: 220px minmax(0, 1fr); }
+.butler-history { overflow-y: auto; border-right: 1px solid var(--line); padding: 14px 10px; background: #0a0e16; }
+.butler-history > .kicker { display: block; padding: 0 7px 9px; }
+.butler-history button { display: block; width: 100%; margin-bottom: 5px; border-color: transparent; padding: 9px; text-align: left; background: transparent; }
+.butler-history button.selected { border-color: #304a76; background: #121c2d; }
+.butler-history strong, .butler-history small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.butler-history strong { color: #bdc9e5; font-size: .7rem; }
+.butler-history small, .butler-history p { margin-top: 4px; color: #64769d; font-size: .62rem; }
+.butler-chat { display: flex; min-width: 0; min-height: 0; flex-direction: column; }
+.butler-messages { overflow-y: auto; min-height: 180px; flex: 1; padding: 18px; }
+.butler-message, .human-message { width: min(78%, 560px); margin-bottom: 12px; border: 1px solid var(--line); border-radius: 8px; padding: 11px 12px; background: #101521; }
+.human-message { margin-left: auto; border-color: #2d4f85; background: #14233a; }
+.butler-message > div, .human-message > div { display: flex; align-items: center; gap: 6px; color: #7f92b9; font-size: .64rem; }
+.butler-message small, .human-message small { margin-left: auto; color: #506184; }
+.butler-message p, .human-message p { margin: 8px 0 0; color: #c4cfe7; font-size: .75rem; line-height: 1.6; white-space: pre-wrap; }
+.butler-proposal { margin: 0 18px 14px; border: 1px solid #365f99; border-radius: 7px; padding: 13px; background: #101a2a; }
+.butler-proposal header { display: flex; align-items: flex-start; justify-content: space-between; }
+.butler-proposal h2 { margin: 4px 0 0; font-size: .88rem; }
+.butler-proposal code { color: #6f85ad; font-size: .65rem; }
+.butler-proposal dl { margin: 12px 0; }
+.butler-proposal dl > div { border-top: 1px solid #243553; padding: 8px 0; }
+.butler-proposal dt { color: #6d80a7; font-size: .63rem; }
+.butler-proposal dd { margin: 4px 0 0; color: #c4d0e9; font-size: .72rem; line-height: 1.5; }
+.butler-proposal > p { color: #8192b4; font-size: .65rem; line-height: 1.5; }
+.butler-proposal-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.butler-proposal-actions button.selected { border-color: #6a9eff; background: #1b3153; color: white; }
+.butler-proposal-actions button.primary { margin-left: auto; }
+.butler-composer { display: grid; grid-template-columns: 1fr auto; gap: 8px; border-top: 1px solid var(--line); padding: 12px 18px 18px; }
+.butler-composer textarea, .butler-welcome textarea { min-height: 76px; resize: vertical; border: 1px solid var(--line-strong); border-radius: 6px; padding: 10px; background: #0c111b; color: var(--text); line-height: 1.5; }
+.butler-composer button { align-self: end; }
+.butler-dispatched { display: flex; align-items: center; gap: 7px; margin: 0 18px 18px; border: 1px solid rgba(46,204,138,.3); border-radius: 6px; padding: 10px; background: rgba(46,204,138,.07); color: #74dfb3; font-size: .7rem; }
+.butler-welcome { display: grid; width: min(560px, calc(100% - 36px)); margin: auto; gap: 12px; padding: 30px 0; text-align: center; }
+.butler-welcome > svg { margin: 0 auto; color: var(--acc); }
+.butler-welcome h2 { margin: 0; font-size: 1rem; }
+.butler-welcome p { margin: 0; color: #7183aa; font-size: .7rem; line-height: 1.6; }
+.butler-welcome label { text-align: left; }
+.butler-intake-options { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
 .preflight { margin-top: 18px; border-top: 1px solid var(--line); padding-top: 16px; }
 .preflight-heading, .estimate-card > div { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .preflight-heading h2 { margin: 3px 0 0; color: #dce4f6; font-size: .9rem; }
@@ -275,4 +318,9 @@ textarea { min-height: 84px; resize: vertical; line-height: 1.5; }
   .artifact-actions { grid-column: 1 / -1; }
   .artifact-actions button { flex: 1; }
   .editor-grid textarea { min-height: 190px; }
+  .butler-layout { grid-template-columns: 1fr; }
+  .butler-history { max-height: 120px; border-right: 0; border-bottom: 1px solid var(--line); }
+  .butler-message, .human-message { width: 92%; }
+  .butler-composer { grid-template-columns: 1fr; }
+  .butler-intake-options { grid-template-columns: 1fr; }
 }

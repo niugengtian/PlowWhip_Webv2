@@ -77,30 +77,31 @@ def test_project_butler_asks_one_question_then_requires_human_confirmation() -> 
 
             boundary_answer = client.post(
                 f"/api/projects/{project['id']}/butler/conversations/"
-                f"{conversation['id']}/answers",
+                f"{conversation['id']}/messages",
                 json={
                     "expected_revision": conversation["revision"],
-                    "field": "boundaries",
-                    "values": [
-                        "只改控制平面和 Web UI",
-                        "不读取其他项目聊天，不共享项目会话",
-                    ],
+                    "content": (
+                        "只改控制平面和 Web UI\n"
+                        "不读取其他项目聊天，不共享项目会话"
+                    ),
                 },
             ).json()
             assert boundary_answer["confidence"] == 65
             assert boundary_answer["expected_field"] == "acceptance"
+            assert boundary_answer["messages"][-2]["content"].startswith(
+                "只改控制平面"
+            )
             assert boundary_answer["messages"][-1]["kind"] == "question"
 
             proposal_response = client.post(
                 f"/api/projects/{project['id']}/butler/conversations/"
-                f"{conversation['id']}/answers",
+                f"{conversation['id']}/messages",
                 json={
                     "expected_revision": boundary_answer["revision"],
-                    "field": "acceptance",
-                    "values": [
-                        "未满足三要素时一次只问一个问题",
-                        "确认后独立角色可以同时进入 ready",
-                    ],
+                    "content": (
+                        "未满足三要素时一次只问一个问题\n"
+                        "确认后独立角色可以同时进入 ready"
+                    ),
                 },
             )
             assert proposal_response.status_code == 200, proposal_response.text
@@ -110,6 +111,36 @@ def test_project_butler_asks_one_question_then_requires_human_confirmation() -> 
             assert proposal["expected_field"] is None
             assert len(proposal["proposal_hash"]) == 64
             assert proposal["messages"][-1]["kind"] == "proposal"
+
+            revision_without_field = client.post(
+                f"/api/projects/{project['id']}/butler/conversations/"
+                f"{conversation['id']}/messages",
+                json={
+                    "expected_revision": proposal["revision"],
+                    "content": "最后一条验收标准还需要更准确",
+                },
+            )
+            assert revision_without_field.status_code == 409
+            old_proposal_hash = proposal["proposal_hash"]
+            revised = client.post(
+                f"/api/projects/{project['id']}/butler/conversations/"
+                f"{conversation['id']}/messages",
+                json={
+                    "expected_revision": proposal["revision"],
+                    "field": "acceptance",
+                    "content": (
+                        "未满足三要素时一次只问一个问题\n"
+                        "确认后四个独立角色同时进入 ready"
+                    ),
+                },
+            )
+            assert revised.status_code == 200, revised.text
+            proposal = revised.json()
+            assert proposal["status"] == "awaiting_confirmation"
+            assert proposal["messages"][-2]["payload"]["proposal_revision"] is True
+            assert proposal["messages"][-1]["kind"] == "proposal"
+            assert proposal["spec"]["acceptance"][-1].startswith("确认后四个")
+            assert proposal["proposal_hash"] != old_proposal_hash
 
             non_human = client.post(
                 f"/api/projects/{project['id']}/butler/conversations/"

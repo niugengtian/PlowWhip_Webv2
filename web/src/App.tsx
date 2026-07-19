@@ -5,12 +5,13 @@ import {
   Plus, Pulse, Robot, ShieldCheck, TerminalWindow, WarningCircle, X,
 } from '@phosphor-icons/react'
 import {
-  api, AuditEntry, ButlerConversation, Convention, ConventionSuggestion, GlobalButlerOverview, Goal, OutboxEvent, PermissionGrant,
+  api, AuditEntry, Convention, ConventionSuggestion, GlobalButlerOverview, Goal, OutboxEvent, PermissionGrant,
   Project, Provider, RuntimeHealth, RuntimeSettings, SchedulerStatus, Task, TaskArtifact, TaskEvent,
   TaskDeletionEligibility, TaskSizingEstimate, TaskSizingInputs, TaskStatus, Usage, Worker,
   WorkerDetail, WorkerStream,
 } from './api'
 import { ButlerConsole } from './components/ButlerConsole'
+import { ProjectButlerDialog } from './components/ProjectButlerDialog'
 import { startLiveRefresh } from './liveRefresh'
 
 type Health = {
@@ -92,22 +93,12 @@ export function App() {
   const [deletionEligibility, setDeletionEligibility] = useState<TaskDeletionEligibility | null>(null)
   const [selectedProject, setSelectedProject] = useState<string>('all')
   const [taskForm, setTaskForm] = useState(initialTask)
-  const [goalForm, setGoalForm] = useState({
-    title: '', objective: '', projectId: '', provider: 'cursor',
-    boundariesText: '', acceptanceText: '',
-    networkRequirement: 'none',
-    executable: 'python3',
-    argumentsJson: '["-c", "from pathlib import Path; Path(\'result.txt\').write_text(\'quality-pass\', encoding=\'utf-8\')"]',
-    verifyPath: 'result.txt', verifyText: 'quality-pass',
-    sizingInputs: initialSizingInputs,
-  })
   const [projectForm, setProjectForm] = useState({ name: '', path: '', hostPath: '' })
   const [showCreateTask, setShowCreateTask] = useState(false)
-  const [showCreateGoal, setShowCreateGoal] = useState(false)
+  const [showProjectButler, setShowProjectButler] = useState(false)
+  const [butlerProjectId, setButlerProjectId] = useState('')
   const [taskEstimate, setTaskEstimate] = useState<TaskSizingEstimate | null>(null)
-  const [goalEstimate, setGoalEstimate] = useState<TaskSizingEstimate | null>(null)
   const [estimatedSizingInputs, setEstimatedSizingInputs] = useState<TaskSizingInputs | null>(null)
-  const [estimatedGoalSizingInputs, setEstimatedGoalSizingInputs] = useState<TaskSizingInputs | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
@@ -236,74 +227,12 @@ export function App() {
     }, '诊断任务已加入队列')
   }
 
-  async function createGoal(event: FormEvent) {
-    event.preventDefault()
-    if (goalEstimate?.status !== 'estimated' || estimatedGoalSizingInputs !== goalForm.sizingInputs) return
-    await action(async () => {
-      const provider = providers.find((item) => item.name === goalForm.provider)
-      const boundaries = lines(goalForm.boundariesText)
-      const acceptance = lines(goalForm.acceptanceText)
-      const payload: Record<string, unknown> = {
-        title: goalForm.title,
-        objective: goalForm.objective,
-        instruction: goalForm.objective,
-        source_type: 'human',
-        provider: goalForm.provider,
-        network_requirement: goalForm.networkRequirement,
-        sizing_inputs: goalForm.sizingInputs,
-        boundaries,
-        scope: [],
-        acceptance,
-        artifacts: [goalForm.verifyPath],
-        constraints: [`network:${goalForm.networkRequirement}`],
-        deadline: { hard_seconds: goalEstimate.hard_deadline_seconds },
-        verification: [
-          { kind: 'exit_code', expected: 0 },
-          { kind: 'file_exists', path: goalForm.verifyPath },
-          { kind: 'file_contains', path: goalForm.verifyPath, contains: goalForm.verifyText },
-        ],
-      }
-      if (provider?.adapter === 'generic-command' || goalForm.provider === 'generic-command') {
-        const args = JSON.parse(goalForm.argumentsJson) as unknown
-        if (!Array.isArray(args) || args.some((value) => typeof value !== 'string')) throw new Error('参数必须是字符串 JSON 数组')
-        payload.command = { argv: [goalForm.executable, ...args] }
-      }
-      let conversation: ButlerConversation | null = null
-      try {
-        conversation = await api.startProjectButler(goalForm.projectId, payload)
-        while (conversation.status === 'clarifying' && conversation.expected_field) {
-          const question = conversation.messages.at(-1)?.content ?? '请补充当前缺失信息'
-          const answer = window.prompt(question)
-          if (!answer?.trim()) throw new Error('项目管家尚未获得完整信息，未创建目标')
-          conversation = await api.answerProjectButler(
-            goalForm.projectId,
-            conversation,
-            conversation.expected_field,
-            lines(answer),
-          )
-        }
-        if (
-          conversation.status !== 'awaiting_confirmation'
-          || !conversation.proposal_hash
-        ) throw new Error('项目管家尚未生成可确认方案')
-        const confirmed = window.confirm(
-          `项目管家把握度 ${conversation.confidence}%\n\n`
-          + `目标：${String(conversation.spec.objective)}\n`
-          + `边界：${String((conversation.spec.boundaries as string[]).join('；'))}\n`
-          + `验收：${String((conversation.spec.acceptance as string[]).join('；'))}\n\n`
-          + '确认后才会拆分并唤醒 Worker。是否执行？',
-        )
-        if (!confirmed) throw new Error('方案未确认，项目管家不会执行')
-        conversation = await api.confirmProjectButler(goalForm.projectId, conversation)
-      } finally {
-        await refreshProviders()
-      }
-      if (!conversation?.goal_id) throw new Error('项目管家确认后未返回 Goal')
-      const created = await api.getGoal(conversation.goal_id)
-      await Promise.all([refreshGoals(), refreshTasks()])
-      selectGoal(created)
-      setShowCreateGoal(false)
-    }, '目标已拆分并进入自动推进')
+  async function openDispatchedGoal(goalId: string) {
+    const created = await api.getGoal(goalId)
+    await Promise.all([refreshGoals(), refreshTasks(), refreshProviders()])
+    selectGoal(created)
+    setShowProjectButler(false)
+    setNotice('目标已拆分并进入自动推进')
   }
 
   async function estimateTask() {
@@ -312,22 +241,10 @@ export function App() {
     try { setTaskEstimate(await api.estimateTask(sizingInputs)); setEstimatedSizingInputs(sizingInputs) } catch (reason) { setError(messageOf(reason)) } finally { setBusy(false) }
   }
 
-  async function estimateGoal() {
-    const sizingInputs = goalForm.sizingInputs
-    setBusy(true); setError(null); setNotice(null); setGoalEstimate(null); setEstimatedGoalSizingInputs(null)
-    try { setGoalEstimate(await api.estimateTask(sizingInputs)); setEstimatedGoalSizingInputs(sizingInputs) } catch (reason) { setError(messageOf(reason)) } finally { setBusy(false) }
-  }
-
   function setSizingInputs(sizingInputs: TaskSizingInputs) {
     setTaskForm((current) => ({ ...current, sizingInputs }))
     setTaskEstimate(null)
     setEstimatedSizingInputs(null)
-  }
-
-  function setGoalSizingInputs(sizingInputs: TaskSizingInputs) {
-    setGoalForm((current) => ({ ...current, sizingInputs }))
-    setGoalEstimate(null)
-    setEstimatedGoalSizingInputs(null)
   }
 
   async function createProject(event: FormEvent) {
@@ -433,7 +350,7 @@ export function App() {
           <div className="context-actions">
             <button className="ghost" onClick={() => action(async () => { await Promise.all([refreshTasks(), refreshGoals(), refreshProjects(), refreshProviders(), refreshGlobalButler()]) }, '状态已刷新')}><ArrowsClockwise size={16} />刷新</button>
             <button className="ghost" onClick={() => { setTaskEstimate(null); setEstimatedSizingInputs(null); setShowCreateTask(true) }}>诊断任务</button>
-            <button className="primary" onClick={() => { setGoalEstimate(null); setEstimatedGoalSizingInputs(null); setShowCreateGoal(true) }}><Plus size={16} weight="bold" />提交目标</button>
+            <button className="primary" onClick={() => { setButlerProjectId(selectedProject === 'all' ? '' : selectedProject); setShowProjectButler(true) }}><Plus size={16} weight="bold" />与项目管家对话</button>
           </div>
         </div>
 
@@ -442,7 +359,7 @@ export function App() {
         {outbox.filter((event) => event.event_type === 'task.needs_human' && !event.delivered_at).length > 0 && <div className="banner warning"><WarningCircle size={18} weight="fill" />存在需要人工判断的任务，自动调度已对这些任务停手。</div>}
 
         {view === 'board' && <Board tasks={visibleTasks} goals={goals.filter((goal) => selectedProject === 'all' || goal.project_id === selectedProject)} projects={projects} workers={workers.map((item) => item.worker)} providers={providers} usage={usage} onNavigate={setView} onSelect={selectTask} onSelectGoal={selectGoal} />}
-        {view === 'butler' && <GlobalButlerView overview={globalButler} onOpenProject={(projectId) => { setGoalForm((current) => ({ ...current, projectId })); setShowCreateGoal(true) }} />}
+        {view === 'butler' && <GlobalButlerView overview={globalButler} onOpenProject={(projectId) => { setButlerProjectId(projectId); setShowProjectButler(true) }} />}
         {view === 'tasks' && <TasksView tasks={visibleTasks} goals={goals.filter((goal) => selectedProject === 'all' || goal.project_id === selectedProject)} workers={workers.map((item) => item.worker)} selected={selectedTask} selectedGoal={selectedGoal} events={events} artifacts={artifacts} artifactError={artifactError} deletionEligibility={deletionEligibility} busy={busy} onSelect={selectTask} onSelectGoal={selectGoal} onDrive={driveTask} onDelete={deleteTask} onControl={controlTask} onOpenArtifact={openArtifact} onCopyArtifact={copyArtifactPath} />}
         {view === 'projects' && <ProjectsView projects={projects} form={projectForm} setForm={setProjectForm} onCreate={createProject} onRelease={(project) => action(async () => { await api.releaseProject(project.id); await refreshProjects() }, '项目已完成并释放 Worker')} busy={busy} />}
         {view === 'workers' && <WorkersView items={workers.filter(({ project }) => selectedProject === 'all' || project.id === selectedProject)} providers={providers} busy={busy} onRebind={(worker, provider) => action(async () => { await api.rebindWorker(worker.id, provider); await refreshProjects() }, 'Worker 已轮转并重新绑定')} />}
@@ -452,7 +369,7 @@ export function App() {
         {view === 'settings' && <SettingsView settings={settings} setSettings={setSettings} scheduler={scheduler} convention={convention} setConvention={setConvention} suggestion={suggestion} setSuggestion={setSuggestion} projects={projects} tasks={tasks} providers={providers} refineProvider={effectiveRefineProvider} setRefineProvider={setRefineProvider} busy={busy} onSaveSettings={saveSettings} onTick={() => action(async () => { await api.schedulerTick(); setScheduler(await api.schedulerStatus()); await Promise.all([refreshTasks(), refreshGoals()]) }, 'Tick 已完成')} onLoadConvention={loadConvention} onSaveConvention={saveConvention} onRefine={refineConvention} />}
       </main>
 
-      {showCreateGoal && <GoalDrawer form={goalForm} setForm={setGoalForm} setSizingInputs={setGoalSizingInputs} estimate={estimatedGoalSizingInputs === goalForm.sizingInputs ? goalEstimate : null} projects={projects} providers={providers} busy={busy} onClose={() => setShowCreateGoal(false)} onEstimate={estimateGoal} onSubmit={createGoal} />}
+      {showProjectButler && <ProjectButlerDialog key={butlerProjectId || 'new'} initialProjectId={butlerProjectId} projects={projects} providers={providers} onClose={() => setShowProjectButler(false)} onDispatched={openDispatchedGoal} />}
       {showCreateTask && <TaskDrawer form={taskForm} setForm={setTaskForm} setSizingInputs={setSizingInputs} estimate={estimatedSizingInputs === taskForm.sizingInputs ? taskEstimate : null} projects={projects} providers={providers} busy={busy} onClose={() => setShowCreateTask(false)} onEstimate={estimateTask} onSubmit={createTask} />}
     </div>
   )
@@ -627,34 +544,6 @@ function SettingsView(props: { settings: RuntimeSettings | null; setSettings: (v
   </div>
 }
 
-function GoalDrawer(props: {
-  form: {
-    title: string; objective: string; projectId: string; provider: string; networkRequirement: string
-    boundariesText: string; acceptanceText: string
-    executable: string; argumentsJson: string; verifyPath: string; verifyText: string; sizingInputs: TaskSizingInputs
-  }
-  setForm: (value: {
-    title: string; objective: string; projectId: string; provider: string; networkRequirement: string
-    boundariesText: string; acceptanceText: string
-    executable: string; argumentsJson: string; verifyPath: string; verifyText: string; sizingInputs: TaskSizingInputs
-  }) => void
-  setSizingInputs: (value: TaskSizingInputs) => void
-  estimate: TaskSizingEstimate | null
-  projects: Project[]
-  providers: Provider[]
-  busy: boolean
-  onClose: () => void
-  onEstimate: () => void
-  onSubmit: (event: FormEvent) => void
-}) {
-  const { form, setForm, setSizingInputs, estimate, projects, providers, busy, onClose, onEstimate, onSubmit } = props
-  const sizing = form.sizingInputs
-  const setSizing = <K extends keyof TaskSizingInputs>(key: K, value: TaskSizingInputs[K]) => setSizingInputs({ ...sizing, [key]: value })
-  const ready = estimate?.status === 'estimated'
-  const provider = providers.find((item) => item.name === form.provider)
-  return <div className="drawer-backdrop" onMouseDown={onClose}><aside className="drawer" onMouseDown={(event) => event.stopPropagation()}><div className="drawer-head"><div><span className="kicker">直接与项目管家对话</span><h1>确认目标后执行</h1></div><button aria-label="关闭" onClick={onClose}><X size={18} /></button></div><form onSubmit={onSubmit}><Field label="标题"><input required value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} placeholder="一个可验收的业务目标" /></Field><Field label="目标"><textarea required value={form.objective} onChange={(event) => setForm({ ...form, objective: event.target.value })} placeholder="最终要得到什么结果？" /></Field><Field label="边界（每行一条）"><textarea value={form.boundariesText} onChange={(event) => setForm({ ...form, boundariesText: event.target.value })} placeholder={'允许修改什么\n明确不应改变什么'} /></Field><Field label="验收标准（每行一条）"><textarea value={form.acceptanceText} onChange={(event) => setForm({ ...form, acceptanceText: event.target.value })} placeholder={'可运行的验证结果\n必须存在的证据或产物'} /></Field><div className="form-grid two"><Field label="项目"><select required value={form.projectId} onChange={(event) => setForm({ ...form, projectId: event.target.value })}><option value="">选择项目</option>{projects.filter((p) => p.status === 'active').map((project) => <option value={project.id} key={project.id}>{project.name}</option>)}</select></Field><Field label="默认 Provider"><select value={form.provider} onChange={(event) => setForm({ ...form, provider: event.target.value })}>{providers.filter((item) => item.enabled).map((item) => <option value={item.name} key={item.name}>{item.display_name}</option>)}</select></Field></div><p className="form-help">缺失信息时项目管家一次只问一个问题；达到 95% 把握后展示方案，得到你的确认才拆分和唤醒 Worker。大型目标按独立角色并行，真实依赖才串行。Provider：{provider?.status ?? '待探测'}。</p><div className="form-grid two"><Field label="验证文件 / 产物路径"><input value={form.verifyPath} onChange={(event) => setForm({ ...form, verifyPath: event.target.value })} /></Field><Field label="必须包含"><input value={form.verifyText} onChange={(event) => setForm({ ...form, verifyText: event.target.value })} /></Field></div><section className="preflight"><div className="preflight-heading"><div><span className="kicker">入队前必做</span><h2>0 Token 规则评估</h2></div><span>不调用模型</span></div><div className="form-grid two"><NumberField label="涉及层数" value={sizing.layers_touched} onChange={(value) => setSizing('layers_touched', value)} /><NumberField label="组件数" value={sizing.components_touched} onChange={(value) => setSizing('components_touched', value)} /><NumberField label="预计文件数" value={sizing.estimated_files_changed} onChange={(value) => setSizing('estimated_files_changed', value)} /><Field label="风险"><select value={sizing.risk_level} onChange={(event) => setSizing('risk_level', event.target.value as TaskSizingInputs['risk_level'])}><option value="low">低</option><option value="medium">中</option><option value="high">高</option></select></Field></div><details className="preflight-advanced"><summary>高级预判</summary><div className="form-grid two"><NumberField label="验证命令数" value={sizing.verification_commands_count} onChange={(value) => setSizing('verification_commands_count', value)} /><NumberField label="预计验证秒数" value={sizing.estimated_verification_seconds} onChange={(value) => setSizing('estimated_verification_seconds', value)} /><NumberField label="外部依赖数" value={sizing.external_dependencies_count} onChange={(value) => setSizing('external_dependencies_count', value)} /></div><div className="check-grid"><Check label="包含迁移" checked={sizing.has_migration} onChange={(value) => setSizing('has_migration', value)} /><Check label="包含部署" checked={sizing.has_deploy} onChange={(value) => setSizing('has_deploy', value)} /></div></details><div className="gate-grid"><Check label="产物明确" checked={sizing.gate_artifact} onChange={(value) => setSizing('gate_artifact', value)} /><Check label="边界明确" checked={sizing.gate_boundary} onChange={(value) => setSizing('gate_boundary', value)} /><Check label="验证明确" checked={sizing.gate_verification} onChange={(value) => setSizing('gate_verification', value)} /><Check label="依赖明确" checked={sizing.gate_dependency} onChange={(value) => setSizing('gate_dependency', value)} /></div><button type="button" className="full" disabled={busy} onClick={onEstimate}><Pulse size={16} />执行 0 Token 预判</button>{estimate && <EstimateCard estimate={estimate} />}</section><button className="primary full" disabled={busy || !projects.length || !ready}><Plus size={16} />与项目管家确认方案</button></form></aside></div>
-}
-
 function TaskDrawer(props: { form: typeof initialTask; setForm: (value: typeof initialTask) => void; setSizingInputs: (value: TaskSizingInputs) => void; estimate: TaskSizingEstimate | null; projects: Project[]; providers: Provider[]; busy: boolean; onClose: () => void; onEstimate: () => void; onSubmit: (event: FormEvent) => void }) {
   const { form, setForm, setSizingInputs, estimate, projects, providers, busy, onClose, onEstimate, onSubmit } = props
   const sizing = form.sizingInputs
@@ -698,7 +587,6 @@ function value(item: Record<string, unknown>, keys: string[], fallback = '暂无
   return fallback
 }
 function listValue(value: unknown) { return Array.isArray(value) ? value.map(String).join(', ') : value ? String(value) : '' }
-function lines(value: string) { return value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean) }
 function summary(value: unknown, keys: string[]) {
   const item = recordValue(value)
   const parts = keys.flatMap((key) => item[key] === null || item[key] === undefined ? [] : [`${key}=${String(item[key])}`])

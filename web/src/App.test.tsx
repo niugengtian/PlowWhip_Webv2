@@ -590,51 +590,77 @@ test('clears the successful preflight when the estimate API later fails', async 
   expect(screen.getByRole('button', { name: '检查 Provider 并加入任务队列' })).toBeDisabled()
 })
 
-test('submits a goal through the project Butler confirmation gate', async () => {
+test('holds a persistent dialogue with the project Butler before human confirmation', async () => {
   let intakePayload: Record<string, unknown> | null = null
+  const messagePayloads: Record<string, unknown>[] = []
   let confirmationPayload: Record<string, unknown> | null = null
-  vi.spyOn(window, 'confirm').mockReturnValue(true)
+  const baseFetch = vi.mocked(fetch)
+  const messages = [
+    {
+      id: 'message-1', ordinal: 1, sender_type: 'human',
+      kind: 'instruction', content: '自动拆分并推进', payload: {}, created_at: 'now',
+    },
+    {
+      id: 'message-2', ordinal: 2, sender_type: 'project_butler',
+      kind: 'question', content: '这个目标允许修改什么、明确不应改变什么？', payload: { field: 'boundaries' }, created_at: 'now',
+    },
+  ]
+  const conversation = (
+    status: 'clarifying' | 'awaiting_confirmation' | 'dispatched',
+    revision: number,
+    expectedField: 'boundaries' | 'acceptance' | null,
+  ) => ({
+    id: 'conversation-1', scope: 'project', project_id: project.id,
+    source_type: 'human', source_id: null, status, revision,
+    confidence: expectedField === 'boundaries' ? 35 : expectedField === 'acceptance' ? 65 : 95,
+    expected_field: expectedField,
+    spec: {
+      title: '自动拆分并推进', objective: '自动拆分并推进',
+      boundaries: revision >= 1 ? ['只改控制面'] : [],
+      acceptance: revision >= 2 ? ['并行角色可见'] : [],
+      provider: 'cursor',
+    },
+    proposal_hash: status === 'clarifying' ? null : 'a'.repeat(64),
+    goal_id: status === 'dispatched' ? 'goal-1' : null,
+    messages: [...messages],
+    direct_project_butler_url: `/api/projects/${project.id}/butler/conversations/conversation-1`,
+  })
   vi.stubGlobal(
     'fetch',
     vi.fn().mockImplementation(async (input: string | URL | Request, init?: RequestInit) => {
       const path = String(input)
-      if (path === '/api/tasks/estimate') {
-        return { ok: true, json: async () => estimate }
+      if (
+        path === `/api/projects/${project.id}/butler/conversations`
+        && init?.method !== 'POST'
+      ) {
+        return { ok: true, json: async () => [] }
       }
       if (
         path === `/api/projects/${project.id}/butler/conversations`
         && init?.method === 'POST'
       ) {
         intakePayload = JSON.parse(String(init.body)) as Record<string, unknown>
-        return {
-          ok: true,
-          json: async () => ({
-            id: 'conversation-1', scope: 'project', project_id: project.id,
-            source_type: 'human', source_id: null, status: 'awaiting_confirmation',
-            revision: 0, confidence: 95, expected_field: null,
-            spec: {
-              ...intakePayload,
-              boundaries: ['只改控制面'],
-              acceptance: ['并行角色可见'],
-            },
-            proposal_hash: 'a'.repeat(64), goal_id: null,
-            messages: [{
-              id: 'message-1', ordinal: 1, sender_type: 'project_butler',
-              kind: 'proposal', content: '请确认', payload: {}, created_at: 'now',
-            }],
-            direct_project_butler_url: `/api/projects/${project.id}/butler/conversations/conversation-1`,
-          }),
+        return { ok: true, json: async () => conversation('clarifying', 0, 'boundaries') }
+      }
+      if (path.endsWith('/butler/conversations/conversation-1/messages')) {
+        const payload = JSON.parse(String(init?.body)) as Record<string, unknown>
+        messagePayloads.push(payload)
+        if (messagePayloads.length === 1) {
+          messages.push(
+            { id: 'message-3', ordinal: 3, sender_type: 'human', kind: 'answer', content: '只改控制面', payload: {}, created_at: 'now' },
+            { id: 'message-4', ordinal: 4, sender_type: 'project_butler', kind: 'question', content: '用哪些可验证结果判断目标已经完成？', payload: {}, created_at: 'now' },
+          )
+          return { ok: true, json: async () => conversation('clarifying', 1, 'acceptance') }
         }
+        messages.push(
+          { id: 'message-5', ordinal: 5, sender_type: 'human', kind: 'answer', content: '并行角色可见', payload: {}, created_at: 'now' },
+          { id: 'message-6', ordinal: 6, sender_type: 'project_butler', kind: 'proposal', content: '请确认', payload: {}, created_at: 'now' },
+        )
+        return { ok: true, json: async () => conversation('awaiting_confirmation', 2, null) }
       }
       if (path.endsWith('/butler/conversations/conversation-1/confirm')) {
         confirmationPayload = JSON.parse(String(init?.body)) as Record<string, unknown>
-        return { ok: true, json: async () => ({
-          id: 'conversation-1', scope: 'project', project_id: project.id,
-          source_type: 'human', source_id: null, status: 'dispatched',
-          revision: 1, confidence: 95, expected_field: null,
-          spec: intakePayload, proposal_hash: 'a'.repeat(64), goal_id: 'goal-1',
-          messages: [], direct_project_butler_url: null,
-        }) }
+        return { ok: true, json: async () => conversation('dispatched', 3, null) }
       }
       if (path === '/api/goals/goal-1') {
         return { ok: true, json: async () => ({
@@ -652,51 +678,39 @@ test('submits a goal through the project Butler confirmation gate', async () => 
           updated_at: '2026-07-17T00:00:00Z', work_items: [],
         }) }
       }
-      return {
-        ok: true,
-        json: async () => path === '/api/projects' ? [project] : path === '/api/providers' ? [provider] : path === '/api/goals' ? [] : path === '/api/tasks' ? [] : path === '/api/settings' ? ({
-          revision: 0, updated_at: null, values: {
-            scheduler_interval_seconds: 30, scheduler_lease_seconds: 90, cron_enabled: true,
-            cron_expression: '*/1 * * * *', cron_timezone: 'Asia/Shanghai', cron_misfire_policy: 'catch_up_once',
-            max_parallel_workers: 4, auto_dispatch: true,
-            max_same_failure: 3, max_no_progress: 3,
-            context_max_bytes: 32768, rotation_max_bytes: 262144,
-            checkpoint_max_bytes: 4096, handoff_max_bytes: 2048,
-            observation_tail_lines: 20, observation_max_bytes: 8192,
-          },
-        }) : path === '/api/scheduler/status' ? ({
-          runtime: { fencing_token: 0, last_tick_at: null, last_result: null, last_error: null, runner_id: null, runner_started_at: null, runner_heartbeat_at: null, runner_stopped_at: null, runner_error: null },
-          engine: { backend: 'embedded-cron', active: true, managed_by: 'docker', data_dir: '/data' },
-          schedule: { enabled: true, expression: '*/1 * * * *', timezone: 'Asia/Shanghai', misfire_policy: 'catch_up_once', next_run_at: null },
-          authorization_required: false, model_invoked: false,
-        }) : path === '/api/system/health' ? ({ connectivity: 'unknown', domestic_ok: null, overseas_ok: null, last_tick_at: null, last_resume_at: null, consecutive_failures: 0 }) : path === '/api/usage' ? ({ input_tokens: 0, output_tokens: 0, total_tokens: 0, control_tokens: 0, projects: [], tasks: [] }) : path === '/api/conventions/global/global' ? ({ scope: 'global', scope_id: 'global', content: '', revision: 0, updated_at: null }) : ['/api/outbox', '/api/audit', '/api/permissions'].includes(path) || path.endsWith('/events') || path.endsWith('/artifacts') ? [] : ({
-          status: 'ok', version: '0.1.0', database: { status: 'ok', journal_mode: 'wal', migration_count: 17 },
-        }),
-      }
+      return baseFetch(input, init)
     }),
   )
   render(<App />)
-  fireEvent.click(await screen.findByRole('button', { name: '提交目标' }))
-  await screen.findByRole('heading', { name: '确认目标后执行' })
-  fireEvent.change(screen.getByLabelText('标题'), { target: { value: '无人值守目标' } })
-  fireEvent.change(screen.getByLabelText('目标'), { target: { value: '自动拆分并推进' } })
-  fireEvent.change(screen.getByLabelText('边界（每行一条）'), { target: { value: '只改控制面' } })
-  fireEvent.change(screen.getByLabelText('验收标准（每行一条）'), { target: { value: '并行角色可见' } })
-  fireEvent.change(screen.getByLabelText('项目'), { target: { value: project.id } })
-  fireEvent.click(screen.getByRole('button', { name: '执行 0 Token 预判' }))
-  await screen.findByText('服务端 Tier M')
-  fireEvent.click(screen.getByRole('button', { name: '与项目管家确认方案' }))
+  fireEvent.click(await screen.findByRole('button', { name: '与项目管家对话' }))
+  await screen.findByRole('heading', { name: '直接与项目管家对话' })
+  fireEvent.change(screen.getByLabelText('给项目管家的指令'), { target: { value: '自动拆分并推进' } })
+  fireEvent.click(screen.getByRole('button', { name: '发送给项目管家' }))
+  expect(await screen.findByText('这个目标允许修改什么、明确不应改变什么？')).toBeInTheDocument()
+  fireEvent.change(screen.getByLabelText('回复项目管家'), { target: { value: '只改控制面' } })
+  fireEvent.click(screen.getByRole('button', { name: '发送' }))
+  expect(await screen.findByText('用哪些可验证结果判断目标已经完成？')).toBeInTheDocument()
+  fireEvent.change(screen.getByLabelText('回复项目管家'), { target: { value: '并行角色可见' } })
+  fireEvent.click(screen.getByRole('button', { name: '发送' }))
+  expect(await screen.findByRole('heading', { name: '需求完整度 95%' })).toBeInTheDocument()
+  fireEvent.click(screen.getByRole('button', { name: '确认方案并执行' }))
   expect(await screen.findByText('目标已拆分并进入自动推进')).toBeInTheDocument()
   expect(intakePayload).toMatchObject({
-    title: '无人值守目标',
-    objective: '自动拆分并推进',
     instruction: '自动拆分并推进',
-    boundaries: ['只改控制面'],
-    acceptance: ['并行角色可见'],
+    source_type: 'human',
+    provider: 'cursor',
+    sizing_inputs: {
+      layers_touched: 1,
+      components_touched: 3,
+      estimated_files_changed: 4,
+    },
   })
-  expect(intakePayload).not.toHaveProperty('project_id')
+  expect(messagePayloads).toEqual([
+    { expected_revision: 0, content: '只改控制面', sender_type: 'human' },
+    { expected_revision: 1, content: '并行角色可见', sender_type: 'human' },
+  ])
   expect(confirmationPayload).toEqual({
-    expected_revision: 0,
+    expected_revision: 2,
     proposal_hash: 'a'.repeat(64),
     actor_type: 'human',
   })

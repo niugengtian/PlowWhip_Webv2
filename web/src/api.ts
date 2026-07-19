@@ -469,19 +469,21 @@ export const api = {
       idempotencyKey: crypto.randomUUID(),
       body: JSON.stringify(payload),
     }),
-  answerProjectButler: (
+  projectButlerConversations: (projectId: string) =>
+    request<ButlerConversation[]>(`/api/projects/${projectId}/butler/conversations`),
+  sendProjectButlerMessage: (
     projectId: string,
     conversation: ButlerConversation,
-    field: NonNullable<ButlerConversation['expected_field']>,
-    values: string[],
+    content: string,
+    field?: NonNullable<ButlerConversation['expected_field']>,
   ) => request<ButlerConversation>(
-    `/api/projects/${projectId}/butler/conversations/${conversation.id}/answers`,
+    `/api/projects/${projectId}/butler/conversations/${conversation.id}/messages`,
     {
       method: 'POST',
       body: JSON.stringify({
         expected_revision: conversation.revision,
-        field,
-        values,
+        content,
+        ...(field ? { field } : {}),
         sender_type: 'human',
       }),
     },

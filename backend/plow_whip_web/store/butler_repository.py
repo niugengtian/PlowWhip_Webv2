@@ -165,6 +165,95 @@ class ButlerRepository:
                 self._append_proposal(connection, conversation_id, draft, proposal_hash)
             return self._get_with_connection(connection, conversation_id)
 
+    def post_message(
+        self,
+        conversation_id: str,
+        *,
+        expected_revision: int,
+        content: str,
+        sender_type: str,
+        field: str | None = None,
+    ) -> dict[str, Any]:
+        """Accept one conversational turn and emit the Butler's next turn."""
+        clean_content = content.strip()
+        if not clean_content:
+            raise InvalidTransitionError("message must not be empty")
+        with self.database.transaction(immediate=True) as connection:
+            row = self._row(connection, conversation_id)
+            if int(row["revision"]) != expected_revision:
+                raise RevisionConflictError(
+                    f"expected revision {expected_revision}, current {row['revision']}"
+                )
+            if row["status"] not in {"clarifying", "awaiting_confirmation"}:
+                raise InvalidTransitionError("conversation is no longer accepting messages")
+
+            active_field = row["expected_field"]
+            if row["status"] == "clarifying":
+                if field is not None and field != active_field:
+                    raise InvalidTransitionError(
+                        f"message must address the one active question: {active_field}"
+                    )
+                target_field = active_field
+            else:
+                if field is None:
+                    raise InvalidTransitionError(
+                        "select objective, boundaries, or acceptance before revising a proposal"
+                    )
+                target_field = field
+
+            draft = json.loads(row["spec_json"])
+            values = _message_values(clean_content)
+            if target_field != "objective" and not values:
+                raise InvalidTransitionError(
+                    "message must contain at least one non-empty value"
+                )
+            draft[target_field] = clean_content if target_field == "objective" else values
+            expected = _next_missing_field(draft)
+            confidence = _confidence(draft)
+            status = "clarifying" if expected else "awaiting_confirmation"
+            proposal_hash = _proposal_hash(draft) if not expected else None
+            connection.execute(
+                """
+                UPDATE butler_conversations
+                SET status = ?, revision = revision + 1, confidence = ?,
+                    expected_field = ?, spec_json = ?, proposal_hash = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    confidence,
+                    expected,
+                    _json(draft),
+                    proposal_hash,
+                    conversation_id,
+                ),
+            )
+            self._append(
+                connection,
+                conversation_id,
+                sender_type,
+                "answer",
+                clean_content,
+                {
+                    "field": target_field,
+                    "values": values,
+                    "proposal_revision": row["status"] == "awaiting_confirmation",
+                },
+            )
+            if expected:
+                self._append(
+                    connection,
+                    conversation_id,
+                    "project_butler",
+                    "question",
+                    _QUESTIONS[expected],
+                    {"field": expected},
+                )
+            else:
+                self._append_proposal(connection, conversation_id, draft, proposal_hash)
+            return self._get_with_connection(connection, conversation_id)
+
     def mark_dispatched(
         self,
         conversation_id: str,
@@ -388,6 +477,11 @@ def _strings(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _message_values(content: str) -> list[str]:
+    values = [line.strip(" \t-•") for line in content.splitlines()]
+    return [value for value in values if value]
 
 
 def _next_missing_field(draft: dict[str, Any]) -> str | None:

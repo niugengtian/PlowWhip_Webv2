@@ -17,6 +17,7 @@ from plow_whip_web.api.schemas import (
     ButlerConfirm,
     ButlerConversationStart,
     ButlerConversationView,
+    ButlerMessageCreate,
     ExpectedRevision,
     ConventionPut,
     ConventionRefineRequest,
@@ -696,6 +697,29 @@ def create_app(settings: Settings) -> FastAPI:
         if record["project_id"] != project_id:
             raise NotFoundError(f"butler conversation not found: {conversation_id}")
         return ButlerConversationView(**record)
+
+    @app.post(
+        "/api/projects/{project_id}/butler/conversations/{conversation_id}/messages",
+        response_model=ButlerConversationView,
+        tags=["butlers"],
+    )
+    def post_project_butler_message(
+        request: Request,
+        project_id: str,
+        conversation_id: str,
+        payload: ButlerMessageCreate,
+    ) -> ButlerConversationView:
+        repository: ButlerRepository = request.app.state.butler_repository
+        current = repository.get(conversation_id)
+        if current["project_id"] != project_id:
+            raise NotFoundError(f"butler conversation not found: {conversation_id}")
+        return ButlerConversationView(**repository.post_message(
+            conversation_id,
+            expected_revision=payload.expected_revision,
+            content=payload.content,
+            sender_type=payload.sender_type,
+            field=payload.field,
+        ))
 
     @app.post(
         "/api/projects/{project_id}/butler/conversations/{conversation_id}/answers",

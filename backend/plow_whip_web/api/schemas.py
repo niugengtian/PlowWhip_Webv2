@@ -346,6 +346,15 @@ class ButlerAnswer(BaseModel):
     sender_type: Literal["human", "agent"] = "human"
 
 
+class ButlerMessageCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_revision: Annotated[int, Field(ge=0)]
+    content: Annotated[str, Field(min_length=1, max_length=10_000)]
+    sender_type: Literal["human", "agent"] = "human"
+    field: Literal["objective", "boundaries", "acceptance"] | None = None
+
+
 class ButlerConfirm(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
