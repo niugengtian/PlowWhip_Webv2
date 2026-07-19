@@ -15,10 +15,11 @@
 0025_execution_episodes.sql
 0026_dispatch_model_calls_worker_stream.sql
 0027_task_sessions_bounded_continuity.sql
+0028_butler_intake.sql
 ```
 
 这条血统来自已部署并经过运行验证的 `62acdf36`，再向前应用 task-scoped
-session 连续性迁移 `0027`。
+session 连续性迁移 `0027`，再追加两级管家会话与确认门迁移 `0028`。
 
 ## 已废止的分叉
 

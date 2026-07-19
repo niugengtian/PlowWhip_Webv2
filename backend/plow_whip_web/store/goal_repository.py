@@ -196,7 +196,7 @@ class GoalRepository:
                         role_id,
                         f"goal:{goal_id}:item:{item.ordinal}",
                         network_requirement,
-                        provider,
+                        item.provider or provider,
                         json.dumps(sizing, ensure_ascii=False, sort_keys=True),
                         json.dumps(execution_policy, ensure_ascii=False, sort_keys=True),
                         goal_id,
@@ -703,7 +703,8 @@ class GoalRepository:
             raise NotFoundError(f"goal not found: {goal_id}")
         tasks = connection.execute(
             """
-            SELECT t.id, t.title, t.objective, t.status, t.role_id, t.worker_id,
+            SELECT t.id, t.title, t.objective, t.status, t.role_id, r.kind AS role,
+                   t.worker_id,
                    t.work_item_kind, t.ordinal, t.depends_on_json, t.blocked_reason,
                    t.parent_task_id, t.revision, t.provider, t.created_at, t.updated_at,
                    t.last_error, t.last_evidence_hash, t.attempts_used, t.max_attempts,
@@ -725,6 +726,7 @@ class GoalRepository:
                    ts.session_generation AS task_session_generation,
                    ts.replacement_reason AS task_session_replacement_reason
             FROM tasks t
+            JOIN roles r ON r.id = t.role_id
             JOIN task_specs s ON s.task_id = t.id
                 AND s.spec_revision = t.current_spec_revision
             LEFT JOIN workers w ON w.id = t.worker_id
@@ -804,6 +806,7 @@ class GoalRepository:
                     "objective": task_spec["objective"],
                     "status": task["status"],
                     "role_id": task["role_id"],
+                    "role": str(task["role"]).split(":", 1)[0],
                     "worker_id": task["worker_id"] or (worker["id"] if worker else None),
                     "work_item_kind": task["work_item_kind"],
                     "ordinal": task["ordinal"],

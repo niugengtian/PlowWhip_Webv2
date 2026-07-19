@@ -107,6 +107,58 @@ export type Goal = {
   spec: Task['spec']
 }
 
+export type ButlerMessage = {
+  id: string
+  ordinal: number
+  sender_type: 'project_butler' | 'global_butler' | 'human' | 'agent'
+  kind: 'instruction' | 'question' | 'answer' | 'proposal' | 'confirmation'
+  content: string
+  payload: Record<string, unknown>
+  created_at: string
+}
+
+export type ButlerConversation = {
+  id: string
+  scope: 'global' | 'project'
+  project_id: string | null
+  source_type: 'human' | 'global_butler' | 'agent'
+  source_id: string | null
+  status: 'clarifying' | 'awaiting_confirmation' | 'dispatched' | 'rejected'
+  revision: number
+  confidence: number
+  expected_field: 'objective' | 'boundaries' | 'acceptance' | null
+  spec: Record<string, unknown>
+  proposal_hash: string | null
+  goal_id: string | null
+  messages: ButlerMessage[]
+  direct_project_butler_url: string | null
+}
+
+export type GlobalButlerOverview = {
+  scope: 'global'
+  workspace_root: string | null
+  projects: {
+    id: string
+    name: string
+    path: string
+    host_path: string | null
+    resource_path: string
+    status: string
+    goal_count: number
+    running_goals: number
+    active_tasks: number
+    active_workers: number
+  }[]
+  totals: {
+    projects: number
+    running_goals: number
+    active_tasks: number
+    active_workers: number
+  }
+  canonical_sources: string[]
+  model_invoked: false
+}
+
 export type TaskArtifact = {
   relative_path: string
   host_path: string
@@ -407,6 +459,46 @@ export const api = {
   schedulerStatus: () => request<SchedulerStatus>('/api/scheduler/status'),
   schedulerTick: () => request<Record<string, unknown>>('/api/scheduler/tick', { method: 'POST' }),
   projects: () => request<Project[]>('/api/projects'),
+  globalButlerOverview: (workspaceRoot?: string) =>
+    request<GlobalButlerOverview>(
+      `/api/butlers/global/overview${workspaceRoot ? `?workspace_root=${encodeURIComponent(workspaceRoot)}` : ''}`,
+    ),
+  startProjectButler: (projectId: string, payload: Record<string, unknown>) =>
+    request<ButlerConversation>(`/api/projects/${projectId}/butler/conversations`, {
+      method: 'POST',
+      idempotencyKey: crypto.randomUUID(),
+      body: JSON.stringify(payload),
+    }),
+  answerProjectButler: (
+    projectId: string,
+    conversation: ButlerConversation,
+    field: NonNullable<ButlerConversation['expected_field']>,
+    values: string[],
+  ) => request<ButlerConversation>(
+    `/api/projects/${projectId}/butler/conversations/${conversation.id}/answers`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        expected_revision: conversation.revision,
+        field,
+        values,
+        sender_type: 'human',
+      }),
+    },
+  ),
+  confirmProjectButler: (projectId: string, conversation: ButlerConversation) =>
+    request<ButlerConversation>(
+      `/api/projects/${projectId}/butler/conversations/${conversation.id}/confirm`,
+      {
+        method: 'POST',
+        idempotencyKey: crypto.randomUUID(),
+        body: JSON.stringify({
+          expected_revision: conversation.revision,
+          proposal_hash: conversation.proposal_hash,
+          actor_type: 'human',
+        }),
+      },
+    ),
   createProject: (payload: { name: string; path: string; host_path?: string | null }) =>
     request<Project>('/api/projects', { method: 'POST', body: JSON.stringify(payload) }),
   releaseProject: (projectId: string) =>

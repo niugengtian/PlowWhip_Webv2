@@ -182,7 +182,10 @@ class ContextCompiler:
         connection = self.database.connect()
         try:
             row = connection.execute("SELECT kind FROM roles WHERE id = ?", (role_id,)).fetchone()
-            return row["kind"] if row else "fullstack"
+            # Goal/manual/replacement roles are ephemeral identities such as
+            # ``backend:<goal>:1``. Context must retain the semantic prompt,
+            # not silently fall back to fullstack for every ephemeral role.
+            return str(row["kind"]).split(":", 1)[0] if row else "fullstack"
         finally:
             connection.close()
 

@@ -60,14 +60,13 @@ def test_butler_routing_is_deterministic_and_bounded() -> None:
     assert first.model_invoked is False
     assert [item.role for item in first.items] == [item.role for item in second.items]
     assert first.route == "capability-milestones"
-    assert {item.role for item in first.items} == {"capability"}
+    assert [item.role for item in first.items] == [
+        "backend", "frontend", "ui", "devops_sre"
+    ]
     assert {item.kind for item in first.items} == {"implementation"}
     assert 2 <= len(first.items) <= 6
     assert all(item.acceptance == () for item in first.items)
-    assert all(
-        item.depends_on_ordinals == ((item.ordinal - 1,) if item.ordinal > 1 else ())
-        for item in first.items
-    )
+    assert all(item.depends_on_ordinals == () for item in first.items)
 
 
 def test_fresh_and_idempotent_migration_adds_goals() -> None:

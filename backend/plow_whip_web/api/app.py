@@ -13,11 +13,16 @@ from fastapi.staticfiles import StaticFiles
 from plow_whip_web import __version__
 from plow_whip_web.api.schemas import (
     ArtifactOpenRequest,
+    ButlerAnswer,
+    ButlerConfirm,
+    ButlerConversationStart,
+    ButlerConversationView,
     ExpectedRevision,
     ConventionPut,
     ConventionRefineRequest,
     GoalCreate,
     GoalView,
+    GlobalButlerRoute,
     ProjectCreate,
     ProjectView,
     ProviderPut,
@@ -74,6 +79,7 @@ from plow_whip_web.store.permission_repository import PermissionRepository
 from plow_whip_web.store.provider_repository import ProviderRepository
 from plow_whip_web.store.task_repository import TaskRepository
 from plow_whip_web.store.goal_repository import GoalRepository
+from plow_whip_web.store.butler_repository import ButlerRepository
 from plow_whip_web.store.host_job_repository import HostJobRepository
 from plow_whip_web.providers.host_bridge import HostBridgeClient
 from plow_whip_web.providers.pool import ProviderPool
@@ -88,6 +94,7 @@ def create_app(settings: Settings) -> FastAPI:
     database.migrate()
     task_repository = TaskRepository(database)
     goal_repository = GoalRepository(database)
+    butler_repository = ButlerRepository(database)
     host_jobs = HostJobRepository(database)
     project_repository = ProjectRepository(database)
     runtime_settings = SettingsRepository(database)
@@ -136,6 +143,7 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.database = database
     app.state.task_repository = task_repository
     app.state.goal_repository = goal_repository
+    app.state.butler_repository = butler_repository
     app.state.host_jobs = host_jobs
     app.state.project_repository = project_repository
     app.state.task_service = task_service
@@ -239,6 +247,10 @@ def create_app(settings: Settings) -> FastAPI:
             "durable_host_jobs": True,
             "early_cli_session_persistence": True,
             "safe_running_cancel": True,
+            "global_butler_resource_index": True,
+            "project_butler_intake": True,
+            "human_confirmation_gate": True,
+            "parallel_capability_dag": True,
             "convention_refinement": True,
             "platform_api_key_required": False,
             "sprint": 9,
@@ -599,6 +611,182 @@ def create_app(settings: Settings) -> FastAPI:
         repository: ProjectRepository = request.app.state.project_repository
         return ProjectView(**repository.release(project_id))
 
+    @app.get("/api/butlers/global/overview", tags=["butlers"])
+    def global_butler_overview(
+        request: Request, workspace_root: str | None = None
+    ) -> dict[str, object]:
+        repository: ButlerRepository = request.app.state.butler_repository
+        return repository.global_overview(workspace_root=workspace_root)
+
+    @app.post(
+        "/api/butlers/global/route",
+        response_model=ButlerConversationView,
+        status_code=201,
+        tags=["butlers"],
+    )
+    def route_global_butler_command(
+        request: Request,
+        payload: GlobalButlerRoute,
+        idempotency_key: str = Header(
+            alias="Idempotency-Key", min_length=8, max_length=200
+        ),
+    ) -> ButlerConversationView:
+        repository: ButlerRepository = request.app.state.butler_repository
+        draft = payload.model_dump(exclude={"project_id", "source_type", "source_id", "instruction"})
+        record = repository.start_project_conversation(
+            project_id=payload.project_id,
+            source_type="global_butler",
+            source_id=payload.source_id,
+            instruction=payload.instruction,
+            draft=draft,
+            idempotency_key=idempotency_key,
+        )
+        return ButlerConversationView(**record)
+
+    @app.post(
+        "/api/projects/{project_id}/butler/conversations",
+        response_model=ButlerConversationView,
+        status_code=201,
+        tags=["butlers"],
+    )
+    def start_project_butler_conversation(
+        request: Request,
+        project_id: str,
+        payload: ButlerConversationStart,
+        idempotency_key: str = Header(
+            alias="Idempotency-Key", min_length=8, max_length=200
+        ),
+    ) -> ButlerConversationView:
+        repository: ButlerRepository = request.app.state.butler_repository
+        draft = payload.model_dump(exclude={"source_type", "source_id", "instruction"})
+        record = repository.start_project_conversation(
+            project_id=project_id,
+            source_type=payload.source_type,
+            source_id=payload.source_id,
+            instruction=payload.instruction,
+            draft=draft,
+            idempotency_key=idempotency_key,
+        )
+        return ButlerConversationView(**record)
+
+    @app.get(
+        "/api/projects/{project_id}/butler/conversations",
+        response_model=list[ButlerConversationView],
+        tags=["butlers"],
+    )
+    def list_project_butler_conversations(
+        request: Request, project_id: str
+    ) -> list[ButlerConversationView]:
+        repository: ButlerRepository = request.app.state.butler_repository
+        return [
+            ButlerConversationView(**record)
+            for record in repository.list_project(project_id)
+        ]
+
+    @app.get(
+        "/api/projects/{project_id}/butler/conversations/{conversation_id}",
+        response_model=ButlerConversationView,
+        tags=["butlers"],
+    )
+    def get_project_butler_conversation(
+        request: Request, project_id: str, conversation_id: str
+    ) -> ButlerConversationView:
+        repository: ButlerRepository = request.app.state.butler_repository
+        record = repository.get(conversation_id)
+        if record["project_id"] != project_id:
+            raise NotFoundError(f"butler conversation not found: {conversation_id}")
+        return ButlerConversationView(**record)
+
+    @app.post(
+        "/api/projects/{project_id}/butler/conversations/{conversation_id}/answers",
+        response_model=ButlerConversationView,
+        tags=["butlers"],
+    )
+    def answer_project_butler(
+        request: Request,
+        project_id: str,
+        conversation_id: str,
+        payload: ButlerAnswer,
+    ) -> ButlerConversationView:
+        repository: ButlerRepository = request.app.state.butler_repository
+        current = repository.get(conversation_id)
+        if current["project_id"] != project_id:
+            raise NotFoundError(f"butler conversation not found: {conversation_id}")
+        return ButlerConversationView(**repository.answer(
+            conversation_id,
+            expected_revision=payload.expected_revision,
+            field=payload.field,
+            values=payload.values,
+            sender_type=payload.sender_type,
+        ))
+
+    @app.post(
+        "/api/projects/{project_id}/butler/conversations/{conversation_id}/confirm",
+        response_model=ButlerConversationView,
+        tags=["butlers"],
+    )
+    def confirm_project_butler(
+        request: Request,
+        project_id: str,
+        conversation_id: str,
+        payload: ButlerConfirm,
+        idempotency_key: str = Header(
+            alias="Idempotency-Key", min_length=8, max_length=200
+        ),
+    ) -> ButlerConversationView:
+        repository: ButlerRepository = request.app.state.butler_repository
+        current = repository.get(conversation_id)
+        if current["project_id"] != project_id:
+            raise NotFoundError(f"butler conversation not found: {conversation_id}")
+        spec = current["spec"]
+        sizing_inputs = spec.get("sizing_inputs") or {
+            "layers_touched": 1,
+            "components_touched": 1,
+            "estimated_files_changed": 1,
+            "has_migration": False,
+            "has_deploy": False,
+            "verification_commands_count": max(1, len(spec.get("verification") or [])),
+            "estimated_verification_seconds": 60,
+            "external_dependencies_count": 0,
+            "risk_level": "low",
+            "independent_review_required": False,
+            "gate_artifact": True,
+            "gate_boundary": True,
+            "gate_verification": True,
+            "gate_dependency": True,
+        }
+        goal_payload = GoalCreate.model_validate({
+            "title": spec["title"],
+            "objective": spec["objective"],
+            "project_id": project_id,
+            "provider": spec.get("provider") or "cursor",
+            "role_providers": spec.get("role_providers") or {},
+            "network_requirement": spec.get("network_requirement") or "none",
+            "verification": spec.get("verification") or [
+                {"kind": "exit_code", "expected": 0}
+            ],
+            "scope": list(dict.fromkeys([
+                *(spec.get("scope") or []),
+                *(spec.get("boundaries") or []),
+            ])),
+            "acceptance": spec["acceptance"],
+            "artifacts": spec.get("artifacts") or [],
+            "constraints": spec.get("constraints") or [],
+            "deadline": spec.get("deadline"),
+            "sizing_inputs": sizing_inputs,
+            "command": spec.get("command"),
+            "plan_items": spec.get("plan_items"),
+        })
+        goal = _create_goal_record(
+            request, goal_payload, f"butler-confirm:{conversation_id}:goal"
+        )
+        return ButlerConversationView(**repository.mark_dispatched(
+            conversation_id,
+            expected_revision=payload.expected_revision,
+            proposal_hash=payload.proposal_hash,
+            goal_id=goal.id,
+        ))
+
     @app.post(
         "/api/tasks/estimate",
         response_model=TaskSizingEstimateResponse,
@@ -614,76 +802,7 @@ def create_app(settings: Settings) -> FastAPI:
         payload: GoalCreate,
         idempotency_key: str = Header(alias="Idempotency-Key", min_length=8, max_length=200),
     ) -> GoalView:
-        projects: ProjectRepository = request.app.state.project_repository
-        goals: GoalRepository = request.app.state.goal_repository
-        provider_pool: ProviderPool = request.app.state.provider_pool
-        model_calls: ModelCallLedger = request.app.state.model_calls
-        project = projects.get(payload.project_id)
-        sizing_inputs = TaskSizingInputs(**payload.sizing_inputs.model_dump())
-        route_call = model_calls.prepare(
-            idempotency_key=f"{idempotency_key}:router",
-            call_kind="router", provider="internal",
-            model="butler-v1", project_id=payload.project_id,
-        )
-        plan_call = model_calls.prepare(
-            idempotency_key=f"{idempotency_key}:planner",
-            call_kind="butler_planner", provider="internal",
-            model="butler-v1", project_id=payload.project_id,
-        )
-        model_calls.dispatched(route_call["call_id"])
-        model_calls.dispatched(plan_call["call_id"])
-        try:
-            plan = plan_goal_work_items(
-                title=payload.title,
-                objective=payload.objective,
-                sizing_inputs=sizing_inputs,
-                structured_items=payload.plan_items,
-                execution_policy=project["execution_policy"],
-            )
-        except Exception as error:
-            model_calls.settle(
-                route_call["call_id"], failed=True, error_class=type(error).__name__
-            )
-            model_calls.settle(
-                plan_call["call_id"], failed=True, error_class=type(error).__name__
-            )
-            raise
-        model_calls.settle(route_call["call_id"])
-        model_calls.settle(plan_call["call_id"])
-        if plan.status == "needs_planning":
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "message": "dispatch gates incomplete; goal cannot be created",
-                    "code": "needs_planning",
-                    "missing_gates": list(plan.missing_gates),
-                },
-            )
-        # One task-level Provider decision; no role catalog or per-role binding gate.
-        provider_pool.require_ready(payload.provider)
-        record = goals.create_with_plan(
-            title=payload.title,
-            objective=payload.objective,
-            project_id=payload.project_id,
-            project_path=project["path"],
-            provider=payload.provider,
-            plan=plan,
-            sizing_inputs=payload.sizing_inputs.model_dump(),
-            verification=[item.model_dump(exclude_none=True) for item in payload.verification],
-            scope=payload.scope,
-            acceptance=payload.acceptance,
-            artifacts=payload.artifacts,
-            constraints=payload.constraints,
-            deadline=payload.deadline.model_dump() if payload.deadline else None,
-            idempotency_key=idempotency_key,
-            network_requirement=payload.network_requirement,
-            command=(
-                payload.command.model_dump()
-                if payload.command is not None
-                else {"argv": None, "timeout_seconds": 60, "output_limit_bytes": 131_072}
-            ),
-        )
-        return GoalView(**record)
+        return _create_goal_record(request, payload, idempotency_key)
 
     @app.get("/api/goals", response_model=list[GoalView], tags=["goals"])
     def list_goals(request: Request) -> list[GoalView]:
@@ -907,6 +1026,97 @@ def _task_host_path(
     project: ProjectRepository = request.app.state.project_repository
     record = project.get(project_id)
     return str(record["host_path"] or record["path"])
+
+
+def _create_goal_record(
+    request: Request, payload: GoalCreate, idempotency_key: str
+) -> GoalView:
+    """One dispatch path for confirmed Butler proposals and compatibility clients."""
+    projects: ProjectRepository = request.app.state.project_repository
+    goals: GoalRepository = request.app.state.goal_repository
+    provider_pool: ProviderPool = request.app.state.provider_pool
+    model_calls: ModelCallLedger = request.app.state.model_calls
+    project = projects.get(payload.project_id)
+    sizing_inputs = TaskSizingInputs(**payload.sizing_inputs.model_dump())
+    route_call = model_calls.prepare(
+        idempotency_key=f"{idempotency_key}:router",
+        call_kind="router",
+        provider="internal",
+        model="butler-v2",
+        project_id=payload.project_id,
+    )
+    plan_call = model_calls.prepare(
+        idempotency_key=f"{idempotency_key}:planner",
+        call_kind="butler_planner",
+        provider="internal",
+        model="butler-v2",
+        project_id=payload.project_id,
+    )
+    model_calls.dispatched(route_call["call_id"])
+    model_calls.dispatched(plan_call["call_id"])
+    try:
+        plan = plan_goal_work_items(
+            title=payload.title,
+            objective=payload.objective,
+            sizing_inputs=sizing_inputs,
+            structured_items=payload.plan_items,
+            execution_policy=project["execution_policy"],
+            role_providers=payload.role_providers,
+        )
+        providers = {
+            item.provider or payload.provider
+            for item in plan.items
+        }
+        for provider in sorted(providers):
+            provider_pool.require_ready(provider)
+    except Exception as error:
+        model_calls.settle(
+            route_call["call_id"], failed=True, error_class=type(error).__name__
+        )
+        model_calls.settle(
+            plan_call["call_id"], failed=True, error_class=type(error).__name__
+        )
+        raise
+    model_calls.settle(route_call["call_id"])
+    model_calls.settle(plan_call["call_id"])
+    if plan.status == "needs_planning":
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "dispatch gates incomplete; goal cannot be created",
+                "code": "needs_planning",
+                "missing_gates": list(plan.missing_gates),
+            },
+        )
+    record = goals.create_with_plan(
+        title=payload.title,
+        objective=payload.objective,
+        project_id=payload.project_id,
+        project_path=project["path"],
+        provider=payload.provider,
+        plan=plan,
+        sizing_inputs=payload.sizing_inputs.model_dump(),
+        verification=[
+            item.model_dump(exclude_none=True) for item in payload.verification
+        ],
+        scope=payload.scope,
+        acceptance=payload.acceptance,
+        artifacts=payload.artifacts,
+        constraints=payload.constraints,
+        deadline=payload.deadline.model_dump() if payload.deadline else None,
+        idempotency_key=idempotency_key,
+        network_requirement=payload.network_requirement,
+        command=(
+            payload.command.model_dump()
+            if payload.command is not None
+            else {
+                "argv": None,
+                "timeout_seconds": 60,
+                "output_limit_bytes": 131_072,
+            }
+        ),
+    )
+    return GoalView(**record)
 
 
 def _preview_to_persistence(

@@ -9,7 +9,7 @@ plow-whip Web v2 is a Docker-first local control plane with four explicit layers
 
 The image runs one embedded Cron engine beside the Web server. Its standard five-field schedule is stored in SQLite and managed from Settings. Each due slot takes one fenced global lease, reconciles expired work, probes connectivity and enabled Providers, selects a bounded batch, obtains worker/resource leases and dispatches. A duplicate container cannot dispatch concurrently because the database lease and fencing token are authoritative.
 
-Project-role-provider sessions are reused until explicit rotation/rebind or project release. The internal binding id is separate from the CLI external session id. Provider switching is never implicit. Context is compiled from objective, one compact role template and global/project/task Convention instead of replaying a full chat.
+The logical Worker keeps the `project + role` responsibility boundary, but a physical Provider session is scoped to `project + role + Task`. Only retries of the same Task may resume that session. The internal binding id is separate from the CLI external session id. Provider switching is never implicit. Context is compiled from the immutable TaskSpec, compact role template, global/project/task Convention, and bounded structured checkpoint instead of replaying a full chat.
 
 Probe, wake, lease, recovery and scheduling are deterministic 0 Token actions. A model is invoked only after a ready task is leased to a model Provider, or when the operator explicitly requests Convention refinement. Refinement returns a suggestion and usage record; it never overwrites Convention automatically.
 
@@ -20,18 +20,20 @@ A writable verification Worker is an implementation capability, not independent 
 
 ## Goal orchestration
 
-The primary product path is goal submission, not manual role picking.
+The primary product path is direct conversation with a Project Butler, not manual role picking.
 
-1. `POST /api/goals` is the sole split entry. The Butler routes an immutable GoalSpec
-   into a bounded ordered chain of implementation work items. There is no general DAG in this release.
-2. Each `project + role` reuses one stable Worker session. Task slices do not open a new session by default. Token usage and cached/context pressure are telemetry only and never rotate a Provider session. Consecutive no-progress/tool aborts retain the bounded FaultPolicy rotation, while explicit operator rotate/rebind remains available. Provider capacity is deferred with backoff, and the local Journal byte threshold rotates the file generation only.
-3. Cross-role handoff is structured metadata only: evidence hash and artifact paths. Full model history is never copied between roles. SQLite stores goals/tasks/leases/session ids, Token usage, and file path/hash/offset metadata; stdout/stderr and journals remain file-backed and rotate by `rotation_max_bytes`.
-4. Child work items reuse the existing 0 Token sizing → deadline/attempt/lease path
+1. The Global Butler is a read-only cross-project index over registered Project, Goal, Task, and Worker state. It can filter registered resource paths under a requested workspace root and route a command to one Project Butler. It never owns a project conversation or reads project file contents.
+2. A Project Butler conversation is durable and project-scoped. It requires objective, boundaries, and acceptance criteria; the server exposes exactly one active question at a time. Complete input produces a 95%-confidence proposal hash. Only an explicit human confirmation of the current revision and hash can create a Goal.
+3. Confirmed XS/S/M goals retain the bounded simple-worker/fullstack routes. L/XL goals become a semantic role DAG: independent backend/frontend/ui/devops_sre items are ready concurrently, while structured plan dependencies are validated as an acyclic earlier-ordinal graph. Each item may select a role-specific Provider, and every selected Provider is probed before the Goal write.
+4. Cross-role handoff is structured metadata only: evidence hash and artifact paths. Full model history is never copied between roles. SQLite stores Butler messages, proposals, goals/tasks/leases/session ids, Token usage, and file path/hash/offset metadata; stdout/stderr and journals remain file-backed and rotate by `rotation_max_bytes`.
+5. Child work items reuse the existing 0 Token sizing → deadline/attempt/lease path
    and Provider readiness probes. The Scheduler advances ready children, feeds Evidence
    Delta into the same-role session on repairable failure, and completes the goal only
    after every child has a passing EvidenceManifest bound to its run and TaskSpec revision.
 
-Manual `POST /api/tasks` remains a diagnostic escape hatch.
+`POST /api/projects/{project_id}/butler/conversations` is the product intake.
+`POST /api/goals` remains a compatibility/control-plane primitive, and manual
+`POST /api/tasks` remains a diagnostic escape hatch; neither is used by the Web goal flow.
 
 ## Runtime resource gates
 

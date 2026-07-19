@@ -127,11 +127,11 @@ def test_diagnostic_role_is_ephemeral_not_a_new_permanent_pool(butler_app) -> No
     [
         ("XS", "simple-worker", 1, "simple-worker:"),
         ("M", "ephemeral-fullstack", 1, "fullstack:"),
-        ("L", "capability-milestones", 4, "capability:"),
+        ("L", "capability-milestones", 3, None),
     ],
 )
-def test_butler_routes_fixtures_without_role_provider_decisions(
-    butler_app, size: str, route: str, count: int, role_prefix: str
+def test_butler_routes_fixtures_with_parallel_semantic_roles(
+    butler_app, size: str, route: str, count: int, role_prefix: str | None
 ) -> None:
     _, client, project = butler_app
     response = _create_goal(client, project["id"], size)
@@ -145,7 +145,13 @@ def test_butler_routes_fixtures_without_role_provider_decisions(
     state = client.get(f"/api/projects/{project['id']}").json()
     ephemeral = [role for role in state["roles"] if role["status"] == "ephemeral"]
     assert len(ephemeral) == count
-    assert all(role["kind"].startswith(role_prefix) for role in ephemeral)
+    if role_prefix:
+        assert all(role["kind"].startswith(role_prefix) for role in ephemeral)
+    else:
+        assert {
+            role["kind"].split(":", 1)[0] for role in ephemeral
+        } == {"backend", "frontend", "ui"}
+        assert all(item["status"] == "ready" for item in goal["work_items"])
 
 
 def test_simple_worker_is_released_only_after_verified_terminal(butler_app) -> None:

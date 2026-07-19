@@ -5,7 +5,7 @@ import {
   Plus, Pulse, Robot, ShieldCheck, TerminalWindow, WarningCircle, X,
 } from '@phosphor-icons/react'
 import {
-  api, AuditEntry, Convention, ConventionSuggestion, Goal, OutboxEvent, PermissionGrant,
+  api, AuditEntry, ButlerConversation, Convention, ConventionSuggestion, GlobalButlerOverview, Goal, OutboxEvent, PermissionGrant,
   Project, Provider, RuntimeHealth, RuntimeSettings, SchedulerStatus, Task, TaskArtifact, TaskEvent,
   TaskDeletionEligibility, TaskSizingEstimate, TaskSizingInputs, TaskStatus, Usage, Worker,
   WorkerDetail, WorkerStream,
@@ -19,7 +19,7 @@ type Health = {
   database: { status: string; journal_mode: string; migration_count: number }
 }
 
-type View = 'board' | 'tasks' | 'projects' | 'workers' | 'providers' | 'usage' | 'audit' | 'settings'
+type View = 'butler' | 'board' | 'tasks' | 'projects' | 'workers' | 'providers' | 'usage' | 'audit' | 'settings'
 
 const roleNames: Record<string, string> = {
   butler: '常驻管家',
@@ -39,6 +39,7 @@ const statusNames: Record<TaskStatus, string> = {
 }
 
 const navItems: { id: View; label: string; icon: typeof Kanban }[] = [
+  { id: 'butler', label: '全局管家', icon: Network },
   { id: 'board', label: '任务看板', icon: Kanban },
   { id: 'tasks', label: '任务', icon: ListChecks },
   { id: 'projects', label: '项目', icon: FolderOpen },
@@ -71,6 +72,7 @@ export function App() {
   const [tasks, setTasks] = useState<Task[]>([])
   const [goals, setGoals] = useState<Goal[]>([])
   const [projects, setProjects] = useState<Project[]>([])
+  const [globalButler, setGlobalButler] = useState<GlobalButlerOverview | null>(null)
   const [providers, setProviders] = useState<Provider[]>([])
   const [settings, setSettings] = useState<RuntimeSettings | null>(null)
   const [scheduler, setScheduler] = useState<SchedulerStatus | null>(null)
@@ -92,6 +94,7 @@ export function App() {
   const [taskForm, setTaskForm] = useState(initialTask)
   const [goalForm, setGoalForm] = useState({
     title: '', objective: '', projectId: '', provider: 'cursor',
+    boundariesText: '', acceptanceText: '',
     networkRequirement: 'none',
     executable: 'python3',
     argumentsJson: '["-c", "from pathlib import Path; Path(\'result.txt\').write_text(\'quality-pass\', encoding=\'utf-8\')"]',
@@ -121,11 +124,16 @@ export function App() {
   }, [])
   const refreshProjects = useCallback(async () => setProjects(await api.projects()), [])
   const refreshProviders = useCallback(async () => setProviders(await api.providers()), [])
+  const refreshGlobalButler = useCallback(
+    async () => setGlobalButler(await api.globalButlerOverview()),
+    [],
+  )
 
   useEffect(() => {
     Promise.all([
       fetch('/health').then((response) => response.json() as Promise<Health>).then(setHealth),
       api.tasks().then(setTasks), api.goals().then(setGoals), api.projects().then(setProjects), api.providers().then(setProviders),
+      api.globalButlerOverview().then(setGlobalButler),
       api.settings().then(setSettings), api.schedulerStatus().then(setScheduler),
       api.runtimeHealth().then(setRuntimeHealth), api.usage().then(setUsage),
       api.audit().then(setAudit), api.outbox().then(setOutbox), api.permissions().then(setPermissions),
@@ -233,17 +241,19 @@ export function App() {
     if (goalEstimate?.status !== 'estimated' || estimatedGoalSizingInputs !== goalForm.sizingInputs) return
     await action(async () => {
       const provider = providers.find((item) => item.name === goalForm.provider)
+      const boundaries = lines(goalForm.boundariesText)
+      const acceptance = lines(goalForm.acceptanceText)
       const payload: Record<string, unknown> = {
         title: goalForm.title,
         objective: goalForm.objective,
-        project_id: goalForm.projectId,
+        instruction: goalForm.objective,
+        source_type: 'human',
         provider: goalForm.provider,
         network_requirement: goalForm.networkRequirement,
         sizing_inputs: goalForm.sizingInputs,
-        scope: [`project:${goalForm.projectId}`],
-        acceptance: [
-          `artifact:${goalForm.verifyPath}:contains:${goalForm.verifyText}`,
-        ],
+        boundaries,
+        scope: [],
+        acceptance,
         artifacts: [goalForm.verifyPath],
         constraints: [`network:${goalForm.networkRequirement}`],
         deadline: { hard_seconds: goalEstimate.hard_deadline_seconds },
@@ -258,12 +268,38 @@ export function App() {
         if (!Array.isArray(args) || args.some((value) => typeof value !== 'string')) throw new Error('参数必须是字符串 JSON 数组')
         payload.command = { argv: [goalForm.executable, ...args] }
       }
-      let created: Goal
+      let conversation: ButlerConversation | null = null
       try {
-        created = await api.createGoal(payload)
+        conversation = await api.startProjectButler(goalForm.projectId, payload)
+        while (conversation.status === 'clarifying' && conversation.expected_field) {
+          const question = conversation.messages.at(-1)?.content ?? '请补充当前缺失信息'
+          const answer = window.prompt(question)
+          if (!answer?.trim()) throw new Error('项目管家尚未获得完整信息，未创建目标')
+          conversation = await api.answerProjectButler(
+            goalForm.projectId,
+            conversation,
+            conversation.expected_field,
+            lines(answer),
+          )
+        }
+        if (
+          conversation.status !== 'awaiting_confirmation'
+          || !conversation.proposal_hash
+        ) throw new Error('项目管家尚未生成可确认方案')
+        const confirmed = window.confirm(
+          `项目管家把握度 ${conversation.confidence}%\n\n`
+          + `目标：${String(conversation.spec.objective)}\n`
+          + `边界：${String((conversation.spec.boundaries as string[]).join('；'))}\n`
+          + `验收：${String((conversation.spec.acceptance as string[]).join('；'))}\n\n`
+          + '确认后才会拆分并唤醒 Worker。是否执行？',
+        )
+        if (!confirmed) throw new Error('方案未确认，项目管家不会执行')
+        conversation = await api.confirmProjectButler(goalForm.projectId, conversation)
       } finally {
         await refreshProviders()
       }
+      if (!conversation?.goal_id) throw new Error('项目管家确认后未返回 Goal')
+      const created = await api.getGoal(conversation.goal_id)
       await Promise.all([refreshGoals(), refreshTasks()])
       selectGoal(created)
       setShowCreateGoal(false)
@@ -395,7 +431,7 @@ export function App() {
         <div className="context-bar">
           <div><span>项目范围</span><select value={selectedProject} onChange={(event) => setSelectedProject(event.target.value)}><option value="all">全部项目</option>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></div>
           <div className="context-actions">
-            <button className="ghost" onClick={() => action(async () => { await Promise.all([refreshTasks(), refreshGoals(), refreshProjects(), refreshProviders()]) }, '状态已刷新')}><ArrowsClockwise size={16} />刷新</button>
+            <button className="ghost" onClick={() => action(async () => { await Promise.all([refreshTasks(), refreshGoals(), refreshProjects(), refreshProviders(), refreshGlobalButler()]) }, '状态已刷新')}><ArrowsClockwise size={16} />刷新</button>
             <button className="ghost" onClick={() => { setTaskEstimate(null); setEstimatedSizingInputs(null); setShowCreateTask(true) }}>诊断任务</button>
             <button className="primary" onClick={() => { setGoalEstimate(null); setEstimatedGoalSizingInputs(null); setShowCreateGoal(true) }}><Plus size={16} weight="bold" />提交目标</button>
           </div>
@@ -406,6 +442,7 @@ export function App() {
         {outbox.filter((event) => event.event_type === 'task.needs_human' && !event.delivered_at).length > 0 && <div className="banner warning"><WarningCircle size={18} weight="fill" />存在需要人工判断的任务，自动调度已对这些任务停手。</div>}
 
         {view === 'board' && <Board tasks={visibleTasks} goals={goals.filter((goal) => selectedProject === 'all' || goal.project_id === selectedProject)} projects={projects} workers={workers.map((item) => item.worker)} providers={providers} usage={usage} onNavigate={setView} onSelect={selectTask} onSelectGoal={selectGoal} />}
+        {view === 'butler' && <GlobalButlerView overview={globalButler} onOpenProject={(projectId) => { setGoalForm((current) => ({ ...current, projectId })); setShowCreateGoal(true) }} />}
         {view === 'tasks' && <TasksView tasks={visibleTasks} goals={goals.filter((goal) => selectedProject === 'all' || goal.project_id === selectedProject)} workers={workers.map((item) => item.worker)} selected={selectedTask} selectedGoal={selectedGoal} events={events} artifacts={artifacts} artifactError={artifactError} deletionEligibility={deletionEligibility} busy={busy} onSelect={selectTask} onSelectGoal={selectGoal} onDrive={driveTask} onDelete={deleteTask} onControl={controlTask} onOpenArtifact={openArtifact} onCopyArtifact={copyArtifactPath} />}
         {view === 'projects' && <ProjectsView projects={projects} form={projectForm} setForm={setProjectForm} onCreate={createProject} onRelease={(project) => action(async () => { await api.releaseProject(project.id); await refreshProjects() }, '项目已完成并释放 Worker')} busy={busy} />}
         {view === 'workers' && <WorkersView items={workers.filter(({ project }) => selectedProject === 'all' || project.id === selectedProject)} providers={providers} busy={busy} onRebind={(worker, provider) => action(async () => { await api.rebindWorker(worker.id, provider); await refreshProjects() }, 'Worker 已轮转并重新绑定')} />}
@@ -435,13 +472,18 @@ function Board({ tasks, goals, projects, workers, providers, usage, onNavigate, 
       <Metric icon={TerminalWindow} label="可用 Provider" value={providers.filter(providerFullyReady).length} hint={`${providers.filter((p) => p.enabled).length} 已启用`} onClick={() => onNavigate('providers')} />
       <Metric icon={Coins} label="今日 Token" value={usage?.total_tokens ?? 0} hint="控制链 0" onClick={() => onNavigate('usage')} />
     </section>
-    <section className="panel board-panel"><div className="panel-heading"><div><span className="kicker">管家唯一入口</span><h1>提交目标 → 策略路由 → 任务 Gate</h1></div><span className="muted">按体量路由 · 临时 Worker 终态释放</span></div>
+    <section className="panel board-panel"><div className="panel-heading"><div><span className="kicker">项目管家主入口</span><h1>澄清 → 人类确认 → 角色 DAG → 任务 Gate</h1></div><span className="muted">独立角色并行 · 真实依赖串行</span></div>
       <div className="goal-strip">{goals.length ? goals.map((goal) => <button className="task-card" key={goal.id} onClick={() => onSelectGoal(goal)}><div><StatusPill status={(goal.status === 'running' ? 'ready' : goal.status === 'completed' ? 'completed' : goal.status === 'needs_human' ? 'needs_human' : 'terminal_failed') as TaskStatus} /><small>{goal.provider}</small></div><strong>{goal.title}</strong><p>{goal.objective}</p><footer><span>{goal.work_items.length} 工作项</span><span>{goal.status}</span></footer></button>) : <div className="empty-column">从管家入口提交目标后按 ProjectExecutionPolicy 路由。</div>}</div>
     </section>
     <section className="panel board-panel"><div className="panel-heading"><div><span className="kicker">全局任务流</span><h1>任务看板</h1></div><span className="muted">项目 + 角色 + Task 会话 · 租约隔离 · 证据完成</span></div>
       <div className="kanban-grid">{columns.map((column) => { const items = tasks.filter((task) => column.statuses.includes(task.status)); return <div className="kanban-column" key={column.title}><div className={`column-title ${column.tone}`}><span>{column.title}</span><b>{items.length}</b></div><div className="column-body">{items.length ? items.map((task) => <button className="task-card" key={task.id} onClick={() => onSelect(task)}><div><StatusPill status={task.status} /><small>{task.provider}{task.work_item_kind ? ` · ${task.work_item_kind}` : ''}</small></div><strong>{task.title}</strong><p>{task.objective}</p><footer><span>{task.attempts_used}/{task.max_attempts} 次</span><span>{task.tokens_used} Token</span></footer></button>) : <div className="empty-column">当前没有任务</div>}</div></div> })}</div>
     </section>
   </>
+}
+
+function GlobalButlerView({ overview, onOpenProject }: { overview: GlobalButlerOverview | null; onOpenProject: (projectId: string) => void }) {
+  if (!overview) return <section className="panel"><div className="empty-state"><Network size={38} /><h2>正在读取全局资源索引</h2></div></section>
+  return <><section className="metrics-strip"><Metric icon={FolderOpen} label="项目" value={overview.totals.projects} hint="注册资源" /><Metric icon={Kanban} label="运行中 Goal" value={overview.totals.running_goals} hint="规范状态" /><Metric icon={ListChecks} label="活动 Task" value={overview.totals.active_tasks} hint="非终态" /><Metric icon={Robot} label="活动 Worker" value={overview.totals.active_workers} hint="未释放" /></section><section className="panel"><div className="panel-heading"><div><span className="kicker">只读跨项目索引</span><h1>全局管家</h1></div><span className="muted">不共享项目会话 · 不读取全量文件或聊天</span></div><section className="work-items"><div className="section-heading"><div><span className="kicker">Registered resources</span><h2>项目管家入口</h2></div><span>真源：{overview.canonical_sources.join(' / ')}</span></div>{overview.projects.map((project) => <article key={project.id}><div><strong>{project.name}</strong><small>{project.resource_path}</small></div><div><span>{project.running_goals} Goal · {project.active_tasks} Task · {project.active_workers} Worker</span><button className="primary" onClick={() => onOpenProject(project.id)}>直接与项目管家对话</button></div></article>)}</section></section></>
 }
 
 function TasksView({ tasks, goals, workers, selected, selectedGoal, events, artifacts, artifactError, deletionEligibility, busy, onSelect, onSelectGoal, onDrive, onDelete, onControl, onOpenArtifact, onCopyArtifact }: { tasks: Task[]; goals: Goal[]; workers: Worker[]; selected: Task | null; selectedGoal: Goal | null; events: TaskEvent[]; artifacts: TaskArtifact[]; artifactError: string | null; deletionEligibility: TaskDeletionEligibility | null; busy: boolean; onSelect: (task: Task) => void; onSelectGoal: (goal: Goal) => void; onDrive: (task: Task) => void; onDelete: (task: Task) => void; onControl: (task: Task, action: 'pause' | 'resume' | 'cancel' | 'needs_human') => void; onOpenArtifact: (task: Task, artifact: TaskArtifact, target: 'finder' | 'cursor') => void; onCopyArtifact: (artifact: TaskArtifact) => void }) {
@@ -458,7 +500,7 @@ function GoalDetail({ goal, tasks, workers }: { goal: Goal; tasks: Task[]; worke
     const task = tasks.find((candidate) => candidate.id === String(item.id))
     const detail = { ...item, ...(task ?? {}) } as Record<string, unknown>
     const worker = workers.find((candidate) => candidate.id === value(detail, ['worker_id']))
-    return <article className="work-item-card" key={String(item.id)}><header><span>{String(detail.ordinal ?? 'P')}</span><div><strong>{String(detail.title ?? detail.id)}</strong><small>{String(detail.status ?? 'unknown')}</small></div></header><dl className="facts"><Fact label="角色 / Provider" value={`${roleNames[value(detail, ['work_item_kind', 'role'])] ?? value(detail, ['work_item_kind', 'role'])} · ${value(detail, ['provider'])}`} /><Fact label="依赖" value={listValue(detail.depends_on) || '无'} mono /><Fact label="阻塞原因" value={value(detail, ['blocked_reason'], '无')} /><Fact label="Task session" value={value(detail, ['external_session_id'], worker?.external_session_id ?? '尚未建立')} mono /><Fact label="Generation" value={value(detail, ['session_generation'], worker ? String(worker.session_generation) : '尚未建立')} /><Fact label="Session scope" value={value(detail, ['session_scope'], 'worker_legacy')} /><Fact label="Replacement reason" value={value(detail, ['rotation_reason'], worker?.rotation_reason ?? '无')} /><Fact label="Last context pressure" value={value(detail, ['last_context_pressure'], worker ? String(worker.last_context_pressure_tokens) : '暂无（API 未提供）')} /><Fact label="Pressure trigger" value={value(detail, ['last_context_pressure_reason'], worker?.last_context_pressure_reason ?? '暂无（API 未提供）')} /><Fact label="Sizing" value={summary(detail.sizing, ['size_class', 'status'])} /><Fact label="Execution" value={executionSummary(detail)} /><Fact label="Attempt / progress" value={`${value(detail, ['attempts_used'], '0')}/${value(detail, ['max_attempts'], '—')} · ${value(detail, ['status'], 'unknown')}`} /><Fact label="Verification" value={verificationState(detail)} /><TaskRuntimeFacts item={detail} /></dl></article>
+    return <article className="work-item-card" key={String(item.id)}><header><span>{String(detail.ordinal ?? 'P')}</span><div><strong>{String(detail.title ?? detail.id)}</strong><small>{String(detail.status ?? 'unknown')}</small></div></header><dl className="facts"><Fact label="角色 / Provider" value={`${roleNames[value(detail, ['role'])] ?? value(detail, ['role'])} · ${value(detail, ['provider'])}`} /><Fact label="依赖" value={listValue(detail.depends_on) || '无'} mono /><Fact label="阻塞原因" value={value(detail, ['blocked_reason'], '无')} /><Fact label="Task session" value={value(detail, ['external_session_id'], worker?.external_session_id ?? '尚未建立')} mono /><Fact label="Generation" value={value(detail, ['session_generation'], worker ? String(worker.session_generation) : '尚未建立')} /><Fact label="Session scope" value={value(detail, ['session_scope'], 'worker_legacy')} /><Fact label="Replacement reason" value={value(detail, ['rotation_reason'], worker?.rotation_reason ?? '无')} /><Fact label="Last context pressure" value={value(detail, ['last_context_pressure'], worker ? String(worker.last_context_pressure_tokens) : '暂无（API 未提供）')} /><Fact label="Pressure trigger" value={value(detail, ['last_context_pressure_reason'], worker?.last_context_pressure_reason ?? '暂无（API 未提供）')} /><Fact label="Sizing" value={summary(detail.sizing, ['size_class', 'status'])} /><Fact label="Execution" value={executionSummary(detail)} /><Fact label="Attempt / progress" value={`${value(detail, ['attempts_used'], '0')}/${value(detail, ['max_attempts'], '—')} · ${value(detail, ['status'], 'unknown')}`} /><Fact label="Verification" value={verificationState(detail)} /><TaskRuntimeFacts item={detail} /></dl></article>
   })}</section></>
 }
 
@@ -588,10 +630,12 @@ function SettingsView(props: { settings: RuntimeSettings | null; setSettings: (v
 function GoalDrawer(props: {
   form: {
     title: string; objective: string; projectId: string; provider: string; networkRequirement: string
+    boundariesText: string; acceptanceText: string
     executable: string; argumentsJson: string; verifyPath: string; verifyText: string; sizingInputs: TaskSizingInputs
   }
   setForm: (value: {
     title: string; objective: string; projectId: string; provider: string; networkRequirement: string
+    boundariesText: string; acceptanceText: string
     executable: string; argumentsJson: string; verifyPath: string; verifyText: string; sizingInputs: TaskSizingInputs
   }) => void
   setSizingInputs: (value: TaskSizingInputs) => void
@@ -608,7 +652,7 @@ function GoalDrawer(props: {
   const setSizing = <K extends keyof TaskSizingInputs>(key: K, value: TaskSizingInputs[K]) => setSizingInputs({ ...sizing, [key]: value })
   const ready = estimate?.status === 'estimated'
   const provider = providers.find((item) => item.name === form.provider)
-  return <div className="drawer-backdrop" onMouseDown={onClose}><aside className="drawer" onMouseDown={(event) => event.stopPropagation()}><div className="drawer-head"><div><span className="kicker">管家唯一沟通入口</span><h1>提交目标</h1></div><button aria-label="关闭" onClick={onClose}><X size={18} /></button></div><form onSubmit={onSubmit}><Field label="标题"><input required value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} placeholder="一个可验收的业务目标" /></Field><Field label="目标"><textarea required value={form.objective} onChange={(event) => setForm({ ...form, objective: event.target.value })} placeholder="系统按 ProjectExecutionPolicy 路由并自动推进" /></Field><div className="form-grid two"><Field label="项目"><select required value={form.projectId} onChange={(event) => setForm({ ...form, projectId: event.target.value })}><option value="">选择项目</option>{projects.filter((p) => p.status === 'active').map((project) => <option value={project.id} key={project.id}>{project.name}</option>)}</select></Field><Field label="Provider"><select value={form.provider} onChange={(event) => setForm({ ...form, provider: event.target.value })}>{providers.filter((item) => item.enabled).map((item) => <option value={item.name} key={item.name}>{item.display_name}</option>)}</select></Field></div><p className="form-help">按体量选择 simple-worker、单 fullstack 或有界 capability 里程碑；每项自带验证 Gate。启动后临时 Worker 在终态释放。Provider 总状态：{provider?.status ?? '待探测'}。</p><div className="form-grid two"><Field label="验证文件 / 产物路径"><input value={form.verifyPath} onChange={(event) => setForm({ ...form, verifyPath: event.target.value })} /></Field><Field label="必须包含"><input value={form.verifyText} onChange={(event) => setForm({ ...form, verifyText: event.target.value })} /></Field></div><section className="preflight"><div className="preflight-heading"><div><span className="kicker">入队前必做</span><h2>0 Token 规则评估</h2></div><span>不调用模型</span></div><div className="form-grid two"><NumberField label="涉及层数" value={sizing.layers_touched} onChange={(value) => setSizing('layers_touched', value)} /><NumberField label="组件数" value={sizing.components_touched} onChange={(value) => setSizing('components_touched', value)} /><NumberField label="预计文件数" value={sizing.estimated_files_changed} onChange={(value) => setSizing('estimated_files_changed', value)} /><Field label="风险"><select value={sizing.risk_level} onChange={(event) => setSizing('risk_level', event.target.value as TaskSizingInputs['risk_level'])}><option value="low">低</option><option value="medium">中</option><option value="high">高</option></select></Field></div><details className="preflight-advanced"><summary>高级预判</summary><div className="form-grid two"><NumberField label="验证命令数" value={sizing.verification_commands_count} onChange={(value) => setSizing('verification_commands_count', value)} /><NumberField label="预计验证秒数" value={sizing.estimated_verification_seconds} onChange={(value) => setSizing('estimated_verification_seconds', value)} /><NumberField label="外部依赖数" value={sizing.external_dependencies_count} onChange={(value) => setSizing('external_dependencies_count', value)} /></div><div className="check-grid"><Check label="包含迁移" checked={sizing.has_migration} onChange={(value) => setSizing('has_migration', value)} /><Check label="包含部署" checked={sizing.has_deploy} onChange={(value) => setSizing('has_deploy', value)} /></div></details><div className="gate-grid"><Check label="产物明确" checked={sizing.gate_artifact} onChange={(value) => setSizing('gate_artifact', value)} /><Check label="边界明确" checked={sizing.gate_boundary} onChange={(value) => setSizing('gate_boundary', value)} /><Check label="验证明确" checked={sizing.gate_verification} onChange={(value) => setSizing('gate_verification', value)} /><Check label="依赖明确" checked={sizing.gate_dependency} onChange={(value) => setSizing('gate_dependency', value)} /></div><button type="button" className="full" disabled={busy} onClick={onEstimate}><Pulse size={16} />执行 0 Token 预判</button>{estimate && <EstimateCard estimate={estimate} />}</section><button className="primary full" disabled={busy || !projects.length || !ready}><Plus size={16} />检查 Provider 并提交目标</button></form></aside></div>
+  return <div className="drawer-backdrop" onMouseDown={onClose}><aside className="drawer" onMouseDown={(event) => event.stopPropagation()}><div className="drawer-head"><div><span className="kicker">直接与项目管家对话</span><h1>确认目标后执行</h1></div><button aria-label="关闭" onClick={onClose}><X size={18} /></button></div><form onSubmit={onSubmit}><Field label="标题"><input required value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} placeholder="一个可验收的业务目标" /></Field><Field label="目标"><textarea required value={form.objective} onChange={(event) => setForm({ ...form, objective: event.target.value })} placeholder="最终要得到什么结果？" /></Field><Field label="边界（每行一条）"><textarea value={form.boundariesText} onChange={(event) => setForm({ ...form, boundariesText: event.target.value })} placeholder={'允许修改什么\n明确不应改变什么'} /></Field><Field label="验收标准（每行一条）"><textarea value={form.acceptanceText} onChange={(event) => setForm({ ...form, acceptanceText: event.target.value })} placeholder={'可运行的验证结果\n必须存在的证据或产物'} /></Field><div className="form-grid two"><Field label="项目"><select required value={form.projectId} onChange={(event) => setForm({ ...form, projectId: event.target.value })}><option value="">选择项目</option>{projects.filter((p) => p.status === 'active').map((project) => <option value={project.id} key={project.id}>{project.name}</option>)}</select></Field><Field label="默认 Provider"><select value={form.provider} onChange={(event) => setForm({ ...form, provider: event.target.value })}>{providers.filter((item) => item.enabled).map((item) => <option value={item.name} key={item.name}>{item.display_name}</option>)}</select></Field></div><p className="form-help">缺失信息时项目管家一次只问一个问题；达到 95% 把握后展示方案，得到你的确认才拆分和唤醒 Worker。大型目标按独立角色并行，真实依赖才串行。Provider：{provider?.status ?? '待探测'}。</p><div className="form-grid two"><Field label="验证文件 / 产物路径"><input value={form.verifyPath} onChange={(event) => setForm({ ...form, verifyPath: event.target.value })} /></Field><Field label="必须包含"><input value={form.verifyText} onChange={(event) => setForm({ ...form, verifyText: event.target.value })} /></Field></div><section className="preflight"><div className="preflight-heading"><div><span className="kicker">入队前必做</span><h2>0 Token 规则评估</h2></div><span>不调用模型</span></div><div className="form-grid two"><NumberField label="涉及层数" value={sizing.layers_touched} onChange={(value) => setSizing('layers_touched', value)} /><NumberField label="组件数" value={sizing.components_touched} onChange={(value) => setSizing('components_touched', value)} /><NumberField label="预计文件数" value={sizing.estimated_files_changed} onChange={(value) => setSizing('estimated_files_changed', value)} /><Field label="风险"><select value={sizing.risk_level} onChange={(event) => setSizing('risk_level', event.target.value as TaskSizingInputs['risk_level'])}><option value="low">低</option><option value="medium">中</option><option value="high">高</option></select></Field></div><details className="preflight-advanced"><summary>高级预判</summary><div className="form-grid two"><NumberField label="验证命令数" value={sizing.verification_commands_count} onChange={(value) => setSizing('verification_commands_count', value)} /><NumberField label="预计验证秒数" value={sizing.estimated_verification_seconds} onChange={(value) => setSizing('estimated_verification_seconds', value)} /><NumberField label="外部依赖数" value={sizing.external_dependencies_count} onChange={(value) => setSizing('external_dependencies_count', value)} /></div><div className="check-grid"><Check label="包含迁移" checked={sizing.has_migration} onChange={(value) => setSizing('has_migration', value)} /><Check label="包含部署" checked={sizing.has_deploy} onChange={(value) => setSizing('has_deploy', value)} /></div></details><div className="gate-grid"><Check label="产物明确" checked={sizing.gate_artifact} onChange={(value) => setSizing('gate_artifact', value)} /><Check label="边界明确" checked={sizing.gate_boundary} onChange={(value) => setSizing('gate_boundary', value)} /><Check label="验证明确" checked={sizing.gate_verification} onChange={(value) => setSizing('gate_verification', value)} /><Check label="依赖明确" checked={sizing.gate_dependency} onChange={(value) => setSizing('gate_dependency', value)} /></div><button type="button" className="full" disabled={busy} onClick={onEstimate}><Pulse size={16} />执行 0 Token 预判</button>{estimate && <EstimateCard estimate={estimate} />}</section><button className="primary full" disabled={busy || !projects.length || !ready}><Plus size={16} />与项目管家确认方案</button></form></aside></div>
 }
 
 function TaskDrawer(props: { form: typeof initialTask; setForm: (value: typeof initialTask) => void; setSizingInputs: (value: TaskSizingInputs) => void; estimate: TaskSizingEstimate | null; projects: Project[]; providers: Provider[]; busy: boolean; onClose: () => void; onEstimate: () => void; onSubmit: (event: FormEvent) => void }) {
@@ -654,6 +698,7 @@ function value(item: Record<string, unknown>, keys: string[], fallback = '暂无
   return fallback
 }
 function listValue(value: unknown) { return Array.isArray(value) ? value.map(String).join(', ') : value ? String(value) : '' }
+function lines(value: string) { return value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean) }
 function summary(value: unknown, keys: string[]) {
   const item = recordValue(value)
   const parts = keys.flatMap((key) => item[key] === null || item[key] === undefined ? [] : [`${key}=${String(item[key])}`])

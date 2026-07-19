@@ -27,6 +27,7 @@ class PlannedWorkItem:
     depends_on_ordinals: tuple[int, ...]
     acceptance: tuple[str, ...] = ()
     artifacts: tuple[str, ...] = ()
+    provider: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,8 +48,9 @@ def plan_goal_work_items(
     sizing_inputs: TaskSizingInputs,
     structured_items: list[dict[str, Any]] | None = None,
     execution_policy: dict[str, Any] | None = None,
+    role_providers: dict[str, str] | None = None,
 ) -> GoalPlan:
-    """Route through the project policy; no PM/reviewer or per-role decisions."""
+    """Build a bounded semantic role DAG; completion still uses task-local Gates."""
     gate_inputs = replace(sizing_inputs, independent_review_required=False)
     preview = estimate_task_sizing(gate_inputs)
     if preview["status"] == "needs_planning":
@@ -84,9 +86,17 @@ def plan_goal_work_items(
             "butler_aggregate_is_coordination_source",
         ]
 
+    if role_providers:
+        items = [
+            replace(item, provider=role_providers.get(item.role, item.provider))
+            for item in items
+        ]
     validated = validate_goal_plan(
         items,
-        available_roles={"simple-worker", "fullstack", "capability"},
+        available_roles={
+            "simple-worker", "fullstack", "backend", "frontend", "ui",
+            "devops_sre", "verification",
+        },
         sizing_preview=preview,
     )
     return GoalPlan(
@@ -189,6 +199,7 @@ def plan_to_dict(plan: GoalPlan) -> dict[str, Any]:
                 "depends_on_ordinals": list(item.depends_on_ordinals),
                 "acceptance": list(item.acceptance),
                 "artifacts": list(item.artifacts),
+                "provider": item.provider,
             }
             for item in plan.items
         ],
@@ -208,8 +219,14 @@ def _default_items(
     elif route == "ephemeral-fullstack":
         count, role = 1, "fullstack"
     else:
-        count = min(max_milestones, max(2, (sizing_inputs.components_touched + 1) // 2))
-        role = "capability"
+        roles = ["backend"]
+        if sizing_inputs.layers_touched >= 2:
+            roles.append("frontend")
+        if sizing_inputs.components_touched >= 3:
+            roles.append("ui")
+        if sizing_inputs.has_deploy or sizing_inputs.has_migration:
+            roles.append("devops_sre")
+        count = min(max_milestones, len(roles))
 
     constraints = []
     if sizing_inputs.has_migration:
@@ -220,15 +237,23 @@ def _default_items(
     return [
         PlannedWorkItem(
             ordinal=index,
-            role=role,
+            role=(role if route != "capability-milestones" else roles[index - 1]),
             kind="implementation",
-            title=(title if count == 1 else f"{title} · 有界里程碑 {index}/{count}"),
+            title=(
+                title
+                if count == 1
+                else f"{title} · {roles[index - 1]} {index}/{count}"
+            ),
             objective=(
                 f"{objective}\n\nExecution route: {route}. "
-                f"Complete bounded milestone {index}/{count}; its verification Gate "
+                f"Complete the "
+                f"{(role if route != 'capability-milestones' else roles[index - 1])} "
+                f"role lane {index}/{count}; its verification Gate "
                 f"must pass before termination.{suffix}"
             ),
-            depends_on_ordinals=((index - 1,) if index > 1 else ()),
+            # Different capability lanes are independent by default. Explicit
+            # structured plans add only real data/deploy dependencies.
+            depends_on_ordinals=(),
         )
         for index in range(1, count + 1)
     ]
@@ -253,7 +278,7 @@ def _parse_structured_items(
             PlannedWorkItem(
                 ordinal=int(raw["ordinal"]),
                 role=(
-                    "capability"
+                    str(raw.get("role") or "backend")
                     if route == "capability-milestones"
                     else "simple-worker" if route == "simple-worker" else "fullstack"
                 ),
@@ -263,6 +288,7 @@ def _parse_structured_items(
                 depends_on_ordinals=tuple(int(dep) for dep in depends),
                 acceptance=tuple(str(item) for item in acceptance),
                 artifacts=tuple(str(item) for item in artifacts),
+                provider=(str(raw["provider"]) if raw.get("provider") else None),
             )
         )
     return items

@@ -5,8 +5,10 @@ from __future__ import annotations
 # for old projects and task-local capability workers.
 ROLE_PROMPTS: dict[str, str] = {
     "butler": (
-        "你是项目唯一常驻管家入口。按 ProjectExecutionPolicy 路由任务，"
-        "只创建有界临时 Worker，并以验证证据决定终态。"
+        "你是逻辑常驻、项目隔离的项目管家。先确认目标、边界和验收标准；"
+        "信息不足时一次只问一个问题，达到 95% 把握后必须由人类确认。"
+        "确认后按真实依赖拆成语义角色 DAG，唤醒有界临时 Worker，"
+        "并以确定性验证证据决定终态。"
     ),
     "coordination": (
         "你是项目协调角色（PM）。拆解可验证交付，维护依赖、风险、验收证据；"

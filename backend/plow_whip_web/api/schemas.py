@@ -261,6 +261,10 @@ class GoalCreate(BaseModel):
     # Optional bounded structured plan. Model PM is not implemented this sprint;
     # when omitted, a deterministic template (sizing flags only) is used.
     plan_items: list[dict[str, Any]] | None = None
+    role_providers: dict[
+        Literal["backend", "frontend", "ui", "devops_sre", "verification", "fullstack"],
+        Annotated[str, Field(pattern=r"^[a-z][a-z0-9-]{1,63}$")],
+    ] = Field(default_factory=dict)
 
     @field_validator("artifacts")
     @classmethod
@@ -288,6 +292,86 @@ class GoalView(BaseModel):
     work_items: list[dict[str, Any]]
     spec_revision: int
     spec: dict[str, Any]
+
+
+class ButlerConversationStart(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_type: Literal["human", "global_butler", "agent"] = "human"
+    source_id: Annotated[str | None, Field(max_length=200)] = None
+    instruction: Annotated[str, Field(min_length=1, max_length=10_000)]
+    title: Annotated[str | None, Field(max_length=200)] = None
+    objective: Annotated[str | None, Field(max_length=4000)] = None
+    boundaries: Annotated[list[str], Field(max_length=64)] = Field(default_factory=list)
+    acceptance: Annotated[list[str], Field(max_length=64)] = Field(default_factory=list)
+    scope: Annotated[list[str], Field(max_length=64)] = Field(default_factory=list)
+    artifacts: Annotated[list[str], Field(max_length=64)] = Field(default_factory=list)
+    constraints: Annotated[list[str], Field(max_length=64)] = Field(default_factory=list)
+    provider: Annotated[str, Field(pattern=r"^[a-z][a-z0-9-]{1,63}$")] = "cursor"
+    role_providers: dict[
+        Literal["backend", "frontend", "ui", "devops_sre", "verification", "fullstack"],
+        Annotated[str, Field(pattern=r"^[a-z][a-z0-9-]{1,63}$")],
+    ] = Field(default_factory=dict)
+    network_requirement: Literal["none", "any", "domestic", "overseas"] = "none"
+    verification: Annotated[list[VerificationSpec], Field(max_length=32)] = Field(
+        default_factory=lambda: [VerificationSpec(kind="exit_code", expected=0)]
+    )
+    sizing_inputs: TaskSizingEstimateRequest | None = None
+    deadline: TaskDeadline | None = None
+    command: CommandSpec | None = None
+    plan_items: list[dict[str, Any]] | None = None
+
+    @field_validator("artifacts")
+    @classmethod
+    def butler_artifact_paths_must_be_safe(cls, value: list[str]) -> list[str]:
+        if any(
+            not item or Path(item).is_absolute() or ".." in Path(item).parts
+            for item in value
+        ):
+            raise ValueError("artifacts require safe relative paths")
+        return value
+
+
+class GlobalButlerRoute(ButlerConversationStart):
+    project_id: str
+    source_type: Literal["human", "agent"] = "human"
+
+
+class ButlerAnswer(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_revision: Annotated[int, Field(ge=0)]
+    field: Literal["objective", "boundaries", "acceptance"]
+    values: Annotated[list[str], Field(min_length=1, max_length=64)]
+    sender_type: Literal["human", "agent"] = "human"
+
+
+class ButlerConfirm(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_revision: Annotated[int, Field(ge=0)]
+    proposal_hash: Annotated[str, Field(min_length=64, max_length=64)]
+    actor_type: Literal["human"]
+
+
+class ButlerConversationView(BaseModel):
+    id: str
+    scope: Literal["global", "project"]
+    project_id: str | None
+    source_type: Literal["human", "global_butler", "agent"]
+    source_id: str | None
+    status: Literal["clarifying", "awaiting_confirmation", "dispatched", "rejected"]
+    revision: int
+    confidence: int
+    expected_field: Literal["objective", "boundaries", "acceptance"] | None
+    spec: dict[str, Any]
+    proposal_hash: str | None
+    goal_id: str | None
+    idempotency_key: str
+    created_at: str
+    updated_at: str
+    messages: list[dict[str, Any]]
+    direct_project_butler_url: str | None
 
 
 class TaskEventView(BaseModel):

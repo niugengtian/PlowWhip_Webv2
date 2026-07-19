@@ -590,8 +590,10 @@ test('clears the successful preflight when the estimate API later fails', async 
   expect(screen.getByRole('button', { name: '检查 Provider 并加入任务队列' })).toBeDisabled()
 })
 
-test('submits a goal through the primary PM entry', async () => {
-  let goalPayload: Record<string, unknown> | null = null
+test('submits a goal through the project Butler confirmation gate', async () => {
+  let intakePayload: Record<string, unknown> | null = null
+  let confirmationPayload: Record<string, unknown> | null = null
+  vi.spyOn(window, 'confirm').mockReturnValue(true)
   vi.stubGlobal(
     'fetch',
     vi.fn().mockImplementation(async (input: string | URL | Request, init?: RequestInit) => {
@@ -599,29 +601,56 @@ test('submits a goal through the primary PM entry', async () => {
       if (path === '/api/tasks/estimate') {
         return { ok: true, json: async () => estimate }
       }
-      if (path === '/api/goals' && init?.method === 'POST') {
-        goalPayload = JSON.parse(String(init.body)) as Record<string, unknown>
+      if (
+        path === `/api/projects/${project.id}/butler/conversations`
+        && init?.method === 'POST'
+      ) {
+        intakePayload = JSON.parse(String(init.body)) as Record<string, unknown>
         return {
           ok: true,
           json: async () => ({
-            id: 'goal-1', title: goalPayload?.title, objective: goalPayload?.objective,
-            project_id: project.id, provider: 'cursor', status: 'running',
-            spec_revision: 1,
+            id: 'conversation-1', scope: 'project', project_id: project.id,
+            source_type: 'human', source_id: null, status: 'awaiting_confirmation',
+            revision: 0, confidence: 95, expected_field: null,
             spec: {
-              objective: goalPayload?.objective,
-              scope: goalPayload?.scope,
-              acceptance: goalPayload?.acceptance,
-              verification: goalPayload?.verification,
-              artifacts: goalPayload?.artifacts,
-              constraints: goalPayload?.constraints,
-              deadline: goalPayload?.deadline,
+              ...intakePayload,
+              boundaries: ['只改控制面'],
+              acceptance: ['并行角色可见'],
             },
-            plan: { status: 'planned', items: [], model_invoked: false },
-            sizing_inputs: goalPayload?.sizing_inputs ?? null,
-            parent_task_id: 'parent-1', created_at: '2026-07-17T00:00:00Z',
-            updated_at: '2026-07-17T00:00:00Z', work_items: [],
+            proposal_hash: 'a'.repeat(64), goal_id: null,
+            messages: [{
+              id: 'message-1', ordinal: 1, sender_type: 'project_butler',
+              kind: 'proposal', content: '请确认', payload: {}, created_at: 'now',
+            }],
+            direct_project_butler_url: `/api/projects/${project.id}/butler/conversations/conversation-1`,
           }),
         }
+      }
+      if (path.endsWith('/butler/conversations/conversation-1/confirm')) {
+        confirmationPayload = JSON.parse(String(init?.body)) as Record<string, unknown>
+        return { ok: true, json: async () => ({
+          id: 'conversation-1', scope: 'project', project_id: project.id,
+          source_type: 'human', source_id: null, status: 'dispatched',
+          revision: 1, confidence: 95, expected_field: null,
+          spec: intakePayload, proposal_hash: 'a'.repeat(64), goal_id: 'goal-1',
+          messages: [], direct_project_butler_url: null,
+        }) }
+      }
+      if (path === '/api/goals/goal-1') {
+        return { ok: true, json: async () => ({
+          id: 'goal-1', title: '无人值守目标', objective: '自动拆分并推进',
+          project_id: project.id, provider: 'cursor', status: 'running',
+          spec_revision: 1,
+          spec: {
+            objective: '自动拆分并推进', scope: ['只改控制面'],
+            acceptance: ['并行角色可见'], verification: [], artifacts: [],
+            constraints: [], deadline: { hard_seconds: 1200 },
+          },
+          plan: { status: 'planned', items: [], model_invoked: false },
+          sizing_inputs: estimate, parent_task_id: null,
+          created_at: '2026-07-17T00:00:00Z',
+          updated_at: '2026-07-17T00:00:00Z', work_items: [],
+        }) }
       }
       return {
         ok: true,
@@ -648,20 +677,29 @@ test('submits a goal through the primary PM entry', async () => {
   )
   render(<App />)
   fireEvent.click(await screen.findByRole('button', { name: '提交目标' }))
-  await screen.findByRole('heading', { name: '提交目标' })
+  await screen.findByRole('heading', { name: '确认目标后执行' })
   fireEvent.change(screen.getByLabelText('标题'), { target: { value: '无人值守目标' } })
   fireEvent.change(screen.getByLabelText('目标'), { target: { value: '自动拆分并推进' } })
+  fireEvent.change(screen.getByLabelText('边界（每行一条）'), { target: { value: '只改控制面' } })
+  fireEvent.change(screen.getByLabelText('验收标准（每行一条）'), { target: { value: '并行角色可见' } })
   fireEvent.change(screen.getByLabelText('项目'), { target: { value: project.id } })
   fireEvent.click(screen.getByRole('button', { name: '执行 0 Token 预判' }))
   await screen.findByText('服务端 Tier M')
-  fireEvent.click(screen.getByRole('button', { name: '检查 Provider 并提交目标' }))
+  fireEvent.click(screen.getByRole('button', { name: '与项目管家确认方案' }))
   expect(await screen.findByText('目标已拆分并进入自动推进')).toBeInTheDocument()
-  expect(goalPayload).toMatchObject({
+  expect(intakePayload).toMatchObject({
     title: '无人值守目标',
     objective: '自动拆分并推进',
-    project_id: project.id,
+    instruction: '自动拆分并推进',
+    boundaries: ['只改控制面'],
+    acceptance: ['并行角色可见'],
   })
-  expect(goalPayload).not.toHaveProperty('role')
+  expect(intakePayload).not.toHaveProperty('project_id')
+  expect(confirmationPayload).toEqual({
+    expected_revision: 0,
+    proposal_hash: 'a'.repeat(64),
+    actor_type: 'human',
+  })
 })
 
 test('shows every legacy quality profile as deterministic verification', async () => {
