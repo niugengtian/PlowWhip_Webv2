@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import json
-import uuid
 from typing import Any
 
+from plow_whip_web.runtime.aggregate_reducer import AggregateReducer
 from plow_whip_web.store.database import Database
 
 
@@ -30,6 +30,7 @@ class RecoveryService:
             for task in stale:
                 target = "ready" if task["attempts_used"] < task["max_attempts"] else "needs_human"
                 revision = task["revision"] + 1
+                event_key = f"recovery:{task['id']}:{revision}"
                 connection.execute(
                     "UPDATE tasks SET status = ?, revision = ?, worker_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                     (target, revision, task["id"]),
@@ -50,9 +51,10 @@ class RecoveryService:
                 )
                 connection.execute(
                     """
-                    UPDATE token_reservations
-                    SET status = 'released', settled_at = CURRENT_TIMESTAMP
-                    WHERE task_id = ? AND status = 'active'
+                    UPDATE model_calls
+                    SET status = 'failed', error_class = 'recovery_released',
+                        settled_at = CURRENT_TIMESTAMP
+                    WHERE task_id = ? AND status = 'prepared'
                     """,
                     (task["id"],),
                 )
@@ -63,8 +65,25 @@ class RecoveryService:
                     """,
                     (
                         task["id"], json.dumps({"target": target}, sort_keys=True), revision,
-                        f"recovery:{task['id']}:{uuid.uuid4()}",
+                        event_key,
                     ),
+                )
+                AggregateReducer.record(
+                    connection,
+                    aggregate_type="task",
+                    aggregate_id=task["id"],
+                    revision=revision,
+                    idempotency_key=f"task-transition:{event_key}",
+                    actor_type="runtime",
+                    actor_id=None,
+                    reason="task.recovered",
+                    previous_state={
+                        "status": task["status"],
+                        "revision": int(task["revision"]),
+                    },
+                    new_state={"status": target, "revision": revision},
+                    previous_evidence_hash=task["last_evidence_hash"],
+                    new_evidence_hash=task["last_evidence_hash"],
                 )
                 if target == "needs_human":
                     connection.execute(

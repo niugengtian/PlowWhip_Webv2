@@ -134,6 +134,19 @@ button.full { width: 100%; }
 .work-item-card header strong { color: #dce5f8; font-size: .75rem; }
 .work-item-card header small { margin-top: 3px; color: #687b9f; font-size: .62rem; }
 .work-item-card .facts { border: 0; }
+.control-plane { border-bottom: 1px solid var(--line); padding: 17px 18px; }
+.control-plane > .facts { margin: 0 -18px; }
+.control-list { margin-top: 16px; }
+.control-list h3 { margin: 0 0 8px; color: #c7d2ea; font-size: .76rem; }
+.help-grid { display: grid; gap: 10px; padding: 14px; }
+.help-card { margin-top: 6px; border: 1px solid #26324d; border-radius: 6px; padding: 12px; background: #111725; }
+.help-card header { display: flex; justify-content: space-between; gap: 12px; }
+.help-card header strong, .help-card header small { display: block; }
+.help-card header small, .help-card code { margin-top: 4px; color: #65779c; font-size: .62rem; }
+.help-card p, .help-card blockquote { color: #9aa9c9; font-size: .72rem; line-height: 1.55; }
+.help-card blockquote { margin: 8px 0; border-left: 2px solid #395688; padding-left: 10px; }
+.help-card textarea { min-height: 66px; }
+.help-card .detail-actions { padding: 10px 0 0; }
 .artifacts { border-bottom: 1px solid var(--line); padding: 17px 18px; }
 .section-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
 .section-heading h2 { margin: 3px 0 0; color: #d9e2f7; font-size: .86rem; }

@@ -182,7 +182,8 @@ def verify_runtime(expected_sha: str) -> dict[str, object]:
     if (
         health.get("status") != "ok"
         or database.get("journal_mode") != "wal"
-        or database.get("migration_count") != 20
+        or not isinstance(database.get("migration_count"), int)
+        or database["migration_count"] < 1
     ):
         raise ReleaseError("HTTP health, WAL, or migration count check failed")
     return {

@@ -21,6 +21,7 @@ class ExecutionResult:
     cached_input_tokens: int = 0
     output_tokens: int = 0
     external_session_id: str | None = None
+    snapshot_kind: str = "per_call"
     attribution_granularity: str = "turn"
     value_classification: str = "unknown"
 
@@ -35,6 +36,7 @@ class ExecutionResult:
             "cached_input_tokens": self.cached_input_tokens,
             "output_tokens": self.output_tokens,
             "external_session_id": self.external_session_id,
+            "snapshot_kind": self.snapshot_kind,
             "attribution_granularity": self.attribution_granularity,
             "value_classification": self.value_classification,
         }

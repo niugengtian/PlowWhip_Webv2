@@ -186,7 +186,7 @@ def test_one_hundred_fault_injection_policy_cases_are_bounded(case: int) -> None
     classes = [
         "timeout", "command_failed", "verification_failed", "no_progress",
         "database_locked", "domestic_unavailable", "overseas_unavailable", "offline",
-        "provider_auth", "permission_denied", "budget_exceeded", "unknown",
+        "provider_auth", "permission_denied", "unknown",
     ]
     failure = classes[case % len(classes)]
     occurrences = case % 5 + 1
@@ -195,6 +195,6 @@ def test_one_hundred_fault_injection_policy_cases_are_bounded(case: int) -> None
     assert decision in {"defer", "needs_human", "terminal_failed", "retry_backoff"}
     if failure in {"database_locked", "domestic_unavailable", "overseas_unavailable", "offline"}:
         assert decision == "defer"
-    if failure in {"provider_auth", "permission_denied", "budget_exceeded"}:
+    if failure in {"provider_auth", "permission_denied"}:
         assert decision == "needs_human"
     assert FaultPolicy.model_invoked is False

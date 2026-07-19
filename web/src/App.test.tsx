@@ -35,6 +35,7 @@ let listedTasks: Record<string, unknown>[] = []
 let listedGoals: Record<string, unknown>[] = []
 let listedProviders: Record<string, unknown>[] = []
 let listedProjects: Record<string, unknown>[] = []
+let listedHelp: Record<string, unknown>[] = []
 
 class FakeEventSource {
   static instances: FakeEventSource[] = []
@@ -72,6 +73,7 @@ beforeEach(() => {
   listedGoals = []
   listedProviders = [provider]
   listedProjects = [project]
+  listedHelp = []
   FakeEventSource.instances = []
   vi.stubGlobal(
     'fetch',
@@ -132,9 +134,21 @@ beforeEach(() => {
           command: {}, verification: [], sizing: estimate, execution_budget: {}, manual_override: false, override_reason: null,
         }) }
       }
+      if (path.startsWith('/api/aggregates/') && path.endsWith('/control-plane')) {
+        const parts = path.split('/')
+        const aggregateType = parts[3]
+        const aggregateId = parts[4]
+        return { ok: true, json: async () => ({
+          aggregate_type: aggregateType, aggregate_id: aggregateId,
+          canonical_state: { status: 'running', revision: 1, evidence_hash: null, updated_at: '2026-07-17T00:00:00Z' },
+          next_action: { kind: 'observe', label: '观察 canonical 执行状态', requires_owner: false },
+          session_identity: 'project_id+role_id+task_id', provider_sessions: [], help_requests: [],
+          lineage: [], deletion: { status: 'stop_required', eligible: false, next_action: 'request_safe_stop', expected_revision: 1, active_task_ids: [aggregateId], pending_host_jobs: [], cascade_task_count: 0, artifact_files_deleted: false, usage_retention: 'anonymous' },
+        }) }
+      }
       return {
         ok: true,
-        json: async () => path === '/api/projects' ? listedProjects : path === '/api/providers' ? listedProviders : path === '/api/goals' ? listedGoals : path === '/api/tasks' ? listedTasks : path.endsWith('/events') || path.endsWith('/artifacts') || ['/api/outbox', '/api/audit', '/api/permissions'].includes(path) ? [] : path === '/api/settings' ? settings : path === '/api/scheduler/status' ? scheduler : path === '/api/system/health' ? ({ connectivity: 'unknown', domestic_ok: null, overseas_ok: null, last_tick_at: null, last_resume_at: null, consecutive_failures: 0 }) : path === '/api/usage' ? ({ input_tokens: 0, output_tokens: 0, total_tokens: 0, control_tokens: 0, projects: [], tasks: [] }) : path === '/api/conventions/global/global' ? ({ scope: 'global', scope_id: 'global', content: '', revision: 0, updated_at: null }) : ({
+        json: async () => path === '/api/projects' ? listedProjects : path === '/api/providers' ? listedProviders : path === '/api/goals' ? listedGoals : path === '/api/tasks' ? listedTasks : path === '/api/butler/help' ? listedHelp : path.endsWith('/events') || path.endsWith('/artifacts') || ['/api/outbox', '/api/audit', '/api/permissions'].includes(path) ? [] : path === '/api/settings' ? settings : path === '/api/scheduler/status' ? scheduler : path === '/api/system/health' ? ({ connectivity: 'unknown', domestic_ok: null, overseas_ok: null, last_tick_at: null, last_resume_at: null, consecutive_failures: 0 }) : path === '/api/usage' ? ({ input_tokens: 0, output_tokens: 0, total_tokens: 0, control_tokens: 0, projects: [], tasks: [] }) : path === '/api/conventions/global/global' ? ({ scope: 'global', scope_id: 'global', content: '', revision: 0, updated_at: null }) : ({
           status: 'ok',
           version: '0.1.0',
           database: { status: 'ok', journal_mode: 'wal', migration_count: 8 },
@@ -161,6 +175,36 @@ test('shows the approved product priority', () => {
   expect(
     screen.getByText('保障质量并消除无价值循环，同时保留高价值上下文。'),
   ).toBeInTheDocument()
+})
+
+test('shows durable owner escalation and persists the owner reply', async () => {
+  const help = {
+    id: 'help-1', project_id: project.id, goal_id: null, task_id: 'task-1', worker_id: 'worker-1',
+    category: 'decision', severity: 'blocking', status: 'owner_escalated',
+    question: '选择安全方案？', checkpoint: { task_id: 'task-1' }, revision: 1,
+    created_at: '2026-07-17T00:00:00Z', updated_at: '2026-07-17T00:01:00Z', resolved_at: null,
+    replies: [{ id: 'reply-1', revision: 1, sender: 'butler', content: '需要主人决定', bounded_context: { task_id: 'task-1' }, created_at: '2026-07-17T00:01:00Z' }],
+  }
+  listedHelp = [help]
+  let replyPayload: Record<string, unknown> | null = null
+  const defaultFetch = vi.mocked(fetch)
+  vi.stubGlobal('fetch', vi.fn().mockImplementation(async (input: string | URL | Request, init?: RequestInit) => {
+    if (String(input) === '/api/butler/help/help-1/replies') {
+      replyPayload = JSON.parse(String(init?.body)) as Record<string, unknown>
+      listedHelp = [{ ...help, status: 'answered', revision: 2, resolved_at: '2026-07-17T00:02:00Z' }]
+      return { ok: true, json: async () => listedHelp[0] }
+    }
+    return defaultFetch(input, init)
+  }))
+
+  render(<App />)
+  fireEvent.click(await screen.findByRole('button', { name: '立即处理' }))
+  expect(screen.getByRole('heading', { name: '求助、回复与主人升级' })).toBeInTheDocument()
+  fireEvent.change(screen.getByLabelText('回复 help-1'), { target: { value: '采用方案 A' } })
+  fireEvent.click(screen.getByRole('button', { name: '主人回复并解决' }))
+
+  expect(await screen.findByText('回复已持久化')).toBeInTheDocument()
+  expect(replyPayload).toMatchObject({ sender: 'owner', content: '采用方案 A', escalate: false })
 })
 
 test('uses EventSource refresh and closes it on unmount', async () => {
@@ -244,6 +288,7 @@ test('keeps task and goal selection mutually exclusive and shows layered goal ru
     work_items: [{
       id: 'child-1', ordinal: 2, title: 'UI child', work_item_kind: 'ui', provider: 'cursor',
       depends_on: ['child-0'], status: 'running', blocked_reason: 'waiting for backend',
+      external_session_id: 'cursor-session-7', session_generation: 18,
       sizing: { size_class: 'M', status: 'estimated' },
       execution_budget: { total_token_hard_cap: 225_000, hard_deadline_seconds: 1200 },
       verification: [{ kind: 'file_exists', path: 'result.txt' }],
@@ -269,7 +314,7 @@ test('keeps task and goal selection mutually exclusive and shows layered goal ru
 
   expect(screen.getByRole('heading', { name: 'Release Goal' })).toBeInTheDocument()
   expect(screen.getByText('结构化/确定性计划，模型 PM 尚未实现')).toBeInTheDocument()
-  for (const label of ['角色 / Provider', '依赖', '阻塞原因', 'Worker session', 'Generation', 'Rotation reason', 'Last context pressure', 'Pressure trigger', 'Sizing', 'Budget', 'Attempt / progress', 'Verification', 'Output ref', 'Segments / bytes / offset', 'Cached 计入 Total', 'Hard cap']) {
+  for (const label of ['角色 / Provider', '依赖', '阻塞原因', 'Physical session', 'Task generation', 'Rotation reason', 'Last context pressure', 'Pressure trigger', 'Sizing', 'Usage estimate', 'Attempt / progress', 'Verification', 'Output ref', 'Segments / bytes / offset', 'Cached 计入 Total', 'Token control']) {
     expect(screen.getByText(label)).toBeInTheDocument()
   }
   expect(screen.getByText('cursor-session-7')).toBeInTheDocument()
@@ -278,7 +323,7 @@ test('keeps task and goal selection mutually exclusive and shows layered goal ru
   expect(screen.getByText('sessions/ui/current.jsonl')).toBeInTheDocument()
   expect(screen.getByText('3 / 8192 / 4096')).toBeInTheDocument()
   expect(screen.getByText('是，已包含在 Input 中，不重复相加')).toBeInTheDocument()
-  expect(screen.getByText('结算硬门；派发前执行 context-pressure guard')).toBeInTheDocument()
+  expect(screen.getByText('observe-only；不拒派发、不取消、不改写终态')).toBeInTheDocument()
   expect(screen.getByText(/turn \/ unknown/)).toBeInTheDocument()
   expect(screen.getByText(/Uncached 不等于新工作或有价值/)).toBeInTheDocument()
 })
@@ -470,8 +515,8 @@ test('clears the successful preflight when the estimate API later fails', async 
   expect(screen.getByRole('button', { name: '检查 Provider 并加入任务队列' })).toBeDisabled()
 })
 
-test('submits a goal through the primary PM entry', async () => {
-  let goalPayload: Record<string, unknown> | null = null
+test('submits a goal through the unified Butler intake', async () => {
+  let intakePayload: Record<string, unknown> | null = null
   vi.stubGlobal(
     'fetch',
     vi.fn().mockImplementation(async (input: string | URL | Request, init?: RequestInit) => {
@@ -479,15 +524,31 @@ test('submits a goal through the primary PM entry', async () => {
       if (path === '/api/tasks/estimate') {
         return { ok: true, json: async () => estimate }
       }
-      if (path === '/api/goals' && init?.method === 'POST') {
-        goalPayload = JSON.parse(String(init.body)) as Record<string, unknown>
+      if (path === '/api/butler/intakes' && init?.method === 'POST') {
+        intakePayload = JSON.parse(String(init.body)) as Record<string, unknown>
         return {
           ok: true,
           json: async () => ({
-            id: 'goal-1', title: goalPayload?.title, objective: goalPayload?.objective,
+            id: 'intake-1', project_id: project.id, source: 'structured',
+            instruction: intakePayload?.instruction, input: intakePayload?.structured_input,
+            status: 'dispatched', deterministic_size: 'medium', assessed_size: 'medium',
+            confidence: 80, revision: 1, current_question_id: null,
+            proposal: {}, proposal_hash: 'a'.repeat(64),
+            confirmed_proposal_hash: null, selected_provider: 'cursor',
+            goal_id: 'goal-1', questions: [],
+          }),
+        }
+      }
+      if (path === '/api/goals/goal-1') {
+        const structured = intakePayload?.structured_input as Record<string, unknown>
+        return {
+          ok: true,
+          json: async () => ({
+            id: 'goal-1', title: structured.title, objective: intakePayload?.instruction,
             project_id: project.id, provider: 'cursor', status: 'running',
+            revision: 0, last_evidence_hash: null,
             plan: { status: 'planned', items: [], model_invoked: false },
-            sizing_inputs: goalPayload?.sizing_inputs ?? null,
+            sizing_inputs: structured.sizing_inputs ?? null,
             parent_task_id: 'parent-1', created_at: '2026-07-17T00:00:00Z',
             updated_at: '2026-07-17T00:00:00Z', work_items: [],
           }),
@@ -508,7 +569,7 @@ test('submits a goal through the primary PM entry', async () => {
           engine: { backend: 'embedded-cron', active: true, managed_by: 'docker', data_dir: '/data' },
           schedule: { enabled: true, expression: '*/1 * * * *', timezone: 'Asia/Shanghai', misfire_policy: 'catch_up_once', next_run_at: null },
           authorization_required: false, model_invoked: false,
-        }) : path === '/api/system/health' ? ({ connectivity: 'unknown', domestic_ok: null, overseas_ok: null, last_tick_at: null, last_resume_at: null, consecutive_failures: 0 }) : path === '/api/usage' ? ({ input_tokens: 0, output_tokens: 0, total_tokens: 0, control_tokens: 0, projects: [], tasks: [] }) : path === '/api/conventions/global/global' ? ({ scope: 'global', scope_id: 'global', content: '', revision: 0, updated_at: null }) : ['/api/outbox', '/api/audit', '/api/permissions'].includes(path) || path.endsWith('/events') || path.endsWith('/artifacts') ? [] : ({
+        }) : path === '/api/system/health' ? ({ connectivity: 'unknown', domestic_ok: null, overseas_ok: null, last_tick_at: null, last_resume_at: null, consecutive_failures: 0 }) : path === '/api/usage' ? ({ input_tokens: 0, output_tokens: 0, total_tokens: 0, control_tokens: 0, projects: [], tasks: [] }) : path === '/api/conventions/global/global' ? ({ scope: 'global', scope_id: 'global', content: '', revision: 0, updated_at: null }) : path.startsWith('/api/aggregates/') ? ({ aggregate_type: 'goal', aggregate_id: 'goal-1', canonical_state: { status: 'running', revision: 0, evidence_hash: null, updated_at: '2026-07-17T00:00:00Z' }, next_action: { kind: 'observe', label: '观察 canonical 执行状态', requires_owner: false }, session_identity: 'project_id+role_id+task_id', provider_sessions: [], help_requests: [], lineage: [], deletion: { status: 'deletable', eligible: true, next_action: 'delete', expected_revision: 0, active_task_ids: [], pending_host_jobs: [], cascade_task_count: 0, artifact_files_deleted: false, usage_retention: 'anonymous' } }) : ['/api/outbox', '/api/audit', '/api/permissions', '/api/butler/help'].includes(path) || path.endsWith('/events') || path.endsWith('/artifacts') ? [] : ({
           status: 'ok', version: '0.1.0', database: { status: 'ok', journal_mode: 'wal', migration_count: 17 },
         }),
       }
@@ -523,13 +584,14 @@ test('submits a goal through the primary PM entry', async () => {
   fireEvent.click(screen.getByRole('button', { name: '执行 0 Token 预判' }))
   await screen.findByText('服务端 Tier M')
   fireEvent.click(screen.getByRole('button', { name: '检查 Provider 并提交目标' }))
-  expect(await screen.findByText('目标已拆分并进入自动推进')).toBeInTheDocument()
-  expect(goalPayload).toMatchObject({
-    title: '无人值守目标',
-    objective: '自动拆分并推进',
+  expect(await screen.findByText('目标已进入 Butler intake')).toBeInTheDocument()
+  expect(intakePayload).toMatchObject({
+    source: 'structured',
+    instruction: '自动拆分并推进',
     project_id: project.id,
+    structured_input: { title: '无人值守目标' },
   })
-  expect(goalPayload).not.toHaveProperty('role')
+  expect(intakePayload).not.toHaveProperty('role')
 })
 
 test('shows every legacy quality profile as deterministic verification', async () => {

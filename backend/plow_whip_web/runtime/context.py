@@ -9,6 +9,7 @@ from typing import Any
 
 from plow_whip_web.domain.model import DomainError
 from plow_whip_web.roles import ROLE_PROMPTS
+from plow_whip_web.runtime.continuity import resolve_continuity_limits
 from plow_whip_web.store.convention_repository import ConventionRepository
 from plow_whip_web.store.database import Database
 from plow_whip_web.store.settings_repository import SettingsRepository
@@ -33,6 +34,13 @@ class ContextCompiler:
     def compile(self, task_id: str) -> dict[str, Any]:
         task = self.tasks.get(task_id)
         role = self._role(task.role_id)
+        conventions = self.conventions.resolve(
+            project_id=task.project_id, task_id=task.id
+        )
+        continuity = resolve_continuity_limits(
+            self.settings.get()["values"], conventions
+        )
+        limits = continuity["values"]
         sections: list[tuple[str, int, int]] = [
             ("## Objective\n" + task.objective, 3, 512),
             ("## Role\n" + ROLE_PROMPTS.get(role, ROLE_PROMPTS["fullstack"]), 2, 384),
@@ -54,7 +62,7 @@ class ContextCompiler:
                     failure_delta, ensure_ascii=False, sort_keys=True,
                     separators=(",", ":"),
                 ),
-                4096,
+                limits["checkpoint_max_bytes"],
             )
             sections.append((
                 "## Previous verification Evidence Delta\n"
@@ -69,7 +77,7 @@ class ContextCompiler:
                     task.handoff, ensure_ascii=False, sort_keys=True,
                     separators=(",", ":"),
                 ),
-                2048,
+                limits["handoff_max_bytes"],
             )
             sections.append((
                 "## Role Handoff\n"
@@ -79,7 +87,7 @@ class ContextCompiler:
                 5,
                 512,
             ))
-        for convention in self.conventions.resolve(project_id=task.project_id, task_id=task.id):
+        for convention in conventions:
             if convention["content"]:
                 priority, floor = {
                     "global": (0, 0),
@@ -93,9 +101,18 @@ class ContextCompiler:
                 ))
         protected = [
             f"## Boundaries\nProject path: {task.project_path}\nTask id: {task.id}\nWorker id: {task.worker_id or 'pending'}",
+            "## Effective continuity limits\n" + json.dumps(
+                {
+                    key: {"value": value, "source": continuity["sources"][key]}
+                    for key, value in limits.items()
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
             "## Completion rule\nOnly verification evidence can move this task to completed.",
         ]
-        max_bytes = self.settings.get()["values"]["context_max_bytes"]
+        max_bytes = limits["context_max_bytes"]
         content = _fit_sections(sections, protected, max_bytes)
         digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
         relative = Path("contexts") / task.id / f"{digest}.md"
@@ -121,8 +138,20 @@ class ContextCompiler:
         return {
             "task_id": task.id, "role": role, "content": content, "content_hash": digest,
             "byte_size": len(content.encode("utf-8")), "max_bytes": max_bytes,
+            "effective_limits": {
+                key: {"value": value, "source": continuity["sources"][key]}
+                for key, value in limits.items()
+            },
+            "warnings": continuity["warnings"],
             "relative_path": str(relative), "model_invoked": False,
         }
+
+    def effective_limits(self, task_id: str) -> dict[str, Any]:
+        task = self.tasks.get(task_id)
+        return resolve_continuity_limits(
+            self.settings.get()["values"],
+            self.conventions.resolve(project_id=task.project_id, task_id=task.id),
+        )
 
     def _role(self, role_id: str | None) -> str:
         if role_id is None:

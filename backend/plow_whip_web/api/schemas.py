@@ -144,6 +144,57 @@ class ExpectedRevision(BaseModel):
     expected_revision: Annotated[int, Field(ge=0)]
 
 
+class DeletionRequest(ExpectedRevision):
+    reason: Annotated[str, Field(min_length=1, max_length=1000)]
+    actor_id: Annotated[str | None, Field(max_length=200)] = None
+
+
+class EvidenceRewriteRequest(ExpectedRevision):
+    evidence_hash: Annotated[str, Field(min_length=8, max_length=256)]
+    reason: Annotated[str, Field(min_length=1, max_length=1000)]
+    actor_id: Annotated[str | None, Field(max_length=200)] = None
+
+
+class ButlerIntakeCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    project_id: str
+    source: Literal["structured", "natural_language"]
+    instruction: Annotated[str, Field(min_length=1, max_length=8000)]
+    structured_input: dict[str, Any] | None = None
+    model_size: Literal["small", "medium", "large"] | None = None
+    confidence: Annotated[int, Field(ge=0, le=100)] = 0
+    proposal: dict[str, Any] | None = None
+
+
+class ButlerAnswer(ExpectedRevision):
+    answer: Annotated[str, Field(min_length=1, max_length=4000)]
+    confidence: Annotated[int, Field(ge=0, le=100)]
+    proposal: dict[str, Any] | None = None
+
+
+class ButlerConfirm(ExpectedRevision):
+    proposal_hash: Annotated[str, Field(min_length=64, max_length=64)]
+    approved: bool
+    reason: Annotated[str, Field(min_length=1, max_length=1000)]
+
+
+class WorkerHelpCreate(BaseModel):
+    project_id: str
+    task_id: str
+    worker_id: str | None = None
+    category: Annotated[str, Field(min_length=1, max_length=100)]
+    severity: Literal["normal", "blocking", "extreme"] = "normal"
+    question: Annotated[str, Field(min_length=1, max_length=4000)]
+    checkpoint: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkerHelpReply(ExpectedRevision):
+    sender: Literal["butler", "owner", "system"]
+    content: Annotated[str, Field(min_length=1, max_length=4000)]
+    bounded_context: dict[str, Any] = Field(default_factory=dict)
+    escalate: bool = False
+
+
 class TaskView(BaseModel):
     id: str
     title: str
@@ -216,6 +267,8 @@ class GoalView(BaseModel):
     project_id: str
     provider: str
     status: str
+    revision: int = 0
+    last_evidence_hash: str | None = None
     plan: dict[str, Any]
     sizing_inputs: dict[str, Any] | None
     parent_task_id: str | None
@@ -296,7 +349,12 @@ class RuntimeSettingsValues(BaseModel):
     convention_refinement_token_budget: Annotated[int, Field(ge=1, le=100_000_000)] = 10_000
     max_same_failure: Annotated[int, Field(ge=1, le=20)] = 2
     max_no_progress: Annotated[int, Field(ge=1, le=20)] = 3
+    session_no_progress_rotation_threshold: Annotated[int, Field(ge=1, le=20)] = 2
     context_max_bytes: Annotated[int, Field(ge=4096, le=1_048_576)] = 32_768
+    checkpoint_max_bytes: Annotated[int, Field(ge=512, le=262_144)] = 4096
+    handoff_max_bytes: Annotated[int, Field(ge=512, le=262_144)] = 4096
+    observation_tail_lines: Annotated[int, Field(ge=1, le=200)] = 20
+    observation_max_bytes: Annotated[int, Field(ge=1024, le=1_048_576)] = 65_536
     rotation_max_bytes: Annotated[int, Field(ge=16_384, le=16_777_216)] = 262_144
     @model_validator(mode="after")
     def lease_must_exceed_interval(self) -> "RuntimeSettingsValues":

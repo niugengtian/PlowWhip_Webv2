@@ -1,5 +1,7 @@
 # Codex P1 优化结果
 
+> 历史实现报告。其 Token reservation、hard-cap 拒派发/终态 Gate 已由迁移 0021 和 observe-only `model_calls` ledger 删除；当前事实以 `BUTLER_CONTROL_PLANE_RESULT.md`、`ARCHITECTURE.md` 和 `RUNBOOK.md` 为准。
+
 日期：2026-07-17
 
 ## 工作树边界

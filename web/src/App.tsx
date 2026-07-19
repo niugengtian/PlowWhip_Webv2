@@ -5,9 +5,9 @@ import {
   Plus, Pulse, Robot, ShieldCheck, TerminalWindow, WarningCircle, X,
 } from '@phosphor-icons/react'
 import {
-  api, AuditEntry, Convention, ConventionSuggestion, Goal, OutboxEvent, PermissionGrant,
+  AggregateControlPlane, api, AuditEntry, ButlerIntake, Convention, ConventionSuggestion, Goal, OutboxEvent, PermissionGrant,
   Project, Provider, RuntimeHealth, RuntimeSettings, SchedulerStatus, Task, TaskArtifact, TaskEvent,
-  TaskSizingEstimate, TaskSizingInputs, TaskStatus, Usage, Worker,
+  TaskSizingEstimate, TaskSizingInputs, TaskStatus, Usage, Worker, WorkerHelp,
 } from './api'
 import { startLiveRefresh } from './liveRefresh'
 
@@ -17,7 +17,7 @@ type Health = {
   database: { status: string; journal_mode: string; migration_count: number }
 }
 
-type View = 'board' | 'tasks' | 'projects' | 'workers' | 'providers' | 'usage' | 'audit' | 'settings'
+type View = 'board' | 'tasks' | 'butler' | 'projects' | 'workers' | 'providers' | 'usage' | 'audit' | 'settings'
 
 const roleNames: Record<string, string> = {
   coordination: '协调 / PM',
@@ -38,6 +38,7 @@ const statusNames: Record<TaskStatus, string> = {
 const navItems: { id: View; label: string; icon: typeof Kanban }[] = [
   { id: 'board', label: '任务看板', icon: Kanban },
   { id: 'tasks', label: '任务', icon: ListChecks },
+  { id: 'butler', label: 'Butler', icon: Robot },
   { id: 'projects', label: '项目', icon: FolderOpen },
   { id: 'workers', label: 'Worker', icon: Robot },
   { id: 'providers', label: 'Provider', icon: TerminalWindow },
@@ -75,6 +76,7 @@ export function App() {
   const [usage, setUsage] = useState<Usage | null>(null)
   const [audit, setAudit] = useState<AuditEntry[]>([])
   const [outbox, setOutbox] = useState<OutboxEvent[]>([])
+  const [helpRequests, setHelpRequests] = useState<WorkerHelp[]>([])
   const [permissions, setPermissions] = useState<PermissionGrant[]>([])
   const [convention, setConvention] = useState<Convention | null>(null)
   const [suggestion, setSuggestion] = useState<ConventionSuggestion | null>(null)
@@ -83,6 +85,7 @@ export function App() {
   const [selectedGoal, setSelectedGoal] = useState<Goal | null>(null)
   const [events, setEvents] = useState<TaskEvent[]>([])
   const [artifacts, setArtifacts] = useState<TaskArtifact[]>([])
+  const [controlPlane, setControlPlane] = useState<AggregateControlPlane | null>(null)
   const [artifactError, setArtifactError] = useState<string | null>(null)
   const [selectedProject, setSelectedProject] = useState<string>('all')
   const [taskForm, setTaskForm] = useState(initialTask)
@@ -97,6 +100,7 @@ export function App() {
   const [projectForm, setProjectForm] = useState({ name: '', path: '', hostPath: '' })
   const [showCreateTask, setShowCreateTask] = useState(false)
   const [showCreateGoal, setShowCreateGoal] = useState(false)
+  const [butlerIntake, setButlerIntake] = useState<ButlerIntake | null>(null)
   const [taskEstimate, setTaskEstimate] = useState<TaskSizingEstimate | null>(null)
   const [goalEstimate, setGoalEstimate] = useState<TaskSizingEstimate | null>(null)
   const [estimatedSizingInputs, setEstimatedSizingInputs] = useState<TaskSizingInputs | null>(null)
@@ -117,6 +121,7 @@ export function App() {
   }, [])
   const refreshProjects = useCallback(async () => setProjects(await api.projects()), [])
   const refreshProviders = useCallback(async () => setProviders(await api.providers()), [])
+  const refreshHelp = useCallback(async () => setHelpRequests(await api.helpRequests()), [])
 
   useEffect(() => {
     Promise.all([
@@ -125,6 +130,7 @@ export function App() {
       api.settings().then(setSettings), api.schedulerStatus().then(setScheduler),
       api.runtimeHealth().then(setRuntimeHealth), api.usage().then(setUsage),
       api.audit().then(setAudit), api.outbox().then(setOutbox), api.permissions().then(setPermissions),
+      api.helpRequests().then(setHelpRequests),
       api.convention('global', 'global').then(setConvention),
     ]).catch((reason: unknown) => setError(messageOf(reason)))
   }, [])
@@ -149,8 +155,21 @@ export function App() {
   }, [selectedTask?.id, selectedTask?.revision])
 
   useEffect(() => {
-    return startLiveRefresh(() => Promise.all([refreshTasks(), refreshGoals()]))
-  }, [refreshTasks, refreshGoals])
+    const aggregateType = selectedTask ? 'task' : selectedGoal ? 'goal' : null
+    const aggregateId = selectedTask?.id ?? selectedGoal?.id
+    if (!aggregateType || !aggregateId) return
+    let current = true
+    api.aggregateControlPlane(aggregateType, aggregateId).then((next) => {
+      if (current) setControlPlane(next)
+    }).catch((reason: unknown) => {
+      if (current) setError(messageOf(reason))
+    })
+    return () => { current = false }
+  }, [selectedTask, selectedGoal])
+
+  useEffect(() => {
+    return startLiveRefresh(() => Promise.all([refreshTasks(), refreshGoals(), refreshHelp()]))
+  }, [refreshTasks, refreshGoals, refreshHelp])
 
   function selectTask(task: Task) {
     if (selectedTask?.id !== task.id) {
@@ -160,6 +179,7 @@ export function App() {
     }
     setSelectedTask(task)
     setSelectedGoal(null)
+    setControlPlane(null)
     setView('tasks')
   }
 
@@ -169,12 +189,17 @@ export function App() {
     setArtifactError(null)
     setSelectedGoal(goal)
     setSelectedTask(null)
+    setControlPlane(null)
     setView('tasks')
   }
 
   const visibleTasks = useMemo(
     () => selectedProject === 'all' ? tasks : tasks.filter((task) => task.project_id === selectedProject),
     [selectedProject, tasks],
+  )
+  const visibleHelp = useMemo(
+    () => selectedProject === 'all' ? helpRequests : helpRequests.filter((item) => item.project_id === selectedProject),
+    [helpRequests, selectedProject],
   )
   const workers = useMemo(
     () => projects.flatMap((project) => project.workers.map((worker) => ({ project, worker }))),
@@ -242,16 +267,47 @@ export function App() {
         if (!Array.isArray(args) || args.some((value) => typeof value !== 'string')) throw new Error('参数必须是字符串 JSON 数组')
         payload.command = { argv: [goalForm.executable, ...args] }
       }
-      let created: Goal
+      let intake: ButlerIntake
       try {
-        created = await api.createGoal(payload)
+        intake = await api.createButlerIntake({
+          project_id: goalForm.projectId,
+          source: 'structured',
+          instruction: goalForm.objective,
+          structured_input: payload,
+          confidence: 80,
+        })
       } finally {
         await refreshProviders()
       }
-      await Promise.all([refreshGoals(), refreshTasks()])
-      selectGoal(created)
-      setShowCreateGoal(false)
-    }, '目标已拆分并进入自动推进')
+      setButlerIntake(intake)
+      if (intake.status === 'dispatched') await completeButlerDispatch(intake)
+    }, '目标已进入 Butler intake')
+  }
+
+  async function completeButlerDispatch(intake: ButlerIntake) {
+    if (!intake.goal_id) throw new Error('Butler 未返回已派发 Goal')
+    const created = await api.getGoal(intake.goal_id)
+    await Promise.all([refreshGoals(), refreshTasks()])
+    selectGoal(created)
+    setButlerIntake(null)
+    setShowCreateGoal(false)
+  }
+
+  async function answerButler(answer: string, confidence: number) {
+    if (!butlerIntake) return
+    await action(async () => {
+      const next = await api.answerButlerIntake(butlerIntake, answer, confidence)
+      setButlerIntake(next)
+    }, '回答已持久化；大型目标仍需确认方案')
+  }
+
+  async function confirmButler(approved: boolean) {
+    if (!butlerIntake) return
+    await action(async () => {
+      const next = await api.confirmButlerIntake(butlerIntake, approved)
+      setButlerIntake(next)
+      if (next.status === 'dispatched') await completeButlerDispatch(next)
+    }, approved ? '主人已确认方案，目标开始派发' : '主人已拒绝方案')
   }
 
   async function estimateTask() {
@@ -293,6 +349,24 @@ export function App() {
 
   async function controlTask(task: Task, control: 'pause' | 'resume' | 'cancel' | 'needs_human') {
     await action(async () => { await api.controlTask(task, control, `operator_${control}`); await refreshTasks() })
+  }
+
+  async function deleteTask(task: Task) {
+    if (!window.confirm(`删除 Task「${task.title}」？活跃执行会先安全停止，产物文件不会删除。`)) return
+    await action(async () => {
+      await api.deleteTask(task)
+      setSelectedTask(null)
+      await Promise.all([refreshTasks(), refreshGoals()])
+    }, 'Task 删除请求已持久化')
+  }
+
+  async function deleteGoal(goal: Goal) {
+    if (!window.confirm(`删除 Goal「${goal.title}」及其控制面 Task？产物文件不会删除。`)) return
+    await action(async () => {
+      await api.deleteGoal(goal)
+      setSelectedGoal(null)
+      await Promise.all([refreshGoals(), refreshTasks()])
+    }, 'Goal 级联删除请求已持久化')
   }
 
   async function driveTask(task: Task) {
@@ -345,6 +419,21 @@ export function App() {
     }, '精炼建议已生成，尚未写入')
   }
 
+  async function replyHelp(
+    help: WorkerHelp, sender: 'butler' | 'owner', content: string, escalate: boolean,
+  ) {
+    await action(async () => {
+      await api.replyHelp(help, sender, content, escalate)
+      await refreshHelp()
+      const aggregateType = selectedTask ? 'task' : selectedGoal ? 'goal' : null
+      const aggregateId = selectedTask?.id ?? selectedGoal?.id
+      if (aggregateType && aggregateId) {
+        setControlPlane(await api.aggregateControlPlane(aggregateType, aggregateId))
+      }
+      setOutbox(await api.outbox())
+    }, escalate ? '求助已升级给主人' : '回复已持久化')
+  }
+
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -367,16 +456,18 @@ export function App() {
           <div className="context-actions">
             <button className="ghost" onClick={() => action(async () => { await Promise.all([refreshTasks(), refreshGoals(), refreshProjects(), refreshProviders()]) }, '状态已刷新')}><ArrowsClockwise size={16} />刷新</button>
             <button className="ghost" onClick={() => { setTaskEstimate(null); setEstimatedSizingInputs(null); setShowCreateTask(true) }}>诊断任务</button>
-            <button className="primary" onClick={() => { setGoalEstimate(null); setEstimatedGoalSizingInputs(null); setShowCreateGoal(true) }}><Plus size={16} weight="bold" />提交目标</button>
+            <button className="primary" onClick={() => { setGoalEstimate(null); setEstimatedGoalSizingInputs(null); setButlerIntake(null); setShowCreateGoal(true) }}><Plus size={16} weight="bold" />提交目标</button>
           </div>
         </div>
 
         {error && <div className="banner error"><WarningCircle size={18} weight="fill" /><span>{error}</span><button aria-label="关闭错误" onClick={() => setError(null)}><X size={16} /></button></div>}
         {notice && <div className="banner success"><CheckCircle size={18} weight="fill" /><span>{notice}</span><button aria-label="关闭提示" onClick={() => setNotice(null)}><X size={16} /></button></div>}
         {outbox.filter((event) => event.event_type === 'task.needs_human' && !event.delivered_at).length > 0 && <div className="banner warning"><WarningCircle size={18} weight="fill" />存在需要人工判断的任务，自动调度已对这些任务停手。</div>}
+        {visibleHelp.some((item) => item.status === 'owner_escalated') && <div className="banner warning"><WarningCircle size={18} weight="fill" /><span>存在等待主人回复的 Butler 升级。</span><button onClick={() => setView('butler')}>立即处理</button></div>}
 
         {view === 'board' && <Board tasks={visibleTasks} goals={goals.filter((goal) => selectedProject === 'all' || goal.project_id === selectedProject)} projects={projects} workers={workers.map((item) => item.worker)} providers={providers} usage={usage} onNavigate={setView} onSelect={selectTask} onSelectGoal={selectGoal} />}
-        {view === 'tasks' && <TasksView tasks={visibleTasks} goals={goals.filter((goal) => selectedProject === 'all' || goal.project_id === selectedProject)} workers={workers.map((item) => item.worker)} selected={selectedTask} selectedGoal={selectedGoal} events={events} artifacts={artifacts} artifactError={artifactError} busy={busy} onSelect={selectTask} onSelectGoal={selectGoal} onDrive={driveTask} onControl={controlTask} onOpenArtifact={openArtifact} onCopyArtifact={copyArtifactPath} />}
+        {view === 'tasks' && <TasksView tasks={visibleTasks} goals={goals.filter((goal) => selectedProject === 'all' || goal.project_id === selectedProject)} workers={workers.map((item) => item.worker)} selected={selectedTask} selectedGoal={selectedGoal} controlPlane={controlPlane} events={events} artifacts={artifacts} artifactError={artifactError} busy={busy} onSelect={selectTask} onSelectGoal={selectGoal} onDrive={driveTask} onControl={controlTask} onDeleteTask={deleteTask} onDeleteGoal={deleteGoal} onOpenArtifact={openArtifact} onCopyArtifact={copyArtifactPath} onReplyHelp={replyHelp} />}
+        {view === 'butler' && <HelpView items={visibleHelp} tasks={tasks} busy={busy} onReply={replyHelp} />}
         {view === 'projects' && <ProjectsView projects={projects} form={projectForm} setForm={setProjectForm} onCreate={createProject} onRelease={(project) => action(async () => { await api.releaseProject(project.id); await refreshProjects() }, '项目已完成并释放 Worker')} busy={busy} />}
         {view === 'workers' && <WorkersView items={workers.filter(({ project }) => selectedProject === 'all' || project.id === selectedProject)} providers={providers} busy={busy} onRebind={(worker, provider) => action(async () => { await api.rebindWorker(worker.id, provider); await refreshProjects() }, 'Worker 已轮转并重新绑定')} />}
         {view === 'providers' && <ProvidersView providers={providers} busy={busy} onProbe={probeProvider} onToggle={toggleProvider} />}
@@ -385,7 +476,7 @@ export function App() {
         {view === 'settings' && <SettingsView settings={settings} setSettings={setSettings} scheduler={scheduler} convention={convention} setConvention={setConvention} suggestion={suggestion} setSuggestion={setSuggestion} projects={projects} tasks={tasks} providers={providers} refineProvider={effectiveRefineProvider} setRefineProvider={setRefineProvider} busy={busy} onSaveSettings={saveSettings} onTick={() => action(async () => { await api.schedulerTick(); setScheduler(await api.schedulerStatus()); await Promise.all([refreshTasks(), refreshGoals()]) }, 'Tick 已完成')} onLoadConvention={loadConvention} onSaveConvention={saveConvention} onRefine={refineConvention} />}
       </main>
 
-      {showCreateGoal && <GoalDrawer form={goalForm} setForm={setGoalForm} setSizingInputs={setGoalSizingInputs} estimate={estimatedGoalSizingInputs === goalForm.sizingInputs ? goalEstimate : null} projects={projects} providers={providers} busy={busy} onClose={() => setShowCreateGoal(false)} onEstimate={estimateGoal} onSubmit={createGoal} />}
+      {showCreateGoal && <GoalDrawer form={goalForm} setForm={setGoalForm} setSizingInputs={setGoalSizingInputs} estimate={estimatedGoalSizingInputs === goalForm.sizingInputs ? goalEstimate : null} intake={butlerIntake} projects={projects} providers={providers} busy={busy} onClose={() => { setButlerIntake(null); setShowCreateGoal(false) }} onEstimate={estimateGoal} onSubmit={createGoal} onAnswer={answerButler} onConfirm={confirmButler} />}
       {showCreateTask && <TaskDrawer form={taskForm} setForm={setTaskForm} setSizingInputs={setSizingInputs} estimate={estimatedSizingInputs === taskForm.sizingInputs ? taskEstimate : null} projects={projects} providers={providers} busy={busy} onClose={() => setShowCreateTask(false)} onEstimate={estimateTask} onSubmit={createTask} />}
     </div>
   )
@@ -405,32 +496,65 @@ function Board({ tasks, goals, projects, workers, providers, usage, onNavigate, 
       <Metric icon={TerminalWindow} label="可用 Provider" value={providers.filter(providerFullyReady).length} hint={`${providers.filter((p) => p.enabled).length} 已启用`} onClick={() => onNavigate('providers')} />
       <Metric icon={Coins} label="今日 Token" value={usage?.total_tokens ?? 0} hint="控制链 0" onClick={() => onNavigate('usage')} />
     </section>
-    <section className="panel board-panel"><div className="panel-heading"><div><span className="kicker">目标主流程</span><h1>提交目标 → 计划 → 子项 → 验证</h1></div><span className="muted">结构化计划 · 同角色会话续接 · 独立验证完成</span></div>
+    <section className="panel board-panel"><div className="panel-heading"><div><span className="kicker">目标主流程</span><h1>提交目标 → 计划 → 子项 → 验证</h1></div><span className="muted">结构化计划 · Task 级物理会话 · 独立验证完成</span></div>
       <div className="goal-strip">{goals.length ? goals.map((goal) => <button className="task-card" key={goal.id} onClick={() => onSelectGoal(goal)}><div><StatusPill status={(goal.status === 'running' ? 'ready' : goal.status === 'completed' ? 'completed' : goal.status === 'needs_human' ? 'needs_human' : 'terminal_failed') as TaskStatus} /><small>{goal.provider}</small></div><strong>{goal.title}</strong><p>{goal.objective}</p><footer><span>{goal.work_items.length} 工作项</span><span>{goal.status}</span></footer></button>) : <div className="empty-column">提交目标后生成结构化/确定性计划；模型 PM 尚未实现。</div>}</div>
     </section>
-    <section className="panel board-panel"><div className="panel-heading"><div><span className="kicker">全局任务流</span><h1>任务看板</h1></div><span className="muted">同一角色单会话 · 租约隔离 · 证据完成</span></div>
+    <section className="panel board-panel"><div className="panel-heading"><div><span className="kicker">全局任务流</span><h1>任务看板</h1></div><span className="muted">project + role + task 会话 · 租约隔离 · 证据完成</span></div>
       <div className="kanban-grid">{columns.map((column) => { const items = tasks.filter((task) => column.statuses.includes(task.status)); return <div className="kanban-column" key={column.title}><div className={`column-title ${column.tone}`}><span>{column.title}</span><b>{items.length}</b></div><div className="column-body">{items.length ? items.map((task) => <button className="task-card" key={task.id} onClick={() => onSelect(task)}><div><StatusPill status={task.status} /><small>{task.provider}{task.work_item_kind ? ` · ${task.work_item_kind}` : ''}</small></div><strong>{task.title}</strong><p>{task.objective}</p><footer><span>{task.attempts_used}/{task.max_attempts} 次</span><span>{task.tokens_used} Token</span></footer></button>) : <div className="empty-column">当前没有任务</div>}</div></div> })}</div>
     </section>
   </>
 }
 
-function TasksView({ tasks, goals, workers, selected, selectedGoal, events, artifacts, artifactError, busy, onSelect, onSelectGoal, onDrive, onControl, onOpenArtifact, onCopyArtifact }: { tasks: Task[]; goals: Goal[]; workers: Worker[]; selected: Task | null; selectedGoal: Goal | null; events: TaskEvent[]; artifacts: TaskArtifact[]; artifactError: string | null; busy: boolean; onSelect: (task: Task) => void; onSelectGoal: (goal: Goal) => void; onDrive: (task: Task) => void; onControl: (task: Task, action: 'pause' | 'resume' | 'cancel' | 'needs_human') => void; onOpenArtifact: (task: Task, artifact: TaskArtifact, target: 'finder' | 'cursor') => void; onCopyArtifact: (artifact: TaskArtifact) => void }) {
+function TasksView({ tasks, goals, workers, selected, selectedGoal, controlPlane, events, artifacts, artifactError, busy, onSelect, onSelectGoal, onDrive, onControl, onDeleteTask, onDeleteGoal, onOpenArtifact, onCopyArtifact, onReplyHelp }: { tasks: Task[]; goals: Goal[]; workers: Worker[]; selected: Task | null; selectedGoal: Goal | null; controlPlane: AggregateControlPlane | null; events: TaskEvent[]; artifacts: TaskArtifact[]; artifactError: string | null; busy: boolean; onSelect: (task: Task) => void; onSelectGoal: (goal: Goal) => void; onDrive: (task: Task) => void; onControl: (task: Task, action: 'pause' | 'resume' | 'cancel' | 'needs_human') => void; onDeleteTask: (task: Task) => void; onDeleteGoal: (goal: Goal) => void; onOpenArtifact: (task: Task, artifact: TaskArtifact, target: 'finder' | 'cursor') => void; onCopyArtifact: (artifact: TaskArtifact) => void; onReplyHelp: (help: WorkerHelp, sender: 'butler' | 'owner', content: string, escalate: boolean) => void }) {
   return <div className="split-layout"><section className="panel list-panel"><div className="panel-heading"><div><span className="kicker">目标 / 任务</span><h1>{goals.length} 目标 · {tasks.length} 工作项</h1></div></div>
     <div className="dense-list">
       {goals.map((goal) => <button key={goal.id} className={selectedGoal?.id === goal.id ? 'selected' : ''} onClick={() => onSelectGoal(goal)}><span className="list-icon"><Kanban size={18} /></span><span><strong>{goal.title}</strong><small>{goal.provider} · {goal.status} · {goal.work_items.length} 项</small></span></button>)}
       {tasks.map((task) => <button key={task.id} className={selected?.id === task.id ? 'selected' : ''} onClick={() => onSelect(task)}><span className="list-icon"><ListChecks size={18} /></span><span><strong>{task.title}</strong><small>{task.provider} · {statusNames[task.status]}{task.work_item_kind ? ` · ${task.work_item_kind}` : ''}</small></span><StatusPill status={task.status} /></button>)}
     </div></section>
-    <section className="panel detail-panel">{selectedGoal && !selected ? <GoalDetail goal={selectedGoal} tasks={tasks} workers={workers} /> : selected ? <><div className="panel-heading"><div><span className="kicker">{selected.id}</span><h1>{selected.title}</h1></div><StatusPill status={selected.status} /></div><p className="objective">{selected.objective}</p><div className="detail-actions">{selected.status === 'ready' && selected.work_item_kind !== 'coordination' && <button className="primary" disabled={busy} onClick={() => onDrive(selected)}><Play size={16} weight="fill" />立即驱动</button>}{selected.status === 'ready' && <button disabled={busy} onClick={() => onControl(selected, 'pause')}><Pause size={16} />暂停</button>}{selected.status === 'paused' && <button disabled={busy} onClick={() => onControl(selected, 'resume')}><Play size={16} />恢复</button>}{!['completed', 'terminal_failed', 'cancelled'].includes(selected.status) && <button className="danger" disabled={busy} onClick={() => onControl(selected, 'cancel')}><X size={16} />取消</button>}</div><div className="facts"><Fact label="Provider" value={selected.provider} /><Fact label="验证机制" value="确定性验证" /><Fact label="验证状态" value={verificationState(selected as unknown as Record<string, unknown>)} /><Fact label="工作项" value={selected.work_item_kind ?? 'manual'} /><Fact label="依赖" value={(selected.depends_on ?? []).join(', ') || '无'} mono /><Fact label="阻塞原因" value={selected.blocked_reason ?? '无'} /><Fact label="Worker" value={selected.worker_id ?? '尚未领取'} mono /><Fact label="资源锁" value={selected.resource_key ?? '项目级默认锁'} mono /><Fact label="尝试 / 预算" value={`${selected.attempts_used}/${selected.max_attempts} · ${selected.tokens_used}/${selected.token_budget} Token`} /><TaskRuntimeFacts item={selected as unknown as Record<string, unknown>} /></div><section className="artifacts"><div className="section-heading"><div><span className="kicker">主机项目目录</span><h2>任务产物</h2></div><span>{artifacts.filter((item) => item.exists).length} 个已定位</span></div>{artifactError ? <p className="artifact-error">Host Bridge 暂时无法定位产物：{artifactError}</p> : artifacts.length ? artifacts.map((artifact) => <article className={artifact.exists ? '' : 'missing'} key={artifact.relative_path}><div className="artifact-icon"><FileCode size={19} /></div><div className="artifact-main"><strong>{artifact.relative_path}</strong><code title={artifact.host_path}>{artifact.host_path}</code><small>{artifact.exists ? `${formatBytes(artifact.bytes)} · SHA-256 ${artifact.sha256?.slice(0, 12) ?? '文件过大未哈希'}…` : '尚未在主机项目目录生成'}</small></div><div className="artifact-actions"><button disabled={busy || !artifact.exists} onClick={() => onCopyArtifact(artifact)}><Copy size={15} />复制路径</button><button disabled={busy || !artifact.actions.includes('finder')} onClick={() => onOpenArtifact(selected, artifact, 'finder')}><FolderOpen size={15} />Finder</button>{artifact.actions.includes('cursor') && <button className="primary" disabled={busy} onClick={() => onOpenArtifact(selected, artifact, 'cursor')}><TerminalWindow size={15} />Cursor 打开</button>}</div></article>) : <p className="artifact-empty">该任务没有声明文件产物。容器不会保存项目报告或代码。</p>}</section><div className="timeline"><h2>状态事件</h2>{events.map((event) => <div key={event.sequence}><span>{event.sequence}</span><strong>{event.event_type}</strong><small>{event.created_at}</small></div>)}</div></> : <div className="empty-state"><ListChecks size={38} /><h2>选择一个目标或任务</h2><p>查看结构化计划、角色依赖、会话 generation、输出元数据与验证状态。</p></div>}</section></div>
+    <section className="panel detail-panel">{selectedGoal && !selected ? <GoalDetail goal={selectedGoal} tasks={tasks} workers={workers} busy={busy} controlPlane={controlPlane} onDelete={onDeleteGoal} onReplyHelp={onReplyHelp} /> : selected ? <>
+      <div className="panel-heading"><div><span className="kicker">{selected.id}</span><h1>{selected.title}</h1></div><StatusPill status={selected.status} /></div>
+      <p className="objective">{selected.objective}</p>
+      <div className="detail-actions">{selected.status === 'ready' && selected.work_item_kind !== 'coordination' && <button className="primary" disabled={busy} onClick={() => onDrive(selected)}><Play size={16} weight="fill" />立即驱动</button>}{selected.status === 'ready' && <button disabled={busy} onClick={() => onControl(selected, 'pause')}><Pause size={16} />暂停</button>}{selected.status === 'paused' && <button disabled={busy} onClick={() => onControl(selected, 'resume')}><Play size={16} />恢复</button>}{!['completed', 'terminal_failed', 'cancelled'].includes(selected.status) && <button className="danger" disabled={busy} onClick={() => onControl(selected, 'cancel')}><X size={16} />取消</button>}<button className="danger" disabled={busy} onClick={() => onDeleteTask(selected)}>删除 Task</button></div>
+      <div className="facts"><Fact label="Provider" value={selected.provider} /><Fact label="验证机制" value="确定性验证" /><Fact label="验证状态" value={verificationState(selected as unknown as Record<string, unknown>)} /><Fact label="工作项" value={selected.work_item_kind ?? 'manual'} /><Fact label="依赖" value={(selected.depends_on ?? []).join(', ') || '无'} mono /><Fact label="阻塞原因" value={selected.blocked_reason ?? '无'} /><Fact label="Worker" value={selected.worker_id ?? '尚未领取'} mono /><Fact label="资源锁" value={selected.resource_key ?? '项目级默认锁'} mono /><Fact label="尝试 / 用量" value={`${selected.attempts_used}/${selected.max_attempts} · ${selected.tokens_used} Token（observe-only）`} /><TaskRuntimeFacts item={selected as unknown as Record<string, unknown>} /></div>
+      <ControlPlanePanel value={controlPlane} busy={busy} onReply={onReplyHelp} />
+      <section className="artifacts"><div className="section-heading"><div><span className="kicker">主机项目目录</span><h2>任务产物</h2></div><span>{artifacts.filter((item) => item.exists).length} 个已定位</span></div>{artifactError ? <p className="artifact-error">Host Bridge 暂时无法定位产物：{artifactError}</p> : artifacts.length ? artifacts.map((artifact) => <article className={artifact.exists ? '' : 'missing'} key={artifact.relative_path}><div className="artifact-icon"><FileCode size={19} /></div><div className="artifact-main"><strong>{artifact.relative_path}</strong><code title={artifact.host_path}>{artifact.host_path}</code><small>{artifact.exists ? `${formatBytes(artifact.bytes)} · SHA-256 ${artifact.sha256?.slice(0, 12) ?? '文件过大未哈希'}…` : '尚未在主机项目目录生成'}</small></div><div className="artifact-actions"><button disabled={busy || !artifact.exists} onClick={() => onCopyArtifact(artifact)}><Copy size={15} />复制路径</button><button disabled={busy || !artifact.actions.includes('finder')} onClick={() => onOpenArtifact(selected, artifact, 'finder')}><FolderOpen size={15} />Finder</button>{artifact.actions.includes('cursor') && <button className="primary" disabled={busy} onClick={() => onOpenArtifact(selected, artifact, 'cursor')}><TerminalWindow size={15} />Cursor 打开</button>}</div></article>) : <p className="artifact-empty">该任务没有声明文件产物。容器不会保存项目报告或代码。</p>}</section>
+      <div className="timeline"><h2>状态事件</h2>{events.map((event) => <div key={event.sequence}><span>{event.sequence}</span><strong>{event.event_type}</strong><small>{event.created_at}</small></div>)}</div>
+    </> : <div className="empty-state"><ListChecks size={38} /><h2>选择一个目标或任务</h2><p>查看结构化计划、角色依赖、会话 generation、输出元数据与验证状态。</p></div>}</section>
+  </div>
 }
 
-function GoalDetail({ goal, tasks, workers }: { goal: Goal; tasks: Task[]; workers: Worker[] }) {
+function GoalDetail({ goal, tasks, workers, busy, controlPlane, onDelete, onReplyHelp }: { goal: Goal; tasks: Task[]; workers: Worker[]; busy: boolean; controlPlane: AggregateControlPlane | null; onDelete: (goal: Goal) => void; onReplyHelp: (help: WorkerHelp, sender: 'butler' | 'owner', content: string, escalate: boolean) => void }) {
   const modelPmImplemented = goal.plan.model_pm_implemented === true
-  return <><div className="panel-heading"><div><span className="kicker">{goal.id}</span><h1>{goal.title}</h1></div><span className="status-pill">{goal.status}</span></div><p className="objective">{goal.objective}</p><div className="facts"><Fact label="计划机制" value={modelPmImplemented ? '模型 PM 计划' : '结构化/确定性计划，模型 PM 尚未实现'} /><Fact label="Provider" value={goal.provider} /><Fact label="父任务" value={goal.parent_task_id ?? '—'} mono /><Fact label="工作项" value={String(goal.work_items.length)} /><Fact label="Goal sizing" value={summary(goal.sizing_inputs, ['size_class', 'status', 'risk_level'])} /><Fact label="Goal 状态" value={goal.status} /></div><section className="work-items"><div className="section-heading"><div><span className="kicker">计划 → 子项 → 验证</span><h2>工作项运行态</h2></div><span>只显示元数据，不读取 stdout/stderr</span></div>{goal.work_items.map((item) => {
+  return <><div className="panel-heading"><div><span className="kicker">{goal.id}</span><h1>{goal.title}</h1></div><span className="status-pill">{goal.status}</span></div><p className="objective">{goal.objective}</p><div className="detail-actions"><button className="danger" disabled={busy} onClick={() => onDelete(goal)}>删除 Goal</button></div><div className="facts"><Fact label="计划机制" value={modelPmImplemented ? '模型 PM 计划' : '结构化/确定性计划，模型 PM 尚未实现'} /><Fact label="Provider" value={goal.provider} /><Fact label="父任务" value={goal.parent_task_id ?? '—'} mono /><Fact label="工作项" value={String(goal.work_items.length)} /><Fact label="Goal sizing" value={summary(goal.sizing_inputs, ['size_class', 'status', 'risk_level'])} /><Fact label="Goal 状态" value={goal.status} /></div><section className="work-items"><div className="section-heading"><div><span className="kicker">计划 → 子项 → 验证</span><h2>工作项运行态</h2></div><span>只显示元数据，不读取 stdout/stderr</span></div>{goal.work_items.map((item) => {
     const task = tasks.find((candidate) => candidate.id === String(item.id))
     const detail = { ...item, ...(task ?? {}) } as Record<string, unknown>
     const worker = workers.find((candidate) => candidate.id === value(detail, ['worker_id']))
-    return <article className="work-item-card" key={String(item.id)}><header><span>{String(detail.ordinal ?? 'P')}</span><div><strong>{String(detail.title ?? detail.id)}</strong><small>{String(detail.status ?? 'unknown')}</small></div></header><dl className="facts"><Fact label="角色 / Provider" value={`${roleNames[value(detail, ['work_item_kind', 'role'])] ?? value(detail, ['work_item_kind', 'role'])} · ${value(detail, ['provider'])}`} /><Fact label="依赖" value={listValue(detail.depends_on) || '无'} mono /><Fact label="阻塞原因" value={value(detail, ['blocked_reason'], '无')} /><Fact label="Worker session" value={worker?.external_session_id ?? worker?.session_id ?? '暂无（API 未提供）'} mono /><Fact label="Generation" value={worker ? String(worker.session_generation) : '暂无（API 未提供）'} /><Fact label="Rotation reason" value={worker?.rotation_reason ?? '暂无（API 未提供）'} /><Fact label="Last context pressure" value={value(detail, ['last_context_pressure'], worker ? String(worker.last_context_pressure_tokens) : '暂无（API 未提供）')} /><Fact label="Pressure trigger" value={value(detail, ['last_context_pressure_reason'], worker?.last_context_pressure_reason ?? '暂无（API 未提供）')} /><Fact label="Sizing" value={summary(detail.sizing, ['size_class', 'status'])} /><Fact label="Budget" value={budgetSummary(detail)} /><Fact label="Attempt / progress" value={`${value(detail, ['attempts_used'], '0')}/${value(detail, ['max_attempts'], '—')} · ${value(detail, ['status'], 'unknown')}`} /><Fact label="Verification" value={verificationState(detail)} /><TaskRuntimeFacts item={detail} /></dl></article>
-  })}</section></>
+    return <article className="work-item-card" key={String(item.id)}>
+      <header><span>{String(detail.ordinal ?? 'P')}</span><div><strong>{String(detail.title ?? detail.id)}</strong><small>{String(detail.status ?? 'unknown')}</small></div></header>
+      <dl className="facts"><Fact label="角色 / Provider" value={`${roleNames[value(detail, ['work_item_kind', 'role'])] ?? value(detail, ['work_item_kind', 'role'])} · ${value(detail, ['provider'])}`} /><Fact label="依赖" value={listValue(detail.depends_on) || '无'} mono /><Fact label="阻塞原因" value={value(detail, ['blocked_reason'], '无')} /><Fact label="Physical session" value={value(detail, ['external_session_id'], '尚未为此 Task 建立')} mono /><Fact label="Task generation" value={value(detail, ['session_generation'], '尚未建立')} /><Fact label="Rotation reason" value={worker?.rotation_reason ?? '无'} /><Fact label="Last context pressure" value={value(detail, ['last_context_pressure'], worker ? String(worker.last_context_pressure_tokens) : '暂无')} /><Fact label="Pressure trigger" value={value(detail, ['last_context_pressure_reason'], worker?.last_context_pressure_reason ?? '暂无')} /><Fact label="Sizing" value={summary(detail.sizing, ['size_class', 'status'])} /><Fact label="Usage estimate" value={budgetSummary(detail)} /><Fact label="Attempt / progress" value={`${value(detail, ['attempts_used'], '0')}/${value(detail, ['max_attempts'], '—')} · ${value(detail, ['status'], 'unknown')}`} /><Fact label="Verification" value={verificationState(detail)} /><TaskRuntimeFacts item={detail} /></dl>
+    </article>
+  })}</section><ControlPlanePanel value={controlPlane} busy={busy} onReply={onReplyHelp} /></>
+}
+
+function ControlPlanePanel({ value: state, busy, onReply }: { value: AggregateControlPlane | null; busy: boolean; onReply: (help: WorkerHelp, sender: 'butler' | 'owner', content: string, escalate: boolean) => void }) {
+  if (!state) return <section className="control-plane"><p className="muted">正在读取 canonical control-plane state…</p></section>
+  return <section className="control-plane" aria-label="Canonical control plane">
+    <div className="section-heading"><div><span className="kicker">Canonical state</span><h2>状态、下一动作与证据 lineage</h2></div><span>最近 {state.lineage.length} 条（最多 20）</span></div>
+    <div className="facts"><Fact label="状态 / revision" value={`${state.canonical_state.status} / ${state.canonical_state.revision}`} /><Fact label="明确下一动作" value={state.next_action.label} /><Fact label="证据 hash" value={state.canonical_state.evidence_hash ?? '尚无'} mono /><Fact label="删除资格" value={`${state.deletion.status} · ${state.deletion.next_action}`} /><Fact label="删除保留" value="Token 匿名保留；产物文件不删除" /><Fact label="Session identity" value={state.session_identity} mono /></div>
+    {state.provider_sessions.length > 0 && <div className="control-list"><h3>Task 级 Provider Sessions</h3>{state.provider_sessions.map((session) => <div className="usage-row" key={session.id}><span>{session.provider} · {session.state}<small>{session.project_id} + {session.role_id} + {session.task_id}</small></span><strong>generation {session.session_generation} · {session.external_session_id ?? '尚未建立'}</strong></div>)}</div>}
+    {state.help_requests.length > 0 && <div className="control-list"><h3>求助与升级链路</h3>{state.help_requests.map((help) => <HelpCard key={help.id} item={help} busy={busy} onReply={onReply} />)}</div>}
+    <div className="timeline"><h2>版本化 reducer lineage</h2>{state.lineage.map((item) => <div key={item.sequence}><span>r{item.revision}</span><strong>{String(item.previous_state.status ?? 'absent')} → {String(item.new_state.status ?? 'unknown')} · {item.reason}</strong><small>{item.actor_type} · {item.new_evidence_hash?.slice(0, 12) ?? '无证据'}…</small></div>)}</div>
+  </section>
+}
+
+function HelpView({ items, tasks, busy, onReply }: { items: WorkerHelp[]; tasks: Task[]; busy: boolean; onReply: (help: WorkerHelp, sender: 'butler' | 'owner', content: string, escalate: boolean) => void }) {
+  return <section className="panel"><div className="panel-heading"><div><span className="kicker">Butler help inbox</span><h1>求助、回复与主人升级</h1></div><span className="muted">只显示持久化状态；事件请求不代表问题已解决</span></div><div className="help-grid">{items.length ? items.map((item) => <div key={item.id}><small className="muted">Task：{tasks.find((task) => task.id === item.task_id)?.title ?? item.task_id}</small><HelpCard item={item} busy={busy} onReply={onReply} /></div>) : <div className="empty-state compact"><Robot size={34} /><h2>当前没有求助</h2><p>Worker help 与主人升级会在这里显示。</p></div>}</div></section>
+}
+
+function HelpCard({ item, busy, onReply }: { item: WorkerHelp; busy: boolean; onReply: (help: WorkerHelp, sender: 'butler' | 'owner', content: string, escalate: boolean) => void }) {
+  const [draft, setDraft] = useState('')
+  const active = item.status === 'open' || item.status === 'owner_escalated'
+  return <article className="help-card"><header><div><strong>{item.category} · {item.severity}</strong><small>{item.status} · revision {item.revision}</small></div><code>{item.id}</code></header><p>{item.question}</p>{item.replies.map((reply) => <blockquote key={reply.id}><strong>{reply.sender}</strong>：{reply.content}</blockquote>)}{active && <><textarea aria-label={`回复 ${item.id}`} value={draft} onChange={(event) => setDraft(event.target.value)} placeholder={item.status === 'owner_escalated' ? '主人给出决定或补充约束' : 'Butler 给 Worker 的有界回复'} /><div className="detail-actions">{item.status === 'open' ? <><button className="primary" disabled={busy || !draft.trim()} onClick={() => onReply(item, 'butler', draft, false)}>Butler 回复 Worker</button><button disabled={busy || !draft.trim()} onClick={() => onReply(item, 'butler', draft, true)}>升级给主人</button></> : <button className="primary" disabled={busy || !draft.trim()} onClick={() => onReply(item, 'owner', draft, false)}>主人回复并解决</button>}</div></>}</article>
 }
 
 function TaskRuntimeFacts({ item }: { item: Record<string, unknown> }) {
@@ -444,7 +568,7 @@ function TaskRuntimeFacts({ item }: { item: Record<string, unknown> }) {
   const segments = value(item, ['output_segments', 'segments'], value(handoff, ['output_segments', 'segments'], '暂无（API 未提供）'))
   const bytes = value(item, ['output_bytes', 'bytes'], value(handoff, ['output_bytes', 'bytes'], '暂无（API 未提供）'))
   const offset = value(item, ['output_offset', 'offset'], value(handoff, ['output_offset', 'offset'], '暂无（API 未提供）'))
-  return <><Fact label="Input / Cached carry-in / Uncached input / Output / Total" value={`${input} / ${cachedInput} / ${uncachedInput} / ${output} / ${total}`} /><Fact label="Cached 计入 Total" value="是，已包含在 Input 中，不重复相加" /><Fact label="Attribution" value={`${value(item, ['attribution_granularity'], 'turn')} / ${value(item, ['value_classification'], 'unknown')}（Uncached 不等于新工作或有价值）`} /><Fact label="Hard cap" value="结算硬门；派发前执行 context-pressure guard" /><Fact label="Output ref" value={outputRef} mono /><Fact label="Segments / bytes / offset" value={`${segments} / ${bytes} / ${offset}`} /></>
+  return <><Fact label="Input / Cached carry-in / Uncached input / Output / Total" value={`${input} / ${cachedInput} / ${uncachedInput} / ${output} / ${total}`} /><Fact label="Cached 计入 Total" value="是，已包含在 Input 中，不重复相加" /><Fact label="Attribution" value={`${value(item, ['attribution_granularity'], 'turn')} / ${value(item, ['value_classification'], 'unknown')}（Uncached 不等于新工作或有价值）`} /><Fact label="Token control" value="observe-only；不拒派发、不取消、不改写终态" /><Fact label="Output ref" value={outputRef} mono /><Fact label="Segments / bytes / offset" value={`${segments} / ${bytes} / ${offset}`} /></>
 }
 
 function ProjectsView({ projects, form, setForm, onCreate, onRelease, busy }: { projects: Project[]; form: { name: string; path: string; hostPath: string }; setForm: (value: { name: string; path: string; hostPath: string }) => void; onCreate: (event: FormEvent) => void; onRelease: (project: Project) => void; busy: boolean }) {
@@ -483,7 +607,7 @@ function AuditView({ audit, permissions, onRefresh }: { audit: AuditEntry[]; per
 function SettingsView(props: { settings: RuntimeSettings | null; setSettings: (value: RuntimeSettings) => void; scheduler: SchedulerStatus | null; convention: Convention | null; setConvention: (value: Convention) => void; suggestion: ConventionSuggestion | null; setSuggestion: (value: ConventionSuggestion | null) => void; projects: Project[]; tasks: Task[]; providers: Provider[]; refineProvider: string; setRefineProvider: (value: string) => void; busy: boolean; onSaveSettings: (event: FormEvent) => void; onTick: () => void; onLoadConvention: (scope: Convention['scope'], id: string) => void; onSaveConvention: (event: FormEvent) => void; onRefine: () => void }) {
   const { settings, setSettings, scheduler, convention, setConvention, suggestion, setSuggestion, projects, tasks, providers, refineProvider, setRefineProvider, busy, onSaveSettings, onTick, onLoadConvention, onSaveConvention, onRefine } = props
   return <div className="settings-layout"><section className="panel cron-panel"><div className="panel-heading"><div><span className="kicker">单一全局 Crontab</span><h1>无人值守调度</h1></div><StatusDot ok={Boolean(scheduler?.engine.active)} label={scheduler?.engine.active ? '运行中' : '未运行'} /></div><div className="facts"><Fact label="引擎" value={scheduler ? `${scheduler.engine.managed_by} · ${scheduler.engine.backend}` : '检测中'} /><Fact label="下次执行" value={scheduler?.schedule.next_run_at ?? '尚未计算'} /><Fact label="Fencing" value={String(scheduler?.runtime.fencing_token ?? 0)} /><Fact label="最近 Tick" value={scheduler?.runtime.last_tick_at ?? '尚未执行'} /></div><button className="primary" disabled={busy} onClick={onTick}><Play size={16} />立即运行 Tick</button></section>
-    {settings && <form className="panel form-panel" onSubmit={onSaveSettings}><div className="panel-heading"><div><span className="kicker">设置修订 {settings.revision}</span><h1>Crontab 与防循环</h1></div></div><div className="form-grid"><Field label="Cron 表达式"><input value={settings.values.cron_expression} onChange={(event) => setSettings({ ...settings, values: { ...settings.values, cron_expression: event.target.value } })} /></Field><Field label="时区"><input value={settings.values.cron_timezone} onChange={(event) => setSettings({ ...settings, values: { ...settings.values, cron_timezone: event.target.value } })} /></Field><Field label="错过执行"><select value={settings.values.cron_misfire_policy} onChange={(event) => setSettings({ ...settings, values: { ...settings.values, cron_misfire_policy: event.target.value as 'catch_up_once' | 'skip' } })}><option value="catch_up_once">恢复后只补跑一次</option><option value="skip">跳过</option></select></Field><NumberField label="最大并行 Worker" value={settings.values.max_parallel_workers} onChange={(value) => setSettings({ ...settings, values: { ...settings.values, max_parallel_workers: value } })} /><NumberField label="同类失败熔断" value={settings.values.max_same_failure} onChange={(value) => setSettings({ ...settings, values: { ...settings.values, max_same_failure: value } })} /><NumberField label="无进展熔断" value={settings.values.max_no_progress} onChange={(value) => setSettings({ ...settings, values: { ...settings.values, max_no_progress: value } })} /><NumberField label="Context 最大字节" value={settings.values.context_max_bytes} onChange={(value) => setSettings({ ...settings, values: { ...settings.values, context_max_bytes: value } })} /><NumberField label="文件轮转字节" value={settings.values.rotation_max_bytes} onChange={(value) => setSettings({ ...settings, values: { ...settings.values, rotation_max_bytes: value } })} /><NumberField label="默认 Token 预算" value={settings.values.task_default_token_budget} onChange={(value) => setSettings({ ...settings, values: { ...settings.values, task_default_token_budget: value } })} /></div><label className="toggle-row"><input type="checkbox" checked={settings.values.cron_enabled} onChange={(event) => setSettings({ ...settings, values: { ...settings.values, cron_enabled: event.target.checked } })} /><span>启用容器内 Crontab</span></label><label className="toggle-row"><input type="checkbox" checked={settings.values.auto_dispatch} onChange={(event) => setSettings({ ...settings, values: { ...settings.values, auto_dispatch: event.target.checked } })} /><span>自动派发待执行任务</span></label><button className="primary" disabled={busy}>保存设置</button></form>}
+    {settings && <form className="panel form-panel" onSubmit={onSaveSettings}><div className="panel-heading"><div><span className="kicker">设置修订 {settings.revision}</span><h1>Crontab 与防循环</h1></div></div><div className="form-grid"><Field label="Cron 表达式"><input value={settings.values.cron_expression} onChange={(event) => setSettings({ ...settings, values: { ...settings.values, cron_expression: event.target.value } })} /></Field><Field label="时区"><input value={settings.values.cron_timezone} onChange={(event) => setSettings({ ...settings, values: { ...settings.values, cron_timezone: event.target.value } })} /></Field><Field label="错过执行"><select value={settings.values.cron_misfire_policy} onChange={(event) => setSettings({ ...settings, values: { ...settings.values, cron_misfire_policy: event.target.value as 'catch_up_once' | 'skip' } })}><option value="catch_up_once">恢复后只补跑一次</option><option value="skip">跳过</option></select></Field><NumberField label="最大并行 Worker" value={settings.values.max_parallel_workers} onChange={(value) => setSettings({ ...settings, values: { ...settings.values, max_parallel_workers: value } })} /><NumberField label="同类失败熔断" value={settings.values.max_same_failure} onChange={(value) => setSettings({ ...settings, values: { ...settings.values, max_same_failure: value } })} /><NumberField label="无进展熔断" value={settings.values.max_no_progress} onChange={(value) => setSettings({ ...settings, values: { ...settings.values, max_no_progress: value } })} /><NumberField label="Context 最大字节" value={settings.values.context_max_bytes} onChange={(value) => setSettings({ ...settings, values: { ...settings.values, context_max_bytes: value } })} /><NumberField label="文件轮转字节" value={settings.values.rotation_max_bytes} onChange={(value) => setSettings({ ...settings, values: { ...settings.values, rotation_max_bytes: value } })} /><NumberField label="默认 Token 估算（observe-only）" value={settings.values.task_default_token_budget} onChange={(value) => setSettings({ ...settings, values: { ...settings.values, task_default_token_budget: value } })} /></div><label className="toggle-row"><input type="checkbox" checked={settings.values.cron_enabled} onChange={(event) => setSettings({ ...settings, values: { ...settings.values, cron_enabled: event.target.checked } })} /><span>启用容器内 Crontab</span></label><label className="toggle-row"><input type="checkbox" checked={settings.values.auto_dispatch} onChange={(event) => setSettings({ ...settings, values: { ...settings.values, auto_dispatch: event.target.checked } })} /><span>自动派发待执行任务</span></label><button className="primary" disabled={busy}>保存设置</button></form>}
     {convention && <form className="panel convention-panel" onSubmit={onSaveConvention}><div className="panel-heading"><div><span className="kicker">全局 · 项目 · Task</span><h1>Convention 编辑器</h1></div><span className="revision">修订 {convention.revision}</span></div><div className="form-grid two"><Field label="作用域"><select value={convention.scope} onChange={(event) => { const scope = event.target.value as Convention['scope']; const id = scope === 'global' ? 'global' : scope === 'project' ? projects[0]?.id ?? '' : tasks[0]?.id ?? ''; onLoadConvention(scope, id) }}><option value="global">全局</option><option value="project">项目</option><option value="task">Task</option></select></Field><Field label="目标"><select disabled={convention.scope === 'global'} value={convention.scope_id} onChange={(event) => onLoadConvention(convention.scope, event.target.value)}>{convention.scope === 'global' ? <option value="global">全局</option> : convention.scope === 'project' ? projects.map((project) => <option value={project.id} key={project.id}>{project.name}</option>) : tasks.map((task) => <option value={task.id} key={task.id}>{task.title}</option>)}</select></Field></div><div className="editor-grid"><div><label>当前 Convention</label><textarea value={convention.content} onChange={(event) => setConvention({ ...convention, content: event.target.value })} placeholder="写下质量门、权限边界和必须验证的完成条件。" /></div><div><label>{suggestion ? `${suggestion.provider} 精炼建议` : 'Worker 精炼建议'}</label><textarea value={suggestion?.suggestion ?? ''} readOnly placeholder="点击“模型精炼”后在这里审阅建议；不会自动覆盖原文。" /></div></div><div className="detail-actions"><select className="inline-select" value={refineProvider} onChange={(event) => setRefineProvider(event.target.value)}>{providers.filter((provider) => provider.enabled && provider.capabilities.includes('refine_convention')).map((provider) => <option value={provider.name} key={provider.name}>{provider.display_name}{provider.status === 'available' ? '' : '（当前不可用）'}</option>)}</select><button type="button" disabled={busy || !convention.content.trim()} onClick={onRefine}><MagicWand size={16} />模型精炼（计 Token）</button>{suggestion && <button type="button" onClick={() => { setConvention({ ...convention, content: suggestion.suggestion }); setSuggestion(null) }}><CheckCircle size={16} />采用建议</button>}<button className="primary" disabled={busy}>保存 Convention</button></div><p className="form-help">精炼是明确的模型动作，会记录 Token；保存仍需人工确认。Crontab、探测和状态扫描不会调用模型。</p></form>}
   </div>
 }
@@ -499,19 +623,32 @@ function GoalDrawer(props: {
   }) => void
   setSizingInputs: (value: TaskSizingInputs) => void
   estimate: TaskSizingEstimate | null
+  intake: ButlerIntake | null
   projects: Project[]
   providers: Provider[]
   busy: boolean
   onClose: () => void
   onEstimate: () => void
   onSubmit: (event: FormEvent) => void
+  onAnswer: (answer: string, confidence: number) => void
+  onConfirm: (approved: boolean) => void
 }) {
-  const { form, setForm, setSizingInputs, estimate, projects, providers, busy, onClose, onEstimate, onSubmit } = props
+  const { form, setForm, setSizingInputs, estimate, intake, projects, providers, busy, onClose, onEstimate, onSubmit, onAnswer, onConfirm } = props
   const sizing = form.sizingInputs
   const setSizing = <K extends keyof TaskSizingInputs>(key: K, value: TaskSizingInputs[K]) => setSizingInputs({ ...sizing, [key]: value })
   const ready = estimate?.status === 'estimated'
   const provider = providers.find((item) => item.name === form.provider)
+  if (intake) {
+    return <div className="drawer-backdrop" onMouseDown={onClose}><aside className="drawer" onMouseDown={(event) => event.stopPropagation()}><div className="drawer-head"><div><span className="kicker">统一 Butler intake</span><h1>目标澄清与确认</h1></div><button aria-label="关闭" onClick={onClose}><X size={18} /></button></div><ButlerIntakeStep intake={intake} busy={busy} onAnswer={onAnswer} onConfirm={onConfirm} /></aside></div>
+  }
   return <div className="drawer-backdrop" onMouseDown={onClose}><aside className="drawer" onMouseDown={(event) => event.stopPropagation()}><div className="drawer-head"><div><span className="kicker">目标主流程唯一入口</span><h1>提交目标</h1></div><button aria-label="关闭" onClick={onClose}><X size={18} /></button></div><form onSubmit={onSubmit}><Field label="标题"><input required value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} placeholder="一个可验收的业务目标" /></Field><Field label="目标"><textarea required value={form.objective} onChange={(event) => setForm({ ...form, objective: event.target.value })} placeholder="系统会按角色拆成有序工作项并自动推进" /></Field><div className="form-grid two"><Field label="项目"><select required value={form.projectId} onChange={(event) => setForm({ ...form, projectId: event.target.value })}><option value="">选择项目</option>{projects.filter((p) => p.status === 'active').map((project) => <option value={project.id} key={project.id}>{project.name}</option>)}</select></Field><Field label="Provider"><select value={form.provider} onChange={(event) => setForm({ ...form, provider: event.target.value })}>{providers.filter((item) => item.enabled).map((item) => <option value={item.name} key={item.name}>{item.display_name}</option>)}</select></Field></div><p className="form-help">当前生成结构化/确定性计划，模型 PM 尚未实现；各角色复用 project+role 稳定会话。Provider 总状态：{provider?.status ?? '待探测'}。</p><div className="form-grid two"><Field label="验证文件 / 产物路径"><input value={form.verifyPath} onChange={(event) => setForm({ ...form, verifyPath: event.target.value })} /></Field><Field label="必须包含"><input value={form.verifyText} onChange={(event) => setForm({ ...form, verifyText: event.target.value })} /></Field></div><section className="preflight"><div className="preflight-heading"><div><span className="kicker">入队前必做</span><h2>0 Token 规则评估</h2></div><span>不调用模型</span></div><div className="form-grid two"><NumberField label="涉及层数" value={sizing.layers_touched} onChange={(value) => setSizing('layers_touched', value)} /><NumberField label="组件数" value={sizing.components_touched} onChange={(value) => setSizing('components_touched', value)} /><NumberField label="预计文件数" value={sizing.estimated_files_changed} onChange={(value) => setSizing('estimated_files_changed', value)} /><Field label="风险"><select value={sizing.risk_level} onChange={(event) => setSizing('risk_level', event.target.value as TaskSizingInputs['risk_level'])}><option value="low">低</option><option value="medium">中</option><option value="high">高</option></select></Field></div><details className="preflight-advanced"><summary>高级预判</summary><div className="form-grid two"><NumberField label="验证命令数" value={sizing.verification_commands_count} onChange={(value) => setSizing('verification_commands_count', value)} /><NumberField label="预计验证秒数" value={sizing.estimated_verification_seconds} onChange={(value) => setSizing('estimated_verification_seconds', value)} /><NumberField label="外部依赖数" value={sizing.external_dependencies_count} onChange={(value) => setSizing('external_dependencies_count', value)} /></div><div className="check-grid"><Check label="包含迁移" checked={sizing.has_migration} onChange={(value) => setSizing('has_migration', value)} /><Check label="包含部署" checked={sizing.has_deploy} onChange={(value) => setSizing('has_deploy', value)} /></div></details><div className="gate-grid"><Check label="产物明确" checked={sizing.gate_artifact} onChange={(value) => setSizing('gate_artifact', value)} /><Check label="边界明确" checked={sizing.gate_boundary} onChange={(value) => setSizing('gate_boundary', value)} /><Check label="验证明确" checked={sizing.gate_verification} onChange={(value) => setSizing('gate_verification', value)} /><Check label="依赖明确" checked={sizing.gate_dependency} onChange={(value) => setSizing('gate_dependency', value)} /></div><button type="button" className="full" disabled={busy} onClick={onEstimate}><Pulse size={16} />执行 0 Token 预判</button>{estimate && <EstimateCard estimate={estimate} />}</section><button className="primary full" disabled={busy || !projects.length || !ready}><Plus size={16} />检查 Provider 并提交目标</button></form></aside></div>
+}
+
+function ButlerIntakeStep({ intake, busy, onAnswer, onConfirm }: { intake: ButlerIntake; busy: boolean; onAnswer: (answer: string, confidence: number) => void; onConfirm: (approved: boolean) => void }) {
+  const [answer, setAnswer] = useState('')
+  const [confidence, setConfidence] = useState(intake.confidence)
+  const question = intake.questions.find((item) => item.id === intake.current_question_id)
+  return <section className="preflight" aria-label="Butler intake 状态"><div className="preflight-heading"><div><span className="kicker">Butler · 修订 {intake.revision}</span><h2>{intake.assessed_size} · {intake.status}</h2></div><span>把握 {intake.confidence}%</span></div>{intake.status === 'clarifying' && question && <><p>{question.question}</p><Field label="主人回答"><textarea value={answer} onChange={(event) => setAnswer(event.target.value)} /></Field><NumberField label="回答后的把握百分比" value={confidence} onChange={setConfidence} /><button type="button" className="full" disabled={busy || !answer.trim()} onClick={() => onAnswer(answer, confidence)}>提交这一个回答</button></>}{intake.status === 'awaiting_confirmation' && <><p>达到 95% 后仍不会自动派发。请核对下面方案及其版本化 hash。</p><pre>{JSON.stringify(intake.proposal, null, 2)}</pre><code>{intake.proposal_hash}</code><div className="detail-actions"><button type="button" className="primary" disabled={busy} onClick={() => onConfirm(true)}>确认当前方案并派发</button><button type="button" className="danger" disabled={busy} onClick={() => onConfirm(false)}>拒绝方案</button></div></>}</section>
 }
 
 function TaskDrawer(props: { form: typeof initialTask; setForm: (value: typeof initialTask) => void; setSizingInputs: (value: TaskSizingInputs) => void; estimate: TaskSizingEstimate | null; projects: Project[]; providers: Provider[]; busy: boolean; onClose: () => void; onEstimate: () => void; onSubmit: (event: FormEvent) => void }) {
@@ -532,10 +669,10 @@ const gateNames = {
 }
 
 function EstimateCard({ estimate }: { estimate: TaskSizingEstimate }) {
-  if (estimate.status === 'needs_planning') return <div className="estimate-card blocked" role="status"><strong>暂不可入队：先补齐计划</strong><p>缺少：{estimate.missing_gates.map((gate) => gateNames[gate]).join('、')}。请先拆分任务或补齐对应 gate，不能用超大预算绕过。</p><small>0 Token 规则评估 · 未调用模型</small></div>
+  if (estimate.status === 'needs_planning') return <div className="estimate-card blocked" role="status"><strong>暂不可入队：先补齐计划</strong><p>缺少：{estimate.missing_gates.map((gate) => gateNames[gate]).join('、')}。Token 估算只用于观察，不影响该确定性规划检查。</p><small>0 Token 规则评估 · 未调用模型</small></div>
   const input = estimate.estimated_input_tokens
   const output = estimate.estimated_output_tokens
-  return <div className="estimate-card" role="status"><div><strong>服务端 Tier {estimate.size_class}</strong><span>0 Token 规则评估</span></div><dl><Fact label="Input Token" value={`${formatNumber(input?.min)}–${formatNumber(input?.max)} · p90 ${formatNumber(input?.p90)}`} /><Fact label="Output Token" value={`${formatNumber(output?.min)}–${formatNumber(output?.max)} · p90 ${formatNumber(output?.p90)}`} /><Fact label="Token 预算" value={formatNumber(estimate.total_token_hard_cap)} /><Fact label="预留 Token" value={formatNumber(estimate.reserved_tokens)} /><Fact label="Soft Timeout" value={`${estimate.soft_deadline_seconds}s`} /><Fact label="Hard Timeout" value={`${estimate.hard_deadline_seconds}s`} /><Fact label="最大尝试" value={formatNumber(estimate.max_attempts)} /><Fact label="验证超时" value={`${estimate.verification_timeout_seconds}s`} /></dl><p title={estimate.rationale.join('; ')}>{estimate.rationale.slice(-3).join(' · ')}</p><small>{estimate.model_invoked ? '调用了模型' : '未调用模型'} · 服务端规则 {estimate.bootstrap_version}</small></div>
+  return <div className="estimate-card" role="status"><div><strong>服务端 Tier {estimate.size_class}</strong><span>0 Token 规则评估</span></div><dl><Fact label="Input Token" value={`${formatNumber(input?.min)}–${formatNumber(input?.max)} · p90 ${formatNumber(input?.p90)}`} /><Fact label="Output Token" value={`${formatNumber(output?.min)}–${formatNumber(output?.max)} · p90 ${formatNumber(output?.p90)}`} /><Fact label="Token 估算上界（observe-only）" value={formatNumber(estimate.total_token_hard_cap)} /><Fact label="历史预留估算（不 Gate）" value={formatNumber(estimate.reserved_tokens)} /><Fact label="Soft Timeout" value={`${estimate.soft_deadline_seconds}s`} /><Fact label="Hard Timeout" value={`${estimate.hard_deadline_seconds}s`} /><Fact label="最大尝试" value={formatNumber(estimate.max_attempts)} /><Fact label="验证超时" value={`${estimate.verification_timeout_seconds}s`} /></dl><p title={estimate.rationale.join('; ')}>{estimate.rationale.slice(-3).join(' · ')}</p><small>{estimate.model_invoked ? '调用了模型' : '未调用模型'} · 服务端规则 {estimate.bootstrap_version}</small></div>
 }
 
 function Metric({ icon: Icon, label, value, hint, onClick }: { icon: typeof Kanban; label: string; value: number; hint: string; onClick?: () => void }) {
@@ -569,7 +706,7 @@ function budgetSummary(item: Record<string, unknown>) {
   const cap = value(budget, ['total_token_hard_cap'], value(item, ['token_budget'], '—'))
   const used = value(item, ['tokens_used'], '—')
   const deadline = value(budget, ['hard_deadline_seconds'], '—')
-  return `${used}/${cap} Token · hard ${deadline}s`
+  return `${used} used / ${cap} observed estimate · hard ${deadline}s`
 }
 function verificationState(item: Record<string, unknown>) {
   if (item.last_evidence_hash) return `已验证 · ${String(item.last_evidence_hash).slice(0, 12)}`

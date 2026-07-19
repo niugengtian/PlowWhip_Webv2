@@ -1,5 +1,7 @@
 # Cursor 第 3 代独立审查报告（Codex P1 优化后）
 
+> 历史审查快照。本文中的 Token reservation/hard-cap 结论已被迁移 0021 与 observe-only `model_calls` ledger 替换；当前事实以 `BUTLER_CONTROL_PLANE_RESULT.md`、`ARCHITECTURE.md` 和 `RUNBOOK.md` 为准。
+
 审查日期：2026-07-17  
 审查基线：分支 `codex/sprint-9-execution-continuity`，未提交工作树（含 `0014_token_reservations.sql` 及关联运行时改动）  
 对照文档：`报告.md`（优化前独立审查）、`docs/CODEX_OPTIMIZATION_RESULT.md`（实现方自证）  

@@ -1,61 +1,54 @@
 # Architecture
 
-plow-whip Web v2 is a Docker-first local control plane with four explicit layers.
+plow-whip Web v2 is a Docker-first local control plane. FastAPI and React expose controls; SQLite/WAL owns canonical state; deterministic services schedule, recover and verify; Provider adapters execute work in the original host project directory.
 
-1. FastAPI and React expose Chinese product controls and evidence.
-2. SQLite/WAL is the source of truth for projects, tasks, leases, workers, sessions, budgets, events and audit.
-3. The deterministic runtime performs scheduling, recovery, context compilation, verification and fault classification without model calls.
-4. Provider adapters are workers. All user-selectable project workers run through the restricted authenticated Host Bridge against the original host project directory. Generic Command remains an internal deterministic test adapter and is not exposed in the Web UI worker pool.
+## Canonical aggregates
 
-The image runs one embedded Cron engine beside the Web server. Its standard five-field schedule is stored in SQLite and managed from Settings. Each due slot takes one fenced global lease, reconciles expired work, probes connectivity and enabled Providers, selects a bounded batch, obtains worker/resource leases and dispatches. A duplicate container cannot dispatch concurrently because the database lease and fencing token are authoritative.
+All goal-shaped external input enters `ButlerIntake`, whether the source is structured JSON or natural language. The public compatibility `POST /api/goals` route also creates a structured intake before a Goal exists. Manual `POST /api/tasks` remains a diagnostic command, not a second goal workflow.
 
-Project-role-provider sessions are reused until explicit rotation/rebind or project release. The internal binding id is separate from the CLI external session id. Provider switching is never implicit. Context is compiled from objective, one compact role template and global/project/task Convention instead of replaying a full chat.
+The deterministic size floor cannot be downgraded by a model assessment. A large intake has at most one unanswered question, cannot dispatch below 95% confidence, and still requires owner confirmation of the exact proposal hash. Small and medium intakes may select an available Provider and create an ordered Goal/Task plan. Goal creation is idempotent; the following intake transition to `dispatched` and all initial `worker.wake_requested` events commit together. A wake event proves only that dispatch was requested.
 
-Probe, wake, lease, recovery and scheduling are deterministic 0 Token actions. A model is invoked only after a ready task is leased to a model Provider, or when the operator explicitly requests Convention refinement. Refinement returns a suggestion and usage record; it never overwrites Convention automatically.
+Task and Goal state/evidence changes use optimistic revisions and the shared `aggregate_transitions` write protocol, including stale-lease recovery. Each transition records actor, reason, previous/new state and previous/new evidence hashes. Authorized evidence rewrites are CAS-protected and append lineage; reusing an idempotency key for different evidence or command metadata is rejected. Model prose, queued state, heartbeat and wake acceptance cannot create deterministic completion evidence.
 
-SQLite, WAL, logs and archives live in `/data`; `/projects` is a control-plane mount, not an artifact destination. Host and container paths are stored separately because a Docker named volume cannot be treated as a macOS CLI workspace. Project workers execute and deterministically verify against `projects.host_path` through authenticated structured Host Bridge endpoints. Reports, code, and other deliverables remain in the original host checkout.
+## Worker and Provider session identity
 
-Completion is impossible without deterministic verification. Balanced adds one bounded planning record. Strict adds exactly one independent deterministic review; there is no review recursion.
+`project + role` identifies the logical Worker and responsibility boundary. A physical Provider session is a separate `provider_sessions` aggregate keyed by `project + role + task + session_generation`.
 
-## Goal orchestration
+- A different Task never resumes another Task's external session.
+- A retry of the same Task may resume its current generation.
+- The legacy Worker external-session column remains empty; Host Job resume, API projection and usage attribution read only `provider_sessions`.
+- Termination/rotation archives the old generation before a replacement is bound.
+- Replacement Context is compiled from stable conventions, immutable task state, bounded checkpoint/handoff and current evidence. Full chats and unbounded logs are not copied.
 
-The primary product path is goal submission, not manual role picking.
+The file journal rotates independently from the Provider session. Context, checkpoint, handoff, observation, rotation and failure thresholds are one continuity policy. A one-line `Continuity-Limits: {"handoff_max_bytes":6144}` declaration in Task Convention overrides Project Convention, which overrides global Settings. The compiled Context API returns every effective value, its source and conflict warnings; mandatory-boundary conflicts fail compilation. Bounded monitoring defaults to 20 lines, reads structured Task/attempt/Host Job/session/artifact state first and only then a focused log tail.
 
-1. `POST /api/goals` is the sole split entry. A deterministic 0 Token PM planner creates a coordination parent plus an ordered linear chain of implementation/verification work items (1-7). There is no general DAG in this release.
-2. Each `project + role` reuses one stable Worker session. Task slices do not open a new session by default. The pre-dispatch guard records the task reserve, prior same-generation cached carry-in, hard cap, and an explainable decision. With only turn-level attribution, the projected relationship is `unknown`; cached/context pressure is telemetry and does not rotate the Provider session. A task whose settled `input + output` actually exceeds its hard cap rotates once in the settlement transaction. Consecutive no-progress/tool aborts retain the existing bounded FaultPolicy rotation, while explicit operator rotate/rebind remains available. Rotation trigger keys make repeated Scheduler ticks generation-idempotent. Provider capacity does not rotate, and the local Journal byte threshold rotates the file generation only.
-3. Cross-role handoff is structured metadata only: evidence hash and artifact paths. Full model history is never copied between roles. SQLite stores goals/tasks/leases/budgets/session ids and file path/hash/offset metadata; stdout/stderr and journals remain file-backed and rotate by `rotation_max_bytes`.
-4. Child work items reuse the existing 0 Token sizing → dynamic token/deadline/attempt/lease path and Provider readiness probes. The Scheduler advances ready children, feeds Evidence Delta into the same-role session on repairable failure, and completes the parent only after every implementation child and the independent verification child succeed.
+## Usage is observe-only
 
-Manual `POST /api/tasks` remains a diagnostic escape hatch.
+`model_calls` is the only stored usage ledger. The legacy `token_usage` name is a read-only compatibility view and `token_reservations` no longer exists. Every settled model call, including a real call that reports zero Token, retains direct Goal/Task/attempt/Worker/Host Job/Provider attribution, physical session/generation, stable anonymous Goal/Task hashes, raw usage and normalized values. Deterministic Generic Command executions do not create fake ModelCall rows. Non-Task model calls such as Convention refinement are project-attributed one-shot calls and are recorded in the same ledger.
 
-## Runtime resource gates
+Provider cumulative snapshots are linked in settlement order within one physical session. Input, cached-input and output counters are normalized independently: a monotonic counter contributes its delta and a reset counter contributes its current value. Normalized cached input is bounded by normalized input, so total usage is always `input + output`.
 
-`max_parallel_workers` is a system-wide in-flight limit. Both Scheduler selection and the transactional task claim count `running`, `verifying`, `stopping`, and unconsumed Host Jobs. The Scheduler subtracts existing work before selecting a batch; the claim transaction is the final guard for manual drives and concurrent callers.
+Token values never reject admission, cancel a run, rotate a session or change a verified terminal result. Historical token-budget and sizing fields remain as compatibility estimates for old clients. Execution safety is enforced by concurrency, lease/fencing, wall-clock deadlines, same-failure/no-progress handling, Provider readiness and deterministic verification.
 
-Every Host model task reserves its sized task allocation in the same SQLite transaction that creates its attempt and run. Active reservations and recorded usage both count against the global daily budget, so concurrent claims cannot allocate the same daily capacity. A zero task or global budget rejects the Host call before claim or dispatch. Completion reconciles the reservation to reported usage; cancellation, interruption, and stale-run recovery settle or release it.
+## Execution and evidence
 
-Provider usage is stored as `input_tokens`, `cached_input_tokens`, `uncached_input_tokens = input - cached`, and `output_tokens`. Cached input is a subset of input, so accounting total and the task hard-cap comparison are always `input + output`; cached input is never added again. `uncached_input` means cache miss only—it does not prove new work, value, or waste. Each call records task, Worker, session generation, rotation reason, `attribution_granularity=turn`, and `value_classification=unknown`. Worker rows retain the same last-usage and guard metadata. SQLite stores only these numbers, session ids, failure classes, and output refs/hashes/bytes/offsets—not prompt, stdout, stderr, or key bodies.
+Host CLI execution has one control truth with two ownership domains: SQLite owns Task/attempt/Host Job reconciliation, while Host Bridge owns only process identity, PID and the external session snapshot. A Host completion cannot write Task evidence or terminal state directly; only the versioned reducer path after deterministic verification can. An unconsumed Host Job excludes its Task from speculative stale recovery. If the old process cannot be proven dead, the control plane holds instead of duplicate-dispatching.
 
-The hard cap is a settlement hard gate, not a provider-side mid-turn cutoff. Codex, Cursor, and JSON Worker do not expose one common reliable streaming-usage cancellation contract, so a CLI can report more actual usage than was reserved after the turn ends. The pre-dispatch guard reports prior structured usage, cached carry-in, the estimated new-work reserve, and the hard cap, but does not add them into a projected rotation rule: with turn-level attribution it cannot prove which cached context will be sent again or whether it is valuable. Its relation is therefore `unknown` and it conservatively reuses the session. Reliable content compression is not implemented in this slice; carry-forward is generated only by the existing file Journal mechanism. Convention refinement also has no task budget to reserve against and is not yet part of this ledger.
+Completion requires deterministic verification. File evidence includes path metadata and content hash where supported. Provider output is bounded, redacted and file-backed; SQLite stores references and small structured facts instead of full stdout/stderr or prompts.
 
-## Context and evidence
+## Help, interruption and deletion
 
-Context truncation preserves Boundaries and the Completion rule in full. When the pack is too large, content is reduced deterministically from lower to higher priority: global Convention, continuation/role, objective, project Convention, then task Convention. If the configured limit cannot retain the protected safety tail and minimum task/project allocations, compilation fails instead of dispatching an unsafe pack.
+Worker help requests, Butler/owner replies, bounded same-Task context and owner escalation are revisioned records. The outbox distinguishes help requested, Butler reply, owner escalation and owner resolution. Cross-Task help context is rejected and only one open owner escalation is allowed per Task.
 
-File verification evidence includes the artifact SHA-256, byte size, and nanosecond modification time. These values are part of the evidence hash on both container and Host Bridge verification paths, so later artifact changes no longer match the recorded evidence. Existing verification semantics still allow an unchanged pre-existing file to pass; requiring creation or modification by the current run needs an explicit task-level provenance policy and is not inferred automatically.
+The aggregate control-plane read model composes—not rewrites—canonical Task/Goal state, the explicit next action, Task-scoped sessions, help chain, deletion eligibility and the latest bounded 20 reducer transitions. The Web Task/Goal detail and Butler inbox consume this read model; it is not another state machine.
 
-## Execution continuity
+Task and Goal deletion is a command:
 
-Host CLI execution is a two-ledger protocol:
+1. CAS and idempotency accept the request.
+2. Active Task/Host Job state moves to stopping and cancellation is requested; undispatched Goal children become cancelled in the same transaction.
+3. Only reconciled control rows are deleted in one transaction.
+4. Goal deletion cascades through its Tasks and runtime control rows.
+5. Usage and audit lineage are retained with hashed aggregate identity.
+6. Artifact references are retained in the tombstone and artifact files are never deleted.
 
-1. SQLite creates a stable Host Job id with task attempt, worker generation and fencing token.
-2. Host Bridge writes `dispatching` before process creation, then persists PID, process identity and CLI session as soon as they exist.
-3. The scheduler polls Host Job state and renews task/resource leases without invoking a model.
-4. `completed` enters deterministic verification; `interrupted` releases the dead process lease and requeues with the retained CLI session; `cancelled` releases only after host confirmation.
-5. Host Provider artifact checks run inside the same restricted Host Bridge project root. If the Bridge is unavailable after execution, the unconsumed Host Job retains its lease in `recovery_hold` and verification resumes without another model run.
-
-Host Bridge classifies explicit capacity/rate-limit responses as `provider_capacity`. FaultPolicy retains the same external session and performs bounded defer; repeated capacity with no progress reaches the shared fault threshold and becomes human-visible instead of retrying forever. A single capacity response never rotates the session. Host Job updates are generation-fenced so replaying an old job cannot restore its external session id after rotation.
-
-Artifact discovery is bounded to the file paths already declared by task verification. The bridge returns only path metadata (existence, byte size, SHA-256, and modification time), while fixed Finder-reveal and Cursor-open actions revalidate the project root and reject traversal. The control plane never copies artifact contents into Docker or accepts arbitrary shell strings for artifact actions.
-
-An unconsumed Host Job excludes its task from generic stale-lease recovery. This is the brain-split boundary: inability to prove that the old process is dead causes `recovery_hold`, never speculative duplicate dispatch. A Bridge restart can identify and cancel a live orphan process, but cannot reattach its stdout pipe; after that orphan exits, the task resumes from the persisted CLI session and compact context on a new attempt.
+Repeated deletion returns the same tombstone and does not keep advancing Goal revision while Host reconciliation is pending. Goal-only and Task-attributed ModelCalls are anonymized. SQLite transactions, unique keys and foreign keys provide the concurrency boundary; no parallel deletion workflow exists.

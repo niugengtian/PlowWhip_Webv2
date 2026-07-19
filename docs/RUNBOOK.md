@@ -7,44 +7,43 @@ SHA="$(git rev-parse HEAD)"
 python3 scripts/release_local.py deploy --expected-sha "$SHA"
 ```
 
-This is the only supported local release writer. It holds a process lock, requires
-a clean worktree and exact local/remote branch SHA, passes that SHA into the image
-revision label, preserves named volumes, and rejects a non-unique or unhealthy
-control-plane. Read-only monitors must never run Compose.
+This is the only supported Compose writer. It requires a clean worktree and matching Git revision, holds a local release lock, preserves named volumes and verifies HTTP health, WAL and a non-empty migration ledger. Read-only monitoring must not invoke Compose.
 
-Open `http://127.0.0.1:8742`. Register projects, save Convention and Settings, then **submit a goal**. The control plane PM-splits it into ordered role work items and the scheduler advances them. Manual single-task create remains available under “诊断任务” for debugging only. The built frontend is served by FastAPI.
+Open `http://127.0.0.1:8742`, register the project and submit a goal through Butler. Structured and natural-language submissions share `/api/butler/intakes`; `POST /api/goals` is compatibility syntax that still creates an intake. Large goals remain in clarification/confirmation until the owner confirms the proposal hash. Do not interpret queued, heartbeat, wake or Host Job acceptance as completion.
 
-Python, Node, SQLite runtime and the scheduler are image internals. Source-mode commands remain available to contributors, but they are not production prerequisites.
+## Scheduler and execution safety
 
-## Goal flow
-
-1. Ensure the selected Provider probes ready (`/api/providers/{name}/probe`).
-2. Submit a goal with sizing gates and verification paths (`POST /api/goals`).
-3. Inspect the returned plan: role, ordinal, depends_on, sizing/execution_budget.
-4. Let Cron/Tick auto-dispatch ready children, or run a manual zero-token tick.
-5. Parent goal completes only when all implementation items and the independent verification item are completed.
-
-Provider session rotation reasons visible in Worker status are limited to provable policy events: explicit operator rotate/rebind, settled `budget_exceeded`, and bounded consecutive no-progress/tool-abort recovery. The local Journal byte threshold rotates only `events.current.jsonl`; it does not discard the Provider session. Provider capacity does not rotate a session. Same-role work continues to reuse its external session even when cached context is large, unless one of those explicit policies fires.
-
-## Scheduler
-
-Settings shows the embedded runner heartbeat, five-field Cron expression, timezone, next run and misfire policy. Saving is revision guarded. Manual zero-token tick:
+The embedded scheduler uses one fenced global lease. `max_parallel_workers` includes work already in flight. A Tick reports active work and available slots; zero selected work is normal when capacity is occupied.
 
 ```bash
 docker compose exec control-plane python -m plow_whip_web --data-dir /data scheduler-tick
 ```
 
-`max_parallel_workers` includes work already running from prior ticks and manual drives. A Tick result reports `active` and `available_slots`; `selected: 0` with no error is expected when existing Host Jobs occupy every slot.
+Token settings and historical Task budget fields are estimates/telemetry only. They do not block dispatch, cancel work or change terminal status. `/api/usage` totals `input + output`; cached input is already included in input. Investigate runaway work with wall-clock, process, turn, same-failure and no-progress evidence—not a Token terminal gate.
 
-Host model tasks require positive task and global Token budgets. The control plane reserves the sized allocation before dispatch and exposes active reservation totals from `/api/usage`. Reported actual usage releases unused capacity after settlement. `cached_input_tokens` is already included in `input_tokens`; total is `input + output`, never `input + cached + output`.
+`model_calls` contains model invocations only. Generic Command is deterministic execution and does not create a zero-Token ModelCall. For cumulative Provider snapshots, inspect both raw snapshots and normalized per-session deltas; individual counters may reset independently.
 
-Treat the task hard cap as a turn-end settlement gate, not a provider-side generation cutoff. Before dispatch, the guard reports estimated new-work reserve, prior same-generation cached carry-in, and hard cap separately. Current Provider usage has only turn-level attribution, so their projected relationship is `unknown`: pressure and cached values are telemetry/alerts, not proof of repeated work or permission to rotate. The guard therefore conservatively reuses the external session. If settled `input + output` exceeds the cap, the task becomes `terminal_failed` with `budget_exceeded` and its Worker session is archived/rotated once; an idempotency trigger prevents repeated ticks from incrementing the generation again. There is no mid-turn cancellation claim until a Provider supplies reliable streaming usage with deterministic tests. Content-level value attribution, proof of repeated context, and reliable compression are not implemented.
+Physical Provider sessions are Task-scoped. Confirm `provider_sessions.project_id + role_id + task_id + session_generation` before resuming. Only same-Task retries may reuse the external session. A replacement must archive/unbind the previous generation and use bounded structured context.
 
-`provider_capacity` means the Provider explicitly reported capacity, rate-limit, HTTP 429, or overload. FaultPolicy defers it with backoff while retaining the external session; repeated no-progress reaches `max_no_progress`. Do not manually rotate a session for one capacity response.
+Continuity defaults are in Settings; the normal observation tail is 20 lines. Project or Task Convention may override supported integers with exactly one single-line declaration such as `Continuity-Limits: {"checkpoint_max_bytes":4096,"observation_tail_lines":12}`. Inspect `GET /api/tasks/{id}/context` before dispatch to confirm effective values, sources and warnings. Oversized help checkpoint/reply context is rejected before persistence; Context that cannot retain boundaries and the completion rule is rejected rather than silently dispatched.
+
+## Butler help and interruption
+
+Worker help is persisted and discoverable with `GET /api/butler/help`; the Butler UI can reply, escalate to the owner and persist the owner resolution. A reply can return bounded context only to the same Task; cross-Task context is rejected. The outbox emits distinct help-requested, Butler-reply, owner-escalation and owner-resolution events. An intake interrupt is revisioned first, then non-terminal Goal Tasks receive cancellation commands. Verify Host Job reconciliation before calling the work stopped.
+
+## Safe deletion
+
+`DELETE /api/tasks/{id}` and `DELETE /api/goals/{id}` require `expected_revision`, `reason` and `Idempotency-Key`.
+
+Before mutation, inspect `GET /api/aggregates/{task|goal}/{id}/control-plane`. It returns the canonical revision, explicit next action, Task-scoped Provider sessions, help chain, a bounded latest-20 transition lineage and deletion eligibility.
+
+- HTTP 202 / `stopping` means active execution or an unconsumed Host Job still requires reconciliation.
+- Repeat the same logical delete after cancellation/reconciliation; a replay while still stopping returns the same tombstone without advancing Goal revision.
+- Goal deletion cancels undispatched children immediately and waits for active Host Jobs before cascading physical control-row deletion.
+- Usage and audit are anonymized and retained.
+- Artifact files are never removed by Task/Goal deletion.
 
 ## Upgrade and migration
-
-Create a backup from Health, push the intended clean commit, then run:
 
 ```bash
 SHA="$(git rev-parse HEAD)"
@@ -52,34 +51,19 @@ python3 scripts/release_local.py deploy --expected-sha "$SHA"
 python3 scripts/release_local.py verify --expected-sha "$SHA"
 ```
 
-Do not run a second `docker compose up`, build, restart, or down while this transaction
-is active. Migrations are ordered and idempotent. Migration
-`0020_provider_context_pressure.sql` adds zero-valued legacy usage/pressure defaults
-and no body backfill; it preserves 0017/0018/0019 behavior. Check `/health` and the
-migration count. Never use `down -v` during an upgrade.
+Migrations are ordered and idempotent. `0021_unified_domain_reducer.sql` migrates usage to `model_calls`, removes reservation storage and adds reducer/session/deletion state. `0022_butler_intake_help.sql` adds intake, questions, help and reply state. Check `/health` and `PRAGMA integrity_check`; never run `docker compose down -v` during upgrade.
 
-## macOS Host Bridge
+## Host Bridge
 
-The Bridge remains a host process. Install its persistent user LaunchAgent once:
+Install the macOS LaunchAgent once:
 
 ```bash
 .venv/bin/python scripts/release_local.py install-bridge-macos \
   --project-root /Users/you/work
 ```
 
-The installer refuses replacement while a Host Job is active, keeps one listener on
-8765, uses the repository venv by absolute path, and persists an explicit PATH that
-contains Codex and simple-worker. It reads secrets only from the mode-600
-`.env.local`; no secret value is copied into the plist. All Host Providers share this
-one Bridge. Generic Command remains container-local.
+The Bridge reads secrets only from the mode-600 `.env.local`, restricts project roots and adapters, and keeps Host Job process state outside the container. Container health does not prove container-to-Bridge reachability; verify the configured `host.docker.internal:8765` path when deploying.
 
-## Backup, diagnostics and restore
+## Backup and uninstall
 
-Health creates integrity-checked SQLite backups and secret-free diagnostic ZIPs. Restore requires the exact backup filename and the literal confirmation `RESTORE`; a safety backup is made first.
-
-## Uninstall
-
-Run `docker compose down` to remove the container while preserving data. Only run
-`docker compose down -v` after an explicit decision to destroy SQLite, archives and
-managed projects. On macOS, remove the Host Bridge LaunchAgent separately only when
-the host worker pool is intentionally being uninstalled.
+Health creates integrity-checked SQLite backups and secret-free diagnostics. Restore requires the exact backup name and explicit confirmation. `docker compose down` preserves data; `docker compose down -v` destroys the named volume and must be separately authorized.

@@ -1,5 +1,7 @@
 # plow-whip Web v2 产品与架构设计
 
+> 历史设计草案，不是当前运行契约。本文中的 `Project + Role` physical session、Token hard-budget Gate、预算耗尽终止等设计已被 Task-scoped `project + role + task` session 与 observe-only `model_calls` ledger 替换。当前事实以 `ARCHITECTURE.md`、`RUNBOOK.md` 和 `BUTLER_CONTROL_PLANE_RESULT.md` 为准。
+
 > Sprint 7 架构修订（2026-07-17）：运行基线改为 Docker-first。Python、Web、SQLite 和单一全局 Cron engine 均位于容器；SQLite/日志使用 `/data` named volume，项目使用 `/projects` named volume。本文中宿主 OS scheduler、系统权限申请与 launchd/systemd/Task Scheduler 安装设计已废止，以 `ARCHITECTURE.md`、`RUNBOOK.md` 和 `SPRINT_7_EVIDENCE.md` 为准。
 
 > 状态：重写基线草案

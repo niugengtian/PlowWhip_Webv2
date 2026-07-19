@@ -89,7 +89,7 @@ def validate_goal_plan(
     available_roles: set[str],
     sizing_preview: dict[str, Any],
 ) -> dict[str, Any]:
-    """Schema / capability / dependency / budget / safety checks. 0 Token."""
+    """Schema, capability, dependency, and verification checks. 0 Token."""
     if not items:
         raise DomainError("goal plan must contain at least one work item")
     if len(items) > 7:
@@ -125,17 +125,13 @@ def validate_goal_plan(
     if items[-1].kind != "verification":
         raise DomainError("final work item must be verification")
 
-    hard_cap = sizing_preview.get("total_token_hard_cap")
-    if hard_cap is not None and int(hard_cap) > 1_500_000:
-        raise DomainError("goal budget exceeds safety hard cap")
-
     return {
         "items": items,
         "rationale": (
             "schema_ok",
             "capability_ok",
             "dependency_ok",
-            "budget_safety_ok",
+            "verification_ok",
         ),
     }
 

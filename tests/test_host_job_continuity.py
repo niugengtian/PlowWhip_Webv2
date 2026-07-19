@@ -15,11 +15,7 @@ import pytest
 
 from plow_whip_web.api.app import create_app
 from plow_whip_web.config import Settings
-from plow_whip_web.domain.model import (
-    BudgetExceededError,
-    ProviderUnavailableError,
-    ResourceBusyError,
-)
+from plow_whip_web.domain.model import ProviderUnavailableError, ResourceBusyError
 from plow_whip_web.host_bridge import (
     HostJobManager,
     MAX_OUTPUT_BYTES,
@@ -228,6 +224,7 @@ def test_host_job_timeout_writes_deterministic_carry_forward() -> None:
             "output_bytes": snapshot["output_bytes"],
             "output_segments": snapshot["output_segments"],
             "session_id": "timeout-session",
+            "snapshot_kind": "cumulative",
             "status": "completed",
             "tokens": {
                 "input": 7,
@@ -309,7 +306,7 @@ class FakeAsyncBridge:
         self.start_timeouts.append(timeout_seconds)
         return self.snapshots.setdefault(job_id, {
             "job_id": job_id, "status": "running", "pid": 4242,
-            "session_id": session_id or "cli-session-1",
+            "session_id": session_id or f"cli-session-{self.starts}",
             "heartbeat_at": "2026-07-17T00:00:00+00:00",
         })
 
@@ -414,7 +411,7 @@ def _estimated_codex_task(app: object, root: Path, key: str):
     )
 
 
-def test_estimated_host_dispatch_uses_execution_budget_deadline_and_reservation() -> None:
+def test_estimated_host_dispatch_uses_deadline_without_token_reservation() -> None:
     with TemporaryDirectory() as directory:
         root = Path(directory)
         app = create_app(Settings(
@@ -440,18 +437,18 @@ def test_estimated_host_dispatch_uses_execution_budget_deadline_and_reservation(
                 "SELECT expires_at FROM task_leases WHERE task_id = ?",
                 (task.id,),
             ).fetchone()
-            reservation = connection.execute(
-                "SELECT reserved_tokens FROM token_reservations WHERE task_id = ? AND status = 'active'",
-                (task.id,),
-            ).fetchone()
+            reservation_table = connection.execute(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'token_reservations'"
+            ).fetchone()[0]
         finally:
             connection.close()
-        assert reservation["reserved_tokens"] == 150_000
+        assert reservation_table == 0
         assert task_lease_seconds(running) == 1200 + EXECUTION_DEADLINE_GRACE_SECONDS
         assert lease is not None
 
 
-def test_legacy_host_dispatch_keeps_command_timeout_and_remaining_reservation() -> None:
+def test_legacy_host_dispatch_keeps_command_timeout_without_token_gate() -> None:
     with TemporaryDirectory() as directory:
         root = Path(directory)
         app = create_app(Settings(
@@ -467,18 +464,10 @@ def test_legacy_host_dispatch_keeps_command_timeout_and_remaining_reservation() 
         )
 
         assert bridge.start_timeouts == [60]
-        connection = app.state.database.connect()
-        try:
-            reservation = connection.execute(
-                "SELECT reserved_tokens FROM token_reservations WHERE task_id = ? AND status = 'active'",
-                (task.id,),
-            ).fetchone()
-        finally:
-            connection.close()
-        assert reservation["reserved_tokens"] == 100
+        assert app.state.task_repository.get(task.id).status.value == "running"
 
 
-def test_host_task_zero_budget_is_rejected_before_claim_and_dispatch() -> None:
+def test_historical_zero_budget_does_not_block_dispatch() -> None:
     with TemporaryDirectory() as directory:
         root = Path(directory)
         app = create_app(Settings(
@@ -488,19 +477,15 @@ def test_host_task_zero_budget_is_rejected_before_claim_and_dispatch() -> None:
         app.state.provider_pool.bridge = bridge
         task = _codex_task(app, root, "host-zero-budget", token_budget=0)
 
-        with pytest.raises(BudgetExceededError, match="no reservable tokens"):
-            app.state.task_service.drive(
-                task.id, expected_revision=task.revision,
-                idempotency_key="drive-zero-budget",
-            )
-
-        unchanged = app.state.task_repository.get(task.id)
-        assert unchanged.status.value == "ready"
-        assert unchanged.attempts_used == 0
-        assert bridge.starts == 0
+        running = app.state.task_service.drive(
+            task.id, expected_revision=task.revision,
+            idempotency_key="drive-zero-budget",
+        )
+        assert running.status.value == "running"
+        assert bridge.starts == 1
 
 
-def test_host_budget_reservation_prevents_global_oversubscription() -> None:
+def test_historical_budget_setting_does_not_block_multiple_host_jobs() -> None:
     with TemporaryDirectory() as directory:
         root = Path(directory)
         app = create_app(Settings(
@@ -520,40 +505,14 @@ def test_host_budget_reservation_prevents_global_oversubscription() -> None:
             first.id, expected_revision=first.revision,
             idempotency_key="drive-reserve-first",
         )
-        with pytest.raises(BudgetExceededError, match="global daily"):
-            app.state.task_service.drive(
-                second.id, expected_revision=second.revision,
-                idempotency_key="drive-reserve-second",
-            )
-
-        job = app.state.host_jobs.active()[0]
-        bridge.snapshots[job["job_id"]] = {
-            **bridge.snapshots[job["job_id"]], "status": "completed",
-            "returncode": 0, "input_tokens": 12, "output_tokens": 8,
-        }
-        app.state.task_service.reconcile_host_jobs()
         app.state.task_service.drive(
             second.id, expected_revision=second.revision,
-            idempotency_key="drive-reserve-second-after-settle",
+            idempotency_key="drive-reserve-second",
         )
-
-        connection = app.state.database.connect()
-        try:
-            reservations = connection.execute(
-                "SELECT status, reserved_tokens, actual_tokens FROM token_reservations ORDER BY created_at, run_id"
-            ).fetchall()
-        finally:
-            connection.close()
-        assert {
-            row["status"]: (row["reserved_tokens"], row["actual_tokens"])
-            for row in reservations
-        } == {
-            "settled": (100, 20),
-            "active": (100, None),
-        }
+        assert len(app.state.host_jobs.active()) == 2
 
 
-def test_recovery_releases_reservation_if_claim_crashes_before_host_job() -> None:
+def test_recovery_requeues_claim_that_crashes_before_host_job() -> None:
     with TemporaryDirectory() as directory:
         root = Path(directory)
         app = create_app(Settings(data_dir=root / "runtime"))
@@ -575,13 +534,26 @@ def test_recovery_releases_reservation_if_claim_crashes_before_host_job() -> Non
         assert app.state.task_repository.get(task.id).status.value == "ready"
         connection = app.state.database.connect()
         try:
-            reservation = connection.execute(
-                "SELECT status FROM token_reservations WHERE run_id = ?",
+            call = connection.execute(
+                "SELECT status, error_class FROM model_calls WHERE call_id = ?",
                 (claim.run_id,),
+            ).fetchone()
+            recovered_transition = connection.execute(
+                "SELECT reason, revision, new_state_json FROM aggregate_transitions "
+                "WHERE aggregate_type = 'task' AND aggregate_id = ? "
+                "ORDER BY revision DESC LIMIT 1",
+                (task.id,),
             ).fetchone()
         finally:
             connection.close()
-        assert reservation["status"] == "released"
+        assert (call["status"], call["error_class"]) == (
+            "failed", "recovery_released"
+        )
+        assert (
+            recovered_transition["reason"],
+            recovered_transition["revision"],
+            json.loads(recovered_transition["new_state_json"])["status"],
+        ) == ("task.recovered", claim.task.revision + 1, "ready")
 
 
 def test_scheduler_parallel_limit_counts_existing_host_jobs_across_ticks() -> None:
@@ -874,19 +846,16 @@ def test_interrupted_host_job_reuses_session_without_spending_attempt() -> None:
                 "SELECT external_session_id, last_error FROM workers WHERE id = ?",
                 (running.worker_id,),
             ).fetchone()
-        finally:
-            connection.close()
-        assert worker["external_session_id"] == "cli-session-1"
-        assert worker["last_error"] == "external_execution_interrupted"
-        connection = app.state.database.connect()
-        try:
-            reservation = connection.execute(
-                "SELECT status, actual_tokens FROM token_reservations WHERE run_id = ?",
-                (job["run_id"],),
+            physical = connection.execute(
+                "SELECT external_session_id FROM provider_sessions WHERE task_id = ?",
+                (task.id,),
             ).fetchone()
         finally:
             connection.close()
-        assert (reservation["status"], reservation["actual_tokens"]) == ("settled", 5)
+        assert worker["external_session_id"] is None
+        assert physical["external_session_id"] == "cli-session-1"
+        assert worker["last_error"] == "external_execution_interrupted"
+        assert app.state.budget.summary()["total_tokens"] == 5
 
 
 def test_timeout_completed_snapshot_resumes_same_session_without_verification() -> None:
@@ -927,18 +896,18 @@ def test_timeout_completed_snapshot_resumes_same_session_without_verification() 
                 "SELECT external_session_id, last_error FROM workers WHERE id = ?",
                 (running.worker_id,),
             ).fetchone()
-            reservation = connection.execute(
-                "SELECT status, actual_tokens FROM token_reservations WHERE run_id = ?",
-                (job["run_id"],),
+            physical = connection.execute(
+                "SELECT external_session_id FROM provider_sessions WHERE task_id = ?",
+                (task.id,),
             ).fetchone()
             usage_count = connection.execute(
                 "SELECT COUNT(*) FROM token_usage WHERE run_id = ?", (job["run_id"],)
             ).fetchone()[0]
         finally:
             connection.close()
-        assert worker["external_session_id"] == "timeout-session"
+        assert worker["external_session_id"] is None
+        assert physical["external_session_id"] == "timeout-session"
         assert worker["last_error"] == "external_execution_interrupted"
-        assert (reservation["status"], reservation["actual_tokens"]) == ("settled", 10)
         assert usage_count == 1
 
         connection = app.state.database.connect()
@@ -955,14 +924,9 @@ def test_timeout_completed_snapshot_resumes_same_session_without_verification() 
             replay_usage = connection.execute(
                 "SELECT COUNT(*) FROM token_usage WHERE run_id = ?", (job["run_id"],)
             ).fetchone()[0]
-            replay_reservation = connection.execute(
-                "SELECT status, actual_tokens FROM token_reservations WHERE run_id = ?",
-                (job["run_id"],),
-            ).fetchone()
         finally:
             connection.close()
         assert replay_usage == 1
-        assert (replay_reservation["status"], replay_reservation["actual_tokens"]) == ("settled", 10)
         assert bridge.verify_calls == 0
 
         continuation = app.state.task_service.drive(

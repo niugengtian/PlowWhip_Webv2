@@ -55,6 +55,16 @@ def rotate_worker_in_transaction(
         """,
         (str(uuid.uuid4()), worker_id),
     )
+    connection.execute(
+        """
+        UPDATE provider_sessions
+        SET state = 'archived', archive_reason = ?, archived_at = CURRENT_TIMESTAMP,
+            unbound_at = COALESCE(unbound_at, CURRENT_TIMESTAMP),
+            revision = revision + 1, updated_at = CURRENT_TIMESTAMP
+        WHERE worker_id = ? AND state IN ('bound', 'idle', 'terminating')
+        """,
+        (reason, worker_id),
+    )
     return _worker_view(connection, worker_id)
 
 

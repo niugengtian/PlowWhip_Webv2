@@ -101,7 +101,3 @@ class HostBridgeOutcomeUnknownError(ProviderUnavailableError):
 
 class PolicyViolationError(DomainError):
     pass
-
-
-class BudgetExceededError(DomainError):
-    pass

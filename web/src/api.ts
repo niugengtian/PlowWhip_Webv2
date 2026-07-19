@@ -95,12 +95,115 @@ export type Goal = {
   project_id: string
   provider: string
   status: string
+  revision: number
+  last_evidence_hash: string | null
   plan: Record<string, unknown>
   sizing_inputs: Record<string, unknown> | null
   parent_task_id: string | null
   created_at: string
   updated_at: string
   work_items: Record<string, unknown>[]
+}
+
+export type ButlerIntake = {
+  id: string
+  project_id: string
+  source: 'structured' | 'natural_language'
+  instruction: string
+  input: Record<string, unknown>
+  status: 'clarifying' | 'awaiting_confirmation' | 'dispatching' | 'dispatched' | 'interrupted' | 'failed'
+  deterministic_size: 'small' | 'medium' | 'large'
+  assessed_size: 'small' | 'medium' | 'large'
+  confidence: number
+  revision: number
+  current_question_id: string | null
+  proposal: Record<string, unknown> | null
+  proposal_hash: string | null
+  confirmed_proposal_hash: string | null
+  selected_provider: string | null
+  goal_id: string | null
+  questions: {
+    id: string
+    question: string
+    answer: string | null
+    answered_at: string | null
+  }[]
+}
+
+export type WorkerHelp = {
+  id: string
+  project_id: string
+  goal_id: string | null
+  task_id: string
+  worker_id: string | null
+  category: string
+  severity: 'normal' | 'blocking' | 'extreme'
+  status: 'open' | 'answered' | 'owner_escalated' | 'interrupted'
+  question: string
+  checkpoint: Record<string, unknown>
+  revision: number
+  created_at: string
+  updated_at: string
+  resolved_at: string | null
+  replies: {
+    id: string
+    revision: number
+    sender: 'butler' | 'owner' | 'system'
+    content: string
+    bounded_context: Record<string, unknown>
+    created_at: string
+  }[]
+}
+
+export type AggregateControlPlane = {
+  aggregate_type: 'task' | 'goal'
+  aggregate_id: string
+  canonical_state: {
+    status: string
+    revision: number
+    evidence_hash: string | null
+    updated_at: string
+  }
+  next_action: { kind: string; label: string; requires_owner: boolean }
+  session_identity: 'project_id+role_id+task_id'
+  provider_sessions: {
+    id: string
+    project_id: string
+    role_id: string
+    task_id: string
+    worker_id: string | null
+    provider: string
+    session_generation: number
+    external_session_id: string | null
+    state: string
+    revision: number
+    archive_reason: string | null
+    updated_at: string
+  }[]
+  help_requests: WorkerHelp[]
+  lineage: {
+    sequence: number
+    revision: number
+    actor_type: string
+    actor_id: string | null
+    reason: string
+    previous_state: Record<string, unknown>
+    new_state: Record<string, unknown>
+    previous_evidence_hash: string | null
+    new_evidence_hash: string | null
+    created_at: string
+  }[]
+  deletion: {
+    status: 'deletable' | 'stop_required' | 'stopping' | 'deleted'
+    eligible: boolean
+    next_action: string
+    expected_revision: number | null
+    active_task_ids: string[]
+    pending_host_jobs: string[]
+    cascade_task_count: number
+    artifact_files_deleted: false
+    usage_retention: 'anonymous'
+  }
 }
 
 export type TaskArtifact = {
@@ -168,7 +271,12 @@ export type RuntimeSettingsValues = {
   global_daily_token_budget: number
   max_same_failure: number
   max_no_progress: number
+  session_no_progress_rotation_threshold: number
   context_max_bytes: number
+  checkpoint_max_bytes: number
+  handoff_max_bytes: number
+  observation_tail_lines: number
+  observation_max_bytes: number
   rotation_max_bytes: number
 }
 export type RuntimeSettings = { revision: number; values: RuntimeSettingsValues; updated_at: string | null }
@@ -205,11 +313,12 @@ export type Usage = {
   output_tokens: number
   total_tokens: number
   total_formula: string
-  hard_cap_enforcement: 'settlement_gate'
+  control_gate: 'disabled'
   control_tokens: number
   projects: { project_id: string | null; input_tokens: number; cached_input_tokens: number; uncached_input_tokens: number; output_tokens: number; tokens: number }[]
   tasks: { task_id: string; input_tokens: number; cached_input_tokens: number; uncached_input_tokens: number; output_tokens: number; tokens: number }[]
-  calls: { call_id: string; task_id: string | null; worker_id: string | null; provider: string; session_generation: number | null; input_tokens: number; cached_input_tokens: number; uncached_input_tokens: number; output_tokens: number; attribution_granularity: string; value_classification: string; rotation_reason: string | null; created_at: string }[]
+  attribution: { project_id: string | null; goal_id: string | null; goal_id_hash: string | null; role_id: string | null; task_id: string | null; task_id_hash: string | null; worker_id: string | null; provider: string; physical_session_id: string | null; session_generation: number | null; input_tokens: number; cached_input_tokens: number; output_tokens: number; calls: number }[]
+  calls: { call_id: string; call_kind: string; status: 'prepared' | 'completed' | 'failed'; project_id: string | null; goal_id: string | null; goal_id_hash: string | null; role_id: string | null; task_id: string | null; task_id_hash: string | null; attempt_id: string | null; episode_id: string | null; worker_id: string | null; host_job_id: string | null; provider: string; physical_session_id: string | null; session_generation: number | null; snapshot_kind: 'per_call' | 'cumulative'; previous_call_id: string | null; input_tokens: number; cached_input_tokens: number; uncached_input_tokens: number; output_tokens: number; normalized_input_tokens: number; normalized_cached_input_tokens: number; normalized_output_tokens: number; attribution_granularity: string; value_classification: string; rotation_reason: string | null; created_at: string; settled_at: string | null }[]
 }
 export type RuntimeHealth = {
   connectivity: string
@@ -356,7 +465,64 @@ export const api = {
       idempotencyKey: crypto.randomUUID(),
       body: JSON.stringify(payload),
     }),
+  createButlerIntake: (payload: Record<string, unknown>) =>
+    request<ButlerIntake>('/api/butler/intakes', {
+      method: 'POST',
+      idempotencyKey: crypto.randomUUID(),
+      body: JSON.stringify(payload),
+    }),
+  answerButlerIntake: (
+    intake: ButlerIntake, answer: string, confidence: number,
+  ) => request<ButlerIntake>(`/api/butler/intakes/${intake.id}/answers`, {
+    method: 'POST',
+    idempotencyKey: crypto.randomUUID(),
+    body: JSON.stringify({
+      expected_revision: intake.revision,
+      answer,
+      confidence,
+    }),
+  }),
+  confirmButlerIntake: (intake: ButlerIntake, approved: boolean) =>
+    request<ButlerIntake>(`/api/butler/intakes/${intake.id}/confirm`, {
+      method: 'POST',
+      idempotencyKey: crypto.randomUUID(),
+      body: JSON.stringify({
+        expected_revision: intake.revision,
+        proposal_hash: intake.proposal_hash,
+        approved,
+        reason: approved ? 'owner_confirmed_exact_proposal' : 'owner_rejected_proposal',
+      }),
+    }),
+  helpRequests: (projectId?: string) => request<WorkerHelp[]>(
+    `/api/butler/help${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ''}`,
+  ),
+  replyHelp: (
+    help: WorkerHelp, sender: 'butler' | 'owner', content: string, escalate: boolean,
+  ) => request<WorkerHelp>(`/api/butler/help/${help.id}/replies`, {
+    method: 'POST',
+    idempotencyKey: crypto.randomUUID(),
+    body: JSON.stringify({
+      expected_revision: help.revision,
+      sender,
+      content,
+      bounded_context: { task_id: help.task_id },
+      escalate,
+    }),
+  }),
+  aggregateControlPlane: (aggregateType: 'task' | 'goal', aggregateId: string) =>
+    request<AggregateControlPlane>(
+      `/api/aggregates/${aggregateType}/${aggregateId}/control-plane`,
+    ),
   getGoal: (goalId: string) => request<Goal>(`/api/goals/${goalId}`),
+  deleteGoal: (goal: Goal) =>
+    request<Record<string, unknown>>(`/api/goals/${goal.id}`, {
+      method: 'DELETE',
+      idempotencyKey: crypto.randomUUID(),
+      body: JSON.stringify({
+        expected_revision: goal.revision,
+        reason: 'owner_delete',
+      }),
+    }),
   driveTask: (task: Task) =>
     request<Task>(`/api/tasks/${task.id}/drive`, {
       method: 'POST',
@@ -368,5 +534,14 @@ export const api = {
       method: 'POST',
       idempotencyKey: crypto.randomUUID(),
       body: JSON.stringify({ action, reason, expected_revision: task.revision }),
+    }),
+  deleteTask: (task: Task) =>
+    request<Record<string, unknown>>(`/api/tasks/${task.id}`, {
+      method: 'DELETE',
+      idempotencyKey: crypto.randomUUID(),
+      body: JSON.stringify({
+        expected_revision: task.revision,
+        reason: 'owner_delete',
+      }),
     }),
 }

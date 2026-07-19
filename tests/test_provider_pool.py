@@ -142,6 +142,23 @@ def test_convention_refinement_returns_suggestion_without_overwriting() -> None:
             assert suggestion["input_tokens"] == 21
             assert suggestion["applied"] is False
             assert client.get("/api/conventions/global/global").json()["content"] == saved["content"]
+        connection = app.state.database.connect()
+        try:
+            call = connection.execute(
+                """
+                SELECT project_id, task_id, provider, call_kind,
+                       physical_session_id, session_generation,
+                       normalized_input_tokens, normalized_output_tokens
+                FROM model_calls WHERE call_id = ?
+                """,
+                (suggestion["id"],),
+            ).fetchone()
+        finally:
+            connection.close()
+        assert tuple(call) == (
+            project["id"], None, "simple-worker", "convention_refinement",
+            "simple-session-1", 1, 21, 13
+        )
 
 
 def test_host_bridge_argv_is_fixed_and_stream_parser_keeps_session_and_usage() -> None:

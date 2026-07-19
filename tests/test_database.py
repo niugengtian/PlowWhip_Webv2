@@ -128,12 +128,17 @@ def test_upgrade_migration_scrubs_legacy_sqlite_bodies_once() -> None:
         assert max_attempts == 4
 
 
-def test_0020_upgrades_0019_database_with_safe_metadata_defaults() -> None:
+def test_0021_and_0022_upgrade_0020_database_to_unified_control_plane() -> None:
     with TemporaryDirectory() as directory:
-        db_path = Path(directory) / "upgrade-0019.sqlite3"
+        db_path = Path(directory) / "upgrade-0020.sqlite3"
         migration_dir = Path(database_module.__file__).with_name("migrations")
         migrations = sorted(migration_dir.glob("*.sql"))
-        assert migrations[-1].name == "0020_provider_context_pressure.sql"
+        target_index = next(
+            index
+            for index, migration in enumerate(migrations)
+            if migration.name == "0021_unified_domain_reducer.sql"
+        )
+        assert migrations[-1].name == "0022_butler_intake_help.sql"
         connection = sqlite3.connect(db_path)
         try:
             connection.execute(
@@ -144,7 +149,7 @@ def test_0020_upgrades_0019_database_with_safe_metadata_defaults() -> None:
                 )
                 """
             )
-            for migration in migrations[:-1]:
+            for migration in migrations[:target_index]:
                 for statement in database_module._split_statements(
                     migration.read_text(encoding="utf-8")
                 ):
@@ -178,7 +183,10 @@ def test_0020_upgrades_0019_database_with_safe_metadata_defaults() -> None:
             connection.close()
 
         database = Database(db_path)
-        assert database.migrate() == ["0020_provider_context_pressure.sql"]
+        assert database.migrate() == [
+            "0021_unified_domain_reducer.sql",
+            "0022_butler_intake_help.sql",
+        ]
         assert database.migrate() == []
         connection = database.connect()
         try:

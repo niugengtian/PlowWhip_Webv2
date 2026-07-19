@@ -8,13 +8,13 @@ from typing import Any
 from plow_whip_web.domain.model import ProviderUnavailableError, TaskRecord
 from plow_whip_web.providers.generic_command import ExecutionResult, GenericCommandProvider
 from plow_whip_web.providers.host_bridge import HostBridgeClient
+from plow_whip_web.runtime.model_call_ledger import ModelCallLedger
 from plow_whip_web.runtime.verification import VerificationResult
 from plow_whip_web.store.database import Database
 from plow_whip_web.store.provider_repository import ProviderRepository
 from plow_whip_web.store.task_repository import (
     TaskRepository,
     task_hard_deadline_seconds,
-    task_host_reserved_tokens,
 )
 
 
@@ -217,6 +217,7 @@ class ProviderPool:
         content: str,
         source_revision: int,
         provider_name: str,
+        project_id: str,
         project_path: str,
         instruction: str,
     ) -> dict[str, Any]:
@@ -227,13 +228,13 @@ class ProviderPool:
             "你是 Convention 编辑器。只输出精炼后的 Convention 正文，不要解释，不要代码围栏。\n\n"
             f"精炼要求：{instruction}\n\n原始 Convention：\n{content}"
         )
+        refinement_id = str(uuid.uuid4())
         result = self.bridge.execute(
             provider=provider, project_path=project_path, prompt=prompt,
             session_id=None, timeout_seconds=180,
         )
         status = "completed" if result.returncode == 0 and result.stdout.strip() else "failed"
         with self.database.transaction(immediate=True) as connection:
-            refinement_id = str(uuid.uuid4())
             connection.execute(
                 """
                 INSERT INTO convention_refinements(
@@ -245,6 +246,18 @@ class ProviderPool:
                     refinement_id, scope, scope_id, provider_name, source_revision,
                     result.input_tokens, result.output_tokens, status,
                 ),
+            )
+            ModelCallLedger.record_in_transaction(
+                connection,
+                call_id=refinement_id,
+                execution={
+                    **result.as_dict(),
+                    "attribution_granularity": "project",
+                },
+                provider=provider_name,
+                call_kind="convention_refinement",
+                project_id=project_id,
+                idempotency_key=f"convention-refinement:{refinement_id}",
             )
         if status != "completed":
             raise ProviderUnavailableError(result.stderr or "Convention 精炼未返回结果")

@@ -140,6 +140,9 @@ class HostBridgeClient:
             cached_input_tokens=int(snapshot.get("cached_input_tokens") or 0),
             output_tokens=int(snapshot.get("output_tokens") or 0),
             external_session_id=snapshot.get("session_id"),
+            # Host adapters expose physical-session totals unless the producer
+            # explicitly proves per-call accounting.
+            snapshot_kind=str(snapshot.get("snapshot_kind") or "cumulative"),
             attribution_granularity="turn",
             value_classification="unknown",
         )

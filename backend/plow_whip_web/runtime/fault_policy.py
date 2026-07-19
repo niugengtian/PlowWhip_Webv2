@@ -141,7 +141,7 @@ class FaultPolicy:
             "offline", "transient_transport",
         }:
             return "defer"
-        if failure_class in {"provider_auth", "permission_denied", "budget_exceeded"}:
+        if failure_class in {"provider_auth", "permission_denied"}:
             return "needs_human"
         if occurrences >= 3 or attempts_left <= 0:
             return "terminal_failed"

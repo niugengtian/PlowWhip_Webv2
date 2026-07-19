@@ -21,7 +21,12 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "convention_refinement_token_budget": 10_000,
     "max_same_failure": 2,
     "max_no_progress": 3,
+    "session_no_progress_rotation_threshold": 2,
     "context_max_bytes": 32_768,
+    "checkpoint_max_bytes": 4096,
+    "handoff_max_bytes": 4096,
+    "observation_tail_lines": 20,
+    "observation_max_bytes": 65_536,
     "rotation_max_bytes": 262_144,
 }
 

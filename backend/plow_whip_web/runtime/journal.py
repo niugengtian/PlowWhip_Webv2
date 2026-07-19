@@ -14,7 +14,10 @@ class SessionJournal:
         self.root = data_dir / "sessions"
         self.settings = settings
 
-    def append(self, worker_id: str | None, event: dict[str, Any]) -> dict[str, Any] | None:
+    def append(
+        self, worker_id: str | None, event: dict[str, Any],
+        *, maximum_bytes: int | None = None,
+    ) -> dict[str, Any] | None:
         if not worker_id:
             return None
         directory = self.root / worker_id
@@ -22,7 +25,7 @@ class SessionJournal:
         current = directory / "events.current.jsonl"
         line = json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
         rotated = None
-        maximum = self.settings.get()["values"]["rotation_max_bytes"]
+        maximum = maximum_bytes or self.settings.get()["values"]["rotation_max_bytes"]
         if current.exists() and current.stat().st_size + len(line.encode("utf-8")) > maximum:
             rotated = self._rotate(directory, current)
         with current.open("a", encoding="utf-8") as handle:

@@ -12,6 +12,7 @@ from plow_whip_web.runtime.orchestration import (
     plan_to_dict,
 )
 from plow_whip_web.runtime.sizing import TaskSizingInputs, estimate_task_sizing
+from plow_whip_web.runtime.aggregate_reducer import AggregateReducer
 from plow_whip_web.store.database import Database
 
 
@@ -285,6 +286,38 @@ class GoalRepository:
                     idempotency_key,
                 ),
             )
+            for created in connection.execute(
+                """
+                SELECT id, status, revision, last_evidence_hash
+                FROM tasks WHERE goal_id = ?
+                """,
+                (goal_id,),
+            ).fetchall():
+                AggregateReducer.record(
+                    connection,
+                    aggregate_type="task",
+                    aggregate_id=created["id"],
+                    revision=0,
+                    idempotency_key=f"goal-task-created:{goal_id}:{created['id']}",
+                    actor_type="butler",
+                    actor_id=None,
+                    reason="goal.created",
+                    previous_state={"status": "absent", "revision": -1},
+                    new_state={"status": created["status"], "revision": 0},
+                    new_evidence_hash=created["last_evidence_hash"],
+                )
+            AggregateReducer.record(
+                connection,
+                aggregate_type="goal",
+                aggregate_id=goal_id,
+                revision=0,
+                idempotency_key=f"goal-transition:{idempotency_key}",
+                actor_type="butler",
+                actor_id=None,
+                reason="goal.created",
+                previous_state={"status": "absent", "revision": -1},
+                new_state={"status": "running", "revision": 0},
+            )
             return self._get_with_connection(connection, goal_id)
 
     def get(self, goal_id: str) -> dict[str, Any]:
@@ -378,6 +411,21 @@ class GoalRepository:
                         f"goal-unblock:{row['id']}:{next_revision}",
                     ),
                 )
+                AggregateReducer.record(
+                    connection,
+                    aggregate_type="task",
+                    aggregate_id=row["id"],
+                    revision=next_revision,
+                    idempotency_key=f"goal-unblock-transition:{row['id']}:{next_revision}",
+                    actor_type="runtime",
+                    actor_id=None,
+                    reason="goal.work_item_unblocked",
+                    previous_state={
+                        "status": "paused",
+                        "revision": int(row["revision"]),
+                    },
+                    new_state={"status": "ready", "revision": next_revision},
+                )
                 unblocked.append(row["id"])
 
             parents = connection.execute(
@@ -449,6 +497,11 @@ class GoalRepository:
         task_status: TaskStatus,
         reason: str,
     ) -> None:
+        goal = connection.execute(
+            "SELECT status, revision, last_evidence_hash FROM goals WHERE id = ?",
+            (parent["goal_id"],),
+        ).fetchone()
+        assert goal is not None
         next_revision = int(parent["revision"]) + 1
         connection.execute(
             """
@@ -460,7 +513,8 @@ class GoalRepository:
         )
         connection.execute(
             """
-            UPDATE goals SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
+            UPDATE goals SET status = ?, revision = revision + 1,
+                updated_at = CURRENT_TIMESTAMP WHERE id = ?
             """,
             (goal_status, parent["goal_id"]),
         )
@@ -481,6 +535,42 @@ class GoalRepository:
                 next_revision,
                 f"goal-settle:{parent['goal_id']}:{goal_status}:{next_revision}",
             ),
+        )
+        AggregateReducer.record(
+            connection,
+            aggregate_type="task",
+            aggregate_id=parent["id"],
+            revision=next_revision,
+            idempotency_key=f"goal-parent-transition:{parent['goal_id']}:{next_revision}",
+            actor_type="runtime",
+            actor_id=None,
+            reason=reason,
+            previous_state={
+                "status": "paused",
+                "revision": int(parent["revision"]),
+            },
+            new_state={"status": task_status.value, "revision": next_revision},
+            new_evidence_hash=None,
+        )
+        goal_revision = int(goal["revision"]) + 1
+        AggregateReducer.record(
+            connection,
+            aggregate_type="goal",
+            aggregate_id=parent["goal_id"],
+            revision=goal_revision,
+            idempotency_key=(
+                f"goal-settle-transition:{parent['goal_id']}:{goal_revision}"
+            ),
+            actor_type="runtime",
+            actor_id=None,
+            reason=reason,
+            previous_state={
+                "status": goal["status"],
+                "revision": int(goal["revision"]),
+            },
+            new_state={"status": goal_status, "revision": goal_revision},
+            previous_evidence_hash=goal["last_evidence_hash"],
+            new_evidence_hash=goal["last_evidence_hash"],
         )
 
     def _get_with_connection(self, connection: Any, goal_id: str) -> dict[str, Any]:
@@ -534,6 +624,16 @@ class GoalRepository:
         }
         work_items = []
         for task in tasks:
+            physical_session = connection.execute(
+                """
+                SELECT id, project_id, role_id, task_id, provider,
+                       session_generation, external_session_id, state, revision
+                FROM provider_sessions
+                WHERE task_id = ? AND state IN ('bound', 'idle', 'terminating')
+                ORDER BY session_generation DESC LIMIT 1
+                """,
+                (task["id"],),
+            ).fetchone()
             worker = None
             if task["worker_id"]:
                 worker = {
@@ -624,8 +724,17 @@ class GoalRepository:
                         if task["verification_json"] else []
                     ),
                     "session_id": worker["session_id"] if worker else None,
-                    "external_session_id": worker["external_session_id"] if worker else None,
-                    "session_generation": worker["session_generation"] if worker else None,
+                    "external_session_id": (
+                        physical_session["external_session_id"]
+                        if physical_session else None
+                    ),
+                    "session_generation": (
+                        physical_session["session_generation"]
+                        if physical_session else None
+                    ),
+                    "physical_session": (
+                        dict(physical_session) if physical_session else None
+                    ),
                     "rotation_reason": rotation["reason"] if rotation else None,
                     "input_tokens": worker["last_input_tokens"] if worker else 0,
                     "cached_input_tokens": (
@@ -678,6 +787,8 @@ class GoalRepository:
             "project_id": row["project_id"],
             "provider": row["provider"],
             "status": row["status"],
+            "revision": row["revision"],
+            "last_evidence_hash": row["last_evidence_hash"],
             "plan": json.loads(row["plan_json"]),
             "sizing_inputs": (
                 json.loads(row["sizing_inputs_json"]) if row["sizing_inputs_json"] else None

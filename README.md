@@ -74,9 +74,11 @@ py scripts\release_local.py deploy --expected-sha $sha
 - Compose 使用 `restart: unless-stopped`，Docker 恢复后自动拉起；休眠或停机错过的计划默认只补跑一次。
 - 控制面板 Settings → Crontab 管理支持启停、标准五段表达式、时区、错过执行策略和立即 Tick。
 - 只有一个全局计划扫描所有项目/角色/Worker/Task；数据库租约与 fencing token 防止重复调度和脑裂。
-- `max_parallel_workers` 同时约束跨 Tick 已在途任务和手工派发；Host 模型任务在事务性 claim 中预留剩余任务 Token 额度，并计入全局当日额度。
+- `max_parallel_workers` 同时约束跨 Tick 已在途任务和手工派发；执行安全由租约、deadline 与无进展/同类故障阈值控制，Token 只计量、不拒派发或改写终态。
 - 控制路径只做 SQLite 扫描、网络探测和状态判断，模型调用数与 Token 消费均为 0。
-- **主流程是提交目标**：PM（coordination）0 Token 确定性拆分为有序角色工作项；Scheduler 按依赖自动派发、同角色稳定会话续接，父目标仅在全部实现项与独立 verification 项通过后完成。诊断用的单任务创建仍保留，但不是主入口。
+- **主流程是 Butler intake**：结构化和自然语言目标进入同一状态机；大型目标一次只问一个问题，达到 95% 后仍须主人确认；中小目标可自动选 Provider、拆 Task 并写入 wake 事件。物理 Provider Session 绑定 `project + role + task`，只有同 Task 重试可续接。诊断用的单任务创建仍保留，但不是目标入口。
+- Context/checkpoint/handoff/观察/轮转/失败阈值均可配置；Task Convention 的 `Continuity-Limits: {...}` 单行 JSON 覆盖 Project Convention，Project 再覆盖全局 Settings。`GET /api/tasks/{id}/context` 返回每项有效值、来源和冲突警告，无法保留强制边界时拒绝编译。
+- Butler 页是持久化 help inbox，可完成 Butler 回复、升级给主人和主人解决；Task/Goal 详情的 `control-plane` 读模型同时展示 canonical revision、明确下一动作、Task 级 Session identity、最近 20 条 evidence lineage 与删除资格。
 
 ## 本机 CLI Worker Pool
 
@@ -130,4 +132,4 @@ docker compose exec control-plane python -m plow_whip_web --data-dir /data sched
 
 不要把 SQLite 写进镜像层。数据使用 named volume，因此重建/升级镜像不会丢失；只有明确执行 `docker compose down -v` 才会删除数据卷。
 
-Sprint 0–9 已完成：这是可构建、可运行、可审计、可恢复的容器化 Web MVP。真实 CLI Provider 在 Host Bridge 未配置时会明确阻塞，不会伪装完成；内置 Generic Command 只保留为后端确定性测试适配器，不作为 Web UI 项目 Worker 暴露。
+当前代码是可构建、可运行、可审计、可恢复的容器化 Web MVP。真实 CLI Provider 在 Host Bridge 未配置时会明确阻塞，不会伪装完成；内置 Generic Command 只保留为后端确定性测试适配器，不作为 Web UI 项目 Worker 暴露。

@@ -193,6 +193,7 @@ class HostJobManager:
             "input_tokens": 0,
             "cached_input_tokens": 0,
             "output_tokens": 0,
+            "snapshot_kind": "cumulative",
             "cancel_requested": False,
         }
         with self._lock:
@@ -597,6 +598,7 @@ class HostJobManager:
                 "output": output_tokens,
                 "total": input_tokens + output_tokens,
             },
+            "snapshot_kind": str(record.get("snapshot_kind") or "cumulative"),
             "last_valid_output": {
                 "stdout": str(record.get("stdout") or ""),
                 "stderr": str(record.get("stderr") or ""),
@@ -680,6 +682,7 @@ def execute(payload: dict[str, Any], roots: tuple[Path, ...]) -> dict[str, objec
             "input_tokens": parsed["input_tokens"],
             "cached_input_tokens": parsed["cached_input_tokens"],
             "output_tokens": parsed["output_tokens"],
+            "snapshot_kind": "cumulative",
             "session_id": parsed["session_id"] or session_id,
         }
     except subprocess.TimeoutExpired as error:
@@ -692,6 +695,7 @@ def execute(payload: dict[str, Any], roots: tuple[Path, ...]) -> dict[str, objec
             "input_tokens": 0,
             "cached_input_tokens": 0,
             "output_tokens": 0,
+            "snapshot_kind": "cumulative",
             "session_id": session_id,
         }
 
@@ -716,6 +720,7 @@ def verify(payload: dict[str, Any], roots: tuple[Path, ...]) -> dict[str, object
         cached_input_tokens=int(execution_payload.get("cached_input_tokens", 0)),
         output_tokens=int(execution_payload.get("output_tokens", 0)),
         external_session_id=execution_payload.get("external_session_id"),
+        snapshot_kind=str(execution_payload.get("snapshot_kind") or "cumulative"),
     )
     result = VerificationEngine().verify(project_path, execution, specs)
     return {

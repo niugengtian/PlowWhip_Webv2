@@ -6,13 +6,18 @@ import json
 from pathlib import Path
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from plow_whip_web import __version__
 from plow_whip_web.api.schemas import (
     ArtifactOpenRequest,
+    ButlerAnswer,
+    ButlerConfirm,
+    ButlerIntakeCreate,
+    DeletionRequest,
+    EvidenceRewriteRequest,
     ExpectedRevision,
     ConventionPut,
     ConventionRefineRequest,
@@ -34,10 +39,10 @@ from plow_whip_web.api.schemas import (
     TaskSizingEstimateRequest,
     TaskSizingEstimateResponse,
     TaskView,
+    WorkerHelpCreate,
+    WorkerHelpReply,
 )
 from plow_whip_web.runtime.sizing import TaskSizingInputs, estimate_task_sizing
-from plow_whip_web.runtime.orchestration import plan_goal_work_items
-from dataclasses import replace
 from plow_whip_web.config import Settings
 from plow_whip_web.domain.model import (
     DomainError,
@@ -49,6 +54,8 @@ from plow_whip_web.domain.model import (
     PolicyViolationError,
 )
 from plow_whip_web.runtime.task_service import TaskService
+from plow_whip_web.runtime.aggregate_reducer import AggregateReducer
+from plow_whip_web.runtime.butler_service import ButlerService
 from plow_whip_web.runtime.scheduler import SchedulerService
 from plow_whip_web.runtime.cron import EmbeddedCronRunner, schedule_view
 from plow_whip_web.runtime.budget import BudgetManager
@@ -69,6 +76,8 @@ from plow_whip_web.store.provider_repository import ProviderRepository
 from plow_whip_web.store.task_repository import TaskRepository
 from plow_whip_web.store.goal_repository import GoalRepository
 from plow_whip_web.store.host_job_repository import HostJobRepository
+from plow_whip_web.store.deletion_repository import DeletionRepository
+from plow_whip_web.store.butler_repository import ButlerRepository
 from plow_whip_web.providers.host_bridge import HostBridgeClient
 from plow_whip_web.providers.pool import ProviderPool
 from plow_whip_web.roles import ROLE_PROMPTS
@@ -82,6 +91,9 @@ def create_app(settings: Settings) -> FastAPI:
     task_repository = TaskRepository(database)
     goal_repository = GoalRepository(database)
     host_jobs = HostJobRepository(database)
+    reducer = AggregateReducer(database)
+    deletions = DeletionRepository(database)
+    butler_repository = ButlerRepository(database)
     project_repository = ProjectRepository(database)
     runtime_settings = SettingsRepository(database)
     conventions = ConventionRepository(database)
@@ -97,6 +109,9 @@ def create_app(settings: Settings) -> FastAPI:
     provider_pool = ProviderPool(
         database, providers, task_repository,
         HostBridgeClient(settings.host_bridge_url, settings.host_bridge_token),
+    )
+    butler_service = ButlerService(
+        butler_repository, goal_repository, project_repository, provider_pool
     )
     maintenance = MaintenanceService(
         settings.data_dir, database, runtime_settings, health_repository, providers
@@ -125,6 +140,10 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.task_repository = task_repository
     app.state.goal_repository = goal_repository
     app.state.host_jobs = host_jobs
+    app.state.reducer = reducer
+    app.state.deletions = deletions
+    app.state.butler_repository = butler_repository
+    app.state.butler_service = butler_service
     app.state.project_repository = project_repository
     app.state.task_service = task_service
     app.state.runtime_settings = runtime_settings
@@ -326,7 +345,8 @@ def create_app(settings: Settings) -> FastAPI:
         return pool.refine_convention(
             scope=scope, scope_id=scope_id, content=current["content"],
             source_revision=current["revision"], provider_name=payload.provider,
-            project_path=project_path, instruction=payload.instruction,
+            project_id=project_id, project_path=project_path,
+            instruction=payload.instruction,
         )
 
     @app.get("/api/tasks/{task_id}/context", tags=["context"])
@@ -457,79 +477,210 @@ def create_app(settings: Settings) -> FastAPI:
         preview = estimate_task_sizing(TaskSizingInputs(**payload.model_dump()))
         return TaskSizingEstimateResponse(**preview)
 
+    @app.post("/api/butler/intakes", status_code=201, tags=["butler"])
+    def create_butler_intake(
+        request: Request,
+        payload: ButlerIntakeCreate,
+        idempotency_key: str = Header(
+            alias="Idempotency-Key", min_length=8, max_length=200
+        ),
+    ) -> dict[str, object]:
+        service: ButlerService = request.app.state.butler_service
+        return service.submit(
+            project_id=payload.project_id,
+            source=payload.source,
+            instruction=payload.instruction,
+            structured_input=payload.structured_input,
+            model_size=payload.model_size,
+            confidence=payload.confidence,
+            proposal=payload.proposal,
+            idempotency_key=idempotency_key,
+        )
+
+    @app.get("/api/butler/intakes/{intake_id}", tags=["butler"])
+    def get_butler_intake(request: Request, intake_id: str) -> dict[str, object]:
+        repository: ButlerRepository = request.app.state.butler_repository
+        return repository.get(intake_id)
+
+    @app.post("/api/butler/intakes/{intake_id}/answers", tags=["butler"])
+    def answer_butler_intake(
+        request: Request,
+        intake_id: str,
+        payload: ButlerAnswer,
+        idempotency_key: str = Header(
+            alias="Idempotency-Key", min_length=8, max_length=200
+        ),
+    ) -> dict[str, object]:
+        repository: ButlerRepository = request.app.state.butler_repository
+        return repository.answer(
+            intake_id,
+            expected_revision=payload.expected_revision,
+            answer=payload.answer,
+            confidence=payload.confidence,
+            proposal=payload.proposal,
+            idempotency_key=idempotency_key,
+        )
+
+    @app.post("/api/butler/intakes/{intake_id}/confirm", tags=["butler"])
+    def confirm_butler_intake(
+        request: Request,
+        intake_id: str,
+        payload: ButlerConfirm,
+        idempotency_key: str = Header(
+            alias="Idempotency-Key", min_length=8, max_length=200
+        ),
+    ) -> dict[str, object]:
+        service: ButlerService = request.app.state.butler_service
+        return service.confirm(
+            intake_id,
+            expected_revision=payload.expected_revision,
+            proposal_hash=payload.proposal_hash,
+            approved=payload.approved,
+            reason=payload.reason,
+            idempotency_key=idempotency_key,
+        )
+
+    @app.post("/api/butler/intakes/{intake_id}/interrupt", tags=["butler"])
+    def interrupt_butler_intake(
+        request: Request,
+        intake_id: str,
+        payload: DeletionRequest,
+        idempotency_key: str = Header(
+            alias="Idempotency-Key", min_length=8, max_length=200
+        ),
+    ) -> dict[str, object]:
+        repository: ButlerRepository = request.app.state.butler_repository
+        intake = repository.interrupt(
+            intake_id,
+            expected_revision=payload.expected_revision,
+            reason=payload.reason,
+            idempotency_key=idempotency_key,
+        )
+        cancellations: list[dict[str, object]] = []
+        if intake.get("goal_id"):
+            goal_repo: GoalRepository = request.app.state.goal_repository
+            service: TaskService = request.app.state.task_service
+            for item in goal_repo.get(str(intake["goal_id"]))["work_items"]:
+                if item["status"] in {"completed", "terminal_failed", "cancelled"}:
+                    continue
+                try:
+                    stopped = service.control(
+                        item["id"], action="cancel",
+                        reason=f"Butler intake interrupted: {payload.reason}",
+                        expected_revision=item["revision"],
+                        idempotency_key=f"{idempotency_key}:task:{item['id']}",
+                    )
+                    cancellations.append(
+                        {"task_id": item["id"], "status": stopped.status.value}
+                    )
+                except InvalidTransitionError as error:
+                    cancellations.append(
+                        {"task_id": item["id"], "error": str(error)}
+                    )
+        intake["cancellations"] = cancellations
+        return intake
+
+    @app.post("/api/butler/help", status_code=201, tags=["butler"])
+    def create_worker_help(
+        request: Request,
+        payload: WorkerHelpCreate,
+        idempotency_key: str = Header(
+            alias="Idempotency-Key", min_length=8, max_length=200
+        ),
+    ) -> dict[str, object]:
+        repository: ButlerRepository = request.app.state.butler_repository
+        return repository.create_help(
+            project_id=payload.project_id,
+            task_id=payload.task_id,
+            worker_id=payload.worker_id,
+            category=payload.category,
+            severity=payload.severity,
+            question=payload.question,
+            checkpoint=payload.checkpoint,
+            idempotency_key=idempotency_key,
+        )
+
+    @app.get("/api/butler/help", tags=["butler"])
+    def list_worker_help(
+        request: Request,
+        project_id: str | None = None,
+        goal_id: str | None = None,
+        task_id: str | None = None,
+        status: str | None = None,
+        limit: int = Query(default=20, ge=1, le=100),
+    ) -> list[dict[str, object]]:
+        repository: ButlerRepository = request.app.state.butler_repository
+        return repository.list_help(
+            project_id=project_id,
+            goal_id=goal_id,
+            task_id=task_id,
+            status=status,
+            limit=limit,
+        )
+
+    @app.get("/api/butler/help/{help_id}", tags=["butler"])
+    def get_worker_help(request: Request, help_id: str) -> dict[str, object]:
+        repository: ButlerRepository = request.app.state.butler_repository
+        return repository.get_help(help_id)
+
+    @app.post("/api/butler/help/{help_id}/replies", tags=["butler"])
+    def reply_worker_help(
+        request: Request,
+        help_id: str,
+        payload: WorkerHelpReply,
+        idempotency_key: str = Header(
+            alias="Idempotency-Key", min_length=8, max_length=200
+        ),
+    ) -> dict[str, object]:
+        repository: ButlerRepository = request.app.state.butler_repository
+        return repository.reply_help(
+            help_id,
+            expected_revision=payload.expected_revision,
+            sender=payload.sender,
+            content=payload.content,
+            bounded_context=payload.bounded_context,
+            escalate=payload.escalate,
+            idempotency_key=idempotency_key,
+        )
+
     @app.post("/api/goals", response_model=GoalView, status_code=201, tags=["goals"])
     def create_goal(
         request: Request,
         payload: GoalCreate,
         idempotency_key: str = Header(alias="Idempotency-Key", min_length=8, max_length=200),
     ) -> GoalView:
-        projects: ProjectRepository = request.app.state.project_repository
+        service: ButlerService = request.app.state.butler_service
         goals: GoalRepository = request.app.state.goal_repository
-        provider_pool: ProviderPool = request.app.state.provider_pool
-        project = projects.get(payload.project_id)
-        role_ids = {role["kind"]: role["id"] for role in project["roles"]}
-        required_roles = {
-            "coordination", "backend", "frontend", "ui", "devops_sre", "verification",
-            "fullstack", "web3",
+        structured = {
+            "title": payload.title,
+            "provider": payload.provider,
+            "role_providers": payload.role_providers,
+            "network_requirement": payload.network_requirement,
+            "verification": [
+                item.model_dump(exclude_none=True) for item in payload.verification
+            ],
+            "sizing_inputs": payload.sizing_inputs.model_dump(),
+            "plan_items": payload.plan_items,
+            "command": payload.command.model_dump() if payload.command else None,
+            "risk_level": payload.sizing_inputs.risk_level,
+            "has_migration": payload.sizing_inputs.has_migration,
+            "has_deploy": payload.sizing_inputs.has_deploy,
         }
-        missing = sorted(kind for kind in required_roles if kind not in role_ids)
-        if missing:
-            raise NotFoundError(
-                f"role catalog incomplete for {payload.project_id}: {', '.join(missing)}"
-            )
-        unknown_provider_roles = sorted(set(payload.role_providers) - set(role_ids))
-        if unknown_provider_roles:
-            raise DomainError(
-                f"unknown role provider decision: {', '.join(unknown_provider_roles)}"
-            )
-        sizing_inputs = TaskSizingInputs(**payload.sizing_inputs.model_dump())
-        plan = plan_goal_work_items(
-            title=payload.title,
-            objective=payload.objective,
-            sizing_inputs=sizing_inputs,
-            structured_items=payload.plan_items,
-        )
-        if plan.status == "needs_planning":
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "message": "dispatch gates incomplete; goal cannot be created",
-                    "code": "needs_planning",
-                    "missing_gates": list(plan.missing_gates),
-                },
-            )
-        bindings = projects.role_provider_bindings(payload.project_id)
-        role_providers: dict[str, str] = {"coordination": bindings.get("coordination", payload.provider)}
-        for item in plan.items:
-            selected = bindings.get(item.role) or payload.role_providers.get(item.role)
-            if selected is None:
-                raise DomainError(
-                    f"explicit provider decision required for unbound role: {item.role}"
-                )
-            role_providers[item.role] = selected
-        # Live 0-Token probe per distinct provider before atomic create.
-        for provider_name in sorted(set(role_providers.values())):
-            provider_pool.require_ready(provider_name)
-        binding = projects.resolve_role(payload.project_id, "coordination")
-        record = goals.create_with_plan(
-            title=payload.title,
-            objective=payload.objective,
+        intake = service.submit(
             project_id=payload.project_id,
-            project_path=binding["project_path"],
-            role_providers=role_providers,
-            plan=plan,
-            sizing_inputs=payload.sizing_inputs.model_dump(),
-            verification=[item.model_dump(exclude_none=True) for item in payload.verification],
-            role_ids=role_ids,
-            idempotency_key=idempotency_key,
-            network_requirement=payload.network_requirement,
-            command=(
-                payload.command.model_dump()
-                if payload.command is not None
-                else {"argv": None, "timeout_seconds": 60, "output_limit_bytes": 131_072}
-            ),
+            source="structured",
+            instruction=payload.objective,
+            structured_input=structured,
+            model_size=None,
+            confidence=100,
+            proposal=structured,
+            idempotency_key=f"goal-intake:{idempotency_key}",
         )
-        return GoalView(**record)
+        if intake["status"] != "dispatched":
+            raise InvalidTransitionError(
+                f"goal requires Butler clarification/confirmation; intake_id={intake['id']}"
+            )
+        return GoalView(**goals.get(str(intake["goal_id"])))
 
     @app.get("/api/goals", response_model=list[GoalView], tags=["goals"])
     def list_goals(request: Request) -> list[GoalView]:
@@ -540,6 +691,30 @@ def create_app(settings: Settings) -> FastAPI:
     def get_goal(request: Request, goal_id: str) -> GoalView:
         goals: GoalRepository = request.app.state.goal_repository
         return GoalView(**goals.get(goal_id))
+
+    @app.delete("/api/goals/{goal_id}", tags=["goals"])
+    def delete_goal(
+        request: Request,
+        goal_id: str,
+        payload: DeletionRequest,
+        idempotency_key: str = Header(
+            alias="Idempotency-Key", min_length=8, max_length=200
+        ),
+    ) -> JSONResponse:
+        deletion_repo: DeletionRepository = request.app.state.deletions
+        result = deletion_repo.goal(
+            goal_id,
+            expected_revision=payload.expected_revision,
+            idempotency_key=idempotency_key,
+            actor_type="owner",
+            actor_id=payload.actor_id,
+            reason=payload.reason,
+        )
+        _request_host_cancellations(request, result)
+        return JSONResponse(
+            status_code=202 if result["status"] == "stopping" else 200,
+            content=result,
+        )
 
     @app.post("/api/tasks", response_model=TaskView, status_code=201, tags=["tasks"])
     def create_task(
@@ -595,42 +770,15 @@ def create_app(settings: Settings) -> FastAPI:
                 )
             sizing, execution_budget = _preview_to_persistence(preview)
             estimated_hard_cap = int(execution_budget["total_token_hard_cap"])
-            reserved_tokens = int(execution_budget["reserved_tokens"])
-            if payload.token_budget is not None and payload.token_budget != estimated_hard_cap:
-                reason = (payload.manual_override_reason or "").strip()
-                if not reason:
-                    raise HTTPException(
-                        status_code=400,
-                        detail={
-                            "message": (
-                                "token_budget differs from estimated hard cap; "
-                                "manual_override_reason is required"
-                            ),
-                            "code": "manual_override_required",
-                            "total_token_hard_cap": estimated_hard_cap,
-                        },
-                    )
-                if payload.token_budget < reserved_tokens:
-                    raise HTTPException(
-                        status_code=400,
-                        detail={
-                            "message": (
-                                "token_budget cannot be below reserved_tokens"
-                            ),
-                            "code": "token_budget_below_reserved",
-                            "token_budget": payload.token_budget,
-                            "reserved_tokens": reserved_tokens,
-                        },
-                    )
-                execution_budget["estimated_total_token_hard_cap"] = estimated_hard_cap
-                execution_budget["total_token_hard_cap"] = payload.token_budget
-                create_kwargs["token_budget"] = payload.token_budget
-                create_kwargs["manual_override"] = True
-                create_kwargs["override_reason"] = reason
-            else:
-                create_kwargs["token_budget"] = estimated_hard_cap
-                create_kwargs["manual_override"] = False
-                create_kwargs["override_reason"] = None
+            # Retained as an estimate for old clients. It is never an
+            # admission, cancellation, or terminal-state control.
+            create_kwargs["token_budget"] = (
+                payload.token_budget
+                if payload.token_budget is not None
+                else estimated_hard_cap
+            )
+            create_kwargs["manual_override"] = False
+            create_kwargs["override_reason"] = None
             create_kwargs["sizing"] = sizing
             create_kwargs["execution_budget"] = execution_budget
         else:
@@ -654,6 +802,144 @@ def create_app(settings: Settings) -> FastAPI:
     def get_task(request: Request, task_id: str) -> TaskView:
         repository: TaskRepository = request.app.state.task_repository
         return TaskView.from_record(repository.get(task_id))
+
+    @app.delete("/api/tasks/{task_id}", tags=["tasks"])
+    def delete_task(
+        request: Request,
+        task_id: str,
+        payload: DeletionRequest,
+        idempotency_key: str = Header(
+            alias="Idempotency-Key", min_length=8, max_length=200
+        ),
+    ) -> JSONResponse:
+        deletion_repo: DeletionRepository = request.app.state.deletions
+        result = deletion_repo.task(
+            task_id,
+            expected_revision=payload.expected_revision,
+            idempotency_key=idempotency_key,
+            actor_type="owner",
+            actor_id=payload.actor_id,
+            reason=payload.reason,
+        )
+        _request_host_cancellations(request, result)
+        return JSONResponse(
+            status_code=202 if result["status"] == "stopping" else 200,
+            content=result,
+        )
+
+    @app.get(
+        "/api/aggregates/{aggregate_type}/{aggregate_id}/lineage",
+        tags=["audit"],
+    )
+    def aggregate_lineage(
+        request: Request,
+        aggregate_type: str,
+        aggregate_id: str,
+        limit: int = Query(default=20, ge=1, le=100),
+    ) -> list[dict[str, object]]:
+        reducer_service: AggregateReducer = request.app.state.reducer
+        return reducer_service.lineage(aggregate_type, aggregate_id, limit=limit)
+
+    @app.get(
+        "/api/aggregates/{aggregate_type}/{aggregate_id}/control-plane",
+        tags=["aggregates"],
+    )
+    def aggregate_control_plane(
+        request: Request,
+        aggregate_type: str,
+        aggregate_id: str,
+        limit: int = Query(default=20, ge=1, le=100),
+    ) -> dict[str, object]:
+        if aggregate_type not in {"task", "goal"}:
+            raise NotFoundError(f"unsupported aggregate: {aggregate_type}")
+        database: Database = request.app.state.database
+        table = "tasks" if aggregate_type == "task" else "goals"
+        with database.transaction() as connection:
+            row = connection.execute(
+                f"""
+                SELECT id, status, revision, last_evidence_hash, updated_at
+                FROM {table} WHERE id = ?
+                """,
+                (aggregate_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"{aggregate_type} not found: {aggregate_id}")
+            task_filter = (
+                "ps.task_id = ?" if aggregate_type == "task"
+                else "ps.task_id IN (SELECT id FROM tasks WHERE goal_id = ?)"
+            )
+            sessions = [
+                dict(item)
+                for item in connection.execute(
+                    f"""
+                    SELECT ps.id, ps.project_id, ps.role_id, ps.task_id,
+                           ps.worker_id, ps.provider, ps.session_generation,
+                           ps.external_session_id, ps.state, ps.revision,
+                           ps.archive_reason, ps.updated_at
+                    FROM provider_sessions ps WHERE {task_filter}
+                    ORDER BY ps.updated_at DESC, ps.session_generation DESC LIMIT ?
+                    """,
+                    (aggregate_id, limit),
+                ).fetchall()
+            ]
+            butler: ButlerRepository = request.app.state.butler_repository
+            help_requests = butler.list_help(
+                task_id=aggregate_id if aggregate_type == "task" else None,
+                goal_id=aggregate_id if aggregate_type == "goal" else None,
+                limit=limit,
+                connection=connection,
+            )
+            deletion_repo: DeletionRepository = request.app.state.deletions
+            deletion = deletion_repo.eligibility(
+                aggregate_type, aggregate_id, connection=connection
+            )
+            reducer_service: AggregateReducer = request.app.state.reducer
+            lineage = reducer_service.lineage(
+                aggregate_type, aggregate_id, limit=limit, connection=connection
+            )
+            return {
+                "aggregate_type": aggregate_type,
+                "aggregate_id": aggregate_id,
+                "canonical_state": {
+                    "status": row["status"],
+                    "revision": int(row["revision"]),
+                    "evidence_hash": row["last_evidence_hash"],
+                    "updated_at": row["updated_at"],
+                },
+                "next_action": _canonical_next_action(
+                    str(row["status"]), help_requests
+                ),
+                "session_identity": "project_id+role_id+task_id",
+                "provider_sessions": sessions,
+                "help_requests": help_requests,
+                "lineage": lineage,
+                "deletion": deletion,
+            }
+
+    @app.post(
+        "/api/aggregates/{aggregate_type}/{aggregate_id}/evidence",
+        tags=["audit"],
+    )
+    def rewrite_evidence(
+        request: Request,
+        aggregate_type: str,
+        aggregate_id: str,
+        payload: EvidenceRewriteRequest,
+        idempotency_key: str = Header(
+            alias="Idempotency-Key", min_length=8, max_length=200
+        ),
+    ) -> dict[str, object]:
+        reducer_service: AggregateReducer = request.app.state.reducer
+        return reducer_service.rewrite_evidence(
+            aggregate_type=aggregate_type,
+            aggregate_id=aggregate_id,
+            expected_revision=payload.expected_revision,
+            new_evidence_hash=payload.evidence_hash,
+            actor_type="owner",
+            actor_id=payload.actor_id,
+            reason=payload.reason,
+            idempotency_key=idempotency_key,
+        )
 
     @app.post("/api/tasks/{task_id}/drive", response_model=TaskView, tags=["tasks"])
     def drive_task(
@@ -741,6 +1027,25 @@ def create_app(settings: Settings) -> FastAPI:
     return app
 
 
+def _canonical_next_action(
+    status: str, help_requests: list[dict[str, object]]
+) -> dict[str, object]:
+    if any(item["status"] == "owner_escalated" for item in help_requests):
+        return {"kind": "owner_reply", "label": "主人回复升级问题", "requires_owner": True}
+    if any(item["status"] == "open" for item in help_requests):
+        return {"kind": "butler_reply", "label": "Butler 回复 Worker 求助", "requires_owner": False}
+    actions = {
+        "ready": ("drive", "驱动下一个就绪 Task", False),
+        "paused": ("resume_or_wait", "核对依赖后恢复", False),
+        "running": ("observe", "观察 canonical 执行状态", False),
+        "stopping": ("await_stop", "等待 Host 停止并 reconciliation", False),
+        "verifying": ("await_verification", "等待确定性验证", False),
+        "needs_human": ("owner_decision", "主人处理阻塞", True),
+    }
+    kind, label, requires_owner = actions.get(status, ("none", "无需动作", False))
+    return {"kind": kind, "label": label, "requires_owner": requires_owner}
+
+
 def _task_host_path(
     request: Request, project_id: str | None, fallback_path: str
 ) -> str:
@@ -749,6 +1054,29 @@ def _task_host_path(
     project: ProjectRepository = request.app.state.project_repository
     record = project.get(project_id)
     return str(record["host_path"] or record["path"])
+
+
+def _request_host_cancellations(
+    request: Request, deletion: dict[str, object]
+) -> None:
+    pool: ProviderPool = request.app.state.provider_pool
+    jobs: HostJobRepository = request.app.state.host_jobs
+    results: list[dict[str, object]] = []
+    pending = deletion.get("pending_host_jobs", [])
+    for job_id in pending if isinstance(pending, list) else []:
+        try:
+            snapshot = pool.cancel_task_job(str(job_id))
+            jobs.record(str(job_id), snapshot)
+            results.append({"job_id": str(job_id), "cancel_requested": True})
+        except ProviderUnavailableError as error:
+            results.append(
+                {
+                    "job_id": str(job_id),
+                    "cancel_requested": False,
+                    "error": str(error),
+                }
+            )
+    deletion["host_cancellations"] = results
 
 
 def _preview_to_persistence(

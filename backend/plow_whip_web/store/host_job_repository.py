@@ -26,10 +26,11 @@ class HostJobRepository:
                 return dict(existing)
             context = connection.execute(
                 """
-                SELECT t.worker_id, l.fencing_token, w.session_generation
+                SELECT t.worker_id, l.fencing_token, ps.session_generation
                 FROM tasks t
                 LEFT JOIN task_leases l ON l.task_id = t.id
-                LEFT JOIN workers w ON w.id = t.worker_id
+                LEFT JOIN provider_sessions ps
+                  ON ps.task_id = t.id AND ps.state = 'bound'
                 WHERE t.id = ?
                 """,
                 (task_id,),
@@ -81,13 +82,23 @@ class HostJobRepository:
             if row["worker_id"]:
                 connection.execute(
                     """
-                    UPDATE workers SET external_session_id = COALESCE(?, external_session_id),
-                        last_seen_at = CURRENT_TIMESTAMP, last_error = ?, updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ? AND session_generation IS ?
+                    UPDATE workers SET external_session_id = NULL,
+                        last_seen_at = CURRENT_TIMESTAMP, last_error = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (error_summary, row["worker_id"]),
+                )
+                connection.execute(
+                    """
+                    UPDATE provider_sessions
+                    SET external_session_id = COALESCE(?, external_session_id),
+                        revision = revision + 1, updated_at = CURRENT_TIMESTAMP
+                    WHERE task_id = ? AND session_generation = ?
+                      AND state IN ('bound', 'terminating')
                     """,
                     (
-                        session_id, error_summary, row["worker_id"],
-                        row["session_generation"],
+                        session_id, row["task_id"], row["session_generation"],
                     ),
                 )
             return dict(row)
@@ -210,6 +221,7 @@ def _compact_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
         "job_id", "status", "pid", "session_id", "external_session_id",
         "heartbeat_at", "finished_at", "returncode", "duration_ms",
         "failure_class", "input_tokens", "cached_input_tokens", "output_tokens",
+        "snapshot_kind",
         "cancel_requested",
         "output_ref", "carry_forward_ref",
     }

@@ -15,10 +15,7 @@ from plow_whip_web.domain.model import (
 from plow_whip_web.providers.generic_command import ExecutionResult, GenericCommandProvider
 from plow_whip_web.providers.pool import ProviderPool
 from plow_whip_web.store.task_repository import (
-    task_host_reserved_tokens,
     task_lease_seconds,
-    task_sizing_status,
-    task_token_hard_cap,
 )
 from plow_whip_web.runtime.budget import BudgetManager
 from plow_whip_web.runtime.context import ContextCompiler
@@ -31,9 +28,6 @@ from plow_whip_web.store.project_repository import (
     ProjectRepository,
 )
 from plow_whip_web.store.task_repository import TaskRepository
-
-NO_PROGRESS_ROTATION_THRESHOLD = 2
-
 
 class TaskService:
     def __init__(
@@ -76,31 +70,9 @@ class TaskService:
             )
         if pending.provider == self.provider.name:
             self.command_policy.validate(Path(pending.project_path), pending.command)
-        host_model = bool(
-            provider_config and provider_config["transport"] == "host-bridge"
-        )
-        estimate = (
-            self.provider.estimate_tokens(pending.command)
-            if pending.provider == self.provider.name else 0
-        )
-        reserved_tokens = 0
-        if self.budget:
-            self.budget.ensure(pending, estimate)
-            if host_model:
-                if task_sizing_status(pending) == "estimated":
-                    remaining = pending.token_budget - pending.tokens_used
-                    reserved_tokens = task_host_reserved_tokens(
-                        pending, remaining=remaining,
-                    )
-                else:
-                    reserved_tokens = self.budget.host_reservation(pending)
-        self._evaluate_context_guard(
-            pending, reserved_tokens=reserved_tokens if host_model else 0
-        )
         claim = self.repository.claim(
             task_id, expected_revision=expected_revision,
             idempotency_key=f"{idempotency_key}:claim",
-            reserved_tokens=reserved_tokens,
         )
         if not claim.claimed:
             return claim.task
@@ -111,7 +83,10 @@ class TaskService:
             self.journal.append(claim.task.worker_id, {
                 "event": "task.started", "task_id": task_id,
                 "context_hash": context["content_hash"] if context else None,
-            })
+            }, maximum_bytes=(
+                context["effective_limits"]["rotation_max_bytes"]["value"]
+                if context else None
+            ))
         prompt = context["content"] if context else claim.task.objective
         if (
             provider_config
@@ -207,7 +182,7 @@ class TaskService:
             if status == "completed":
                 if task.status is TaskStatus.STOPPING:
                     result = self.repository.finalize_running_cancel(task_id, job_id=job_id)
-                    self._settle_host_reservation(task, job, snapshot)
+                    self._settle_host_call(task, job, snapshot)
                 else:
                     result = self._handle_host_fault(task, job, snapshot)
                     if result is not None:
@@ -226,6 +201,7 @@ class TaskService:
                             task, job["attempt_id"], job["run_id"], execution,
                             idempotency_prefix=f"host-job:{job_id}",
                             verification=verification,
+                            host_job_id=job_id,
                         )
                     else:
                         result = task
@@ -235,6 +211,7 @@ class TaskService:
                             self.budget.record(
                                 task, self.provider_pool.bridge.result(snapshot).as_dict(),
                                 provider=task.provider, run_id=job["run_id"],
+                                attempt_id=job["attempt_id"], host_job_id=job_id,
                             )
                 self.host_jobs.consume(job_id)
                 settled.append({"task_id": task_id, "status": result.status.value})
@@ -242,7 +219,7 @@ class TaskService:
             if status == "cancelled":
                 if task.status is TaskStatus.STOPPING:
                     result = self.repository.finalize_running_cancel(task_id, job_id=job_id)
-                    self._settle_host_reservation(task, job, snapshot)
+                    self._settle_host_call(task, job, snapshot)
                     self.host_jobs.consume(job_id)
                 else:
                     result = self._handle_host_fault(task, job, snapshot)
@@ -268,11 +245,8 @@ class TaskService:
         decision = FaultPolicy.from_host_snapshot(snapshot)
         if decision.action == "verify":
             return None
+        limits = self._continuity_values(task)
         if decision.failure_class == "provider_capacity" and self.host_jobs:
-            limits = (
-                self.budget.settings.get()["values"]
-                if self.budget else {"max_no_progress": 3}
-            )
             threshold = int(limits["max_no_progress"])
             occurrences = 1 + self.host_jobs.consecutive_faults(
                 job.get("worker_id") or task.worker_id,
@@ -298,8 +272,8 @@ class TaskService:
                 session_generation=job.get("session_generation"),
                 reason=decision.reason,
                 before_job_id=job["job_id"],
-                limit=NO_PROGRESS_ROTATION_THRESHOLD - 1,
-            ) + 1 >= NO_PROGRESS_ROTATION_THRESHOLD
+                limit=int(limits["session_no_progress_rotation_threshold"]) - 1,
+            ) + 1 >= int(limits["session_no_progress_rotation_threshold"])
         )
         execution = {
             "returncode": int(snapshot.get("returncode") or 0),
@@ -307,6 +281,12 @@ class TaskService:
             "input_tokens": int(snapshot.get("input_tokens") or 0),
             "cached_input_tokens": int(snapshot.get("cached_input_tokens") or 0),
             "output_tokens": int(snapshot.get("output_tokens") or 0),
+            "snapshot_kind": str(snapshot.get("snapshot_kind") or "cumulative"),
+            "external_session_id": (
+                snapshot.get("session_id")
+                or snapshot.get("external_session_id")
+                or job.get("external_session_id")
+            ),
             "attribution_granularity": "turn",
             "value_classification": "unknown",
             "output_ref": snapshot.get("output_ref"),
@@ -339,19 +319,17 @@ class TaskService:
                     pass
         return result
 
-    def _settle_host_reservation(
+    def _settle_host_call(
         self, task: TaskRecord, job: dict[str, Any], snapshot: dict[str, Any]
     ) -> None:
         if not self.budget or not self.provider_pool:
             return
         execution = self.provider_pool.bridge.result(snapshot).as_dict()
-        if int(execution["input_tokens"]) + int(execution["output_tokens"]) > 0:
-            self.budget.record(
-                task, execution, provider=task.provider, run_id=job["run_id"],
-                add_to_task=True,
-            )
-        else:
-            self.budget.release(job["run_id"])
+        self.budget.record(
+            task, execution, provider=task.provider, run_id=job["run_id"],
+            add_to_task=True, attempt_id=job["attempt_id"],
+            host_job_id=job["job_id"],
+        )
 
     def control(
         self, task_id: str, *, action: str, reason: str,
@@ -391,6 +369,7 @@ class TaskService:
         self, task: TaskRecord, attempt_id: str, run_id: str,
         execution: ExecutionResult, *, idempotency_prefix: str,
         verification: VerificationResult | None = None,
+        host_job_id: str | None = None,
     ) -> TaskRecord:
         project_path = Path(task.project_path).resolve()
         verifying = self.repository.mark_verifying(
@@ -410,19 +389,16 @@ class TaskService:
             ),
             "summary": verification.summary,
         }
-        limits = self.budget.settings.get()["values"] if self.budget else {}
+        limits = self._continuity_values(task)
         completed = self.repository.finish(
             task.id, expected_revision=verifying.revision,
             attempt_id=attempt_id, run_id=run_id,
             execution=execution.as_dict(), verification=verification_payload,
             idempotency_key=f"{idempotency_prefix}:finish",
             max_same_failure=limits.get("max_same_failure", 3),
+            host_job_id=host_job_id,
         )
         execution_payload = execution.as_dict()
-        if self.budget:
-            self.budget.record(
-                completed, execution_payload, provider=completed.provider, run_id=run_id
-            )
         if self.journal:
             self.journal.append(completed.worker_id, {
                 "event": "task.finished", "task_id": task.id,
@@ -431,65 +407,20 @@ class TaskService:
                 "input_tokens": execution_payload["input_tokens"],
                 "cached_input_tokens": execution_payload["cached_input_tokens"],
                 "output_tokens": execution_payload["output_tokens"],
-            })
+            }, maximum_bytes=int(limits["rotation_max_bytes"]))
         return completed
 
-    def _evaluate_context_guard(
-        self, task: TaskRecord, *, reserved_tokens: int
-    ) -> None:
-        if not self.projects or not task.project_id or not task.role_id:
-            return
-        connection = self.repository.database.connect()
-        try:
-            worker = connection.execute(
-                """
-                SELECT id, status, session_generation, last_cached_input_tokens,
-                       last_context_pressure_tokens, last_context_pressure_reason,
-                       last_context_session_generation
-                FROM workers
-                WHERE project_id = ? AND role_id = ? AND released_at IS NULL
-                """,
-                (task.project_id, task.role_id),
-            ).fetchone()
-        finally:
-            connection.close()
-        if worker is None or worker["status"] != "idle":
-            return
-        settings_repository = (
-            self.journal.settings if self.journal else (
-                self.budget.settings if self.budget else None
-            )
-        )
-        if settings_repository is None:
-            return
-        settings = settings_repository.get()["values"]
-        maximum = int(settings["rotation_max_bytes"])
-        persisted = self.journal.current_bytes(worker["id"]) if self.journal else 0
-        if persisted >= maximum and self.journal:
-            # File Journal rotation is independent from Provider session rotation.
-            self.journal.rotate_current(worker["id"])
-        generation = int(worker["session_generation"])
-        same_generation = worker["last_context_session_generation"] == generation
-        carry_in = int(worker["last_cached_input_tokens"] or 0) if same_generation else 0
-        hard_cap = task_token_hard_cap(task)
-        with self.repository.database.transaction(immediate=True) as connection:
-            connection.execute(
-                """
-                UPDATE workers SET last_context_guard_decision = ?,
-                    last_context_guard_reason = ?,
-                    last_guard_estimated_new_tokens = ?,
-                    last_guard_carry_in_cached_tokens = ?,
-                    last_guard_hard_cap = ?, last_guard_relation = 'unknown',
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ? AND session_generation = ?
-                """,
-                (
-                    "reuse", "turn_attribution_unknown_no_rotation",
-                    reserved_tokens, carry_in, hard_cap,
-                    worker["id"], generation,
-                ),
-            )
-
+    def _continuity_values(self, task: TaskRecord) -> dict[str, Any]:
+        if self.context_compiler:
+            return self.context_compiler.effective_limits(task.id)["values"]
+        if self.budget and self.budget.settings:
+            return self.budget.settings.get()["values"]
+        return {
+            "max_same_failure": 3,
+            "max_no_progress": 3,
+            "session_no_progress_rotation_threshold": 2,
+            "rotation_max_bytes": 262_144,
+        }
 
 def _failure_fingerprint(
     execution: ExecutionResult, checks: list[dict[str, Any]]
