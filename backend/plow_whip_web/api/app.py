@@ -369,6 +369,31 @@ def create_app(settings: Settings) -> FastAPI:
         ledger: ModelCallLedger = request.app.state.model_calls
         return ledger.summary()
 
+    @app.get("/api/usage/daily", tags=["usage"])
+    def usage_daily(
+        request: Request,
+        start: str | None = None,
+        end: str | None = None,
+        days: int | None = None,
+    ) -> dict[str, object]:
+        ledger: ModelCallLedger = request.app.state.model_calls
+        try:
+            start_day, end_day = ledger.resolve_history_range(
+                start=start, end=end, days=days
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return ledger.daily_series(start=start_day, end=end_day)
+
+    @app.get("/api/usage/daily/{day}", tags=["usage"])
+    def usage_daily_day(request: Request, day: str) -> dict[str, object]:
+        ledger: ModelCallLedger = request.app.state.model_calls
+        try:
+            target = ModelCallLedger.resolve_history_range(start=day, end=day)[0]
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return ledger.day_breakdown(target)
+
     @app.get("/api/system/health", tags=["system"])
     def runtime_health(request: Request) -> dict[str, object]:
         repository: HealthRepository = request.app.state.health_repository

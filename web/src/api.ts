@@ -310,6 +310,17 @@ export type Usage = {
   total_tokens: number
   total_formula: string
   usage_semantics?: string
+  timezone?: string
+  today?: {
+    date: string
+    timezone: string
+    input_tokens: number
+    cached_input_tokens: number
+    uncached_input_tokens: number
+    output_tokens: number
+    total_tokens: number
+    calls: number
+  }
   usage_quality?: {
     usage_semantics: 'delta' | 'legacy_inferred_delta' | 'unresolved_snapshot'
     calls: number
@@ -329,6 +340,64 @@ export type Usage = {
   call_kinds: { call_kind: string; tokens: number; calls: number }[]
   sessions: { session_id: string | null; tokens: number; calls: number }[]
   calls: { call_id: string; call_kind: 'executor' | 'butler_planner' | 'router' | 'verifier' | 'convention_refinement'; status: string; task_id: string | null; worker_id: string | null; provider: string; model: string; session_id: string | null; session_generation: number | null; input_tokens: number; cached_input_tokens: number; uncached_input_tokens: number; output_tokens: number; total_tokens: number; error_class: string | null; created_at: string }[]
+}
+export type UsageDailySeries = {
+  timezone: string
+  from: string
+  to: string
+  days: {
+    date: string
+    input_tokens: number
+    cached_input_tokens: number
+    uncached_input_tokens: number
+    output_tokens: number
+    total_tokens: number
+    calls: number
+  }[]
+  totals: {
+    input_tokens: number
+    cached_input_tokens: number
+    uncached_input_tokens: number
+    output_tokens: number
+    total_tokens: number
+    calls: number
+  }
+  total_formula: string
+  cached_input_tokens_in_total: boolean
+}
+export type UsageDailyBreakdown = {
+  date: string
+  timezone: string
+  input_tokens: number
+  cached_input_tokens: number
+  uncached_input_tokens: number
+  output_tokens: number
+  total_tokens: number
+  calls: number
+  total_formula: string
+  cached_input_tokens_in_total: boolean
+  projects: {
+    key: string
+    label: string
+    project_id: string | null
+    input_tokens: number
+    cached_input_tokens: number
+    uncached_input_tokens: number
+    output_tokens: number
+    tokens: number
+    calls: number
+  }[]
+  tasks: {
+    key: string
+    label: string
+    task_id: string | null
+    input_tokens: number
+    cached_input_tokens: number
+    uncached_input_tokens: number
+    output_tokens: number
+    tokens: number
+    calls: number
+  }[]
 }
 export type RuntimeHealth = {
   connectivity: string
@@ -433,6 +502,15 @@ export const api = {
       body: JSON.stringify({ provider, project_id: projectId }),
     }),
   usage: () => request<Usage>('/api/usage'),
+  usageDaily: (params?: { start?: string; end?: string; days?: number }) => {
+    const query = new URLSearchParams()
+    if (params?.start) query.set('start', params.start)
+    if (params?.end) query.set('end', params.end)
+    if (params?.days != null) query.set('days', String(params.days))
+    const suffix = query.toString() ? `?${query.toString()}` : ''
+    return request<UsageDailySeries>(`/api/usage/daily${suffix}`)
+  },
+  usageDailyDay: (day: string) => request<UsageDailyBreakdown>(`/api/usage/daily/${day}`),
   settings: () => request<RuntimeSettings>('/api/settings'),
   updateSettings: (settings: RuntimeSettings) =>
     request<RuntimeSettings>('/api/settings', {

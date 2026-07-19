@@ -181,9 +181,61 @@ beforeEach(() => {
           deleted_at: '2026-07-18T00:00:00Z',
         }) }
       }
+      if (path.startsWith('/api/usage/daily/')) {
+        const day = path.split('/').at(-1)
+        return {
+          ok: true,
+          json: async () => ({
+            date: day,
+            timezone: 'Asia/Shanghai',
+            input_tokens: 0,
+            cached_input_tokens: 0,
+            uncached_input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            calls: 0,
+            total_formula: 'input_tokens + output_tokens',
+            cached_input_tokens_in_total: true,
+            projects: [],
+            tasks: [],
+          }),
+        }
+      }
+      if (path.startsWith('/api/usage/daily')) {
+        return {
+          ok: true,
+          json: async () => ({
+            timezone: 'Asia/Shanghai',
+            from: '2026-07-06',
+            to: '2026-07-19',
+            days: Array.from({ length: 14 }, (_, index) => {
+              const day = String(6 + index).padStart(2, '0')
+              return {
+                date: `2026-07-${day}`,
+                input_tokens: 0,
+                cached_input_tokens: 0,
+                uncached_input_tokens: 0,
+                output_tokens: 0,
+                total_tokens: 0,
+                calls: 0,
+              }
+            }),
+            totals: {
+              input_tokens: 0,
+              cached_input_tokens: 0,
+              uncached_input_tokens: 0,
+              output_tokens: 0,
+              total_tokens: 0,
+              calls: 0,
+            },
+            total_formula: 'input_tokens + output_tokens',
+            cached_input_tokens_in_total: true,
+          }),
+        }
+      }
       return {
         ok: true,
-        json: async () => path === '/api/projects' ? listedProjects : path === '/api/providers' ? listedProviders : path === '/api/goals' ? listedGoals : path === '/api/tasks' ? listedTasks : path.endsWith('/events') || path.endsWith('/artifacts') || ['/api/outbox', '/api/audit', '/api/permissions'].includes(path) ? [] : path === '/api/settings' ? settings : path === '/api/scheduler/status' ? scheduler : path === '/api/system/health' ? ({ connectivity: 'unknown', domestic_ok: null, overseas_ok: null, last_tick_at: null, last_resume_at: null, consecutive_failures: 0 }) : path === '/api/usage' ? ({ input_tokens: 0, output_tokens: 0, total_tokens: 0, control_tokens: 0, projects: [], tasks: [] }) : path === '/api/conventions/global/global' ? ({ scope: 'global', scope_id: 'global', content: '', revision: 0, updated_at: null }) : ({
+        json: async () => path === '/api/projects' ? listedProjects : path === '/api/providers' ? listedProviders : path === '/api/goals' ? listedGoals : path === '/api/tasks' ? listedTasks : path.endsWith('/events') || path.endsWith('/artifacts') || ['/api/outbox', '/api/audit', '/api/permissions'].includes(path) ? [] : path === '/api/settings' ? settings : path === '/api/scheduler/status' ? scheduler : path === '/api/system/health' ? ({ connectivity: 'unknown', domestic_ok: null, overseas_ok: null, last_tick_at: null, last_resume_at: null, consecutive_failures: 0 }) : path === '/api/usage' ? ({ input_tokens: 0, output_tokens: 0, total_tokens: 0, control_tokens: 0, today: { date: '2026-07-19', timezone: 'Asia/Shanghai', input_tokens: 0, cached_input_tokens: 0, uncached_input_tokens: 0, output_tokens: 0, total_tokens: 0, calls: 0 }, projects: [], tasks: [] }) : path === '/api/conventions/global/global' ? ({ scope: 'global', scope_id: 'global', content: '', revision: 0, updated_at: null }) : ({
           status: 'ok',
           version: '0.1.0',
           database: { status: 'ok', journal_mode: 'wal', migration_count: 8 },

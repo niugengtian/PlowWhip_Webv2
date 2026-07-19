@@ -7,11 +7,12 @@ import {
 import {
   api, AuditEntry, Convention, ConventionSuggestion, GlobalButlerOverview, Goal, OutboxEvent, PermissionGrant,
   Project, Provider, RuntimeHealth, RuntimeSettings, SchedulerStatus, Task, TaskArtifact, TaskEvent,
-  TaskDeletionEligibility, TaskSizingEstimate, TaskSizingInputs, TaskStatus, Usage, Worker,
-  WorkerDetail, WorkerStream,
+  TaskDeletionEligibility, TaskSizingEstimate, TaskSizingInputs, TaskStatus, Usage, UsageDailyBreakdown,
+  UsageDailySeries, Worker, WorkerDetail, WorkerStream,
 } from './api'
 import { ButlerConsole } from './components/ButlerConsole'
 import { ProjectButlerDialog } from './components/ProjectButlerDialog'
+import { TokenPieChart, TokenTrendChart } from './components/TokenUsageCharts'
 import { startLiveRefresh } from './liveRefresh'
 
 type Health = {
@@ -387,7 +388,7 @@ function Board({ tasks, goals, projects, workers, providers, usage, onNavigate, 
       <Metric icon={FolderOpen} label="活跃项目" value={projects.filter((p) => p.status === 'active').length} hint="可并行" onClick={() => onNavigate('projects')} />
       <Metric icon={Robot} label="在线 Worker" value={workers.filter((w) => w.status !== 'released').length} hint={`${workers.filter((w) => w.status === 'busy').length} 忙碌`} onClick={() => onNavigate('workers')} />
       <Metric icon={TerminalWindow} label="可用 Provider" value={providers.filter(providerFullyReady).length} hint={`${providers.filter((p) => p.enabled).length} 已启用`} onClick={() => onNavigate('providers')} />
-      <Metric icon={Coins} label="今日 Token" value={usage?.total_tokens ?? 0} hint="控制链 0" onClick={() => onNavigate('usage')} />
+      <Metric icon={Coins} label="今日 Token" value={usage?.today?.total_tokens ?? 0} hint="Asia/Shanghai 日界" onClick={() => onNavigate('usage')} />
     </section>
     <section className="panel board-panel"><div className="panel-heading"><div><span className="kicker">项目管家主入口</span><h1>澄清 → 人类确认 → 角色 DAG → 任务 Gate</h1></div><span className="muted">独立角色并行 · 真实依赖串行</span></div>
       <div className="goal-strip">{goals.length ? goals.map((goal) => <button className="task-card" key={goal.id} onClick={() => onSelectGoal(goal)}><div><StatusPill status={(goal.status === 'running' ? 'ready' : goal.status === 'completed' ? 'completed' : goal.status === 'needs_human' ? 'needs_human' : 'terminal_failed') as TaskStatus} /><small>{goal.provider}</small></div><strong>{goal.title}</strong><p>{goal.objective}</p><footer><span>{goal.work_items.length} 工作项</span><span>{goal.status}</span></footer></button>) : <div className="empty-column">从管家入口提交目标后按 ProjectExecutionPolicy 路由。</div>}</div>
@@ -523,13 +524,209 @@ function ProvidersView({ providers, busy, onProbe, onToggle }: { providers: Prov
 }
 
 function UsageView({ usage, projects, tasks }: { usage: Usage | null; projects: Project[]; tasks: Task[] }) {
+  const [series, setSeries] = useState<UsageDailySeries | null>(null)
+  const [breakdown, setBreakdown] = useState<UsageDailyBreakdown | null>(null)
+  const [selectedDate, setSelectedDate] = useState<string | null>(null)
+  const [rangeDays, setRangeDays] = useState(14)
+  const [historyError, setHistoryError] = useState<string | null>(null)
+  const [dayError, setDayError] = useState<string | null>(null)
+  const [historyLoading, setHistoryLoading] = useState(true)
+
+  useEffect(() => {
+    let active = true
+    api.usageDaily({ days: rangeDays })
+      .then((next) => {
+        if (!active) return
+        setSeries(next)
+        setHistoryError(null)
+        const preferred = next.days.find((day) => day.total_tokens > 0)?.date
+          ?? next.days[next.days.length - 1]?.date
+          ?? null
+        setSelectedDate((current) => {
+          if (current && next.days.some((day) => day.date === current)) return current
+          return preferred
+        })
+      })
+      .catch((reason: unknown) => {
+        if (!active) return
+        setSeries(null)
+        setHistoryError(messageOf(reason))
+      })
+      .finally(() => {
+        if (active) setHistoryLoading(false)
+      })
+    return () => { active = false }
+  }, [rangeDays])
+
+  useEffect(() => {
+    if (!selectedDate) return
+    let active = true
+    api.usageDailyDay(selectedDate)
+      .then((next) => {
+        if (!active) return
+        setBreakdown(next)
+        setDayError(null)
+      })
+      .catch((reason: unknown) => {
+        if (!active) return
+        setBreakdown(null)
+        setDayError(messageOf(reason))
+      })
+    return () => { active = false }
+  }, [selectedDate])
+
+  const selectedPoint = series?.days.find((day) => day.date === selectedDate) ?? null
+  const visibleBreakdown = selectedDate && breakdown?.date === selectedDate ? breakdown : null
   const dimensions = [
     ['Provider', usage?.providers.map((item) => [item.provider, item.tokens, item.calls])],
     ['Model', usage?.models.map((item) => [item.model, item.tokens, item.calls])],
     ['Call kind', usage?.call_kinds.map((item) => [item.call_kind, item.tokens, item.calls])],
     ['Session', usage?.sessions.map((item) => [item.session_id ?? '未绑定', item.tokens, item.calls])],
   ] as const
-  return <div className="settings-layout"><section className="metrics-strip"><Metric icon={Coins} label="Total Token" value={usage?.total_tokens ?? 0} hint="Session 增量后的 Input + Output" /><Metric icon={Network} label="Input" value={usage?.input_tokens ?? 0} hint="包含 Cached；累计快照不重复相加" /><Metric icon={Clock} label="Cached-input" value={usage?.cached_input_tokens ?? 0} hint="Input 子集，不重复相加" /><Metric icon={CheckCircle} label="Output" value={usage?.output_tokens ?? 0} hint="后端已差分计量" /></section><section className="panel"><div className="panel-heading"><div><span className="kicker">ModelCallLedger · {usage?.usage_semantics ?? 'physical_session_delta'}</span><h1>消费明细</h1></div><span className="muted">Token 只计量，不参与任务准入、调度、熔断或终态</span></div>{usage?.raw_snapshot_totals ? <p className="form-help">Provider 原始累计快照合计 {usage.raw_snapshot_totals.total_tokens}；页面总数按相邻 Session 快照增量计量。迁移前缺少物理 Session id 的记录会明确标记为 legacy_inferred_delta，不伪装成精确值。</p> : null}<div className="usage-columns"><div><h2>按项目</h2>{usage?.projects.length ? usage.projects.map((item) => <div className="usage-row" key={item.project_id ?? 'none'}><span>{projects.find((project) => project.id === item.project_id)?.name ?? '未绑定项目'}<small>Input {item.input_tokens} · Cached {item.cached_input_tokens} · Uncached {item.uncached_input_tokens} · Output {item.output_tokens}</small></span><strong>{item.tokens}</strong></div>) : <p className="muted">尚无模型消费。</p>}</div><div><h2>按任务</h2>{usage?.tasks.length ? usage.tasks.map((item) => <div className="usage-row" key={item.task_id ?? 'none'}><span>{tasks.find((task) => task.id === item.task_id)?.title ?? item.task_id ?? '未绑定任务'}<small>Input {item.input_tokens} · Cached {item.cached_input_tokens} · Uncached {item.uncached_input_tokens} · Output {item.output_tokens}</small></span><strong>{item.tokens}</strong></div>) : <p className="muted">调度与探测不会制造账单。</p>}</div></div><div className="usage-columns">{dimensions.map(([label, rows]) => <div key={label}><h2>按 {label}</h2>{rows?.map(([key, tokens, calls]) => <div className="usage-row" key={String(key)}><span>{key}<small>{calls} calls</small></span><strong>{tokens}</strong></div>)}</div>)}</div>{usage?.calls.length ? <div><h2>调用清单</h2>{usage.calls.map((call) => <div className="usage-row" key={call.call_id}><span>{call.task_id ?? call.call_id}<small>{call.call_kind} · {call.status} · {call.provider}/{call.model} · Worker {call.worker_id ?? '—'} · session {call.session_id ?? '—'}</small></span><strong>{call.input_tokens} / {call.cached_input_tokens} / {call.uncached_input_tokens} / {call.output_tokens}</strong></div>)}</div> : null}<p className="muted">Uncached input 仅表示缓存未命中，不等于新工作或有价值内容。</p></section></div>
+
+  return (
+    <div className="settings-layout">
+      <section className="metrics-strip">
+        <Metric icon={Coins} label="Total Token" value={usage?.total_tokens ?? 0} hint="Session 增量后的 Input + Output" />
+        <Metric icon={Network} label="Input" value={usage?.input_tokens ?? 0} hint="包含 Cached；累计快照不重复相加" />
+        <Metric icon={Clock} label="Cached-input" value={usage?.cached_input_tokens ?? 0} hint="Input 子集，不重复相加" />
+        <Metric icon={CheckCircle} label="Output" value={usage?.output_tokens ?? 0} hint="后端已差分计量" />
+      </section>
+
+      <section className="panel">
+        <div className="panel-heading">
+          <div>
+            <span className="kicker">日级分析 · Asia/Shanghai</span>
+            <h1>Token 趋势</h1>
+          </div>
+          <label className="token-range">
+            范围
+            <select
+              aria-label="历史日期范围"
+              value={rangeDays}
+              onChange={(event) => {
+                setRangeDays(Number(event.target.value))
+                setHistoryLoading(true)
+                setHistoryError(null)
+              }}
+            >
+              <option value={7}>近 7 天</option>
+              <option value={14}>近 14 天</option>
+              <option value={30}>近 30 天</option>
+              <option value={90}>近 90 天</option>
+            </select>
+          </label>
+        </div>
+        {historyLoading ? <p className="muted">加载日级趋势…</p> : null}
+        {historyError ? <div className="error-banner" data-testid="token-history-error"><p>{historyError}</p></div> : null}
+        {!historyLoading && !historyError && series ? (
+          <>
+            <TokenTrendChart
+              days={series.days}
+              selectedDate={selectedDate}
+              onSelect={(date) => {
+                setSelectedDate(date)
+                setDayError(null)
+              }}
+            />
+            {selectedPoint ? (
+              <p className="form-help">
+                已选 {selectedPoint.date}：total {selectedPoint.total_tokens}
+                （input {selectedPoint.input_tokens}，其中 cached {selectedPoint.cached_input_tokens} /
+                uncached {selectedPoint.uncached_input_tokens}；output {selectedPoint.output_tokens}）
+              </p>
+            ) : null}
+          </>
+        ) : null}
+        {dayError ? <div className="error-banner" data-testid="token-day-error"><p>{dayError}</p></div> : null}
+        {visibleBreakdown ? (
+          <div className="token-pie-grid" data-testid="token-day-pies">
+            <TokenPieChart
+              title="项目占比"
+              slices={visibleBreakdown.projects}
+              totalTokens={visibleBreakdown.total_tokens}
+              emptyLabel="该日无项目消费。"
+            />
+            <TokenPieChart
+              title="任务占比"
+              slices={visibleBreakdown.tasks}
+              totalTokens={visibleBreakdown.total_tokens}
+              emptyLabel="该日无任务消费。"
+            />
+          </div>
+        ) : null}
+      </section>
+
+      <section className="panel">
+        <div className="panel-heading">
+          <div>
+            <span className="kicker">ModelCallLedger · {usage?.usage_semantics ?? 'physical_session_delta'}</span>
+            <h1>消费明细</h1>
+          </div>
+          <span className="muted">Token 只计量，不参与任务准入、调度、熔断或终态</span>
+        </div>
+        {usage?.raw_snapshot_totals ? (
+          <p className="form-help">
+            Provider 原始累计快照合计 {usage.raw_snapshot_totals.total_tokens}；页面总数按相邻 Session 快照增量计量。迁移前缺少物理 Session id 的记录会明确标记为 legacy_inferred_delta，不伪装成精确值。
+          </p>
+        ) : null}
+        <div className="usage-columns">
+          <div>
+            <h2>按项目</h2>
+            {usage?.projects.length ? usage.projects.map((item) => (
+              <div className="usage-row" key={item.project_id ?? 'none'}>
+                <span>
+                  {projects.find((project) => project.id === item.project_id)?.name ?? '未绑定项目'}
+                  <small>Input {item.input_tokens} · Cached {item.cached_input_tokens} · Uncached {item.uncached_input_tokens} · Output {item.output_tokens}</small>
+                </span>
+                <strong>{item.tokens}</strong>
+              </div>
+            )) : <p className="muted">尚无模型消费。</p>}
+          </div>
+          <div>
+            <h2>按任务</h2>
+            {usage?.tasks.length ? usage.tasks.map((item) => (
+              <div className="usage-row" key={item.task_id ?? 'none'}>
+                <span>
+                  {tasks.find((task) => task.id === item.task_id)?.title ?? item.task_id ?? '未绑定任务'}
+                  <small>Input {item.input_tokens} · Cached {item.cached_input_tokens} · Uncached {item.uncached_input_tokens} · Output {item.output_tokens}</small>
+                </span>
+                <strong>{item.tokens}</strong>
+              </div>
+            )) : <p className="muted">调度与探测不会制造账单。</p>}
+          </div>
+        </div>
+        <div className="usage-columns">
+          {dimensions.map(([label, rows]) => (
+            <div key={label}>
+              <h2>按 {label}</h2>
+              {rows?.map(([key, tokens, calls]) => (
+                <div className="usage-row" key={String(key)}>
+                  <span>{key}<small>{calls} calls</small></span>
+                  <strong>{tokens}</strong>
+                </div>
+              ))}
+            </div>
+          ))}
+        </div>
+        {usage?.calls.length ? (
+          <div>
+            <h2>调用清单</h2>
+            {usage.calls.map((call) => (
+              <div className="usage-row" key={call.call_id}>
+                <span>
+                  {call.task_id ?? call.call_id}
+                  <small>{call.call_kind} · {call.status} · {call.provider}/{call.model} · Worker {call.worker_id ?? '—'} · session {call.session_id ?? '—'}</small>
+                </span>
+                <strong>{call.input_tokens} / {call.cached_input_tokens} / {call.uncached_input_tokens} / {call.output_tokens}</strong>
+              </div>
+            ))}
+          </div>
+        ) : null}
+        <p className="muted">Uncached input 仅表示缓存未命中，不等于新工作或有价值内容。</p>
+      </section>
+    </div>
+  )
 }
 
 function AuditView({ audit, permissions, onRefresh }: { audit: AuditEntry[]; permissions: PermissionGrant[]; onRefresh: () => void }) {
