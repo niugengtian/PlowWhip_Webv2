@@ -13,6 +13,7 @@ import contextlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -44,6 +45,8 @@ BRIDGE_LABEL = "com.plow-whip-web.host-bridge"
 BRIDGE_PORT = 8765
 RELEASE_LABEL = "org.opencontainers.image.revision"
 BRIDGE_PROBE_PAYLOAD = {"adapter": "json-worker", "executable": "simple-worker"}
+DATA_VOLUME = f"{PROJECT}-data"
+DATABASE_PATH = "/data/plow-whip-web.sqlite3"
 
 
 def _manual_text() -> str:
@@ -108,7 +111,13 @@ STATUS
     plow-whip-web status
 
     Reports the prepared release, container health, Bridge readiness, database
-    health, and live Host Job count. Status is read-only.
+    health, migration compatibility, and live Host Job count. Status is read-only.
+
+MIGRATION SAFETY
+    Container start, restart, and rebuild compare the existing named-volume
+    migration manifest with the target source before changing the runtime.
+    Unknown migrations, non-prefix histories, missing checksums, and checksum
+    drift are hard failures and cannot be bypassed with --force.
 
 UNINSTALL
     plow-whip-web uninstall all
@@ -585,6 +594,174 @@ def _guard_host_jobs(runner: Runner, *, force: bool) -> None:
         raise OpsError(f"refusing lifecycle change while {active} Host Job(s) are active; use --force only after review")
 
 
+def _source_migration_manifest(source_dir: Path) -> list[tuple[str, str]]:
+    migration_dir = source_dir / "backend" / "plow_whip_web" / "store" / "migrations"
+    migrations = sorted(migration_dir.glob("*.sql"))
+    if not migrations:
+        raise OpsError(f"source contains no database migrations: {migration_dir}")
+    manifest = [
+        (migration.name, hashlib.sha256(migration.read_bytes()).hexdigest())
+        for migration in migrations
+    ]
+    prefixes = [name.split("_", 1)[0] for name, _checksum in manifest]
+    duplicates = sorted({prefix for prefix in prefixes if prefixes.count(prefix) > 1})
+    if duplicates:
+        raise OpsError(f"target source reuses migration number(s): {duplicates}")
+    return manifest
+
+
+def _assess_migration_compatibility(
+    target: list[tuple[str, str]],
+    applied: list[tuple[str, str | None]] | None,
+) -> dict[str, object]:
+    target_names = [name for name, _checksum in target]
+    if applied is None:
+        return {
+            "status": "compatible",
+            "database": "absent",
+            "applied_count": 0,
+            "target_count": len(target),
+            "target_head": target_names[-1],
+        }
+    applied_names = [name for name, _checksum in applied]
+    unknown = sorted(set(applied_names) - set(target_names))
+    if unknown:
+        raise OpsError(
+            "migration lineage is incompatible; database contains migrations "
+            f"unknown to target source: {unknown}"
+        )
+    expected_prefix = target_names[:len(applied_names)]
+    if applied_names != expected_prefix:
+        raise OpsError(
+            "migration lineage is incompatible; applied migrations are not an "
+            "ordered prefix of the target source"
+        )
+    missing_checksums = [name for name, checksum in applied if not checksum]
+    if missing_checksums:
+        raise OpsError(
+            "migration lineage cannot be verified; database rows are missing "
+            f"checksums: {missing_checksums}"
+        )
+    expected = dict(target)
+    mismatched = [
+        name
+        for name, checksum in applied
+        if checksum is not None and checksum != expected[name]
+    ]
+    if mismatched:
+        raise OpsError(
+            "migration checksum mismatch between database and target source: "
+            f"{mismatched}"
+        )
+    return {
+        "status": "compatible",
+        "database": "present",
+        "applied_count": len(applied),
+        "target_count": len(target),
+        "target_head": target_names[-1],
+        "pending": target_names[len(applied):],
+    }
+
+
+def _database_migration_manifest(
+    runner: Runner,
+) -> list[tuple[str, str | None]] | None:
+    query = (
+        "import json,sqlite3\n"
+        "from pathlib import Path\n"
+        f"path=Path({DATABASE_PATH!r})\n"
+        "if not path.is_file():\n"
+        " print('null')\n"
+        "else:\n"
+        " connection=sqlite3.connect(path)\n"
+        " tables={row[0] for row in connection.execute("
+        "\"SELECT name FROM sqlite_master WHERE type='table'\")}\n"
+        " if 'schema_migrations' not in tables:\n"
+        "  print('[]')\n"
+        " else:\n"
+        "  columns={row[1] for row in connection.execute("
+        "\"PRAGMA table_info(schema_migrations)\")}\n"
+        "  checksum=\"checksum\" if 'checksum' in columns else \"NULL\"\n"
+        "  rows=connection.execute("
+        "f\"SELECT version,{checksum} FROM schema_migrations ORDER BY version\").fetchall()\n"
+        "  print(json.dumps(rows,separators=(',',':')))\n"
+        " connection.close()\n"
+    )
+    containers = runner.run(
+        [
+            "docker", "ps", "-q",
+            "--filter", f"label=com.docker.compose.project={PROJECT}",
+            "--filter", f"label=com.docker.compose.service={SERVICE}",
+        ],
+        capture=True,
+        check=False,
+    )
+    ids = [line.strip() for line in containers.stdout.splitlines() if line.strip()]
+    if len(ids) > 1:
+        raise OpsError("migration preflight found multiple running control-plane containers")
+    if ids:
+        result = runner.run(
+            ["docker", "exec", ids[0], "python", "-c", query],
+            capture=True,
+            check=False,
+        )
+    else:
+        volume = runner.run(
+            ["docker", "volume", "inspect", DATA_VOLUME],
+            capture=True,
+            check=False,
+        )
+        if volume.returncode != 0:
+            return None
+        image = runner.run(
+            ["docker", "image", "inspect", IMAGE],
+            capture=True,
+            check=False,
+        )
+        if image.returncode != 0:
+            raise OpsError(
+                f"cannot verify existing volume {DATA_VOLUME!r}: image {IMAGE!r} is missing"
+            )
+        result = runner.run(
+            [
+                "docker", "run", "--rm",
+                "--volume", f"{DATA_VOLUME}:/data",
+                "--entrypoint", "python",
+                IMAGE, "-c", query,
+            ],
+            capture=True,
+            check=False,
+        )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip().splitlines()
+        summary = detail[-1] if detail else f"exit {result.returncode}"
+        raise OpsError(f"failed to read database migration manifest: {summary[:500]}")
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise OpsError("database migration preflight returned invalid JSON") from error
+    if payload is None:
+        return None
+    if not isinstance(payload, list) or any(
+        not isinstance(row, list)
+        or len(row) != 2
+        or not isinstance(row[0], str)
+        or (row[1] is not None and not isinstance(row[1], str))
+        for row in payload
+    ):
+        raise OpsError("database migration preflight returned an invalid manifest")
+    return [(row[0], row[1]) for row in payload]
+
+
+def _guard_migration_compatibility(
+    release: Release,
+    runner: Runner,
+) -> dict[str, object]:
+    target = _source_migration_manifest(release.source_dir)
+    applied = _database_migration_manifest(runner)
+    return _assess_migration_compatibility(target, applied)
+
+
 def _bridge_token(paths: RuntimePaths) -> str:
     token = _read_env(paths.env_file).get("PLOW_WHIP_BRIDGE_TOKEN", "")
     if len(token) < 24:
@@ -744,6 +921,7 @@ def _rebuild(
     force: bool,
 ) -> dict[str, object]:
     _guard_host_jobs(runner, force=force)
+    compatibility = _guard_migration_compatibility(release, runner)
     _require_private_file(paths.env_file)
     build_args = ["build"]
     if pull:
@@ -768,6 +946,7 @@ def _rebuild(
         "release_sha": release.sha,
         "source": str(release.source_dir),
         "database": health.get("database"),
+        "migration_compatibility": compatibility,
         "bridge": bridge_result,
     }
 
@@ -841,12 +1020,21 @@ def _status(paths: RuntimePaths, config: dict[str, object], runner: Runner) -> d
         bridge = "ready"
     except (OSError, urllib.error.URLError, json.JSONDecodeError, OpsError):
         bridge = "stopped"
+    migration_compatibility: dict[str, object] | None = None
+    migration_error: str | None = None
+    if release is not None and runner.which("docker"):
+        try:
+            migration_compatibility = _guard_migration_compatibility(release, runner)
+        except OpsError as error:
+            migration_error = str(error)
     return {
         "release_sha": release.sha if release else None,
         "source": str(release.source_dir) if release else None,
         "container": container,
         "bridge": bridge,
         "health": health,
+        "migration_compatibility": migration_compatibility,
+        "migration_error": migration_error,
         "active_host_jobs": _active_host_jobs(runner),
         "data_preserved": True,
     }
@@ -1116,6 +1304,9 @@ def execute(args: argparse.Namespace, *, runner: Runner | None = None) -> dict[s
                 )
             result: dict[str, object] = {}
             if args.target in {"all", "container"}:
+                result["migration_compatibility"] = _guard_migration_compatibility(
+                    release, runner
+                )
                 action = "restart" if args.command == "restart" else "up"
                 command = _compose(release, paths, action, SERVICE)
                 if action == "up":

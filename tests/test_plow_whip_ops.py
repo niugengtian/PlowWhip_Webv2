@@ -115,6 +115,50 @@ def test_bridge_probe_payload_matches_host_bridge_protocol() -> None:
     }
 
 
+def test_migration_preflight_accepts_production_prefix() -> None:
+    target = [
+        ("0025_execution_episodes.sql", "a" * 64),
+        ("0026_dispatch_model_calls_worker_stream.sql", "b" * 64),
+        ("0027_task_sessions_bounded_continuity.sql", "c" * 64),
+    ]
+
+    result = ops._assess_migration_compatibility(target, target[:2])
+
+    assert result == {
+        "status": "compatible",
+        "database": "present",
+        "applied_count": 2,
+        "target_count": 3,
+        "target_head": "0027_task_sessions_bounded_continuity.sql",
+        "pending": ["0027_task_sessions_bounded_continuity.sql"],
+    }
+
+
+def test_migration_preflight_rejects_divergent_main_lineage() -> None:
+    target = [
+        ("0021_unified_domain_reducer.sql", "a" * 64),
+        ("0022_butler_intake_help.sql", "b" * 64),
+    ]
+    applied = [
+        ("0021_remove_token_budget.sql", "c" * 64),
+        ("0022_task_spec_continuity.sql", "d" * 64),
+    ]
+
+    with pytest.raises(ops.OpsError, match="unknown to target source"):
+        ops._assess_migration_compatibility(target, applied)
+
+
+def test_migration_preflight_rejects_missing_or_changed_checksums() -> None:
+    target = [("0001_initial.sql", "a" * 64)]
+
+    with pytest.raises(ops.OpsError, match="missing checksums"):
+        ops._assess_migration_compatibility(target, [("0001_initial.sql", None)])
+    with pytest.raises(ops.OpsError, match="checksum mismatch"):
+        ops._assess_migration_compatibility(
+            target, [("0001_initial.sql", "b" * 64)]
+        )
+
+
 @pytest.mark.parametrize("candidate", [Path("/"), Path.home(), ops.TOOL_ROOT])
 def test_runtime_purge_rejects_broad_paths(candidate: Path) -> None:
     with pytest.raises(ops.OpsError, match="unsafe runtime directory"):
