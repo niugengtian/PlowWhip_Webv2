@@ -44,7 +44,9 @@ Backend 默认监听 `127.0.0.1:8742`，Frontend 开发服务器默认监听 `12
 ```
 
 它还提供 `configure`、`start`、`restart` 和安全的 `uninstall`。完整参数与数据保留
-规则见 [本机功能脚本集](docs/OPS_TOOLKIT.zh-CN.md)。
+规则见 [本机功能脚本集](docs/OPS_TOOLKIT.zh-CN.md)。container 启动、重启和
+重建前会强制验证现有 SQLite 与目标源码的迁移血统；详细约束见
+[迁移血统收敛](docs/MIGRATION_LINEAGE_RECONCILIATION.md)。
 
 宿主机只需要 Docker；Python、Node 构建环境、SQLite 运行库、Web 服务和零 Token Cron engine 都在镜像内。macOS/Linux 使用 Bash，Windows 使用 PowerShell：
 

@@ -80,6 +80,19 @@ launchd plist、镜像或 Git。
 并发。检测到活跃 Host Job 时，重建和重启默认拒绝执行；`--force` 只用于操作者
 已经确认任务可以中断的情况。
 
+任何 container 启动、重启或重建之前，CLI 还会读取
+`plow-whip-web-v2-data` 中的 `schema_migrations`，并与目标源码中的迁移文件逐项
+比较。以下情况会直接拒绝操作：
+
+- 数据库包含目标源码未知的迁移；
+- 已执行迁移不是目标迁移历史的有序前缀；
+- 已执行记录缺少 checksum；
+- 数据库记录的 checksum 与目标源码不一致；
+- 目标源码重复使用迁移编号。
+
+迁移不兼容属于数据安全错误，不能用 `--force` 绕过。`--force` 只绕过活跃
+Host Job 保护。
+
 ## 停止、状态与卸载
 
 ```bash
@@ -100,6 +113,9 @@ launchd plist、镜像或 Git。
 
 `uninstall` 默认不带 `-v`，因此 `plow-whip-web-v2-data` 和
 `plow-whip-web-v2-projects` 会保留。只有 `--purge-data --yes` 才删除命名卷。
+
+正式迁移血统及 2026-07-19 的分支收敛说明见
+[迁移血统收敛](MIGRATION_LINEAGE_RECONCILIATION.md)。
 
 ## 常用配置参数
 
