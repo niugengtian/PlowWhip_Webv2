@@ -376,25 +376,93 @@ export function App() {
   )
 }
 
+const GOAL_TERMINAL = new Set(['completed', 'terminal_failed', 'cancelled'])
+const COMPLETED_GOAL_PAGE_SIZE = 4
+
+function goalStatusPill(status: string): TaskStatus {
+  if (status === 'running') return 'ready'
+  if (status === 'completed') return 'completed'
+  if (status === 'needs_human') return 'needs_human'
+  return 'terminal_failed'
+}
+
 function Board({ tasks, goals, projects, workers, providers, usage, onNavigate, onSelect, onSelectGoal }: { tasks: Task[]; goals: Goal[]; projects: Project[]; workers: Worker[]; providers: Provider[]; usage: Usage | null; onNavigate: (view: View) => void; onSelect: (task: Task) => void; onSelectGoal: (goal: Goal) => void }) {
+  const [goalLane, setGoalLane] = useState<'active' | 'completed'>('active')
+  const [completedExpanded, setCompletedExpanded] = useState(false)
+  const [completedPage, setCompletedPage] = useState(0)
   const columns: { title: string; statuses: TaskStatus[]; tone: string }[] = [
     { title: '待执行', statuses: ['ready', 'paused'], tone: 'blue' },
     { title: '执行中', statuses: ['running', 'stopping'], tone: 'violet' },
     { title: '质量验证', statuses: ['verifying'], tone: 'yellow' },
     { title: '已终态', statuses: ['completed', 'terminal_failed', 'cancelled', 'needs_human'], tone: 'green' },
   ]
+  const activeGoals = goals.filter((goal) => !GOAL_TERMINAL.has(goal.status))
+  const completedGoals = goals.filter((goal) => GOAL_TERMINAL.has(goal.status))
+  const completedPages = Math.max(1, Math.ceil(completedGoals.length / COMPLETED_GOAL_PAGE_SIZE))
+  const completedSlice = completedGoals.slice(
+    completedPage * COMPLETED_GOAL_PAGE_SIZE,
+    completedPage * COMPLETED_GOAL_PAGE_SIZE + COMPLETED_GOAL_PAGE_SIZE,
+  )
+  const visibleGoals = goalLane === 'active'
+    ? activeGoals
+    : (completedExpanded ? completedSlice : completedSlice.slice(0, Math.min(2, completedSlice.length)))
+  const todayLabel = usage?.today?.date ? `${usage.today.date} · Asia/Shanghai` : 'Asia/Shanghai 日界'
   return <>
     <section className="metrics-strip">
       <Metric icon={FolderOpen} label="活跃项目" value={projects.filter((p) => p.status === 'active').length} hint="可并行" onClick={() => onNavigate('projects')} />
       <Metric icon={Robot} label="在线 Worker" value={workers.filter((w) => w.status !== 'released').length} hint={`${workers.filter((w) => w.status === 'busy').length} 忙碌`} onClick={() => onNavigate('workers')} />
       <Metric icon={TerminalWindow} label="可用 Provider" value={providers.filter(providerFullyReady).length} hint={`${providers.filter((p) => p.enabled).length} 已启用`} onClick={() => onNavigate('providers')} />
-      <Metric icon={Coins} label="今日 Token" value={usage?.today?.total_tokens ?? 0} hint="Asia/Shanghai 日界" onClick={() => onNavigate('usage')} />
+      <Metric icon={Coins} label="今日 Token" value={usage?.today?.total_tokens ?? 0} hint={todayLabel} onClick={() => onNavigate('usage')} />
     </section>
-    <section className="panel board-panel"><div className="panel-heading"><div><span className="kicker">项目管家主入口</span><h1>澄清 → 人类确认 → 角色 DAG → 任务 Gate</h1></div><span className="muted">独立角色并行 · 真实依赖串行</span></div>
-      <div className="goal-strip">{goals.length ? goals.map((goal) => <button className="task-card" key={goal.id} onClick={() => onSelectGoal(goal)}><div><StatusPill status={(goal.status === 'running' ? 'ready' : goal.status === 'completed' ? 'completed' : goal.status === 'needs_human' ? 'needs_human' : 'terminal_failed') as TaskStatus} /><small>{goal.provider}</small></div><strong>{goal.title}</strong><p>{goal.objective}</p><footer><span>{goal.work_items.length} 工作项</span><span>{goal.status}</span></footer></button>) : <div className="empty-column">从管家入口提交目标后按 ProjectExecutionPolicy 路由。</div>}</div>
+    <section className="panel board-panel goal-panel" data-testid="goal-panel">
+      <div className="panel-heading">
+        <div>
+          <span className="kicker">项目指令 / Goal</span>
+          <h1>独立于任务泳道的目标区</h1>
+        </div>
+        <span className="muted">进行中默认可操作 · 已完成默认有界 · 项目筛选同步约束</span>
+      </div>
+      <div className="goal-lane-tabs" role="tablist" aria-label="指令状态">
+        <button type="button" role="tab" aria-selected={goalLane === 'active'} className={goalLane === 'active' ? 'active' : ''} onClick={() => setGoalLane('active')}>进行中 <b>{activeGoals.length}</b></button>
+        <button type="button" role="tab" aria-selected={goalLane === 'completed'} className={goalLane === 'completed' ? 'active' : ''} onClick={() => { setGoalLane('completed'); setCompletedExpanded(false); setCompletedPage(0) }}>已完成 <b>{completedGoals.length}</b></button>
+      </div>
+      <div className={`goal-strip ${goalLane === 'completed' && !completedExpanded ? 'goal-strip-bounded' : ''}`} data-testid="goal-strip">
+        {visibleGoals.length ? visibleGoals.map((goal) => (
+          <button
+            className={`task-card goal-card ${GOAL_TERMINAL.has(goal.status) ? 'goal-card-completed' : 'goal-card-active'}`}
+            key={goal.id}
+            onClick={() => onSelectGoal(goal)}
+          >
+            <div>
+              <StatusPill status={goalStatusPill(goal.status)} />
+              <small title={goal.provider}>{goal.provider}</small>
+            </div>
+            <strong title={goal.title}>{goal.title}</strong>
+            <p title={goal.objective}>{goal.objective}</p>
+            <footer>
+              <span>{goal.work_items.length} 工作项</span>
+              <span>{goal.status}</span>
+            </footer>
+          </button>
+        )) : <div className="empty-column">{goalLane === 'active' ? '暂无进行中指令。从管家入口提交目标后按 ProjectExecutionPolicy 路由。' : '暂无已完成指令。'}</div>}
+      </div>
+      {goalLane === 'completed' && completedGoals.length > 0 ? (
+        <div className="goal-history-controls">
+          {!completedExpanded ? (
+            <button type="button" className="ghost" onClick={() => setCompletedExpanded(true)}>展开已完成历史（有界分页）</button>
+          ) : (
+            <>
+              <span className="muted">第 {completedPage + 1}/{completedPages} 页 · 每页 {COMPLETED_GOAL_PAGE_SIZE} 条</span>
+              <button type="button" className="ghost" disabled={completedPage <= 0} onClick={() => setCompletedPage((page) => Math.max(0, page - 1))}>上一页</button>
+              <button type="button" className="ghost" disabled={completedPage >= completedPages - 1} onClick={() => setCompletedPage((page) => Math.min(completedPages - 1, page + 1))}>下一页</button>
+              <button type="button" className="ghost" onClick={() => setCompletedExpanded(false)}>折叠长 objective</button>
+            </>
+          )}
+        </div>
+      ) : null}
     </section>
     <section className="panel board-panel"><div className="panel-heading"><div><span className="kicker">全局任务流</span><h1>任务看板</h1></div><span className="muted">项目 + 角色 + Task 会话 · 租约隔离 · 证据完成</span></div>
-      <div className="kanban-grid">{columns.map((column) => { const items = tasks.filter((task) => column.statuses.includes(task.status)); return <div className="kanban-column" key={column.title}><div className={`column-title ${column.tone}`}><span>{column.title}</span><b>{items.length}</b></div><div className="column-body">{items.length ? items.map((task) => <button className="task-card" key={task.id} onClick={() => onSelect(task)}><div><StatusPill status={task.status} /><small>{task.provider}{task.work_item_kind ? ` · ${task.work_item_kind}` : ''}</small></div><strong>{task.title}</strong><p>{task.objective}</p><footer><span>{task.attempts_used}/{task.max_attempts} 次</span><span>{task.tokens_used} Token</span></footer></button>) : <div className="empty-column">当前没有任务</div>}</div></div> })}</div>
+      <div className="kanban-grid" data-testid="kanban-grid">{columns.map((column) => { const items = tasks.filter((task) => column.statuses.includes(task.status)); return <div className="kanban-column" key={column.title}><div className={`column-title ${column.tone}`}><span>{column.title}</span><b>{items.length}</b></div><div className="column-body" data-testid="column-body">{items.length ? items.map((task) => <button className="task-card" key={task.id} onClick={() => onSelect(task)} title={task.title}><div><StatusPill status={task.status} /><small title={`${task.provider}${task.work_item_kind ? ` · ${task.work_item_kind}` : ''}`}>{task.provider}{task.work_item_kind ? ` · ${task.work_item_kind}` : ''}</small></div><strong title={task.title}>{task.title}</strong><p title={task.objective}>{task.objective}</p><footer><span>{task.attempts_used}/{task.max_attempts} 次</span><span title={`${task.tokens_used} Token`}>{task.tokens_used.toLocaleString()} Token</span></footer></button>) : <div className="empty-column">当前没有任务</div>}</div></div> })}</div>
     </section>
   </>
 }
@@ -578,19 +646,75 @@ function UsageView({ usage, projects, tasks }: { usage: Usage | null; projects: 
   const selectedPoint = series?.days.find((day) => day.date === selectedDate) ?? null
   const visibleBreakdown = selectedDate && breakdown?.date === selectedDate ? breakdown : null
   const dimensions = [
-    ['Provider', usage?.providers.map((item) => [item.provider, item.tokens, item.calls])],
-    ['Model', usage?.models.map((item) => [item.model, item.tokens, item.calls])],
-    ['Call kind', usage?.call_kinds.map((item) => [item.call_kind, item.tokens, item.calls])],
-    ['Session', usage?.sessions.map((item) => [item.session_id ?? '未绑定', item.tokens, item.calls])],
+    ['Provider', usage?.providers?.map((item) => [item.provider, item.tokens, item.calls])],
+    ['Model', usage?.models?.map((item) => [item.model, item.tokens, item.calls])],
+    ['Call kind', usage?.call_kinds?.map((item) => [item.call_kind, item.tokens, item.calls])],
+    ['Session', usage?.sessions?.map((item) => [item.session_id ?? '未绑定', item.tokens, item.calls])],
   ] as const
+  const uncached = usage?.uncached_input_tokens ?? Math.max(0, (usage?.input_tokens ?? 0) - (usage?.cached_input_tokens ?? 0))
+  const inputOutputRatio = usage?.ratios?.input_per_output
+    ?? ((usage?.output_tokens ?? 0) > 0 ? (usage?.input_tokens ?? 0) / (usage?.output_tokens ?? 1) : null)
+  const uncachedOutputRatio = usage?.ratios?.uncached_input_per_output
+    ?? ((usage?.output_tokens ?? 0) > 0 ? uncached / (usage?.output_tokens ?? 1) : null)
+  const today = usage?.today
 
   return (
     <div className="settings-layout">
-      <section className="metrics-strip">
-        <Metric icon={Coins} label="Total Token" value={usage?.total_tokens ?? 0} hint="Session 增量后的 Input + Output" />
-        <Metric icon={Network} label="Input" value={usage?.input_tokens ?? 0} hint="包含 Cached；累计快照不重复相加" />
+      <section className="metrics-strip metrics-strip-wide" data-testid="usage-history-metrics">
+        <Metric icon={Coins} label="全历史 Total" value={usage?.total_tokens ?? 0} hint={`scope=all_history · ${usage?.timezone ?? 'Asia/Shanghai'}`} />
+        <Metric icon={Network} label="Input" value={usage?.input_tokens ?? 0} hint="含 Cached；累计快照不重复相加" />
         <Metric icon={Clock} label="Cached-input" value={usage?.cached_input_tokens ?? 0} hint="Input 子集，不重复相加" />
+        <Metric icon={HardDrives} label="Uncached-input" value={uncached} hint="cache miss = Input − Cached" />
         <Metric icon={CheckCircle} label="Output" value={usage?.output_tokens ?? 0} hint="后端已差分计量" />
+      </section>
+      <section className="metrics-strip" data-testid="usage-today-metrics">
+        <Metric icon={Coins} label="今日 Total" value={today?.total_tokens ?? 0} hint={`${today?.date ?? '—'} · Asia/Shanghai 日界`} />
+        <Metric icon={Network} label="今日 Input" value={today?.input_tokens ?? 0} hint="local_day · 非全历史" />
+        <Metric icon={HardDrives} label="今日 Uncached" value={today?.uncached_input_tokens ?? 0} hint="今日 cache miss" />
+        <Metric icon={CheckCircle} label="今日 Output" value={today?.output_tokens ?? 0} hint="今日增量" />
+      </section>
+
+      <section className="panel" data-testid="usage-ratios">
+        <div className="panel-heading">
+          <div>
+            <span className="kicker">可见比值 · 非 Gate</span>
+            <h1>Input/Output 与 Uncached/Output</h1>
+          </div>
+          <span className="muted">比值仅解释账本；不参与预算准入、调度或质量终态</span>
+        </div>
+        <div className="usage-columns">
+          <div className="usage-row"><span>全历史 Input / Output</span><strong>{formatRatio(inputOutputRatio)}</strong></div>
+          <div className="usage-row"><span>全历史 Uncached-input / Output</span><strong>{formatRatio(uncachedOutputRatio)}</strong></div>
+        </div>
+        <p className="form-help">is_budget_gate={String(usage?.ratios?.is_budget_gate ?? false)} · is_quality_gate={String(usage?.ratios?.is_quality_gate ?? false)}。Cached 已计入 Input，Total = Input + Output。</p>
+      </section>
+
+      <section className="panel" data-testid="usage-quality">
+        <div className="panel-heading">
+          <div>
+            <span className="kicker">exact delta · legacy_inferred_delta</span>
+            <h1>账本质量占比</h1>
+          </div>
+          <span className="muted">历史存量可掩盖新链路效果；不作重分类或删除</span>
+        </div>
+        {usage?.usage_quality?.length ? usage.usage_quality.map((item) => (
+          <div className="usage-row" key={item.usage_semantics}>
+            <span>
+              {item.label ?? (item.usage_semantics === 'delta' ? 'exact_delta' : item.usage_semantics)}
+              <small>{item.calls} calls · {item.tokens.toLocaleString()} tokens</small>
+            </span>
+            <strong>
+              Token {(100 * (item.token_share ?? 0)).toFixed(1)}%
+              {' · '}
+              Calls {(100 * (item.call_share ?? 0)).toFixed(1)}%
+            </strong>
+          </div>
+        )) : <p className="muted">尚无 usage_quality 分桶。</p>}
+        {usage?.raw_snapshot_totals ? (
+          <p className="form-help">
+            Provider 原始累计快照合计 {usage.raw_snapshot_totals.total_tokens}；页面总数按相邻 Session 快照增量计量。迁移前缺少物理 Session id 的记录标记为 legacy_inferred_delta，不伪装成 exact delta。
+          </p>
+        ) : null}
       </section>
 
       <section className="panel">
@@ -631,9 +755,10 @@ function UsageView({ usage, projects, tasks }: { usage: Usage | null; projects: 
             />
             {selectedPoint ? (
               <p className="form-help">
-                已选 {selectedPoint.date}：total {selectedPoint.total_tokens}
+                已选范围日 {selectedPoint.date}（Asia/Shanghai）：total {selectedPoint.total_tokens}
                 （input {selectedPoint.input_tokens}，其中 cached {selectedPoint.cached_input_tokens} /
                 uncached {selectedPoint.uncached_input_tokens}；output {selectedPoint.output_tokens}）
+                · 非全历史总量
               </p>
             ) : null}
           </>
@@ -660,20 +785,15 @@ function UsageView({ usage, projects, tasks }: { usage: Usage | null; projects: 
       <section className="panel">
         <div className="panel-heading">
           <div>
-            <span className="kicker">ModelCallLedger · {usage?.usage_semantics ?? 'physical_session_delta'}</span>
+            <span className="kicker">ModelCallLedger · {usage?.usage_semantics ?? 'physical_session_delta'} · 全历史明细</span>
             <h1>消费明细</h1>
           </div>
           <span className="muted">Token 只计量，不参与任务准入、调度、熔断或终态</span>
         </div>
-        {usage?.raw_snapshot_totals ? (
-          <p className="form-help">
-            Provider 原始累计快照合计 {usage.raw_snapshot_totals.total_tokens}；页面总数按相邻 Session 快照增量计量。迁移前缺少物理 Session id 的记录会明确标记为 legacy_inferred_delta，不伪装成精确值。
-          </p>
-        ) : null}
         <div className="usage-columns">
           <div>
             <h2>按项目</h2>
-            {usage?.projects.length ? usage.projects.map((item) => (
+            {usage?.projects?.length ? usage.projects.map((item) => (
               <div className="usage-row" key={item.project_id ?? 'none'}>
                 <span>
                   {projects.find((project) => project.id === item.project_id)?.name ?? '未绑定项目'}
@@ -685,7 +805,7 @@ function UsageView({ usage, projects, tasks }: { usage: Usage | null; projects: 
           </div>
           <div>
             <h2>按任务</h2>
-            {usage?.tasks.length ? usage.tasks.map((item) => (
+            {usage?.tasks?.length ? usage.tasks.map((item) => (
               <div className="usage-row" key={item.task_id ?? 'none'}>
                 <span>
                   {tasks.find((task) => task.id === item.task_id)?.title ?? item.task_id ?? '未绑定任务'}
@@ -709,7 +829,7 @@ function UsageView({ usage, projects, tasks }: { usage: Usage | null; projects: 
             </div>
           ))}
         </div>
-        {usage?.calls.length ? (
+        {usage?.calls?.length ? (
           <div>
             <h2>调用清单</h2>
             {usage.calls.map((call) => (
@@ -768,6 +888,10 @@ function Metric({ icon: Icon, label, value, hint, onClick }: { icon: typeof Kanb
   return onClick
     ? <button type="button" className="metric-card" aria-label={`查看${label}详情`} onClick={onClick}>{content}</button>
     : <article className="metric-card">{content}</article>
+}
+function formatRatio(value: number | null | undefined) {
+  if (value === null || value === undefined || Number.isNaN(value)) return '—'
+  return value.toFixed(2)
 }
 function StatusDot({ ok, label }: { ok: boolean; label: string }) { return <span className={`status-dot ${ok ? 'ok' : 'off'}`}><Circle size={8} weight="fill" />{label}</span> }
 function StatusPill({ status }: { status: TaskStatus }) { return <span className={`status-pill status-${status}`}>{statusNames[status]}</span> }

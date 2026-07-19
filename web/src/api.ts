@@ -305,15 +305,18 @@ export type Convention = {
 export type Usage = {
   input_tokens: number
   cached_input_tokens: number
+  uncached_input_tokens?: number
   cached_input_tokens_in_total: boolean
   output_tokens: number
   total_tokens: number
   total_formula: string
+  scope?: 'all_history' | string
   usage_semantics?: string
   timezone?: string
   today?: {
     date: string
     timezone: string
+    scope?: 'local_day' | string
     input_tokens: number
     cached_input_tokens: number
     uncached_input_tokens: number
@@ -323,9 +326,18 @@ export type Usage = {
   }
   usage_quality?: {
     usage_semantics: 'delta' | 'legacy_inferred_delta' | 'unresolved_snapshot'
+    label?: string
     calls: number
     tokens: number
+    call_share?: number
+    token_share?: number
   }[]
+  ratios?: {
+    input_per_output: number | null
+    uncached_input_per_output: number | null
+    is_budget_gate: boolean
+    is_quality_gate: boolean
+  }
   raw_snapshot_totals?: {
     input_tokens: number
     cached_input_tokens: number

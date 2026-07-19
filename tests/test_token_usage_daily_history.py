@@ -5,6 +5,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from zoneinfo import ZoneInfo
 
+import pytest
 from fastapi.testclient import TestClient
 
 from plow_whip_web.api.app import create_app
@@ -249,3 +250,143 @@ def test_daily_api_rejects_oversized_range() -> None:
         )
         assert response.status_code == 400
         assert "90" in response.json()["detail"]
+
+
+FIXTURE_TASK_ID = "dac716ed-4f78-4736-be68-7305e079519d"
+
+
+def test_exact_fixture_task_tokens_preserve_ledger_semantics() -> None:
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        project_dir = root / "project"
+        project_dir.mkdir()
+        app = _app(directory)
+        project = app.state.project_repository.create(
+            name="fixture-project",
+            path=str(project_dir),
+            host_path=str(project_dir),
+        )
+        connection = app.state.database.connect()
+        try:
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.execute(
+                """
+                INSERT INTO tasks(
+                    id, title, objective, project_path, status, revision,
+                    command_json, verification_json, max_attempts, token_budget,
+                    project_id, provider, quality_profile, sizing_json
+                ) VALUES (?, 'exact fixture', 'preserve ledger totals', ?, 'ready', 0,
+                          '{}', '[]', 1, 0, ?, 'codex', 'deterministic', '{"status":"legacy_fallback"}')
+                """,
+                (FIXTURE_TASK_ID, str(project_dir), str(project["id"])),
+            )
+            connection.commit()
+            connection.execute("PRAGMA foreign_keys = ON")
+        finally:
+            connection.close()
+        ledger = app.state.model_calls
+        call_id = _settle(
+            ledger,
+            key=f"fixture-{FIXTURE_TASK_ID}",
+            project_id=str(project["id"]),
+            task_id=FIXTURE_TASK_ID,
+            input_tokens=107_946,
+            cached_input_tokens=0,
+            output_tokens=37_209,
+            session_id=f"session-{FIXTURE_TASK_ID}",
+            session_generation=1,
+        )
+        # Replay settle must not double-count.
+        ledger.settle(
+            call_id,
+            {
+                "input_tokens": 107_946,
+                "cached_input_tokens": 0,
+                "output_tokens": 37_209,
+            },
+            session_id=f"session-{FIXTURE_TASK_ID}",
+        )
+        summary = ledger.summary()
+        task_row = next(
+            item for item in summary["tasks"] if item["task_id"] == FIXTURE_TASK_ID
+        )
+        assert task_row["input_tokens"] == 107_946
+        assert task_row["cached_input_tokens"] == 0
+        assert task_row["uncached_input_tokens"] == 107_946
+        assert task_row["output_tokens"] == 37_209
+        assert task_row["tokens"] == 145_155
+        assert summary["input_tokens"] == 107_946
+        assert summary["cached_input_tokens"] == 0
+        assert summary["uncached_input_tokens"] == 107_946
+        assert summary["output_tokens"] == 37_209
+        assert summary["total_tokens"] == 145_155
+        assert summary["scope"] == "all_history"
+        assert summary["ratios"]["is_budget_gate"] is False
+        assert summary["ratios"]["is_quality_gate"] is False
+        assert summary["ratios"]["input_per_output"] == pytest.approx(107_946 / 37_209)
+        exact = next(
+            item
+            for item in summary["usage_quality"]
+            if item["usage_semantics"] == "delta"
+        )
+        assert exact["label"] == "exact_delta"
+        assert exact["tokens"] == 145_155
+        assert exact["call_share"] == 1.0
+        assert exact["token_share"] == 1.0
+        assert summary["today"]["timezone"] == USAGE_TIMEZONE
+        assert summary["today"]["scope"] == "local_day"
+        # Full-history total must never be mirrored as "today" semantics alone.
+        assert summary["today"]["total_tokens"] <= summary["total_tokens"]
+
+
+def test_summary_exposes_legacy_and_exact_shares_without_reclassifying() -> None:
+    with TemporaryDirectory() as directory:
+        app = _app(directory)
+        ledger = app.state.model_calls
+        exact_id = _settle(
+            ledger,
+            key="exact-share",
+            input_tokens=100,
+            cached_input_tokens=20,
+            output_tokens=10,
+            session_id="exact-session",
+        )
+        with app.state.database.transaction(immediate=True) as connection:
+            connection.execute(
+                """
+                INSERT INTO model_calls(
+                    call_id, idempotency_key, provider, model, call_kind, status,
+                    input_tokens, cached_input_tokens, output_tokens,
+                    raw_input_tokens, raw_cached_input_tokens, raw_output_tokens,
+                    usage_semantics, normalized_usage_json, settled_at
+                ) VALUES (?, ?, 'codex', 'codex', 'executor', 'completed',
+                          ?, ?, ?, ?, ?, ?, 'legacy_inferred_delta', ?, CURRENT_TIMESTAMP)
+                """,
+                (
+                    "legacy-call",
+                    "legacy-share",
+                    400,
+                    0,
+                    50,
+                    400,
+                    0,
+                    50,
+                    '{"source":"legacy_inferred_delta"}',
+                ),
+            )
+        summary = ledger.summary()
+        assert summary["usage_semantics"] == "mixed_exact_and_legacy_inferred_delta"
+        by_sem = {
+            item["usage_semantics"]: item for item in summary["usage_quality"]
+        }
+        assert by_sem["delta"]["label"] == "exact_delta"
+        assert by_sem["legacy_inferred_delta"]["label"] == "legacy_inferred_delta"
+        assert by_sem["delta"]["tokens"] == 110
+        assert by_sem["legacy_inferred_delta"]["tokens"] == 450
+        assert by_sem["legacy_inferred_delta"]["token_share"] == pytest.approx(450 / 560)
+        assert by_sem["delta"]["call_share"] == pytest.approx(0.5)
+        # Exact call remains exact; legacy remains legacy.
+        settled = next(item for item in summary["calls"] if item["call_id"] == exact_id)
+        legacy = next(item for item in summary["calls"] if item["call_id"] == "legacy-call")
+        assert settled["usage_semantics"] == "delta"
+        assert legacy["usage_semantics"] == "legacy_inferred_delta"

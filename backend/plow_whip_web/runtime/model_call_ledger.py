@@ -283,7 +283,35 @@ class ModelCallLedger:
                 GROUP BY usage_semantics ORDER BY usage_semantics
                 """
             ).fetchall()
-            usage_quality = [dict(row) for row in quality_rows]
+            quality_total_calls = sum(int(row["calls"]) for row in quality_rows)
+            quality_total_tokens = sum(int(row["tokens"]) for row in quality_rows)
+            usage_quality = []
+            for row in quality_rows:
+                semantics = str(row["usage_semantics"])
+                calls_count = int(row["calls"])
+                tokens_count = int(row["tokens"])
+                usage_quality.append(
+                    {
+                        "usage_semantics": semantics,
+                        "label": (
+                            "exact_delta"
+                            if semantics == "delta"
+                            else semantics
+                        ),
+                        "calls": calls_count,
+                        "tokens": tokens_count,
+                        "call_share": (
+                            calls_count / quality_total_calls
+                            if quality_total_calls
+                            else 0.0
+                        ),
+                        "token_share": (
+                            tokens_count / quality_total_tokens
+                            if quality_total_tokens
+                            else 0.0
+                        ),
+                    }
+                )
             has_legacy_inference = any(
                 row["usage_semantics"] == "legacy_inferred_delta"
                 for row in quality_rows
@@ -313,24 +341,42 @@ class ModelCallLedger:
             today_totals = self._aggregate_rows(
                 self._settled_rows_for_dates(connection, today, today)
             )
+            input_tokens = int(total["input_tokens"])
+            cached_input_tokens = int(total["cached_input_tokens"])
+            uncached_input_tokens = max(0, input_tokens - cached_input_tokens)
+            output_tokens = int(total["output_tokens"])
             return {
-                "input_tokens": int(total["input_tokens"]),
-                "cached_input_tokens": int(total["cached_input_tokens"]),
+                "input_tokens": input_tokens,
+                "cached_input_tokens": cached_input_tokens,
+                "uncached_input_tokens": uncached_input_tokens,
                 "cached_input_tokens_in_total": True,
-                "output_tokens": int(total["output_tokens"]),
-                "total_tokens": int(total["input_tokens"])
-                + int(total["output_tokens"]),
+                "output_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
                 "total_formula": "input_tokens + output_tokens",
+                "scope": "all_history",
                 "usage_semantics": (
                     "mixed_exact_and_legacy_inferred_delta"
                     if has_legacy_inference
                     else "physical_session_delta"
                 ),
                 "usage_quality": usage_quality,
+                "ratios": {
+                    "input_per_output": (
+                        input_tokens / output_tokens if output_tokens else None
+                    ),
+                    "uncached_input_per_output": (
+                        uncached_input_tokens / output_tokens
+                        if output_tokens
+                        else None
+                    ),
+                    "is_budget_gate": False,
+                    "is_quality_gate": False,
+                },
                 "timezone": USAGE_TIMEZONE,
                 "today": {
                     "date": today.isoformat(),
                     "timezone": USAGE_TIMEZONE,
+                    "scope": "local_day",
                     **today_totals,
                 },
                 "raw_snapshot_totals": {
