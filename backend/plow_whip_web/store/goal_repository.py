@@ -15,6 +15,7 @@ from plow_whip_web.runtime.orchestration import (
 )
 from plow_whip_web.runtime.sizing import TaskSizingInputs, estimate_task_sizing
 from plow_whip_web.store.database import Database
+from plow_whip_web.store.role_instance_repository import RoleInstanceRepository
 from plow_whip_web.store.task_repository import canonical_task_spec, insert_task_spec
 
 
@@ -148,14 +149,28 @@ class GoalRepository:
                     )
                 sizing, execution_policy = _preview_to_persistence(preview)
                 max_attempts = resolve_max_attempts(execution_policy, 1)
-                role_id = str(uuid.uuid4())
-                connection.execute(
+                # Prefer the project's named capability role so Plan/Task/Role/
+                # Worker/Context all expose the same identity (backend, not a
+                # compound alias or route label).
+                existing_role = connection.execute(
                     """
-                    INSERT INTO roles(id, project_id, kind, status)
-                    VALUES (?, ?, ?, 'ephemeral')
+                    SELECT id FROM roles
+                    WHERE project_id = ? AND kind = ?
+                    ORDER BY created_at ASC, id ASC LIMIT 1
                     """,
-                    (role_id, project_id, f"{item.role}:{goal_id}:{item.ordinal}"),
-                )
+                    (project_id, item.role),
+                ).fetchone()
+                if existing_role is not None:
+                    role_id = str(existing_role["id"])
+                else:
+                    role_id = str(uuid.uuid4())
+                    connection.execute(
+                        """
+                        INSERT INTO roles(id, project_id, kind, status)
+                        VALUES (?, ?, ?, 'ephemeral')
+                        """,
+                        (role_id, project_id, item.role),
+                    )
                 child_command, child_verification = _child_command_and_verification(
                     item=item,
                     shared_command=command,
@@ -227,6 +242,26 @@ class GoalRepository:
                         },
                     ),
                     revision=1,
+                )
+                # Immutable RoleInstance + SessionBinding after confirmed WorkItem.
+                RoleInstanceRepository(self.database).create_for_task(
+                    connection,
+                    project_id=project_id,
+                    goal_id=goal_id,
+                    task_id=task_id,
+                    role_kind=item.role,
+                    role_id=role_id,
+                    provider=item.provider or provider,
+                    task_spec_revision=1,
+                    work_item={
+                        "boundaries": list(scope),
+                        "deliverables": list(item.artifacts),
+                        "verification": [
+                            str(check.get("kind") or check)
+                            for check in child_verification
+                        ],
+                        "tools": [],
+                    },
                 )
 
             connection.execute(

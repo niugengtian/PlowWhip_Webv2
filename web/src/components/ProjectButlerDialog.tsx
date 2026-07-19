@@ -175,6 +175,17 @@ export function ProjectButlerDialog({
         </nav>
         <section className="butler-chat">
           {conversation ? <>
+            <div
+              className="butler-status-banner"
+              data-testid="butler-status-banner"
+              data-status={conversation.status}
+            >
+              <strong>{statusName(conversation.status)}</strong>
+              <span>置信度 {conversation.confidence}%</span>
+              {conversation.expected_field && <span>当前问题：{fieldNames[conversation.expected_field]}</span>}
+              {conversation.status === 'clarifying' && <span>一次只问一个最有价值的问题</span>}
+              {conversation.status === 'awaiting_confirmation' && <span>等待主人确认后才会派发</span>}
+            </div>
             <div className="butler-messages" aria-live="polite">
               {conversation.messages.map((message) => <article
                 className={message.sender_type === 'project_butler' ? 'butler-message' : 'human-message'}
@@ -260,7 +271,7 @@ function ProposalCard({
       <ProposalFact label="边界" value={listValue(conversation.spec.boundaries)} />
       <ProposalFact label="验收标准" value={listValue(conversation.spec.acceptance)} />
     </dl>
-    <p>这 95% 是三项必需信息的结构化完整度，不是模型对语义正确性的自我评分。请核对内容；确认后才会拆分和唤醒 Worker。</p>
+    <p>置信度基于仍未解决、会改变方案的语义缺口，不是字段非空或固定三问。请核对内容；确认后才会拆分和唤醒 Worker。</p>
     <div className="butler-proposal-actions">
       {(Object.keys(fieldNames) as ProposalField[]).map((field) => <button
         type="button"

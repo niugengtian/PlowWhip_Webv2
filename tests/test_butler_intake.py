@@ -174,13 +174,24 @@ def test_project_butler_asks_one_question_then_requires_human_confirmation() -> 
             assert [item["provider"] for item in goal["work_items"]] == [
                 "codex", "cursor", "cursor", "codex"
             ]
-            assert {item["status"] for item in goal["work_items"]} == {"ready"}
+            by_role = {item["role"]: item for item in goal["work_items"]}
+            assert by_role["backend"]["status"] == "ready"
+            assert by_role["frontend"]["status"] == "paused"
+            assert by_role["ui"]["status"] == "ready"
+            assert by_role["devops_sre"]["status"] == "paused"
             assert goal["spec"]["acceptance"] == proposal["spec"]["acceptance"]
             assert goal["spec"]["scope"] == proposal["spec"]["boundaries"]
             for item in goal["work_items"]:
                 context = app.state.context_compiler.compile(item["id"])
                 assert context["role"] == item["role"]
                 assert ROLE_PROMPTS[item["role"]] in context["content"]
+                if item["role"] in {
+                    "backend", "frontend", "ui", "devops_sre", "verification", "fullstack",
+                }:
+                    assert "Think Before Coding" in context["content"]
+                    assert context["behavior_baseline"]["mandatory"] is True
+                else:
+                    assert context["behavior_baseline"]["not_applicable"] is True
 
             retried = client.post(
                 f"/api/projects/{project['id']}/butler/conversations/"

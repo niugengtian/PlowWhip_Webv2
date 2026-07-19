@@ -66,7 +66,12 @@ def test_butler_routing_is_deterministic_and_bounded() -> None:
     assert {item.kind for item in first.items} == {"implementation"}
     assert 2 <= len(first.items) <= 6
     assert all(item.acceptance == () for item in first.items)
-    assert all(item.depends_on_ordinals == () for item in first.items)
+    assert first.items[0].depends_on_ordinals == ()
+    assert first.items[1].depends_on_ordinals == (1,)
+    # ui is not in the shared write-serial set, so it stays independent of backend.
+    assert first.items[2].role == "ui"
+    assert first.items[2].depends_on_ordinals == ()
+    assert first.items[3].depends_on_ordinals == (2,)
 
 
 def test_fresh_and_idempotent_migration_adds_goals() -> None:

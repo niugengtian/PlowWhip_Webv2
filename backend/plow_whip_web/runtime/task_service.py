@@ -50,6 +50,7 @@ class TaskService:
         host_jobs: HostJobRepository | None = None,
         projects: ProjectRepository | None = None,
         model_calls: ModelCallLedger | None = None,
+        role_instances: Any | None = None,
     ) -> None:
         self.repository = repository
         self.provider = provider or GenericCommandProvider()
@@ -63,6 +64,7 @@ class TaskService:
         self.host_jobs = host_jobs
         self.projects = projects
         self.model_calls = model_calls
+        self.role_instances = role_instances
 
     def drive(
         self, task_id: str, *, expected_revision: int, idempotency_key: str
@@ -77,6 +79,22 @@ class TaskService:
         if not self.provider_pool and pending.provider != self.provider.name:
             raise ProviderUnavailableError(
                 f"provider unavailable or not configured: {pending.provider}"
+            )
+        if self.role_instances is not None:
+            from plow_whip_web.runtime.rule_library import provider_invokes_model
+
+            model_invoked = provider_invokes_model(
+                provider=pending.provider,
+                provider_config=provider_config,
+            )
+            if model_invoked:
+                self.role_instances.ensure_for_task(pending, model_invoked=True)
+            self.role_instances.require_dispatchable(
+                task_id=pending.id,
+                provider=pending.provider,
+                command=pending.command,
+                model_invoked=model_invoked,
+                expected_task_spec_revision=pending.spec_revision,
             )
         if pending.provider == self.provider.name:
             self.command_policy.validate(Path(pending.project_path), pending.command)

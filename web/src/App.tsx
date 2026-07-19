@@ -5,8 +5,8 @@ import {
   Plus, Pulse, Robot, ShieldCheck, TerminalWindow, WarningCircle, X,
 } from '@phosphor-icons/react'
 import {
-  api, AuditEntry, Convention, ConventionSuggestion, GlobalButlerOverview, Goal, OutboxEvent, PermissionGrant,
-  Project, Provider, RuntimeHealth, RuntimeSettings, SchedulerStatus, Task, TaskArtifact, TaskEvent,
+  api, AuditEntry, BehaviorBaseline, Convention, ConventionSuggestion, GlobalButlerOverview, Goal, OutboxEvent, PermissionGrant,
+  Project, Provider, RoleInstance, RuntimeHealth, RuntimeSettings, SchedulerStatus, SessionBinding, Task, TaskArtifact, TaskEvent,
   TaskDeletionEligibility, TaskSizingEstimate, TaskSizingInputs, TaskStatus, Usage, UsageDailyBreakdown,
   UsageDailySeries, Worker, WorkerDetail, WorkerStream,
 } from './api'
@@ -482,7 +482,40 @@ function TasksView({ tasks, goals, workers, selected, selectedGoal, events, arti
 }
 
 function GoalDetail({ goal, tasks, workers }: { goal: Goal; tasks: Task[]; workers: Worker[] }) {
-  return <><div className="panel-heading"><div><span className="kicker">{goal.id}</span><h1>{goal.title}</h1></div><span className="status-pill">{goal.status}</span></div><p className="objective">{goal.spec.objective}</p><div className="facts"><Fact label="协调真源" value="GoalSpec / Butler aggregate" /><Fact label="GoalSpec revision" value={String(goal.spec_revision)} /><Fact label="Scope" value={listValue(goal.spec.scope) || '无'} /><Fact label="Acceptance" value={listValue(goal.spec.acceptance) || '无'} /><Fact label="Artifacts" value={listValue(goal.spec.artifacts) || '无'} mono /><Fact label="策略路由" value={String(goal.plan.route ?? 'unknown')} /><Fact label="Provider" value={goal.provider} /><Fact label="工作项" value={String(goal.work_items.length)} /><Fact label="Goal sizing" value={summary(goal.sizing_inputs, ['size_class', 'status', 'risk_level'])} /><Fact label="Goal 状态" value={goal.status} /></div><section className="work-items"><div className="section-heading"><div><span className="kicker">策略路由 → 任务 Gate</span><h2>工作项运行态</h2></div><span>只显示元数据，不读取 stdout/stderr</span></div>{goal.work_items.map((item) => {
+  const [instances, setInstances] = useState<RoleInstance[]>([])
+  const [bindings, setBindings] = useState<SessionBinding[]>([])
+  useEffect(() => {
+    let alive = true
+    Promise.all([
+      api.roleInstances({ goalId: goal.id }),
+      api.sessionBindings({ projectId: goal.project_id }),
+    ]).then(([rolePayload, bindingPayload]) => {
+      if (!alive) return
+      setInstances(rolePayload.items)
+      const taskIds = new Set(
+        (goal.work_items ?? []).map((item) => String(item.id)),
+      )
+      setBindings(bindingPayload.items.filter((item) => taskIds.has(item.task_id)))
+    }).catch(() => {
+      if (!alive) return
+      setInstances([])
+      setBindings([])
+    })
+    return () => { alive = false }
+    // goal.work_items identity is covered by goal.id; avoid effect churn.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [goal.id, goal.project_id])
+  return <><div className="panel-heading"><div><span className="kicker">{goal.id}</span><h1>{goal.title}</h1></div><span className="status-pill">{goal.status}</span></div><p className="objective">{goal.spec.objective}</p><div className="facts"><Fact label="协调真源" value="GoalSpec / Butler aggregate" /><Fact label="GoalSpec revision" value={String(goal.spec_revision)} /><Fact label="Scope" value={listValue(goal.spec.scope) || '无'} /><Fact label="Acceptance" value={listValue(goal.spec.acceptance) || '无'} /><Fact label="Artifacts" value={listValue(goal.spec.artifacts) || '无'} mono /><Fact label="策略路由" value={String(goal.plan.route ?? 'unknown')} /><Fact label="Provider" value={goal.provider} /><Fact label="工作项" value={String(goal.work_items.length)} /><Fact label="Goal sizing" value={summary(goal.sizing_inputs, ['size_class', 'status', 'risk_level'])} /><Fact label="Goal 状态" value={goal.status} /></div>
+  <section className="work-items" data-testid="role-lineage-panel"><div className="section-heading"><div><span className="kicker">Rule → Template → Instance → Session</span><h2>角色来源与绑定</h2></div><span>稳定管家 / 通用模板 / 项目覆盖 / 动态实例</span></div>
+    {instances.length ? instances.map((instance) => {
+      const binding = bindings.find((item) => item.role_instance_id === instance.id)
+      const match = typeof instance.match_reason === 'string'
+        ? instance.match_reason
+        : summary(instance.match_reason ?? {}, ['reused', 'reason', 'generation_reason'])
+      return <article className="work-item-card" key={instance.id}><header><span>RI</span><div><strong>{instance.role_kind}</strong><small>{instance.status}</small></div></header><dl className="facts"><Fact label="模板" value={`${instance.template_id}@${instance.template_revision}`} mono /><Fact label="模板 hash" value={instance.template_hash.slice(0, 12)} mono /><Fact label="实例 hash" value={instance.instance_hash.slice(0, 12)} mono /><Fact label="规则集 hash" value={instance.ruleset_hash.slice(0, 12)} mono /><Fact label="复用/新建理由" value={match || instance.generation_reason || '无'} /><Fact label="Session generation" value={binding ? String(binding.session_generation) : '尚未绑定'} /><Fact label="Binding hash" value={binding ? binding.binding_hash.slice(0, 12) : '—'} mono /><Fact label="TaskSpec revision" value={String(instance.task_spec_revision)} /></dl></article>
+    }) : <p className="artifact-empty">尚无 RoleInstance（本地确定性命令可不创建）</p>}
+  </section>
+  <section className="work-items"><div className="section-heading"><div><span className="kicker">策略路由 → 任务 Gate</span><h2>工作项运行态</h2></div><span>只显示元数据，不读取 stdout/stderr</span></div>{goal.work_items.map((item) => {
     const task = tasks.find((candidate) => candidate.id === String(item.id))
     const detail = { ...item, ...(task ?? {}) } as Record<string, unknown>
     const worker = workers.find((candidate) => candidate.id === value(detail, ['worker_id']))
@@ -855,9 +888,53 @@ function AuditView({ audit, permissions, onRefresh }: { audit: AuditEntry[]; per
 
 function SettingsView(props: { settings: RuntimeSettings | null; setSettings: (value: RuntimeSettings) => void; scheduler: SchedulerStatus | null; convention: Convention | null; setConvention: (value: Convention) => void; suggestion: ConventionSuggestion | null; setSuggestion: (value: ConventionSuggestion | null) => void; projects: Project[]; tasks: Task[]; providers: Provider[]; refineProvider: string; setRefineProvider: (value: string) => void; busy: boolean; onSaveSettings: (event: FormEvent) => void; onTick: () => void; onLoadConvention: (scope: Convention['scope'], id: string) => void; onSaveConvention: (event: FormEvent) => void; onRefine: () => void }) {
   const { settings, setSettings, scheduler, convention, setConvention, suggestion, setSuggestion, projects, tasks, providers, refineProvider, setRefineProvider, busy, onSaveSettings, onTick, onLoadConvention, onSaveConvention, onRefine } = props
+  const [baselineRole, setBaselineRole] = useState('backend')
+  const [baseline, setBaseline] = useState<BehaviorBaseline | null>(null)
+  const [conventionBaseline, setConventionBaseline] = useState<BehaviorBaseline | null>(null)
+  const [effectiveBaseline, setEffectiveBaseline] = useState<BehaviorBaseline | null>(null)
+  useEffect(() => {
+    let alive = true
+    api.behaviorBaseline(baselineRole).then((item) => { if (alive) setBaseline(item) }).catch(() => { if (alive) setBaseline(null) })
+    return () => { alive = false }
+  }, [baselineRole])
+  const projectId = projects[0]?.id
+  const taskId = tasks[0]?.id
+  const taskRoleId = tasks[0]?.role_id ?? undefined
+  useEffect(() => {
+    let alive = true
+    api.conventionInventory({
+      projectId,
+      taskId,
+      roleId: taskRoleId,
+      role: baselineRole,
+    }).then((item) => {
+      if (alive) setConventionBaseline(item.behavior_baseline)
+    }).catch(() => { if (alive) setConventionBaseline(null) })
+    return () => { alive = false }
+  }, [baselineRole, projectId, taskId, taskRoleId])
+  useEffect(() => {
+    let alive = true
+    if (!taskId) {
+      api.behaviorBaseline('butler').then((item) => {
+        if (alive) setEffectiveBaseline(item)
+      }).catch(() => { if (alive) setEffectiveBaseline(null) })
+      return () => { alive = false }
+    }
+    api.conventionEffective(taskId, taskRoleId).then((item) => {
+      if (alive) setEffectiveBaseline(item.behavior_baseline)
+    }).catch(() => {
+      api.behaviorBaseline('butler').then((item) => {
+        if (alive) setEffectiveBaseline(item)
+      }).catch(() => { if (alive) setEffectiveBaseline(null) })
+    })
+    return () => { alive = false }
+  }, [taskId, taskRoleId])
+  const conventionFacts = conventionBaseline ?? baseline
   return <div className="settings-layout"><section className="panel cron-panel"><div className="panel-heading"><div><span className="kicker">单一全局 Crontab</span><h1>无人值守调度</h1></div><StatusDot ok={Boolean(scheduler?.engine.active)} label={scheduler?.engine.active ? '运行中' : '未运行'} /></div><div className="facts"><Fact label="引擎" value={scheduler ? `${scheduler.engine.managed_by} · ${scheduler.engine.backend}` : '检测中'} /><Fact label="下次执行" value={scheduler?.schedule.next_run_at ?? '尚未计算'} /><Fact label="Fencing" value={String(scheduler?.runtime.fencing_token ?? 0)} /><Fact label="最近 Tick" value={scheduler?.runtime.last_tick_at ?? '尚未执行'} /></div><button className="primary" disabled={busy} onClick={onTick}><Play size={16} />立即运行 Tick</button></section>
+    <section className="panel" data-testid="behavior-baseline-panel"><div className="panel-heading"><div><span className="kicker">开发角色行为基线</span><h1>四原则来源与适用性</h1></div></div><div className="form-grid two"><Field label="预览角色"><select value={baselineRole} onChange={(event) => setBaselineRole(event.target.value)}><option value="backend">backend</option><option value="frontend">frontend</option><option value="ui">ui</option><option value="fullstack">fullstack</option><option value="devops_sre">devops_sre</option><option value="verification">verification</option><option value="butler">butler（非开发）</option><option value="coordination">coordination（非开发）</option></select></Field></div>{baseline && <div className="facts" data-testid="behavior-baseline-facts"><Fact label="适用性" value={baseline.not_applicable ? '不适用' : '适用（开发角色）'} /><Fact label="Mandatory" value={baseline.mandatory ? '是' : '否'} /><Fact label="保留量" value={String(baseline.effective_reserve_bytes)} /><Fact label="Revision" value={String(baseline.revision)} /><Fact label="Source" value={baseline.source} mono /><Fact label="配置来源" value={baseline.config_source ?? 'rule_versions:development'} mono />{baseline.reason ? <Fact label="说明" value={baseline.reason} /> : null}</div>}</section>
     {settings && <form className="panel form-panel" onSubmit={onSaveSettings}><div className="panel-heading"><div><span className="kicker">设置修订 {settings.revision}</span><h1>无人值守、Token 节省与快速续接</h1></div><span className="muted">优先级：Task + 角色 ＞ 项目 ＞ 全局</span></div><h2>调度</h2><div className="form-grid"><Field label="Cron 表达式"><input value={settings.values.cron_expression} onChange={(event) => setSettings({ ...settings, values: { ...settings.values, cron_expression: event.target.value } })} /></Field><Field label="时区"><input value={settings.values.cron_timezone} onChange={(event) => setSettings({ ...settings, values: { ...settings.values, cron_timezone: event.target.value } })} /></Field><Field label="错过执行"><select value={settings.values.cron_misfire_policy} onChange={(event) => setSettings({ ...settings, values: { ...settings.values, cron_misfire_policy: event.target.value as 'catch_up_once' | 'skip' } })}><option value="catch_up_once">恢复后只补跑一次</option><option value="skip">跳过</option></select></Field><NumberField label="最大并行 Worker" value={settings.values.max_parallel_workers} onChange={(value) => setSettings({ ...settings, values: { ...settings.values, max_parallel_workers: value } })} /></div><h2>统一连续性阈值</h2><div className="form-grid"><NumberField label="同类失败熔断" value={settings.values.max_same_failure} onChange={(value) => setSettings({ ...settings, values: { ...settings.values, max_same_failure: value } })} /><NumberField label="无进展熔断" value={settings.values.max_no_progress} onChange={(value) => setSettings({ ...settings, values: { ...settings.values, max_no_progress: value } })} /><NumberField label="Context 最大字节" value={settings.values.context_max_bytes} onChange={(value) => setSettings({ ...settings, values: { ...settings.values, context_max_bytes: value } })} /><NumberField label="Checkpoint 最大字节" value={settings.values.checkpoint_max_bytes} onChange={(value) => setSettings({ ...settings, values: { ...settings.values, checkpoint_max_bytes: value } })} /><NumberField label="Handoff 最大字节" value={settings.values.handoff_max_bytes} onChange={(value) => setSettings({ ...settings, values: { ...settings.values, handoff_max_bytes: value } })} /><NumberField label="观察日志行数" value={settings.values.observation_tail_lines} onChange={(value) => setSettings({ ...settings, values: { ...settings.values, observation_tail_lines: value } })} /><NumberField label="观察最大字节" value={settings.values.observation_max_bytes} onChange={(value) => setSettings({ ...settings, values: { ...settings.values, observation_max_bytes: value } })} /><NumberField label="文件轮转字节" value={settings.values.rotation_max_bytes} onChange={(value) => setSettings({ ...settings, values: { ...settings.values, rotation_max_bytes: value } })} /></div><p className="form-help">当前来源：Context {settings.sources?.context_max_bytes ?? 'global'} · Checkpoint {settings.sources?.checkpoint_max_bytes ?? 'global'} · Handoff {settings.sources?.handoff_max_bytes ?? 'global'} · 观察 {settings.sources?.observation_max_bytes ?? 'global'} · 轮转 {settings.sources?.rotation_max_bytes ?? 'global'}</p>{settings.warnings?.length ? <div className="error-banner">{settings.warnings.map((warning) => <p key={warning}>阈值冲突：{warning}</p>)}</div> : null}<p className="form-help">提交时后端会校验 Checkpoint、Handoff、Context 与轮转/观察阈值；不会用固定 8 KiB 覆盖项目或 Task 特例。</p><label className="toggle-row"><input type="checkbox" checked={settings.values.cron_enabled} onChange={(event) => setSettings({ ...settings, values: { ...settings.values, cron_enabled: event.target.checked } })} /><span>启用容器内 Crontab</span></label><label className="toggle-row"><input type="checkbox" checked={settings.values.auto_dispatch} onChange={(event) => setSettings({ ...settings, values: { ...settings.values, auto_dispatch: event.target.checked } })} /><span>自动派发待执行任务</span></label><button className="primary" disabled={busy}>保存并检查冲突</button></form>}
-    {convention && <form className="panel convention-panel" onSubmit={onSaveConvention}><div className="panel-heading"><div><span className="kicker">全局 · 项目 · Task</span><h1>Convention 编辑器</h1></div><span className="revision">修订 {convention.revision}</span></div><div className="form-grid two"><Field label="作用域"><select value={convention.scope} onChange={(event) => { const scope = event.target.value as Convention['scope']; const id = scope === 'global' ? 'global' : scope === 'project' ? projects[0]?.id ?? '' : tasks[0]?.id ?? ''; onLoadConvention(scope, id) }}><option value="global">全局</option><option value="project">项目</option><option value="task">Task</option></select></Field><Field label="目标"><select disabled={convention.scope === 'global'} value={convention.scope_id} onChange={(event) => onLoadConvention(convention.scope, event.target.value)}>{convention.scope === 'global' ? <option value="global">全局</option> : convention.scope === 'project' ? projects.map((project) => <option value={project.id} key={project.id}>{project.name}</option>) : tasks.map((task) => <option value={task.id} key={task.id}>{task.title}</option>)}</select></Field></div><div className="editor-grid"><div><label>当前 Convention</label><textarea value={convention.content} onChange={(event) => setConvention({ ...convention, content: event.target.value })} placeholder="写下质量门、权限边界和必须验证的完成条件。" /></div><div><label>{suggestion ? `${suggestion.provider} 精炼建议` : 'Worker 精炼建议'}</label><textarea value={suggestion?.suggestion ?? ''} readOnly placeholder="点击“模型精炼”后在这里审阅建议；不会自动覆盖原文。" /></div></div><div className="detail-actions"><select className="inline-select" value={refineProvider} onChange={(event) => setRefineProvider(event.target.value)}>{providers.filter((provider) => provider.enabled && provider.capabilities.includes('refine_convention')).map((provider) => <option value={provider.name} key={provider.name}>{provider.display_name}{provider.status === 'available' ? '' : '（当前不可用）'}</option>)}</select><button type="button" disabled={busy || !convention.content.trim()} onClick={onRefine}><MagicWand size={16} />模型精炼（计 Token）</button>{suggestion && <button type="button" onClick={() => { setConvention({ ...convention, content: suggestion.suggestion }); setSuggestion(null) }}><CheckCircle size={16} />采用建议</button>}<button className="primary" disabled={busy}>保存 Convention</button></div><p className="form-help">精炼是明确的模型动作，会记录 Token；保存仍需人工确认。Crontab、探测和状态扫描不会调用模型。</p></form>}
+    {convention && <form className="panel convention-panel" onSubmit={onSaveConvention}><div className="panel-heading"><div><span className="kicker">全局 · 项目 · Task</span><h1>Convention 编辑器</h1></div><span className="revision">修订 {convention.revision}</span></div><div className="form-grid two"><Field label="作用域"><select value={convention.scope} onChange={(event) => { const scope = event.target.value as Convention['scope']; const id = scope === 'global' ? 'global' : scope === 'project' ? projects[0]?.id ?? '' : tasks[0]?.id ?? ''; onLoadConvention(scope, id) }}><option value="global">全局</option><option value="project">项目</option><option value="task">Task</option></select></Field><Field label="目标"><select disabled={convention.scope === 'global'} value={convention.scope_id} onChange={(event) => onLoadConvention(convention.scope, event.target.value)}>{convention.scope === 'global' ? <option value="global">全局</option> : convention.scope === 'project' ? projects.map((project) => <option value={project.id} key={project.id}>{project.name}</option>) : tasks.map((task) => <option value={task.id} key={task.id}>{task.title}</option>)}</select></Field></div>{conventionFacts && <div className="facts" data-testid="convention-baseline-facts"><Fact label="内置基线适用性" value={conventionFacts.not_applicable ? '不适用' : '适用（开发角色）'} /><Fact label="Mandatory" value={conventionFacts.mandatory ? '是' : '否'} /><Fact label="保留量" value={String(conventionFacts.effective_reserve_bytes)} /><Fact label="Source" value={conventionFacts.source} mono /><Fact label="配置来源" value={conventionFacts.config_source ?? 'rule_versions:development'} mono /></div>}<div className="editor-grid"><div><label>当前 Convention</label><textarea value={convention.content} onChange={(event) => setConvention({ ...convention, content: event.target.value })} placeholder="写下质量门、权限边界和必须验证的完成条件。" /></div><div><label>{suggestion ? `${suggestion.provider} 精炼建议` : 'Worker 精炼建议'}</label><textarea value={suggestion?.suggestion ?? ''} readOnly placeholder="点击“模型精炼”后在这里审阅建议；不会自动覆盖原文。" /></div></div><div className="detail-actions"><select className="inline-select" value={refineProvider} onChange={(event) => setRefineProvider(event.target.value)}>{providers.filter((provider) => provider.enabled && provider.capabilities.includes('refine_convention')).map((provider) => <option value={provider.name} key={provider.name}>{provider.display_name}{provider.status === 'available' ? '' : '（当前不可用）'}</option>)}</select><button type="button" disabled={busy || !convention.content.trim()} onClick={onRefine}><MagicWand size={16} />模型精炼（计 Token）</button>{suggestion && <button type="button" onClick={() => { setConvention({ ...convention, content: suggestion.suggestion }); setSuggestion(null) }}><CheckCircle size={16} />采用建议</button>}<button className="primary" disabled={busy}>保存 Convention</button></div><p className="form-help">精炼是明确的模型动作，会记录 Token；保存仍需人工确认。内置开发角色四原则与可变 Convention 分层展示，只通过同一套 ContextCompiler 汇总。</p></form>}
+    {effectiveBaseline && <section className="panel" data-testid="effective-context-panel"><div className="panel-heading"><div><span className="kicker">Effective Context</span><h1>编译预览中的四原则</h1></div><span className="muted">来自 /api/conventions/effective</span></div><div className="facts" data-testid="effective-context-baseline-facts"><Fact label="适用性" value={effectiveBaseline.not_applicable ? '不适用' : '适用（开发角色）'} /><Fact label="Mandatory" value={effectiveBaseline.mandatory ? '是' : '否'} /><Fact label="保留量" value={String(effectiveBaseline.effective_reserve_bytes)} /><Fact label="Revision" value={String(effectiveBaseline.revision)} /><Fact label="Source" value={effectiveBaseline.source} mono /><Fact label="配置来源" value={effectiveBaseline.config_source ?? 'rule_versions:development'} mono />{effectiveBaseline.reason ? <Fact label="说明" value={effectiveBaseline.reason} /> : null}</div></section>}
   </div>
 }
 

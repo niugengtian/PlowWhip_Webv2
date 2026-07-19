@@ -381,6 +381,9 @@ class ButlerConversationView(BaseModel):
     updated_at: str
     messages: list[dict[str, Any]]
     direct_project_butler_url: str | None
+    auto_dispatch: bool = False
+    structured_goal_spec: bool = False
+    semantic: dict[str, Any] | None = None
 
 
 class TaskEventView(BaseModel):
@@ -513,8 +516,8 @@ class RuntimeSettingsOverrideUpdate(BaseModel):
 
 
 class ConventionPut(BaseModel):
-    scope: Literal["global", "project", "task"]
-    scope_id: Annotated[str, Field(min_length=1, max_length=100)]
+    scope: Literal["global", "project", "task", "task_role"]
+    scope_id: Annotated[str, Field(min_length=1, max_length=200)]
     content: Annotated[str, Field(max_length=100_000)]
     expected_revision: Annotated[int, Field(ge=0)]
 
@@ -522,7 +525,52 @@ class ConventionPut(BaseModel):
     def global_scope_id_is_fixed(self) -> "ConventionPut":
         if self.scope == "global" and self.scope_id != "global":
             raise ValueError("global convention scope_id must be global")
+        if self.scope == "task_role" and ":" not in self.scope_id:
+            raise ValueError("task_role scope_id must be task_id:role_id")
         return self
+
+
+class WorkerHelpCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    task_id: str
+    worker_id: str | None = None
+    blocker: Annotated[str, Field(min_length=1, max_length=4000)]
+    evidence: dict[str, Any] | list[Any]
+    attempted_actions: Annotated[list[str], Field(min_length=1, max_length=32)]
+    minimal_question: Annotated[str, Field(min_length=1, max_length=2000)]
+
+
+class ProjectRoleRuleCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    rule_id: Annotated[str, Field(min_length=1, max_length=200)]
+    rule_revision: int | None = None
+    reason: Annotated[str, Field(min_length=1, max_length=2000)]
+    source: Annotated[str, Field(min_length=1, max_length=200)] = "owner"
+    capability: Annotated[str | None, Field(max_length=80)] = None
+    template_id: Annotated[str | None, Field(max_length=200)] = None
+
+
+class WorkerHelpResolve(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    resolution: Literal["answered", "replanned", "replaced", "closed"]
+    detail: dict[str, Any] | None = None
+
+
+class TaskEscalationCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    task_id: str
+    reason_class: Literal[
+        "credential_or_permission",
+        "safety_or_irreversible",
+        "conflicting_owner_directives",
+        "unresolvable_requirement_ambiguity",
+    ]
+    detail: Annotated[str, Field(min_length=1, max_length=4000)]
+    help_request_id: str | None = None
 
 
 class ConventionRefineRequest(BaseModel):

@@ -108,8 +108,23 @@ class ProjectRepository:
             )
             for kind in DEFAULT_ROLES:
                 connection.execute(
-                    "INSERT INTO roles(id, project_id, kind) VALUES (?, ?, ?)",
+                    """
+                    INSERT INTO roles(id, project_id, kind, legacy)
+                    VALUES (?, ?, ?, 0)
+                    """,
                     (str(uuid.uuid4()), project_id, kind),
+                )
+            # Exactly one ProjectButler; never pre-create fixed development roles.
+            butler_count = int(connection.execute(
+                """
+                SELECT COUNT(*) FROM roles
+                WHERE project_id = ? AND kind = 'butler' AND legacy = 0
+                """,
+                (project_id,),
+            ).fetchone()[0])
+            if butler_count != 1:
+                raise InvalidTransitionError(
+                    "project create must materialize exactly one ProjectButler"
                 )
         return self.get(project_id)
 
@@ -137,7 +152,7 @@ class ProjectRepository:
             if row is None:
                 raise NotFoundError(f"project not found: {project_id}")
             roles = connection.execute(
-                "SELECT id, kind, status FROM roles WHERE project_id = ? ORDER BY kind",
+                "SELECT id, kind, status, legacy FROM roles WHERE project_id = ? ORDER BY kind",
                 (project_id,),
             ).fetchall()
             workers = connection.execute(

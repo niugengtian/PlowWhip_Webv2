@@ -12,6 +12,13 @@ from plow_whip_web.runtime.sizing import TaskSizingInputs, estimate_task_sizing
 RoleKind = str
 WorkItemKind = Literal["coordination", "implementation", "verification"]
 
+# Shared worktree write lanes must serialize. Do not infer from titles/providers.
+SHARED_WORKTREE_SERIAL_ROLES: tuple[str, ...] = (
+    "backend",
+    "frontend",
+    "devops_sre",
+)
+
 # Model PM is not safely wired this sprint. Deterministic validation + optional
 # structured plan input only. Do not claim model PM completion.
 MODEL_PM_IMPLEMENTED = False
@@ -65,13 +72,20 @@ def plan_goal_work_items(
     policy, route = decision.policy, decision.route
     if structured_items is not None:
         items = _parse_structured_items(structured_items, route=route)
+        # Multi-role structured plans keep named roles; force milestone route
+        # semantics instead of collapsing every lane to fullstack/simple-worker.
+        distinct_roles = {item.role for item in items}
+        if len(items) > 1 or distinct_roles - {"simple-worker", "fullstack"}:
+            route = "capability-milestones"
         if route != "capability-milestones" and len(items) != 1:
             raise DomainError(f"{route} requires exactly one ephemeral work item")
         if len(items) > int(policy["max_milestones"]):
             raise DomainError("structured plan exceeds bounded milestone limit")
+        items = _enforce_shared_worktree_serial(items)
         rationale = (
             "bounded milestone input accepted",
             f"project_execution_route={route}",
+            "structured_role_identity_preserved",
         )
     else:
         items = _default_items(
@@ -84,6 +98,7 @@ def plan_goal_work_items(
         rationale = list(preview["rationale"]) + [
             f"project_execution_route={route}",
             "butler_aggregate_is_coordination_source",
+            "shared_worktree_serial_dag",
         ]
 
     if role_providers:
@@ -95,7 +110,7 @@ def plan_goal_work_items(
         items,
         available_roles={
             "simple-worker", "fullstack", "backend", "frontend", "ui",
-            "devops_sre", "verification",
+            "devops_sre", "verification", "web3",
         },
         sizing_preview=preview,
     )
@@ -234,34 +249,39 @@ def _default_items(
     if sizing_inputs.has_deploy:
         constraints.append("rollback-safe deploy evidence")
     suffix = f" Include {', '.join(constraints)}." if constraints else ""
-    return [
+    selected = (
+        [role] * count
+        if route != "capability-milestones"
+        else roles[:count]
+    )
+    items = [
         PlannedWorkItem(
             ordinal=index,
-            role=(role if route != "capability-milestones" else roles[index - 1]),
+            role=selected[index - 1],
             kind="implementation",
             title=(
                 title
                 if count == 1
-                else f"{title} · {roles[index - 1]} {index}/{count}"
+                else f"{title} · {selected[index - 1]} {index}/{count}"
             ),
             objective=(
                 f"{objective}\n\nExecution route: {route}. "
-                f"Complete the "
-                f"{(role if route != 'capability-milestones' else roles[index - 1])} "
+                f"Complete the {selected[index - 1]} "
                 f"role lane {index}/{count}; its verification Gate "
                 f"must pass before termination.{suffix}"
             ),
-            # Different capability lanes are independent by default. Explicit
-            # structured plans add only real data/deploy dependencies.
             depends_on_ordinals=(),
         )
         for index in range(1, count + 1)
     ]
+    return _enforce_shared_worktree_serial(items)
 
 
 def _parse_structured_items(
     raw_items: list[dict[str, Any]], *, route: ExecutionRoute
 ) -> list[PlannedWorkItem]:
+    """Preserve explicit roles from plan_items; never rewrite to route aliases."""
+    del route  # Route may influence count limits elsewhere; roles stay faithful.
     items: list[PlannedWorkItem] = []
     for raw in raw_items:
         kind = str(raw.get("kind") or "")
@@ -274,14 +294,13 @@ def _parse_structured_items(
         artifacts = raw.get("artifacts") or []
         if not isinstance(acceptance, list) or not isinstance(artifacts, list):
             raise DomainError("acceptance/artifacts must be lists")
+        role = str(raw.get("role") or "").strip()
+        if not role:
+            raise DomainError("structured plan_items require an explicit role")
         items.append(
             PlannedWorkItem(
                 ordinal=int(raw["ordinal"]),
-                role=(
-                    str(raw.get("role") or "backend")
-                    if route == "capability-milestones"
-                    else "simple-worker" if route == "simple-worker" else "fullstack"
-                ),
+                role=role,
                 kind=kind,  # type: ignore[arg-type]
                 title=str(raw["title"]),
                 objective=str(raw["objective"]),
@@ -292,3 +311,20 @@ def _parse_structured_items(
             )
         )
     return items
+
+
+def _enforce_shared_worktree_serial(
+    items: list[PlannedWorkItem],
+) -> list[PlannedWorkItem]:
+    """Serialize backend → frontend → devops_sre on a shared worktree via DAG."""
+    serial_set = set(SHARED_WORKTREE_SERIAL_ROLES)
+    last_serial_ordinal: int | None = None
+    rewritten: list[PlannedWorkItem] = []
+    for item in sorted(items, key=lambda entry: entry.ordinal):
+        deps = set(item.depends_on_ordinals)
+        if item.role in serial_set and last_serial_ordinal is not None:
+            deps.add(last_serial_ordinal)
+        rewritten.append(replace(item, depends_on_ordinals=tuple(sorted(deps))))
+        if item.role in serial_set:
+            last_serial_ordinal = item.ordinal
+    return rewritten

@@ -143,15 +143,22 @@ def test_butler_routes_fixtures_with_parallel_semantic_roles(
     assert all(item["verification"] for item in goal["work_items"])
     assert all(item["parent_task_id"] is None for item in goal["work_items"])
     state = client.get(f"/api/projects/{project['id']}").json()
-    ephemeral = [role for role in state["roles"] if role["status"] == "ephemeral"]
-    assert len(ephemeral) == count
+    role_kinds = {item["role"] for item in goal["work_items"]}
+    project_kinds = {role["kind"] for role in state["roles"]}
+    assert role_kinds <= project_kinds
     if role_prefix:
-        assert all(role["kind"].startswith(role_prefix) for role in ephemeral)
+        expected = role_prefix.rstrip(":")
+        assert role_kinds == {expected}
+        assert all(item["role"] == expected for item in goal["work_items"])
     else:
-        assert {
-            role["kind"].split(":", 1)[0] for role in ephemeral
-        } == {"backend", "frontend", "ui"}
-        assert all(item["status"] == "ready" for item in goal["work_items"])
+        assert role_kinds == {"backend", "frontend", "ui"}
+        assert [item["role"] for item in goal["work_items"]] == [
+            "backend", "frontend", "ui"
+        ]
+        by_role = {item["role"]: item for item in goal["work_items"]}
+        assert by_role["backend"]["status"] == "ready"
+        assert by_role["frontend"]["status"] == "paused"
+        assert by_role["ui"]["status"] == "ready"
 
 
 def test_simple_worker_is_released_only_after_verified_terminal(butler_app) -> None:
@@ -169,7 +176,10 @@ def test_simple_worker_is_released_only_after_verified_terminal(butler_app) -> N
     task = next(item for item in goal["work_items"] if item["id"] == task_id)
     assert task["last_evidence_hash"]
     state = client.get(f"/api/projects/{project['id']}").json()
-    worker = next(worker for worker in state["workers"] if worker["role"].startswith("simple-worker:"))
+    worker = next(
+        worker for worker in state["workers"]
+        if worker["role"] == "simple-worker" or worker["role"].startswith("simple-worker:")
+    )
     assert worker["status"] == "released"
     assert worker["released_at"] is not None
     assert worker["rotation_reason"] == "task_terminal"

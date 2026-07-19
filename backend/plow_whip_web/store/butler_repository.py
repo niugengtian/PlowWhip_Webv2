@@ -11,14 +11,14 @@ from plow_whip_web.domain.model import (
     NotFoundError,
     RevisionConflictError,
 )
+from plow_whip_web.runtime.goal_semantics import (
+    assess_goal_semantics,
+    gap_question,
+    next_semantic_gap,
+    structured_fields_provided,
+)
+from plow_whip_web.runtime.sizing import TaskSizingInputs, estimate_task_sizing
 from plow_whip_web.store.database import Database
-
-
-_QUESTIONS = {
-    "objective": "你最终要得到什么可验证的结果？",
-    "boundaries": "这个目标允许修改什么、明确不应改变什么？",
-    "acceptance": "用哪些可验证结果判断目标已经完成？",
-}
 
 
 class ButlerRepository:
@@ -39,10 +39,18 @@ class ButlerRepository:
     ) -> dict[str, Any]:
         conversation_id = str(uuid.uuid4())
         normalized = _normalize_draft(instruction, draft)
-        expected = _next_missing_field(normalized)
-        confidence = _confidence(normalized)
+        structured = structured_fields_provided(draft)
+        assessment = assess_goal_semantics(normalized)
+        expected = None if assessment["ready"] else next_semantic_gap(normalized)
+        confidence = int(assessment["confidence"])
         status = "clarifying" if expected else "awaiting_confirmation"
         proposal_hash = _proposal_hash(normalized) if not expected else None
+        auto_dispatch = _auto_dispatch_eligible(
+            structured=structured,
+            assessment=assessment,
+            draft=normalized,
+            asked_questions=0,
+        )
         with self.database.transaction(immediate=True) as connection:
             duplicate = connection.execute(
                 "SELECT id FROM butler_conversations WHERE idempotency_key = ?",
@@ -71,7 +79,12 @@ class ButlerRepository:
                     status,
                     confidence,
                     expected,
-                    _json(normalized),
+                    _json({**normalized, "_intake": {
+                        "structured": structured,
+                        "auto_dispatch": auto_dispatch,
+                        "semantic": assessment,
+                        "questions_asked": 0 if expected is None else 1,
+                    }}),
                     proposal_hash,
                     idempotency_key,
                 ),
@@ -82,7 +95,7 @@ class ButlerRepository:
                 source_type,
                 "instruction",
                 instruction,
-                {"source_id": source_id},
+                {"source_id": source_id, "structured": structured},
             )
             if expected:
                 self._append(
@@ -90,12 +103,22 @@ class ButlerRepository:
                     conversation_id,
                     "project_butler",
                     "question",
-                    _QUESTIONS[expected],
-                    {"field": expected},
+                    gap_question(expected, normalized),
+                    {"field": expected, "gap": assessment["gaps"][0] if assessment["gaps"] else None},
                 )
             else:
-                self._append_proposal(connection, conversation_id, normalized, proposal_hash)
-            return self._get_with_connection(connection, conversation_id)
+                self._append_proposal(
+                    connection,
+                    conversation_id,
+                    normalized,
+                    proposal_hash,
+                    auto_dispatch=auto_dispatch,
+                    structured=structured,
+                )
+            result = self._get_with_connection(connection, conversation_id)
+            result["auto_dispatch"] = auto_dispatch
+            result["structured_goal_spec"] = structured
+            return result
 
     def answer(
         self,
@@ -122,11 +145,28 @@ class ButlerRepository:
                     f"answer must address the one active question: {row['expected_field']}"
                 )
             draft = json.loads(row["spec_json"])
+            intake = dict(draft.pop("_intake", {}) or {})
             draft[field] = clean_values[0] if field == "objective" else clean_values
-            expected = _next_missing_field(draft)
-            confidence = _confidence(draft)
+            assessment = assess_goal_semantics(draft)
+            expected = None if assessment["ready"] else next_semantic_gap(draft)
+            confidence = int(assessment["confidence"])
             status = "clarifying" if expected else "awaiting_confirmation"
             proposal_hash = _proposal_hash(draft) if not expected else None
+            questions_asked = int(intake.get("questions_asked") or 0) + (1 if expected else 0)
+            structured = bool(intake.get("structured"))
+            auto_dispatch = False
+            if not expected:
+                auto_dispatch = _auto_dispatch_eligible(
+                    structured=structured,
+                    assessment=assessment,
+                    draft=draft,
+                    asked_questions=int(intake.get("questions_asked") or 0),
+                )
+            intake.update({
+                "semantic": assessment,
+                "questions_asked": questions_asked,
+                "auto_dispatch": auto_dispatch,
+            })
             connection.execute(
                 """
                 UPDATE butler_conversations
@@ -139,7 +179,7 @@ class ButlerRepository:
                     status,
                     confidence,
                     expected,
-                    _json(draft),
+                    _json({**draft, "_intake": intake}),
                     proposal_hash,
                     conversation_id,
                 ),
@@ -158,12 +198,22 @@ class ButlerRepository:
                     conversation_id,
                     "project_butler",
                     "question",
-                    _QUESTIONS[expected],
-                    {"field": expected},
+                    gap_question(expected, draft),
+                    {"field": expected, "gap": assessment["gaps"][0] if assessment["gaps"] else None},
                 )
             else:
-                self._append_proposal(connection, conversation_id, draft, proposal_hash)
-            return self._get_with_connection(connection, conversation_id)
+                self._append_proposal(
+                    connection,
+                    conversation_id,
+                    draft,
+                    proposal_hash,
+                    auto_dispatch=auto_dispatch,
+                    structured=structured,
+                )
+            result = self._get_with_connection(connection, conversation_id)
+            result["auto_dispatch"] = auto_dispatch
+            result["structured_goal_spec"] = structured
+            return result
 
     def post_message(
         self,
@@ -202,16 +252,35 @@ class ButlerRepository:
                 target_field = field
 
             draft = json.loads(row["spec_json"])
+            intake = dict(draft.pop("_intake", {}) or {})
             values = _message_values(clean_content)
             if target_field != "objective" and not values:
                 raise InvalidTransitionError(
                     "message must contain at least one non-empty value"
                 )
             draft[target_field] = clean_content if target_field == "objective" else values
-            expected = _next_missing_field(draft)
-            confidence = _confidence(draft)
+            assessment = assess_goal_semantics(draft)
+            expected = None if assessment["ready"] else next_semantic_gap(draft)
+            confidence = int(assessment["confidence"])
             status = "clarifying" if expected else "awaiting_confirmation"
             proposal_hash = _proposal_hash(draft) if not expected else None
+            questions_asked = int(intake.get("questions_asked") or 0)
+            if row["status"] == "clarifying" and expected:
+                questions_asked += 1
+            structured = bool(intake.get("structured"))
+            auto_dispatch = False
+            if not expected:
+                auto_dispatch = _auto_dispatch_eligible(
+                    structured=structured,
+                    assessment=assessment,
+                    draft=draft,
+                    asked_questions=int(intake.get("questions_asked") or 0),
+                )
+            intake.update({
+                "semantic": assessment,
+                "questions_asked": questions_asked,
+                "auto_dispatch": auto_dispatch,
+            })
             connection.execute(
                 """
                 UPDATE butler_conversations
@@ -224,7 +293,7 @@ class ButlerRepository:
                     status,
                     confidence,
                     expected,
-                    _json(draft),
+                    _json({**draft, "_intake": intake}),
                     proposal_hash,
                     conversation_id,
                 ),
@@ -247,12 +316,22 @@ class ButlerRepository:
                     conversation_id,
                     "project_butler",
                     "question",
-                    _QUESTIONS[expected],
-                    {"field": expected},
+                    gap_question(expected, draft),
+                    {"field": expected, "gap": assessment["gaps"][0] if assessment["gaps"] else None},
                 )
             else:
-                self._append_proposal(connection, conversation_id, draft, proposal_hash)
-            return self._get_with_connection(connection, conversation_id)
+                self._append_proposal(
+                    connection,
+                    conversation_id,
+                    draft,
+                    proposal_hash,
+                    auto_dispatch=auto_dispatch,
+                    structured=structured,
+                )
+            result = self._get_with_connection(connection, conversation_id)
+            result["auto_dispatch"] = auto_dispatch
+            result["structured_goal_spec"] = structured
+            return result
 
     def mark_dispatched(
         self,
@@ -391,7 +470,12 @@ class ButlerRepository:
             (conversation_id,),
         ).fetchall()
         result = dict(row)
-        result["spec"] = json.loads(result.pop("spec_json"))
+        raw_spec = json.loads(result.pop("spec_json"))
+        intake = dict(raw_spec.pop("_intake", {}) or {})
+        result["spec"] = raw_spec
+        result["auto_dispatch"] = bool(intake.get("auto_dispatch"))
+        result["structured_goal_spec"] = bool(intake.get("structured"))
+        result["semantic"] = intake.get("semantic")
         result["messages"] = [
             {**dict(message), "payload": json.loads(message["payload_json"])}
             for message in messages
@@ -446,14 +530,28 @@ class ButlerRepository:
         conversation_id: str,
         draft: dict[str, Any],
         proposal_hash: str | None,
+        *,
+        auto_dispatch: bool,
+        structured: bool,
     ) -> None:
+        if structured:
+            message = "已收到完整结构化 GoalSpec，视为主人确认。"
+        elif auto_dispatch:
+            message = "中小型目标要素已充分，无需代主人推断，将自动选择 Provider 并指派。"
+        else:
+            message = "目标、边界和验收标准已达到语义可信度门槛，请由人类直接确认后再执行。"
         self._append(
             connection,
             conversation_id,
             "project_butler",
             "proposal",
-            "目标、边界和验收标准已明确，请由人类直接确认后再执行。",
-            {"proposal_hash": proposal_hash, "spec": draft},
+            message,
+            {
+                "proposal_hash": proposal_hash,
+                "spec": draft,
+                "auto_dispatch": auto_dispatch,
+                "structured": structured,
+            },
         )
 
 
@@ -484,24 +582,36 @@ def _message_values(content: str) -> list[str]:
     return [value for value in values if value]
 
 
-def _next_missing_field(draft: dict[str, Any]) -> str | None:
-    for field in ("objective", "boundaries", "acceptance"):
-        value = draft.get(field)
-        if not value:
-            return field
-    return None
-
-
-def _confidence(draft: dict[str, Any]) -> int:
-    return (
-        (35 if draft.get("objective") else 0)
-        + (30 if draft.get("boundaries") else 0)
-        + (30 if draft.get("acceptance") else 0)
-    )
+def _auto_dispatch_eligible(
+    *,
+    structured: bool,
+    assessment: dict[str, Any],
+    draft: dict[str, Any],
+    asked_questions: int,
+) -> bool:
+    if not assessment.get("ready"):
+        return False
+    if structured:
+        return True
+    if asked_questions > 0:
+        return False
+    sizing = draft.get("sizing_inputs")
+    if not isinstance(sizing, dict):
+        return False
+    try:
+        preview = estimate_task_sizing(TaskSizingInputs(**{
+            key: sizing[key]
+            for key in TaskSizingInputs.__dataclass_fields__
+            if key in sizing
+        }))
+    except (TypeError, KeyError, ValueError):
+        return False
+    return str(preview.get("size_class")) in {"XS", "S", "M"}
 
 
 def _proposal_hash(draft: dict[str, Any]) -> str:
-    return hashlib.sha256(_json(draft).encode("utf-8")).hexdigest()
+    clean = {key: value for key, value in draft.items() if not str(key).startswith("_")}
+    return hashlib.sha256(_json(clean).encode("utf-8")).hexdigest()
 
 
 def _json(value: Any) -> str:

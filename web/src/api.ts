@@ -132,6 +132,75 @@ export type ButlerConversation = {
   goal_id: string | null
   messages: ButlerMessage[]
   direct_project_butler_url: string | null
+  auto_dispatch?: boolean
+  structured_goal_spec?: boolean
+  semantic?: Record<string, unknown> | null
+}
+
+export type BehaviorBaseline = {
+  id: string
+  source: string
+  revision: number
+  version?: number
+  role: string | null
+  applicable: boolean
+  not_applicable?: boolean
+  applicability: string
+  mandatory: boolean
+  effective_reserve_bytes: number
+  config_source?: string
+  reason?: string
+  model_invoked: boolean
+}
+
+export type ConventionInventory = {
+  mutable_conventions: Record<string, unknown>[]
+  bundled_behaviors: Record<string, unknown>[]
+  behavior_baseline: BehaviorBaseline
+  precedence: string[]
+  model_invoked: false
+}
+
+export type EffectiveContextPreview = {
+  project_id: string | null
+  task_id: string
+  role_id: string | null
+  role: string | null
+  behavior_baseline: BehaviorBaseline
+  layers: Record<string, unknown>[]
+  empty_scopes: string[]
+  model_invoked: false
+}
+
+export type RoleInstance = {
+  id: string
+  revision: number
+  project_id: string
+  goal_id: string | null
+  task_id: string
+  role_kind: string
+  template_id: string
+  template_revision: number
+  template_hash: string
+  ruleset_hash: string
+  instance_hash: string
+  task_spec_revision: number
+  provider: string
+  status: string
+  match_reason?: Record<string, unknown> | string | null
+  source_chain?: Record<string, unknown> | null
+  generation_reason?: string | null
+}
+
+export type SessionBinding = {
+  id: string
+  project_id: string
+  role_instance_id: string
+  task_id: string
+  provider: string
+  session_generation: number
+  status: string
+  binding_hash: string
 }
 
 export type GlobalButlerOverview = {
@@ -502,6 +571,44 @@ export const api = {
   recover: () => request<Record<string, unknown>>('/api/system/recover', { method: 'POST' }),
   outbox: () => request<OutboxEvent[]>('/api/outbox'),
   convention: (scope: string, scopeId: string) => request<Convention>(`/api/conventions/${scope}/${scopeId}`),
+  behaviorBaseline: (role?: string) =>
+    request<BehaviorBaseline>(
+      role ? `/api/system/behavior-baseline?role=${encodeURIComponent(role)}` : '/api/system/behavior-baseline',
+    ),
+  roleInstances: (params?: { projectId?: string; goalId?: string; taskId?: string }) => {
+    const query = new URLSearchParams()
+    if (params?.projectId) query.set('project_id', params.projectId)
+    if (params?.goalId) query.set('goal_id', params.goalId)
+    if (params?.taskId) query.set('task_id', params.taskId)
+    const suffix = query.toString() ? `?${query.toString()}` : ''
+    return request<{ items: RoleInstance[]; model_invoked: false }>(`/api/role-instances${suffix}`)
+  },
+  sessionBindings: (params?: { projectId?: string; taskId?: string }) => {
+    const query = new URLSearchParams()
+    if (params?.projectId) query.set('project_id', params.projectId)
+    if (params?.taskId) query.set('task_id', params.taskId)
+    const suffix = query.toString() ? `?${query.toString()}` : ''
+    return request<{ items: SessionBinding[]; model_invoked: false }>(`/api/session-bindings${suffix}`)
+  },
+  roleTemplates: (capability?: string) => {
+    const suffix = capability ? `?capability=${encodeURIComponent(capability)}` : ''
+    return request<{ items: Record<string, unknown>[]; model_invoked: false }>(`/api/role-templates${suffix}`)
+  },
+  conventionInventory: (params?: { projectId?: string; taskId?: string; roleId?: string; role?: string }) => {
+    const query = new URLSearchParams()
+    if (params?.projectId) query.set('project_id', params.projectId)
+    if (params?.taskId) query.set('task_id', params.taskId)
+    if (params?.roleId) query.set('role_id', params.roleId)
+    if (params?.role) query.set('role', params.role)
+    const suffix = query.toString() ? `?${query.toString()}` : ''
+    return request<ConventionInventory>(`/api/conventions/inventory${suffix}`)
+  },
+  conventionEffective: (taskId: string, roleId?: string, role?: string) => {
+    const query = new URLSearchParams({ task_id: taskId })
+    if (roleId) query.set('role_id', roleId)
+    if (role) query.set('role', role)
+    return request<EffectiveContextPreview>(`/api/conventions/effective?${query.toString()}`)
+  },
   updateConvention: (convention: Convention) =>
     request<Convention>('/api/conventions', {
       method: 'PUT',

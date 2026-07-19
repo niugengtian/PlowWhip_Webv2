@@ -39,12 +39,16 @@ from plow_whip_web.api.schemas import (
     TaskDeleteRequest,
     TaskDeletionEligibilityView,
     TaskDeletionView,
+    TaskEscalationCreate,
     TaskEventView,
     TaskArtifactView,
     TaskAmendRequest,
     TaskSizingEstimateRequest,
     TaskSizingEstimateResponse,
     TaskView,
+    ProjectRoleRuleCreate,
+    WorkerHelpCreate,
+    WorkerHelpResolve,
 )
 from plow_whip_web.runtime.sizing import TaskSizingInputs, estimate_task_sizing
 from plow_whip_web.runtime.orchestration import plan_goal_work_items
@@ -82,6 +86,9 @@ from plow_whip_web.store.task_repository import TaskRepository
 from plow_whip_web.store.goal_repository import GoalRepository
 from plow_whip_web.store.butler_repository import ButlerRepository
 from plow_whip_web.store.host_job_repository import HostJobRepository
+from plow_whip_web.store.worker_help_repository import WorkerHelpRepository
+from plow_whip_web.store.role_instance_repository import RoleInstanceRepository
+from plow_whip_web.runtime.legacy_rules import legacy_rules_matrix
 from plow_whip_web.providers.host_bridge import HostBridgeClient
 from plow_whip_web.providers.pool import ProviderPool
 from plow_whip_web.roles import ROLE_PROMPTS
@@ -93,9 +100,12 @@ def create_app(settings: Settings) -> FastAPI:
     settings.prepare()
     database = Database(settings.database_path)
     database.migrate()
+    role_instance_repository = RoleInstanceRepository(database)
+    role_instance_repository.seed_catalog_if_empty()
     task_repository = TaskRepository(database)
     goal_repository = GoalRepository(database)
     butler_repository = ButlerRepository(database)
+    worker_help_repository = WorkerHelpRepository(database)
     host_jobs = HostJobRepository(database)
     project_repository = ProjectRepository(database)
     runtime_settings = SettingsRepository(database)
@@ -124,6 +134,7 @@ def create_app(settings: Settings) -> FastAPI:
         context_compiler=context_compiler, journal=journal,
         provider_pool=provider_pool, host_jobs=host_jobs, projects=project_repository,
         model_calls=model_calls,
+        role_instances=role_instance_repository,
     )
     scheduler_repository = SchedulerRepository(database)
     scheduler_service = SchedulerService(
@@ -145,6 +156,8 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.task_repository = task_repository
     app.state.goal_repository = goal_repository
     app.state.butler_repository = butler_repository
+    app.state.worker_help_repository = worker_help_repository
+    app.state.role_instance_repository = role_instance_repository
     app.state.host_jobs = host_jobs
     app.state.project_repository = project_repository
     app.state.task_service = task_service
@@ -235,6 +248,16 @@ def create_app(settings: Settings) -> FastAPI:
             "zero_token_scheduler": True,
             "compiled_context": True,
             "three_scope_conventions": True,
+            "task_role_conventions": True,
+            "bundled_behavior_packs": True,
+            "convention_effective_preview": True,
+            "semantic_goal_gate": True,
+            "worker_help_escalation": True,
+            "legacy_rules_matrix": True,
+            "rule_library": True,
+            "role_templates": True,
+            "role_instances": True,
+            "session_bindings": True,
             "fault_recovery": True,
             "anti_loop_guards": True,
             "audited_permissions": True,
@@ -317,6 +340,218 @@ def create_app(settings: Settings) -> FastAPI:
     @app.get("/api/roles", tags=["context"])
     def role_templates() -> dict[str, str]:
         return ROLE_PROMPTS
+
+    @app.get("/api/conventions/inventory", tags=["context"])
+    def convention_inventory(
+        request: Request,
+        project_id: str | None = None,
+        task_id: str | None = None,
+        role_id: str | None = None,
+        role: str | None = None,
+    ) -> dict[str, object]:
+        repository: ConventionRepository = request.app.state.conventions
+        return repository.list_inventory(
+            project_id=project_id,
+            task_id=task_id,
+            role_id=role_id,
+            role_kind=role,
+        )
+
+    @app.get("/api/conventions/effective", tags=["context"])
+    def convention_effective(
+        request: Request,
+        task_id: str,
+        project_id: str | None = None,
+        role_id: str | None = None,
+        role: str | None = None,
+    ) -> dict[str, object]:
+        repository: ConventionRepository = request.app.state.conventions
+        task = request.app.state.task_repository.get(task_id)
+        resolved_role_id = role_id or task.role_id
+        role_kind = role
+        if role_kind is None and resolved_role_id:
+            compiled = request.app.state.context_compiler
+            role_kind = compiled._role(resolved_role_id)
+        return repository.effective_context(
+            project_id=project_id or task.project_id,
+            task_id=task_id,
+            role_id=resolved_role_id,
+            role_kind=role_kind,
+        )
+
+    @app.get("/api/system/behavior-baseline", tags=["context"])
+    def behavior_baseline_preview(
+        request: Request, role: str | None = None
+    ) -> dict[str, object]:
+        compiler: ContextCompiler = request.app.state.context_compiler
+        return compiler.preview_behavior_baseline(role)
+
+    @app.get("/api/rules", tags=["roles"])
+    def list_rules(request: Request, scope: str | None = None) -> dict[str, object]:
+        repository: RoleInstanceRepository = request.app.state.role_instance_repository
+        return {
+            "items": repository.list_rules(scope=scope),
+            "model_invoked": False,
+        }
+
+    @app.get("/api/role-templates", tags=["roles"])
+    def list_role_templates(
+        request: Request, capability: str | None = None
+    ) -> dict[str, object]:
+        repository: RoleInstanceRepository = request.app.state.role_instance_repository
+        return {
+            "items": repository.list_templates(capability=capability),
+            "model_invoked": False,
+        }
+
+    @app.get("/api/role-instances", tags=["roles"])
+    def list_role_instances(
+        request: Request,
+        project_id: str | None = None,
+        goal_id: str | None = None,
+        task_id: str | None = None,
+        status: str | None = "active",
+    ) -> dict[str, object]:
+        repository: RoleInstanceRepository = request.app.state.role_instance_repository
+        return {
+            "items": repository.list_instances(
+                project_id=project_id,
+                goal_id=goal_id,
+                task_id=task_id,
+                status=status,
+            ),
+            "model_invoked": False,
+        }
+
+    @app.get("/api/session-bindings", tags=["roles"])
+    def list_session_bindings(
+        request: Request,
+        project_id: str | None = None,
+        task_id: str | None = None,
+        status: str | None = "bound",
+    ) -> dict[str, object]:
+        repository: RoleInstanceRepository = request.app.state.role_instance_repository
+        return {
+            "items": repository.list_bindings(
+                project_id=project_id,
+                task_id=task_id,
+                status=status,
+            ),
+            "model_invoked": False,
+        }
+
+    @app.get("/api/projects/{project_id}/role-rules", tags=["roles"])
+    def list_project_role_rules(
+        request: Request,
+        project_id: str,
+        status: str = "active",
+    ) -> dict[str, object]:
+        repository: RoleInstanceRepository = request.app.state.role_instance_repository
+        return {
+            "items": repository.list_project_role_rules(
+                project_id=project_id, status=status
+            ),
+            "model_invoked": False,
+        }
+
+    @app.post(
+        "/api/projects/{project_id}/role-rules",
+        tags=["roles"],
+        status_code=201,
+    )
+    def create_project_role_rule(
+        request: Request,
+        project_id: str,
+        payload: ProjectRoleRuleCreate,
+    ) -> dict[str, object]:
+        repository: RoleInstanceRepository = request.app.state.role_instance_repository
+        return repository.create_project_role_rule(
+            project_id=project_id,
+            rule_id=payload.rule_id,
+            rule_revision=payload.rule_revision,
+            reason=payload.reason,
+            source=payload.source,
+            capability=payload.capability,
+            template_id=payload.template_id,
+        )
+
+    @app.get("/api/system/legacy-rules-matrix", tags=["system"])
+    def get_legacy_rules_matrix() -> dict[str, object]:
+        return {
+            "items": legacy_rules_matrix(),
+            "model_invoked": False,
+        }
+
+    @app.post(
+        "/api/projects/{project_id}/worker-help",
+        tags=["butlers"],
+        status_code=201,
+    )
+    def create_worker_help(
+        request: Request,
+        project_id: str,
+        payload: WorkerHelpCreate,
+    ) -> dict[str, object]:
+        repository: WorkerHelpRepository = request.app.state.worker_help_repository
+        return repository.create_help_request(
+            project_id=project_id,
+            task_id=payload.task_id,
+            worker_id=payload.worker_id,
+            payload={
+                "blocker": payload.blocker,
+                "evidence": payload.evidence,
+                "attempted_actions": payload.attempted_actions,
+                "minimal_question": payload.minimal_question,
+            },
+        )
+
+    @app.get("/api/projects/{project_id}/worker-help", tags=["butlers"])
+    def list_worker_help(
+        request: Request,
+        project_id: str,
+        task_id: str | None = None,
+    ) -> list[dict[str, object]]:
+        repository: WorkerHelpRepository = request.app.state.worker_help_repository
+        return repository.list_help_requests(project_id, task_id=task_id)
+
+    @app.post(
+        "/api/projects/{project_id}/worker-help/{request_id}/resolve",
+        tags=["butlers"],
+    )
+    def resolve_worker_help(
+        request: Request,
+        project_id: str,
+        request_id: str,
+        payload: WorkerHelpResolve,
+    ) -> dict[str, object]:
+        repository: WorkerHelpRepository = request.app.state.worker_help_repository
+        record = repository.get_help_request(request_id)
+        if record["project_id"] != project_id:
+            raise NotFoundError(f"help request not found: {request_id}")
+        return repository.resolve_help_request(
+            request_id,
+            resolution=payload.resolution,
+            detail=payload.detail,
+        )
+
+    @app.post(
+        "/api/projects/{project_id}/task-escalations",
+        tags=["butlers"],
+        status_code=201,
+    )
+    def create_task_escalation(
+        request: Request,
+        project_id: str,
+        payload: TaskEscalationCreate,
+    ) -> dict[str, object]:
+        repository: WorkerHelpRepository = request.app.state.worker_help_repository
+        return repository.escalate(
+            project_id=project_id,
+            task_id=payload.task_id,
+            reason_class=payload.reason_class,
+            detail=payload.detail,
+            help_request_id=payload.help_request_id,
+        )
 
     @app.get("/api/conventions/{scope}/{scope_id}", tags=["context"])
     def get_convention(request: Request, scope: str, scope_id: str) -> dict[str, object]:
@@ -693,6 +928,7 @@ def create_app(settings: Settings) -> FastAPI:
             draft=draft,
             idempotency_key=idempotency_key,
         )
+        record = _maybe_auto_dispatch_butler(request, project_id, record)
         return ButlerConversationView(**record)
 
     @app.get(
@@ -738,12 +974,16 @@ def create_app(settings: Settings) -> FastAPI:
         current = repository.get(conversation_id)
         if current["project_id"] != project_id:
             raise NotFoundError(f"butler conversation not found: {conversation_id}")
-        return ButlerConversationView(**repository.post_message(
-            conversation_id,
-            expected_revision=payload.expected_revision,
-            content=payload.content,
-            sender_type=payload.sender_type,
-            field=payload.field,
+        return ButlerConversationView(**_maybe_auto_dispatch_butler(
+            request,
+            project_id,
+            repository.post_message(
+                conversation_id,
+                expected_revision=payload.expected_revision,
+                content=payload.content,
+                sender_type=payload.sender_type,
+                field=payload.field,
+            ),
         ))
 
     @app.post(
@@ -761,12 +1001,16 @@ def create_app(settings: Settings) -> FastAPI:
         current = repository.get(conversation_id)
         if current["project_id"] != project_id:
             raise NotFoundError(f"butler conversation not found: {conversation_id}")
-        return ButlerConversationView(**repository.answer(
-            conversation_id,
-            expected_revision=payload.expected_revision,
-            field=payload.field,
-            values=payload.values,
-            sender_type=payload.sender_type,
+        return ButlerConversationView(**_maybe_auto_dispatch_butler(
+            request,
+            project_id,
+            repository.answer(
+                conversation_id,
+                expected_revision=payload.expected_revision,
+                field=payload.field,
+                values=payload.values,
+                sender_type=payload.sender_type,
+            ),
         ))
 
     @app.post(
@@ -924,8 +1168,12 @@ def create_app(settings: Settings) -> FastAPI:
             create_kwargs["execution_policy"] = execution_policy
 
         provider_pool: ProviderPool = request.app.state.provider_pool
-        provider_pool.require_ready(payload.provider)
+        provider = provider_pool.require_ready(payload.provider)
         record = repository.create(**create_kwargs)
+        role_instances = getattr(request.app.state, "role_instance_repository", None)
+        if role_instances is not None and provider.get("model_invoked"):
+            role_instances.ensure_for_task(record, model_invoked=True)
+            record = repository.get(record.id)
         return TaskView.from_record(record)
 
     @app.get("/api/tasks", response_model=list[TaskView], tags=["tasks"])
@@ -953,13 +1201,20 @@ def create_app(settings: Settings) -> FastAPI:
             item.model_dump(exclude_none=True) for item in payload.verification
         ]
         values["deadline"] = payload.deadline.model_dump()
-        return TaskView.from_record(repository.amend_spec(
+        record = repository.amend_spec(
             task_id,
             spec=values,
             reason=payload.reason,
             expected_revision=payload.expected_revision,
             idempotency_key=idempotency_key,
-        ))
+        )
+        role_instances = getattr(request.app.state, "role_instance_repository", None)
+        providers: ProviderRepository = request.app.state.providers
+        provider_view = providers.require(record.provider)
+        if role_instances is not None and provider_view.get("model_invoked"):
+            role_instances.ensure_for_task(record, model_invoked=True)
+            record = repository.get(record.id)
+        return TaskView.from_record(record)
 
     @app.get(
         "/api/tasks/{task_id}/deletion-eligibility",
@@ -1166,6 +1421,71 @@ def _create_goal_record(
         ),
     )
     return GoalView(**record)
+
+
+def _maybe_auto_dispatch_butler(
+    request: Request,
+    project_id: str,
+    record: dict,
+) -> dict:
+    """Structured GoalSpec and ready mid/small goals dispatch without a second confirm."""
+    if not record.get("auto_dispatch"):
+        return record
+    if record.get("status") != "awaiting_confirmation":
+        return record
+    if not record.get("proposal_hash"):
+        return record
+    repository: ButlerRepository = request.app.state.butler_repository
+    spec = record["spec"]
+    sizing_inputs = spec.get("sizing_inputs") or {
+        "layers_touched": 1,
+        "components_touched": 1,
+        "estimated_files_changed": 1,
+        "has_migration": False,
+        "has_deploy": False,
+        "verification_commands_count": max(1, len(spec.get("verification") or [])),
+        "estimated_verification_seconds": 60,
+        "external_dependencies_count": 0,
+        "risk_level": "low",
+        "independent_review_required": False,
+        "gate_artifact": True,
+        "gate_boundary": True,
+        "gate_verification": True,
+        "gate_dependency": True,
+    }
+    goal_payload = GoalCreate.model_validate({
+        "title": spec["title"],
+        "objective": spec["objective"],
+        "project_id": project_id,
+        "provider": spec.get("provider") or "cursor",
+        "role_providers": spec.get("role_providers") or {},
+        "network_requirement": spec.get("network_requirement") or "none",
+        "verification": spec.get("verification") or [
+            {"kind": "exit_code", "expected": 0}
+        ],
+        "scope": list(dict.fromkeys([
+            *(spec.get("scope") or []),
+            *(spec.get("boundaries") or []),
+        ])),
+        "acceptance": spec["acceptance"],
+        "artifacts": spec.get("artifacts") or [],
+        "constraints": spec.get("constraints") or [],
+        "deadline": spec.get("deadline"),
+        "sizing_inputs": sizing_inputs,
+        "command": spec.get("command"),
+        "plan_items": spec.get("plan_items"),
+    })
+    goal = _create_goal_record(
+        request,
+        goal_payload,
+        f"butler-auto:{record['id']}:goal",
+    )
+    return repository.mark_dispatched(
+        record["id"],
+        expected_revision=record["revision"],
+        proposal_hash=record["proposal_hash"],
+        goal_id=goal.id,
+    )
 
 
 def _preview_to_persistence(

@@ -196,7 +196,24 @@ button.full { width: 100%; }
 .provider-setup pre { overflow-x: auto; margin: 0; border-radius: 4px; padding: 9px; background: #080d18; color: #9eb2dc; font-size: .64rem; line-height: 1.5; }
 .provider-setup p { margin: 12px 0 0; font-size: .68rem; line-height: 1.5; }
 
-.form-panel, .convention-panel { padding-bottom: 18px; }
+.butler-status-banner {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  align-items: baseline;
+  margin: 0 18px 12px;
+  padding: 10px 12px;
+  border: 1px solid #365f99;
+  border-radius: 7px;
+  background: #101a2a;
+}
+.butler-status-banner[data-status='awaiting_confirmation'] {
+  border-color: #9a7a3a;
+  background: #1a1710;
+}
+.butler-status-banner strong { font-size: 0.88rem; color: #d7e3ff; }
+.butler-status-banner span { color: #8192b4; font-size: 0.72rem; }
+
 .form-panel > .field, .form-panel > .form-grid, .form-panel > .toggle-row, .form-panel > .form-help, .form-panel > button { margin-right: 18px; margin-left: 18px; }
 .field { display: grid; gap: 6px; margin-top: 13px; }
 .field > span, .editor-grid label { color: #7182a7; font-size: .67rem; font-weight: 650; }
