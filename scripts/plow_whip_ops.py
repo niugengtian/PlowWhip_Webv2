@@ -43,6 +43,7 @@ CONTROL_URL = "http://127.0.0.1:8742"
 BRIDGE_LABEL = "com.plow-whip-web.host-bridge"
 BRIDGE_PORT = 8765
 RELEASE_LABEL = "org.opencontainers.image.revision"
+BRIDGE_PROBE_PAYLOAD = {"adapter": "json-worker", "executable": "simple-worker"}
 
 
 def _manual_text() -> str:
@@ -596,7 +597,7 @@ def _bridge_probe(paths: RuntimePaths, config: dict[str, object], *, timeout: fl
     port = int(bridge.get("port", BRIDGE_PORT))
     request = urllib.request.Request(
         f"http://127.0.0.1:{port}/v1/probe",
-        data=b"{}",
+        data=json.dumps(BRIDGE_PROBE_PAYLOAD, separators=(",", ":")).encode("utf-8"),
         headers={
             "Authorization": f"Bearer {_bridge_token(paths)}",
             "Content-Type": "application/json",
@@ -718,12 +719,15 @@ def _stop_bridge(paths: RuntimePaths, config: dict[str, object], runner: Runner,
 
 
 def _container_to_bridge(release: Release, paths: RuntimePaths, runner: Runner) -> None:
+    probe_data = json.dumps(
+        json.dumps(BRIDGE_PROBE_PAYLOAD, separators=(",", ":"))
+    )
     code = (
         "import json,os,urllib.request;"
         "r=urllib.request.Request(os.environ['PLOW_WHIP_BRIDGE_URL'].rstrip('/')+'/v1/probe',"
-        "data=b'{}',headers={'Authorization':'Bearer '+os.environ['PLOW_WHIP_BRIDGE_TOKEN'],"
+        f"data={probe_data}.encode(),headers={{'Authorization':'Bearer '+os.environ['PLOW_WHIP_BRIDGE_TOKEN'],"
         "'Content-Type':'application/json'},method='POST');"
-        "print(json.loads(urllib.request.urlopen(r,timeout=5).read())['status'])"
+        "print(json.loads(urllib.request.urlopen(r,timeout=5).read()))"
     )
     runner.run(_compose(release, paths, "exec", "-T", SERVICE, "python", "-c", code))
 
@@ -833,8 +837,8 @@ def _status(paths: RuntimePaths, config: dict[str, object], runner: Runner) -> d
     except (OSError, urllib.error.URLError, json.JSONDecodeError, OpsError):
         container = "stopped"
     try:
-        probe = _bridge_probe(paths, config, timeout=2)
-        bridge = "ready" if probe.get("status") else "reachable"
+        _bridge_probe(paths, config, timeout=2)
+        bridge = "ready"
     except (OSError, urllib.error.URLError, json.JSONDecodeError, OpsError):
         bridge = "stopped"
     return {
