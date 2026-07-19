@@ -108,6 +108,13 @@ def test_bridge_plist_contains_env_path_but_not_secret(tmp_path: Path) -> None:
     assert ops._bridge_token(paths) not in serialized
 
 
+def test_bridge_probe_payload_matches_host_bridge_protocol() -> None:
+    assert ops.BRIDGE_PROBE_PAYLOAD == {
+        "adapter": "json-worker",
+        "executable": "simple-worker",
+    }
+
+
 @pytest.mark.parametrize("candidate", [Path("/"), Path.home(), ops.TOOL_ROOT])
 def test_runtime_purge_rejects_broad_paths(candidate: Path) -> None:
     with pytest.raises(ops.OpsError, match="unsafe runtime directory"):
