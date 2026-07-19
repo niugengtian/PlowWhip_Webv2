@@ -136,3 +136,27 @@ docker compose exec control-plane python -m plow_whip_web --data-dir /data sched
 不要把 SQLite 写进镜像层。数据使用 named volume，因此重建/升级镜像不会丢失；只有明确执行 `docker compose down -v` 才会删除数据卷。
 
 Sprint 0–9 已完成：这是可构建、可运行、可审计、可恢复的容器化 Web MVP。真实 CLI Provider 在 Host Bridge 未配置时会明确阻塞，不会伪装完成；内置 Generic Command 只保留为后端确定性测试适配器，不作为 Web UI 项目 Worker 暴露。
+
+## GitHub 发布（GHCR + Release）
+
+仅当推送符合 `vMAJOR.MINOR.PATCH` 的 tag（例如 `v2.0.1`）时，`.github/workflows/release.yml` 才会运行。普通 `push` / PR 只走 `quality.yml`，不构建、不推送镜像、不创建 Release。
+
+发布流程：
+
+1. 工作树干净且质量门命令已在本地确认（与 `quality.yml` 相同）。
+2. 在已合并的提交上创建并推送 tag：`git tag v2.0.1 && git push origin v2.0.1`。
+3. Workflow 先跑 backend（`pytest` + `compileall`）与 frontend（`test` + `typecheck` + `lint` + `build`）；全部通过后才 `publish`。
+4. Buildx 推送 `linux/amd64,linux/arm64` 到唯一镜像仓库 `ghcr.io/niugengtian/plowwhip-webv2`，并打标签 `v2.0.1`、`2.0.1`、`2.0`、`2`、`latest`。
+5. 同一构建输出一个 `sha256` digest；GitHub Release 名称与 tag 一致，自动生成 notes，并附 `release-metadata.json`（image / digest / platforms / `docker pull` 示例）。Release **不**上传 Docker tar。
+
+边界：
+
+- **GHCR** 是镜像真相源；**Release** 只保存引用、digest、拉取命令与发行说明。
+- 生产拉取应固定 digest，而不是浮动 tag：
+
+```bash
+docker pull ghcr.io/niugengtian/plowwhip-webv2@sha256:<digest>
+```
+
+- 本机日常升级仍用 `scripts/release_local.py deploy`；GHCR 发布不替代本机 Compose 写事务，也不部署到 `8742`。
+- 权限仅 `GITHUB_TOKEN` 的 `contents:write` 与 `packages:write`；不增加额外 Secret。

@@ -1,0 +1,167 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/niugengtian/plowwhip-webv2
+  PLATFORMS: linux/amd64,linux/arm64
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e '.[dev]'
+      - run: python -m pytest --cov --cov-report=term-missing
+      - run: python -m compileall -q backend tests
+
+  frontend:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - working-directory: web
+        run: pnpm install --frozen-lockfile
+      - working-directory: web
+        run: pnpm test
+      - working-directory: web
+        run: pnpm run typecheck
+      - working-directory: web
+        run: pnpm run lint
+      - working-directory: web
+        run: pnpm run build
+
+  publish:
+    needs: [backend, frontend]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Require vMAJOR.MINOR.PATCH tag
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import sys
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          if not re.fullmatch(r"v\d+\.\d+\.\d+", tag):
+              sys.exit(f"refusing non vMAJOR.MINOR.PATCH tag: {tag}")
+          PY
+
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{raw}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.title=plowwhip-webv2
+            org.opencontainers.image.description=plow-whip Web v2 control plane
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=MIT
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: ${{ env.PLATFORMS }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            PLOW_WHIP_RELEASE_SHA=${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
+          provenance: mode=max
+          sbom: true
+
+      - name: Write release metadata
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE: ${{ env.IMAGE_NAME }}
+          TAG: ${{ github.ref_name }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+          PLATFORMS: ${{ env.PLATFORMS }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          digest = os.environ["DIGEST"]
+          if not digest.startswith("sha256:"):
+              raise SystemExit(f"unexpected digest: {digest!r}")
+          image = os.environ["IMAGE"]
+          tag = os.environ["TAG"]
+          tags = [line.strip() for line in os.environ["TAGS"].splitlines() if line.strip()]
+          platforms = [p.strip() for p in os.environ["PLATFORMS"].split(",") if p.strip()]
+          payload = {
+              "digest": digest,
+              "docker_pull": f"docker pull {image}@{digest}",
+              "image": image,
+              "platforms": platforms,
+              "tag": tag,
+              "tags": tags,
+          }
+          Path("release-metadata.json").write_text(
+              json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          print(f"Pinned digest: {digest}")
+          print(payload["docker_pull"])
+          PY
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" release-metadata.json \
+            --title "${{ github.ref_name }}" \
+            --generate-notes
