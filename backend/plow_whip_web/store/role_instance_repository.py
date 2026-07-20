@@ -11,7 +11,7 @@ from plow_whip_web.runtime.rule_library import (
     MAX_GENERATED_TEMPLATES_PER_CAPABILITY,
     capability_key_for_role,
     content_hash,
-    is_local_deterministic_simple_worker,
+    is_local_deterministic_worker,
     seed_rules,
     seed_templates,
 )
@@ -628,6 +628,17 @@ class RoleInstanceRepository:
                 (next_generation, task_id),
             )
             connection.execute(
+                """
+                UPDATE workers
+                SET session_generation = ?, external_session_id = NULL,
+                    active_fencing_token = NULL, updated_at = CURRENT_TIMESTAMP
+                WHERE id = (
+                    SELECT worker_id FROM task_sessions WHERE task_id = ?
+                )
+                """,
+                (next_generation, task_id),
+            )
+            connection.execute(
                 "UPDATE role_instances SET replaced_by = ? WHERE id = ?",
                 (created["id"], current["id"]),
             )
@@ -732,12 +743,12 @@ class RoleInstanceRepository:
         model_invoked: bool,
         expected_task_spec_revision: int | None = None,
     ) -> dict[str, Any]:
-        if is_local_deterministic_simple_worker(
+        if is_local_deterministic_worker(
             provider=provider, command=command, model_invoked=model_invoked,
         ):
             return {
                 "allowed": True,
-                "exception": "local_deterministic_simple_worker",
+                "exception": "local_deterministic_worker",
                 "role_instance": None,
                 "session_binding": None,
             }

@@ -1,12 +1,12 @@
-import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react'
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  ArrowsClockwise, CheckCircle, Circle, Clock, Coins, Copy, FileCode, FolderOpen,
+  ArrowsClockwise, ChatCircleDots, CheckCircle, Circle, Clock, Coins, Copy, FileCode, FolderOpen,
   Gear, HardDrives, Kanban, ListChecks, MagicWand, Network, Pause, Play,
   Plus, Pulse, Robot, ShieldCheck, TerminalWindow, WarningCircle, X,
 } from '@phosphor-icons/react'
 import {
-  api, AuditEntry, BehaviorBaseline, Convention, ConventionSuggestion, GlobalButlerOverview, Goal, OutboxEvent, PermissionGrant,
-  Project, Provider, RoleInstance, RuntimeHealth, RuntimeSettings, SchedulerStatus, SessionBinding, Task, TaskArtifact, TaskEvent,
+  api, AlertIncident, Alerts, AuditEntry, BehaviorBaseline, Convention, ConventionSuggestion, GlobalButlerOverview, Goal, OutboxEvent, PermissionGrant,
+  Project, Provider, RoleInstance, RuntimeHealth, RuntimeSettings, RuntimeSettingsOverride, SchedulerStatus, SessionBinding, Task, TaskArtifact, TaskEvent,
   TaskDeletionEligibility, TaskSizingEstimate, TaskSizingInputs, TaskStatus, Usage, UsageDailyBreakdown,
   UsageDailySeries, Worker, WorkerDetail, WorkerStream,
 } from './api'
@@ -21,7 +21,8 @@ type Health = {
   database: { status: string; journal_mode: string; migration_count: number }
 }
 
-type View = 'butler' | 'board' | 'tasks' | 'projects' | 'workers' | 'providers' | 'usage' | 'audit' | 'settings'
+type View = 'butler' | 'projects' | 'tasks' | 'usage' | 'alerts' | 'settings'
+type ProjectScope = Readonly<{ projectId: string; generation: number }>
 
 const roleNames: Record<string, string> = {
   butler: '常驻管家',
@@ -41,14 +42,11 @@ const statusNames: Record<TaskStatus, string> = {
 }
 
 const navItems: { id: View; label: string; icon: typeof Kanban }[] = [
-  { id: 'butler', label: '全局管家', icon: Network },
-  { id: 'board', label: '任务看板', icon: Kanban },
-  { id: 'tasks', label: '任务', icon: ListChecks },
+  { id: 'butler', label: '管家', icon: Network },
   { id: 'projects', label: '项目', icon: FolderOpen },
-  { id: 'workers', label: 'Worker', icon: Robot },
-  { id: 'providers', label: 'Provider', icon: TerminalWindow },
+  { id: 'tasks', label: '任务', icon: ListChecks },
   { id: 'usage', label: 'Token', icon: Coins },
-  { id: 'audit', label: '审计', icon: ShieldCheck },
+  { id: 'alerts', label: '告警', icon: WarningCircle },
   { id: 'settings', label: '设置', icon: Gear },
 ]
 
@@ -61,7 +59,7 @@ const initialSizingInputs: TaskSizingInputs = {
 }
 
 const initialTask = {
-  title: '', objective: '', projectId: '', role: 'fullstack', provider: 'cursor',
+  title: '', objective: '', projectId: '', role: 'fullstack', provider: 'codex',
   networkRequirement: 'none', executable: 'python3',
   argumentsJson: '["-c", "from pathlib import Path; Path(\'result.txt\').write_text(\'quality-pass\', encoding=\'utf-8\')"]',
   verifyPath: 'result.txt', verifyText: 'quality-pass',
@@ -69,7 +67,7 @@ const initialTask = {
 }
 
 export function App() {
-  const [view, setView] = useState<View>('board')
+  const [view, setView] = useState<View>('tasks')
   const [health, setHealth] = useState<Health | null>(null)
   const [tasks, setTasks] = useState<Task[]>([])
   const [goals, setGoals] = useState<Goal[]>([])
@@ -80,12 +78,13 @@ export function App() {
   const [scheduler, setScheduler] = useState<SchedulerStatus | null>(null)
   const [runtimeHealth, setRuntimeHealth] = useState<RuntimeHealth | null>(null)
   const [usage, setUsage] = useState<Usage | null>(null)
+  const [alerts, setAlerts] = useState<Alerts | null>(null)
   const [audit, setAudit] = useState<AuditEntry[]>([])
   const [outbox, setOutbox] = useState<OutboxEvent[]>([])
   const [permissions, setPermissions] = useState<PermissionGrant[]>([])
   const [convention, setConvention] = useState<Convention | null>(null)
   const [suggestion, setSuggestion] = useState<ConventionSuggestion | null>(null)
-  const [refineProvider, setRefineProvider] = useState('simple-worker')
+  const [refineProvider, setRefineProvider] = useState('codex')
   const [selectedTask, setSelectedTask] = useState<Task | null>(null)
   const [selectedGoal, setSelectedGoal] = useState<Goal | null>(null)
   const [events, setEvents] = useState<TaskEvent[]>([])
@@ -93,6 +92,11 @@ export function App() {
   const [artifactError, setArtifactError] = useState<string | null>(null)
   const [deletionEligibility, setDeletionEligibility] = useState<TaskDeletionEligibility | null>(null)
   const [selectedProject, setSelectedProject] = useState<string>('all')
+  const projectScope = useRef<ProjectScope>({ projectId: 'all', generation: 0 })
+  const [refreshInterval, setRefreshInterval] = useState(
+    () => Number(window.localStorage.getItem('plow-whip.refresh-interval') ?? 30_000),
+  )
+  const [refreshState, setRefreshState] = useState<{ status: 'idle' | 'refreshing' | 'ok' | 'error'; at: string | null }>({ status: 'idle', at: null })
   const [taskForm, setTaskForm] = useState(initialTask)
   const [projectForm, setProjectForm] = useState({ name: '', path: '', hostPath: '' })
   const [showCreateTask, setShowCreateTask] = useState(false)
@@ -105,14 +109,18 @@ export function App() {
   const [notice, setNotice] = useState<string | null>(null)
 
   const refreshTasks = useCallback(async () => {
+    const generation = projectScope.current.generation
     const next = await api.tasks()
+    if (generation !== projectScope.current.generation) return
     setTasks(next)
-    setSelectedTask((current) => next.find((task) => task.id === current?.id) ?? current)
+    setSelectedTask((current) => next.find((task) => task.id === current?.id) ?? null)
   }, [])
   const refreshGoals = useCallback(async () => {
+    const generation = projectScope.current.generation
     const next = await api.goals()
+    if (generation !== projectScope.current.generation) return
     setGoals(next)
-    setSelectedGoal((current) => next.find((goal) => goal.id === current?.id) ?? current)
+    setSelectedGoal((current) => next.find((goal) => goal.id === current?.id) ?? null)
   }, [])
   const refreshProjects = useCallback(async () => setProjects(await api.projects()), [])
   const refreshProviders = useCallback(async () => setProviders(await api.providers()), [])
@@ -120,6 +128,12 @@ export function App() {
     async () => setGlobalButler(await api.globalButlerOverview()),
     [],
   )
+  const refreshUsage = useCallback(async () => {
+    const { generation, projectId } = projectScope.current
+    const next = await api.usage(projectId === 'all' ? undefined : projectId)
+    if (generation === projectScope.current.generation) setUsage(next)
+  }, [])
+  const refreshAlerts = useCallback(async () => setAlerts(await api.alerts()), [])
 
   useEffect(() => {
     Promise.all([
@@ -127,11 +141,19 @@ export function App() {
       api.tasks().then(setTasks), api.goals().then(setGoals), api.projects().then(setProjects), api.providers().then(setProviders),
       api.globalButlerOverview().then(setGlobalButler),
       api.settings().then(setSettings), api.schedulerStatus().then(setScheduler),
-      api.runtimeHealth().then(setRuntimeHealth), api.usage().then(setUsage),
+      api.runtimeHealth().then(setRuntimeHealth),
+      api.alerts().then(setAlerts),
       api.audit().then(setAudit), api.outbox().then(setOutbox), api.permissions().then(setPermissions),
       api.convention('global', 'global').then(setConvention),
     ]).catch((reason: unknown) => setError(messageOf(reason)))
   }, [])
+
+  useEffect(() => {
+    const generation = projectScope.current.generation
+    api.usage(selectedProject === 'all' ? undefined : selectedProject)
+      .then((next) => { if (generation === projectScope.current.generation) setUsage(next) })
+      .catch((reason: unknown) => { if (generation === projectScope.current.generation) setError(messageOf(reason)) })
+  }, [selectedProject])
 
   useEffect(() => {
     const taskId = selectedTask?.id
@@ -156,8 +178,46 @@ export function App() {
   }, [selectedTask?.id, selectedTask?.revision])
 
   useEffect(() => {
-    return startLiveRefresh(() => Promise.all([refreshTasks(), refreshGoals()]))
-  }, [refreshTasks, refreshGoals])
+    window.localStorage.setItem('plow-whip.refresh-interval', String(refreshInterval))
+    return startLiveRefresh(async () => {
+      setRefreshState((current) => ({ ...current, status: 'refreshing' }))
+      const { generation, projectId } = projectScope.current
+      try {
+        const requests: Promise<unknown>[] = [refreshProjects()]
+        if (view === 'tasks') requests.push(refreshTasks(), refreshGoals())
+        if (view === 'butler') requests.push(refreshGlobalButler())
+        if (view === 'usage' || view === 'tasks') requests.push(
+          api.usage(projectId === 'all' ? undefined : projectId).then((nextUsage) => {
+            if (generation === projectScope.current.generation) setUsage(nextUsage)
+          }),
+        )
+        if (view === 'alerts') requests.push(refreshAlerts())
+        if (view === 'settings') requests.push(refreshProviders())
+        await Promise.all(requests)
+        setRefreshState({ status: 'ok', at: new Date().toISOString() })
+      } catch (reason) {
+        setRefreshState({ status: 'error', at: new Date().toISOString() })
+        throw reason
+      }
+    }, { intervalMs: refreshInterval })
+  }, [refreshAlerts, refreshGlobalButler, refreshGoals, refreshInterval, refreshProjects, refreshProviders, refreshTasks, view])
+
+  function changeProjectScope(projectId: string) {
+    projectScope.current = {
+      projectId,
+      generation: projectScope.current.generation + 1,
+    }
+    setSelectedProject(projectId)
+    setSelectedTask(null)
+    setSelectedGoal(null)
+    setEvents([])
+    setArtifacts([])
+    setUsage(null)
+    setArtifactError(null)
+    setDeletionEligibility(null)
+    setShowProjectButler(false)
+    setButlerProjectId('')
+  }
 
   function selectTask(task: Task) {
     if (selectedTask?.id !== task.id) {
@@ -255,7 +315,7 @@ export function App() {
         name: projectForm.name, path: projectForm.path,
         host_path: projectForm.hostPath.trim() || null,
       })
-      await refreshProjects(); setSelectedProject(created.id)
+      await refreshProjects(); changeProjectScope(created.id)
       setTaskForm((current) => ({ ...current, projectId: created.id }))
       setProjectForm({ name: '', path: '', hostPath: '' })
     }, '项目已注册')
@@ -347,11 +407,12 @@ export function App() {
 
       <main>
         <div className="context-bar">
-          <div><span>项目范围</span><select value={selectedProject} onChange={(event) => setSelectedProject(event.target.value)}><option value="all">全部项目</option>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></div>
+          <label className="scope-control"><span>项目范围</span><select value={selectedProject} onChange={(event) => changeProjectScope(event.target.value)}><option value="all">全部项目</option>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></label>
           <div className="context-actions">
-            <button className="ghost" onClick={() => action(async () => { await Promise.all([refreshTasks(), refreshGoals(), refreshProjects(), refreshProviders(), refreshGlobalButler()]) }, '状态已刷新')}><ArrowsClockwise size={16} />刷新</button>
-            <button className="ghost" onClick={() => { setTaskEstimate(null); setEstimatedSizingInputs(null); setShowCreateTask(true) }}>诊断任务</button>
-            <button className="primary" onClick={() => { setButlerProjectId(selectedProject === 'all' ? '' : selectedProject); setShowProjectButler(true) }}><Plus size={16} weight="bold" />与项目管家对话</button>
+            <button className="ghost" onClick={() => action(async () => { await Promise.all([refreshTasks(), refreshGoals(), refreshProjects(), refreshProviders(), refreshGlobalButler(), refreshUsage()]) }, '状态已刷新')}><ArrowsClockwise size={16} />刷新</button>
+            <label className="refresh-control">自动刷新<select aria-label="自动刷新间隔" value={refreshInterval} onChange={(event) => setRefreshInterval(Number(event.target.value))}><option value={0}>关闭</option><option value={5_000}>5s</option><option value={10_000}>10s</option><option value={30_000}>30s</option><option value={60_000}>1min</option><option value={300_000}>5min</option><option value={600_000}>10min</option><option value={3_600_000}>1h</option><option value={7_200_000}>2h</option><option value={14_400_000}>4h</option></select></label>
+            <span className={`refresh-state refresh-${refreshState.status}`}>{refreshInterval === 0 ? '自动刷新已关闭' : refreshState.status === 'refreshing' ? '刷新中' : refreshState.at ? `上次成功 ${new Date(refreshState.at).toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai' })}` : '等待首次刷新'}</span>
+            {view === 'tasks' && <button className="ghost" onClick={() => { setTaskEstimate(null); setEstimatedSizingInputs(null); setShowCreateTask(true) }}>诊断任务</button>}
           </div>
         </div>
 
@@ -359,18 +420,17 @@ export function App() {
         {notice && <div className="banner success"><CheckCircle size={18} weight="fill" /><span>{notice}</span><button aria-label="关闭提示" onClick={() => setNotice(null)}><X size={16} /></button></div>}
         {outbox.filter((event) => event.event_type === 'task.needs_human' && !event.delivered_at).length > 0 && <div className="banner warning"><WarningCircle size={18} weight="fill" />存在需要人工判断的任务，自动调度已对这些任务停手。</div>}
 
-        {view === 'board' && <Board tasks={visibleTasks} goals={goals.filter((goal) => selectedProject === 'all' || goal.project_id === selectedProject)} projects={projects} workers={workers.map((item) => item.worker)} providers={providers} usage={usage} onNavigate={setView} onSelect={selectTask} onSelectGoal={selectGoal} />}
-        {view === 'butler' && <GlobalButlerView overview={globalButler} onOpenProject={(projectId) => { setButlerProjectId(projectId); setShowProjectButler(true) }} />}
-        {view === 'tasks' && <TasksView tasks={visibleTasks} goals={goals.filter((goal) => selectedProject === 'all' || goal.project_id === selectedProject)} workers={workers.map((item) => item.worker)} selected={selectedTask} selectedGoal={selectedGoal} events={events} artifacts={artifacts} artifactError={artifactError} deletionEligibility={deletionEligibility} busy={busy} onSelect={selectTask} onSelectGoal={selectGoal} onDrive={driveTask} onDelete={deleteTask} onControl={controlTask} onOpenArtifact={openArtifact} onCopyArtifact={copyArtifactPath} />}
+        {view === 'butler' && (selectedProject === 'all'
+          ? <GlobalButlerView overview={globalButler} onOpenConversation={() => { setButlerProjectId(''); setShowProjectButler(true) }} />
+          : <ProjectButlerLanding project={projects.find((project) => project.id === selectedProject)} onOpenConversation={() => { setButlerProjectId(selectedProject); setShowProjectButler(true) }} />)}
+        {view === 'tasks' && <UnifiedTasksView usage={usage} tasks={visibleTasks} goals={goals.filter((goal) => selectedProject === 'all' || goal.project_id === selectedProject)} workers={workers.filter((item) => selectedProject === 'all' || item.project.id === selectedProject).map((item) => item.worker)} selected={selectedTask} selectedGoal={selectedGoal} events={events} artifacts={artifacts} artifactError={artifactError} deletionEligibility={deletionEligibility} busy={busy} onSelect={selectTask} onSelectGoal={selectGoal} onDrive={driveTask} onDelete={deleteTask} onControl={controlTask} onOpenArtifact={openArtifact} onCopyArtifact={copyArtifactPath} />}
         {view === 'projects' && <ProjectsView projects={projects} form={projectForm} setForm={setProjectForm} onCreate={createProject} onRelease={(project) => action(async () => { await api.releaseProject(project.id); await refreshProjects() }, '项目已完成并释放 Worker')} busy={busy} />}
-        {view === 'workers' && <WorkersView items={workers.filter(({ project }) => selectedProject === 'all' || project.id === selectedProject)} providers={providers} busy={busy} onRebind={(worker, provider) => action(async () => { await api.rebindWorker(worker.id, provider); await refreshProjects() }, 'Worker 已轮转并重新绑定')} />}
-        {view === 'providers' && <ProvidersView providers={providers} busy={busy} onProbe={probeProvider} onToggle={toggleProvider} />}
-        {view === 'usage' && <UsageView usage={usage} projects={projects} tasks={tasks} />}
-        {view === 'audit' && <AuditView audit={audit} permissions={permissions} onRefresh={() => api.audit().then(setAudit)} />}
-        {view === 'settings' && <SettingsView settings={settings} setSettings={setSettings} scheduler={scheduler} convention={convention} setConvention={setConvention} suggestion={suggestion} setSuggestion={setSuggestion} projects={projects} tasks={tasks} providers={providers} refineProvider={effectiveRefineProvider} setRefineProvider={setRefineProvider} busy={busy} onSaveSettings={saveSettings} onTick={() => action(async () => { await api.schedulerTick(); setScheduler(await api.schedulerStatus()); await Promise.all([refreshTasks(), refreshGoals()]) }, 'Tick 已完成')} onLoadConvention={loadConvention} onSaveConvention={saveConvention} onRefine={refineConvention} />}
+        {view === 'usage' && <UsageView key={selectedProject} usage={usage} projectId={selectedProject === 'all' ? undefined : selectedProject} projects={projects} tasks={visibleTasks} />}
+        {view === 'alerts' && <AlertsView alerts={alerts} onRefresh={refreshAlerts} />}
+        {view === 'settings' && <SettingsView settings={settings} setSettings={setSettings} scheduler={scheduler} convention={convention} setConvention={setConvention} suggestion={suggestion} setSuggestion={setSuggestion} projects={projects} tasks={visibleTasks} workers={workers.filter(({ project }) => selectedProject === 'all' || project.id === selectedProject)} selectedProject={selectedProject === 'all' ? undefined : selectedProject} providers={providers} audit={audit} permissions={permissions} refineProvider={effectiveRefineProvider} setRefineProvider={setRefineProvider} busy={busy} onSaveSettings={saveSettings} onTick={() => action(async () => { await api.schedulerTick(); setScheduler(await api.schedulerStatus()); await Promise.all([refreshTasks(), refreshGoals()]) }, 'Tick 已完成')} onLoadConvention={loadConvention} onSaveConvention={saveConvention} onRefine={refineConvention} onProbeProvider={probeProvider} onToggleProvider={toggleProvider} onRebindWorker={(worker, provider) => action(async () => { await api.rebindWorker(worker.id, provider); await refreshProjects() }, 'Worker 已轮转并重新绑定')} onRefreshAudit={() => api.audit().then(setAudit)} />}
       </main>
 
-      {showProjectButler && <ProjectButlerDialog key={butlerProjectId || 'new'} initialProjectId={butlerProjectId} projects={projects} providers={providers} onClose={() => setShowProjectButler(false)} onDispatched={openDispatchedGoal} />}
+      {showProjectButler && <ProjectButlerDialog key={`${selectedProject}:${butlerProjectId || 'new'}`} initialProjectId={butlerProjectId} globalScope={selectedProject === 'all'} projects={projects} providers={providers} onClose={() => setShowProjectButler(false)} onDispatched={openDispatchedGoal} />}
       {showCreateTask && <TaskDrawer form={taskForm} setForm={setTaskForm} setSizingInputs={setSizingInputs} estimate={estimatedSizingInputs === taskForm.sizingInputs ? taskEstimate : null} projects={projects} providers={providers} busy={busy} onClose={() => setShowCreateTask(false)} onEstimate={estimateTask} onSubmit={createTask} />}
     </div>
   )
@@ -380,13 +440,13 @@ const GOAL_TERMINAL = new Set(['completed', 'terminal_failed', 'cancelled'])
 const COMPLETED_GOAL_PAGE_SIZE = 4
 
 function goalStatusPill(status: string): TaskStatus {
-  if (status === 'running') return 'ready'
+  if (status === 'running') return 'running'
   if (status === 'completed') return 'completed'
   if (status === 'needs_human') return 'needs_human'
   return 'terminal_failed'
 }
 
-function Board({ tasks, goals, projects, workers, providers, usage, onNavigate, onSelect, onSelectGoal }: { tasks: Task[]; goals: Goal[]; projects: Project[]; workers: Worker[]; providers: Provider[]; usage: Usage | null; onNavigate: (view: View) => void; onSelect: (task: Task) => void; onSelectGoal: (goal: Goal) => void }) {
+export function Board({ tasks, goals, projects, workers, providers, usage, onNavigate, onSelect, onSelectGoal }: { tasks: Task[]; goals: Goal[]; projects: Project[]; workers: Worker[]; providers: Provider[]; usage: Usage | null; onNavigate: (view: View) => void; onSelect: (task: Task) => void; onSelectGoal: (goal: Goal) => void }) {
   const [goalLane, setGoalLane] = useState<'active' | 'completed'>('active')
   const [completedExpanded, setCompletedExpanded] = useState(false)
   const [completedPage, setCompletedPage] = useState(0)
@@ -410,9 +470,11 @@ function Board({ tasks, goals, projects, workers, providers, usage, onNavigate, 
   return <>
     <section className="metrics-strip">
       <Metric icon={FolderOpen} label="活跃项目" value={projects.filter((p) => p.status === 'active').length} hint="可并行" onClick={() => onNavigate('projects')} />
-      <Metric icon={Robot} label="在线 Worker" value={workers.filter((w) => w.status !== 'released').length} hint={`${workers.filter((w) => w.status === 'busy').length} 忙碌`} onClick={() => onNavigate('workers')} />
-      <Metric icon={TerminalWindow} label="可用 Provider" value={providers.filter(providerFullyReady).length} hint={`${providers.filter((p) => p.enabled).length} 已启用`} onClick={() => onNavigate('providers')} />
-      <Metric icon={Coins} label="今日 Token" value={usage?.today?.total_tokens ?? 0} hint={todayLabel} onClick={() => onNavigate('usage')} />
+      <Metric icon={Robot} label="在线 Worker" value={workers.filter((w) => w.status !== 'released').length} hint={`${workers.filter((w) => w.status === 'busy').length} 忙碌`} onClick={() => onNavigate('projects')} />
+      <Metric icon={TerminalWindow} label="可用 Provider" value={providers.filter(providerFullyReady).length} hint={`${providers.filter((p) => p.enabled).length} 已启用`} onClick={() => onNavigate('settings')} />
+      {usage
+        ? <Metric icon={Coins} label="今日 Token" value={usage.today?.total_tokens ?? 0} hint={todayLabel} onClick={() => onNavigate('usage')} />
+        : <button type="button" className="metric-card" aria-label="查看今日 Token详情" onClick={() => onNavigate('usage')}><div className="metric-icon"><Coins size={18} /></div><div><span>今日 Token</span><strong>加载中</strong></div></button>}
     </section>
     <section className="panel board-panel goal-panel" data-testid="goal-panel">
       <div className="panel-heading">
@@ -467,12 +529,100 @@ function Board({ tasks, goals, projects, workers, providers, usage, onNavigate, 
   </>
 }
 
-function GlobalButlerView({ overview, onOpenProject }: { overview: GlobalButlerOverview | null; onOpenProject: (projectId: string) => void }) {
+function GlobalButlerView({ overview, onOpenConversation }: { overview: GlobalButlerOverview | null; onOpenConversation: () => void }) {
   if (!overview) return <section className="panel"><div className="empty-state"><Network size={38} /><h2>正在读取全局资源索引</h2></div></section>
-  return <><section className="metrics-strip"><Metric icon={FolderOpen} label="项目" value={overview.totals.projects} hint="注册资源" /><Metric icon={Kanban} label="运行中 Goal" value={overview.totals.running_goals} hint="规范状态" /><Metric icon={ListChecks} label="活动 Task" value={overview.totals.active_tasks} hint="非终态" /><Metric icon={Robot} label="活动 Worker" value={overview.totals.active_workers} hint="未释放" /></section><section className="panel"><div className="panel-heading"><div><span className="kicker">只读跨项目索引</span><h1>全局管家</h1></div><span className="muted">不共享项目会话 · 不读取全量文件或聊天</span></div><section className="work-items"><div className="section-heading"><div><span className="kicker">Registered resources</span><h2>项目管家入口</h2></div><span>真源：{overview.canonical_sources.join(' / ')}</span></div>{overview.projects.map((project) => <article key={project.id}><div><strong>{project.name}</strong><small>{project.resource_path}</small></div><div><span>{project.running_goals} Goal · {project.active_tasks} Task · {project.active_workers} Worker</span><button className="primary" onClick={() => onOpenProject(project.id)}>直接与项目管家对话</button></div></article>)}</section></section></>
+  return <><section className="metrics-strip"><Metric icon={FolderOpen} label="项目" value={overview.totals.projects} hint="注册资源" /><Metric icon={Kanban} label="运行中 Goal" value={overview.totals.running_goals} hint="规范状态" /><Metric icon={ListChecks} label="活动 Task" value={overview.totals.active_tasks} hint="非终态" /><Metric icon={Robot} label="活动 Worker" value={overview.totals.active_workers} hint="未释放" /></section><section className="panel butler-home"><div className="panel-heading"><div><span className="kicker">Codex · 全局只读工作区</span><h1>全局管家</h1></div><button className="primary" onClick={onOpenConversation}><ChatCircleDots size={16} />与全局管家对话</button></div><p className="objective">查询全部项目的规范化状态、资源与告警，并把需要执行的工作引导到指定项目管家。全局会话与项目会话严格隔离。</p><section className="work-items"><div className="section-heading"><div><span className="kicker">Registered resources</span><h2>项目状态索引</h2></div><span>真源：{overview.canonical_sources.join(' / ')}</span></div>{overview.projects.map((project) => <article key={project.id}><div><strong>{project.name}</strong><small>{project.resource_path}</small></div><div><span>{project.running_goals} Goal · {project.active_tasks} Task · {project.active_workers} Worker</span><small>切换上方项目范围后直接进入该项目管家</small></div></article>)}</section></section></>
 }
 
-function TasksView({ tasks, goals, workers, selected, selectedGoal, events, artifacts, artifactError, deletionEligibility, busy, onSelect, onSelectGoal, onDrive, onDelete, onControl, onOpenArtifact, onCopyArtifact }: { tasks: Task[]; goals: Goal[]; workers: Worker[]; selected: Task | null; selectedGoal: Goal | null; events: TaskEvent[]; artifacts: TaskArtifact[]; artifactError: string | null; deletionEligibility: TaskDeletionEligibility | null; busy: boolean; onSelect: (task: Task) => void; onSelectGoal: (goal: Goal) => void; onDrive: (task: Task) => void; onDelete: (task: Task) => void; onControl: (task: Task, action: 'pause' | 'resume' | 'cancel' | 'needs_human') => void; onOpenArtifact: (task: Task, artifact: TaskArtifact, target: 'finder' | 'cursor') => void; onCopyArtifact: (artifact: TaskArtifact) => void }) {
+function ProjectButlerLanding({ project, onOpenConversation }: { project?: Project; onOpenConversation: () => void }) {
+  if (!project) return <section className="panel"><div className="empty-state"><Robot size={38} /><h2>项目不存在或已移除</h2></div></section>
+  return <section className="panel butler-home">
+    <div className="panel-heading">
+      <div><span className="kicker">Codex · 项目隔离会话</span><h1>{project.name} 项目管家</h1></div>
+      <button className="primary" onClick={onOpenConversation}><ChatCircleDots size={16} />与项目管家对话</button>
+    </div>
+    <p className="objective">项目管家只处理当前项目。它会先确保目标、边界和验收标准完整；大型目标一次只问一个问题，确认方案后才生成角色实例、冻结规则快照并派发任务。</p>
+    <div className="facts"><Fact label="项目目录" value={project.host_path ?? project.path} mono /><Fact label="常驻角色" value="项目管家（Codex）" /><Fact label="动态 Worker" value={`${project.workers.filter((worker) => worker.status !== 'released').length} 个活动实例`} /><Fact label="会话边界" value="每条新指令一个独立物理会话" /></div>
+  </section>
+}
+
+function UnifiedTasksView(props: {
+  usage: Usage | null
+  tasks: Task[]
+  goals: Goal[]
+  workers: Worker[]
+  selected: Task | null
+  selectedGoal: Goal | null
+  events: TaskEvent[]
+  artifacts: TaskArtifact[]
+  artifactError: string | null
+  deletionEligibility: TaskDeletionEligibility | null
+  busy: boolean
+  onSelect: (task: Task) => void
+  onSelectGoal: (goal: Goal) => void
+  onDrive: (task: Task) => void
+  onDelete: (task: Task) => void
+  onControl: (task: Task, action: 'pause' | 'resume' | 'cancel' | 'needs_human') => void
+  onOpenArtifact: (task: Task, artifact: TaskArtifact, target: 'finder' | 'cursor') => void
+  onCopyArtifact: (artifact: TaskArtifact) => void
+}) {
+  const {
+    usage, tasks, goals, workers, selected, selectedGoal, events, artifacts, artifactError,
+    deletionEligibility, busy, onSelect, onSelectGoal, onDrive, onDelete, onControl,
+    onOpenArtifact, onCopyArtifact,
+  } = props
+  const [completedOpen, setCompletedOpen] = useState(false)
+  const activeGoals = goals.filter((goal) => !GOAL_TERMINAL.has(goal.status))
+  const completedGoals = goals.filter((goal) => GOAL_TERMINAL.has(goal.status))
+  const lanes: { title: string; statuses: TaskStatus[] }[] = [
+    { title: '待执行', statuses: ['ready', 'paused'] },
+    { title: '执行中', statuses: ['running', 'stopping'] },
+    { title: '验证中', statuses: ['verifying'] },
+    { title: '已终态', statuses: ['completed', 'terminal_failed', 'cancelled', 'needs_human'] },
+  ]
+  const activeTasks = tasks.filter((task) => !['completed', 'terminal_failed', 'cancelled'].includes(task.status))
+  return <><section className="metrics-strip task-metrics">
+    <Metric icon={Coins} label="今日 Token" value={usage?.today?.total_tokens ?? 0} hint={`${usage?.today?.date ?? '—'} · 当前项目范围`} />
+    <Metric icon={Kanban} label="进行中 Goal" value={activeGoals.length} hint="待拆分或执行" />
+    <Metric icon={ListChecks} label="活动 Task" value={activeTasks.length} hint="非终态" />
+    <Metric icon={CheckCircle} label="已终态 Task" value={tasks.length - activeTasks.length} hint="完成、失败、取消" />
+  </section><div className="task-workspace" data-testid="unified-task-workspace">
+    <aside className="panel goal-rail">
+      <div className="panel-heading"><div><span className="kicker">项目指令</span><h1>Goal</h1></div><b>{activeGoals.length}</b></div>
+      <div className="goal-rail-list">
+        {activeGoals.map((goal) => <button key={goal.id} className={selectedGoal?.id === goal.id ? 'selected' : ''} onClick={() => onSelectGoal(goal)}><strong>{goal.title}</strong><small>{goal.provider} · {goal.status} · {goal.work_items.length} 项</small></button>)}
+        {!activeGoals.length && <p className="muted">暂无进行中指令。</p>}
+      </div>
+      <button className="goal-history-toggle" onClick={() => setCompletedOpen((value) => !value)}>已完成 {completedGoals.length} {completedOpen ? '收起' : '展开'}</button>
+      {completedOpen && <div className="goal-rail-list completed">{completedGoals.map((goal) => <button key={goal.id} className={selectedGoal?.id === goal.id ? 'selected' : ''} onClick={() => onSelectGoal(goal)}><strong>{goal.title}</strong><small>{goal.status}</small></button>)}</div>}
+    </aside>
+    <section className="panel task-lanes">
+      <div className="panel-heading"><div><span className="kicker">依赖与状态机</span><h1>任务泳道</h1></div><span className="muted">{tasks.length} 个 Task</span></div>
+      <div className="compact-kanban">{lanes.map((lane) => {
+        const items = tasks.filter((task) => lane.statuses.includes(task.status))
+        return <div className="compact-lane" key={lane.title}><header><strong>{lane.title}</strong><b>{items.length}</b></header><div>{items.map((task) => <button key={task.id} className={selected?.id === task.id ? 'selected' : ''} onClick={() => onSelect(task)}><StatusPill status={task.status} /><strong>{task.title}</strong><small>{task.provider} · {task.tokens_used.toLocaleString()} Token</small></button>)}{!items.length && <p>暂无</p>}</div></div>
+      })}</div>
+    </section>
+    <section className="panel detail-panel task-detail">
+      {selectedGoal && !selected ? <GoalDetail goal={selectedGoal} tasks={tasks} workers={workers} /> : selected ? <>
+        <div className="panel-heading"><div><span className="kicker">TaskSpec r{selected.spec_revision}</span><h1>{selected.title}</h1></div><StatusPill status={selected.status} /></div>
+        <p className="objective">{selected.objective}</p>
+        <div className="detail-actions">
+          {selected.status === 'ready' && selected.work_item_kind !== 'coordination' && <button className="primary" disabled={busy} onClick={() => onDrive(selected)}><Play size={16} weight="fill" />立即驱动</button>}
+          {selected.status === 'ready' && <button disabled={busy} onClick={() => onControl(selected, 'pause')}><Pause size={16} />暂停</button>}
+          {selected.status === 'paused' && <button disabled={busy} onClick={() => onControl(selected, 'resume')}><Play size={16} />恢复</button>}
+          {!['completed', 'terminal_failed', 'cancelled'].includes(selected.status) && <button className="danger" disabled={busy} onClick={() => onControl(selected, 'cancel')}><X size={16} />取消</button>}
+          {deletionEligibility?.deletable && <button className="danger" disabled={busy} onClick={() => onDelete(selected)}><X size={16} />永久删除</button>}
+        </div>
+        <div className="facts"><Fact label="Provider" value={selected.provider} /><Fact label="状态真源" value={statusNames[selected.status]} /><Fact label="尝试 / 消费" value={`${selected.attempts_used}/${selected.max_attempts} · ${selected.tokens_used} Token`} /><Fact label="依赖" value={(selected.depends_on ?? []).join(', ') || '无'} mono /><Fact label="阻塞原因" value={selected.blocked_reason ?? '无'} /><Fact label="Worker" value={selected.worker_id ?? '尚未领取'} mono /><TaskRuntimeFacts item={selected as unknown as Record<string, unknown>} /></div>
+        <section className="artifacts"><div className="section-heading"><div><span className="kicker">Evidence / Artifact</span><h2>任务产物</h2></div><span>{artifacts.filter((item) => item.exists).length} 个已定位</span></div>{artifactError ? <p className="artifact-error">{artifactError}</p> : artifacts.length ? artifacts.map((artifact) => <article className={artifact.exists ? '' : 'missing'} key={artifact.relative_path}><div className="artifact-main"><strong>{artifact.relative_path}</strong><code>{artifact.host_path}</code><small>{artifact.exists ? `${formatBytes(artifact.bytes)} · ${artifact.sha256?.slice(0, 12) ?? '未哈希'}` : '尚未生成'}</small></div><div className="artifact-actions"><button disabled={!artifact.exists} onClick={() => onCopyArtifact(artifact)}><Copy size={15} />路径</button><button disabled={!artifact.actions.includes('finder')} onClick={() => onOpenArtifact(selected, artifact, 'finder')}><FolderOpen size={15} />Finder</button></div></article>) : <p className="muted">该任务没有声明文件产物。</p>}</section>
+        <div className="timeline"><h2>最新状态事件</h2>{events.slice(-20).map((event) => <div key={event.sequence}><span>{event.sequence}</span><strong>{event.event_type}</strong><small>{event.created_at}</small></div>)}</div>
+      </> : <div className="empty-state"><ListChecks size={38} /><h2>选择一个 Goal 或 Task</h2><p>范围切换后不会保留上一个项目的详情。</p></div>}
+    </section>
+  </div></>
+}
+
+export function TasksView({ tasks, goals, workers, selected, selectedGoal, events, artifacts, artifactError, deletionEligibility, busy, onSelect, onSelectGoal, onDrive, onDelete, onControl, onOpenArtifact, onCopyArtifact }: { tasks: Task[]; goals: Goal[]; workers: Worker[]; selected: Task | null; selectedGoal: Goal | null; events: TaskEvent[]; artifacts: TaskArtifact[]; artifactError: string | null; deletionEligibility: TaskDeletionEligibility | null; busy: boolean; onSelect: (task: Task) => void; onSelectGoal: (goal: Goal) => void; onDrive: (task: Task) => void; onDelete: (task: Task) => void; onControl: (task: Task, action: 'pause' | 'resume' | 'cancel' | 'needs_human') => void; onOpenArtifact: (task: Task, artifact: TaskArtifact, target: 'finder' | 'cursor') => void; onCopyArtifact: (artifact: TaskArtifact) => void }) {
   return <div className="split-layout"><section className="panel list-panel"><div className="panel-heading"><div><span className="kicker">目标 / 任务</span><h1>{goals.length} 目标 · {tasks.length} 工作项</h1></div></div>
     <div className="dense-list">
       {goals.map((goal) => <button key={goal.id} className={selectedGoal?.id === goal.id ? 'selected' : ''} onClick={() => onSelectGoal(goal)}><span className="list-icon"><Kanban size={18} /></span><span><strong>{goal.title}</strong><small>{goal.provider} · {goal.status} · {goal.work_items.length} 项</small></span></button>)}
@@ -563,7 +713,7 @@ function ProjectsView({ projects, form, setForm, onCreate, onRelease, busy }: { 
     <form className="panel form-panel" onSubmit={onCreate}><div className="panel-heading"><div><span className="kicker">项目 → 角色 → CLI 会话</span><h1>注册项目</h1></div></div><Field label="项目名"><input required value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="例如：支付网关" /></Field><Field label="控制面挂载路径"><input required value={form.path} onChange={(event) => setForm({ ...form, path: event.target.value })} placeholder="/projects/payment" /></Field><Field label="本机项目目录（产物源目录）"><input value={form.hostPath} onChange={(event) => setForm({ ...form, hostPath: event.target.value })} placeholder="/Users/name/work/payment" /></Field><p className="form-help">Worker 只通过 Host Bridge 在本机项目目录工作；报告、代码和其他产物不会复制进容器。控制面只保存任务状态与路径索引。</p><button className="primary" disabled={busy}><Plus size={16} />注册项目</button></form></div>
 }
 
-function WorkersView({ items, providers, busy, onRebind }: { items: { project: Project; worker: Worker }[]; providers: Provider[]; busy: boolean; onRebind: (worker: Worker, provider: string) => void }) {
+export function WorkersView({ items, providers, busy, onRebind }: { items: { project: Project; worker: Worker }[]; providers: Provider[]; busy: boolean; onRebind: (worker: Worker, provider: string) => void }) {
   const [selected, setSelected] = useState<Worker | null>(null)
   const [detail, setDetail] = useState<WorkerDetail | null>(null)
   const [stream, setStream] = useState<WorkerStream | null>(null)
@@ -624,8 +774,9 @@ function ProvidersView({ providers, busy, onProbe, onToggle }: { providers: Prov
   --state-dir "$HOME\\.plow-whip-web\\host-bridge"`}</pre><p>启动后先执行 0 Token 探测。创建任务和每次派发都会由后端重新探测；未就绪时不会入队或领取任务。</p></details><div className="boundary-note"><ShieldCheck size={20} /><div><strong>Host Bridge 安全边界</strong><p>只接受 Codex、Cursor、JSON Worker 三类结构化请求；固定 argv、固定项目根、无 shell 拼接。容器只保存 SQLite、日志和产物路径索引，不保存项目报告或代码。</p></div></div></section>
 }
 
-function UsageView({ usage, projects, tasks }: { usage: Usage | null; projects: Project[]; tasks: Task[] }) {
+function UsageView({ usage, projectId, projects, tasks }: { usage: Usage | null; projectId?: string; projects: Project[]; tasks: Task[] }) {
   const [series, setSeries] = useState<UsageDailySeries | null>(null)
+  const [projectSeries, setProjectSeries] = useState<UsageDailySeries | null>(null)
   const [breakdown, setBreakdown] = useState<UsageDailyBreakdown | null>(null)
   const [selectedDate, setSelectedDate] = useState<string | null>(null)
   const [rangeDays, setRangeDays] = useState(14)
@@ -635,16 +786,21 @@ function UsageView({ usage, projects, tasks }: { usage: Usage | null; projects: 
 
   useEffect(() => {
     let active = true
-    api.usageDaily({ days: rangeDays })
-      .then((next) => {
+    Promise.all([
+      api.usageDaily({ days: rangeDays }),
+      projectId ? api.usageDaily({ days: rangeDays, projectId }) : Promise.resolve(null),
+    ])
+      .then(([globalNext, projectNext]) => {
         if (!active) return
-        setSeries(next)
+        setSeries(globalNext)
+        setProjectSeries(projectNext)
         setHistoryError(null)
-        const preferred = next.days.find((day) => day.total_tokens > 0)?.date
-          ?? next.days[next.days.length - 1]?.date
+        const scoped = projectNext ?? globalNext
+        const preferred = scoped.days.find((day) => day.total_tokens > 0)?.date
+          ?? scoped.days[scoped.days.length - 1]?.date
           ?? null
         setSelectedDate((current) => {
-          if (current && next.days.some((day) => day.date === current)) return current
+          if (current && scoped.days.some((day) => day.date === current)) return current
           return preferred
         })
       })
@@ -657,12 +813,12 @@ function UsageView({ usage, projects, tasks }: { usage: Usage | null; projects: 
         if (active) setHistoryLoading(false)
       })
     return () => { active = false }
-  }, [rangeDays])
+  }, [projectId, rangeDays])
 
   useEffect(() => {
     if (!selectedDate) return
     let active = true
-    api.usageDailyDay(selectedDate)
+    api.usageDailyDay(selectedDate, projectId)
       .then((next) => {
         if (!active) return
         setBreakdown(next)
@@ -674,9 +830,10 @@ function UsageView({ usage, projects, tasks }: { usage: Usage | null; projects: 
         setDayError(messageOf(reason))
       })
     return () => { active = false }
-  }, [selectedDate])
+  }, [projectId, selectedDate])
 
-  const selectedPoint = series?.days.find((day) => day.date === selectedDate) ?? null
+  const scopedSeries = projectSeries ?? series
+  const selectedPoint = scopedSeries?.days.find((day) => day.date === selectedDate) ?? null
   const visibleBreakdown = selectedDate && breakdown?.date === selectedDate ? breakdown : null
   const dimensions = [
     ['Provider', usage?.providers?.map((item) => [item.provider, item.tokens, item.calls])],
@@ -690,18 +847,20 @@ function UsageView({ usage, projects, tasks }: { usage: Usage | null; projects: 
   const uncachedOutputRatio = usage?.ratios?.uncached_input_per_output
     ?? ((usage?.output_tokens ?? 0) > 0 ? uncached / (usage?.output_tokens ?? 1) : null)
   const today = usage?.today
+  const projectName = projects.find((project) => project.id === projectId)?.name
+  const scopeLabel = projectName ? `项目 ${projectName}` : '全部项目'
 
   return (
     <div className="settings-layout">
       <section className="metrics-strip metrics-strip-wide" data-testid="usage-history-metrics">
-        <Metric icon={Coins} label="全历史 Total" value={usage?.total_tokens ?? 0} hint={`scope=all_history · ${usage?.timezone ?? 'Asia/Shanghai'}`} />
+        <Metric icon={Coins} label={projectName ? `${scopeLabel}全历史` : '全历史 Total'} value={usage?.total_tokens ?? 0} hint={`scope=all_history · ${usage?.timezone ?? 'Asia/Shanghai'}`} />
         <Metric icon={Network} label="Input" value={usage?.input_tokens ?? 0} hint="含 Cached；累计快照不重复相加" />
         <Metric icon={Clock} label="Cached-input" value={usage?.cached_input_tokens ?? 0} hint="Input 子集，不重复相加" />
         <Metric icon={HardDrives} label="Uncached-input" value={uncached} hint="cache miss = Input − Cached" />
         <Metric icon={CheckCircle} label="Output" value={usage?.output_tokens ?? 0} hint="后端已差分计量" />
       </section>
       <section className="metrics-strip" data-testid="usage-today-metrics">
-        <Metric icon={Coins} label="今日 Total" value={today?.total_tokens ?? 0} hint={`${today?.date ?? '—'} · Asia/Shanghai 日界`} />
+        <Metric icon={Coins} label={projectName ? `${scopeLabel}今日` : '今日 Total'} value={today?.total_tokens ?? 0} hint={`${today?.date ?? '—'} · Asia/Shanghai 日界`} />
         <Metric icon={Network} label="今日 Input" value={today?.input_tokens ?? 0} hint="local_day · 非全历史" />
         <Metric icon={HardDrives} label="今日 Uncached" value={today?.uncached_input_tokens ?? 0} hint="今日 cache miss" />
         <Metric icon={CheckCircle} label="今日 Output" value={today?.output_tokens ?? 0} hint="今日增量" />
@@ -780,6 +939,8 @@ function UsageView({ usage, projects, tasks }: { usage: Usage | null; projects: 
           <>
             <TokenTrendChart
               days={series.days}
+              comparisonDays={projectSeries?.days}
+              comparisonLabel={projectName ? `项目 ${projectName}` : undefined}
               selectedDate={selectedDate}
               onSelect={(date) => {
                 setSelectedDate(date)
@@ -799,18 +960,18 @@ function UsageView({ usage, projects, tasks }: { usage: Usage | null; projects: 
         {dayError ? <div className="error-banner" data-testid="token-day-error"><p>{dayError}</p></div> : null}
         {visibleBreakdown ? (
           <div className="token-pie-grid" data-testid="token-day-pies">
-            <TokenPieChart
+            {!projectId ? <TokenPieChart
               title="项目占比"
               slices={visibleBreakdown.projects}
               totalTokens={visibleBreakdown.total_tokens}
               emptyLabel="该日无项目消费。"
-            />
-            <TokenPieChart
+            /> : null}
+            {projectId ? <TokenPieChart
               title="任务占比"
               slices={visibleBreakdown.tasks}
               totalTokens={visibleBreakdown.total_tokens}
               emptyLabel="该日无任务消费。"
-            />
+            /> : null}
           </div>
         ) : null}
       </section>
@@ -886,18 +1047,45 @@ function AuditView({ audit, permissions, onRefresh }: { audit: AuditEntry[]; per
   return <div className="settings-layout"><section className="panel"><div className="panel-heading"><div><span className="kicker">本地不可变审计</span><h1>变更记录</h1></div><button onClick={onRefresh}><ArrowsClockwise size={16} />刷新</button></div><div className="audit-table"><div className="table-head"><span>#</span><span>方法</span><span>路径</span><span>状态</span><span>时间</span></div>{audit.map((entry) => <div className="table-row" key={entry.sequence}><span>{entry.sequence}</span><strong>{entry.method}</strong><code>{entry.path}</code><span>{entry.status_code}</span><small>{entry.created_at}</small></div>)}</div></section><section className="panel"><div className="panel-heading"><div><span className="kicker">权限边界</span><h1>权限决策</h1></div></div>{permissions.map((permission) => <div className="usage-row" key={permission.id}><span>{permission.capability} · {permission.resource}</span><strong>{permission.decision}</strong></div>)}</section></div>
 }
 
-function SettingsView(props: { settings: RuntimeSettings | null; setSettings: (value: RuntimeSettings) => void; scheduler: SchedulerStatus | null; convention: Convention | null; setConvention: (value: Convention) => void; suggestion: ConventionSuggestion | null; setSuggestion: (value: ConventionSuggestion | null) => void; projects: Project[]; tasks: Task[]; providers: Provider[]; refineProvider: string; setRefineProvider: (value: string) => void; busy: boolean; onSaveSettings: (event: FormEvent) => void; onTick: () => void; onLoadConvention: (scope: Convention['scope'], id: string) => void; onSaveConvention: (event: FormEvent) => void; onRefine: () => void }) {
-  const { settings, setSettings, scheduler, convention, setConvention, suggestion, setSuggestion, projects, tasks, providers, refineProvider, setRefineProvider, busy, onSaveSettings, onTick, onLoadConvention, onSaveConvention, onRefine } = props
+function AlertsView({ alerts, onRefresh }: { alerts: Alerts | null; onRefresh: () => Promise<void> }) {
+  const [filter, setFilter] = useState<'active' | 'all'>('active')
+  const visible = (alerts?.items ?? []).filter((incident) => filter === 'all' || incident.status !== 'resolved')
+  const grouped = visible.reduce<Record<string, AlertIncident[]>>((result, incident) => {
+    const key = incident.root_kind === 'global_network' ? 'network'
+      : incident.root_kind.includes('network') ? 'network'
+        : incident.root_kind.includes('provider') ? 'provider'
+          : incident.root_kind
+    ;(result[key] ??= []).push(incident)
+    return result
+  }, {})
+  return <section className="panel alerts-view">
+    <div className="panel-heading">
+      <div><span className="kicker">根因关联 · 抑制 · 收敛</span><h1>告警中心</h1></div>
+      <div className="detail-actions"><select value={filter} onChange={(event) => setFilter(event.target.value as 'active' | 'all')}><option value="active">仅活动</option><option value="all">全部历史</option></select><button onClick={() => void onRefresh()}><ArrowsClockwise size={16} />刷新</button></div>
+    </div>
+    <div className="boundary-note"><ShieldCheck size={20} /><div><strong>同一根因只显示一条主告警</strong><p>全局断网会抑制 Provider 和任务级派生告警；原始事件仍保留在事件历史中。恢复需通过连续探测，不以单次成功抖动关闭。</p></div></div>
+    <div className="alert-summary"><Fact label="活动事件" value={String((alerts?.items ?? []).filter((item) => item.status !== 'resolved').length)} /><Fact label="网络状态" value={networkStatusSummary(alerts?.network)} /><Fact label="分组数" value={String(Object.keys(grouped).length)} /></div>
+    {Object.entries(grouped).map(([kind, incidents]) => <section className="alert-group" key={kind}><h2>{kind === 'network' ? '网络根因' : kind === 'provider' ? 'Provider 根因' : kind}</h2>{incidents.map((incident) => <article className={`alert-card severity-${incident.severity}`} key={incident.id}><header><div><strong>{incident.title}</strong><small>{incident.scope_key} · {incident.root_kind}</small></div><span>{incident.status}</span></header><p>{summary(incident.detail, ['reason', 'state', 'provider', 'zone'])}</p><footer><span>首次 {incident.first_seen_at}</span><span>最近 {incident.last_seen_at}</span><span>合并 {incident.occurrence_count} 次</span></footer></article>)}</section>)}
+    {!visible.length && <div className="empty-state"><CheckCircle size={38} /><h2>当前没有活动告警</h2><p>网络、Provider 与运行时状态已收敛。</p></div>}
+  </section>
+}
+
+function SettingsView(props: { settings: RuntimeSettings | null; setSettings: (value: RuntimeSettings) => void; scheduler: SchedulerStatus | null; convention: Convention | null; setConvention: (value: Convention) => void; suggestion: ConventionSuggestion | null; setSuggestion: (value: ConventionSuggestion | null) => void; projects: Project[]; tasks: Task[]; workers: { project: Project; worker: Worker }[]; selectedProject?: string; providers: Provider[]; audit: AuditEntry[]; permissions: PermissionGrant[]; refineProvider: string; setRefineProvider: (value: string) => void; busy: boolean; onSaveSettings: (event: FormEvent) => void; onTick: () => void; onLoadConvention: (scope: Convention['scope'], id: string) => void; onSaveConvention: (event: FormEvent) => void; onRefine: () => void; onProbeProvider: (provider: Provider) => void; onToggleProvider: (provider: Provider) => void; onRebindWorker: (worker: Worker, provider: string) => void; onRefreshAudit: () => void }) {
+  const { settings, setSettings, scheduler, convention, setConvention, suggestion, setSuggestion, projects, tasks, workers, selectedProject, providers, audit, permissions, refineProvider, setRefineProvider, busy, onSaveSettings, onTick, onLoadConvention, onSaveConvention, onRefine, onProbeProvider, onToggleProvider, onRebindWorker, onRefreshAudit } = props
   const [baselineRole, setBaselineRole] = useState('backend')
   const [baseline, setBaseline] = useState<BehaviorBaseline | null>(null)
   const [conventionBaseline, setConventionBaseline] = useState<BehaviorBaseline | null>(null)
   const [effectiveBaseline, setEffectiveBaseline] = useState<BehaviorBaseline | null>(null)
+  const [effectiveSettings, setEffectiveSettings] = useState<RuntimeSettings | null>(null)
+  const [projectOverride, setProjectOverride] = useState<RuntimeSettingsOverride | null>(null)
+  const [frontendInstances, setFrontendInstances] = useState<RoleInstance[]>([])
+  const [settingsError, setSettingsError] = useState<string | null>(null)
   useEffect(() => {
     let alive = true
     api.behaviorBaseline(baselineRole).then((item) => { if (alive) setBaseline(item) }).catch(() => { if (alive) setBaseline(null) })
     return () => { alive = false }
   }, [baselineRole])
-  const projectId = projects[0]?.id
+  const projectId = selectedProject
   const taskId = tasks[0]?.id
   const taskRoleId = tasks[0]?.role_id ?? undefined
   useEffect(() => {
@@ -929,12 +1117,49 @@ function SettingsView(props: { settings: RuntimeSettings | null; setSettings: (v
     })
     return () => { alive = false }
   }, [taskId, taskRoleId])
+  useEffect(() => {
+    let alive = true
+    if (!projectId) {
+      return () => { alive = false }
+    }
+    Promise.all([
+      api.effectiveSettings(projectId, taskId, taskRoleId),
+      api.settingsOverride('project', projectId),
+      api.roleInstances({ projectId }),
+    ]).then(([effective, override, instances]) => {
+      if (!alive) return
+      setEffectiveSettings(effective?.values ? effective : null)
+      setProjectOverride(override?.values ? override : null)
+      setFrontendInstances(instances.items.filter((item) => item.role_kind === 'frontend'))
+      setSettingsError(null)
+    }).catch((reason: unknown) => {
+      if (alive) setSettingsError(messageOf(reason))
+    })
+    return () => { alive = false }
+  }, [projectId, taskId, taskRoleId])
+  async function saveProjectOverride(event: FormEvent) {
+    event.preventDefault()
+    if (!projectOverride) return
+    try {
+      setProjectOverride(await api.updateSettingsOverride(projectOverride))
+      setEffectiveSettings(await api.effectiveSettings(projectId, taskId, taskRoleId))
+      setSettingsError(null)
+    } catch (reason) {
+      setSettingsError(messageOf(reason))
+    }
+  }
   const conventionFacts = conventionBaseline ?? baseline
-  return <div className="settings-layout"><section className="panel cron-panel"><div className="panel-heading"><div><span className="kicker">单一全局 Crontab</span><h1>无人值守调度</h1></div><StatusDot ok={Boolean(scheduler?.engine.active)} label={scheduler?.engine.active ? '运行中' : '未运行'} /></div><div className="facts"><Fact label="引擎" value={scheduler ? `${scheduler.engine.managed_by} · ${scheduler.engine.backend}` : '检测中'} /><Fact label="下次执行" value={scheduler?.schedule.next_run_at ?? '尚未计算'} /><Fact label="Fencing" value={String(scheduler?.runtime.fencing_token ?? 0)} /><Fact label="最近 Tick" value={scheduler?.runtime.last_tick_at ?? '尚未执行'} /></div><button className="primary" disabled={busy} onClick={onTick}><Play size={16} />立即运行 Tick</button></section>
-    <section className="panel" data-testid="behavior-baseline-panel"><div className="panel-heading"><div><span className="kicker">开发角色行为基线</span><h1>四原则来源与适用性</h1></div></div><div className="form-grid two"><Field label="预览角色"><select value={baselineRole} onChange={(event) => setBaselineRole(event.target.value)}><option value="backend">backend</option><option value="frontend">frontend</option><option value="ui">ui</option><option value="fullstack">fullstack</option><option value="devops_sre">devops_sre</option><option value="verification">verification</option><option value="butler">butler（非开发）</option><option value="coordination">coordination（非开发）</option></select></Field></div>{baseline && <div className="facts" data-testid="behavior-baseline-facts"><Fact label="适用性" value={baseline.not_applicable ? '不适用' : '适用（开发角色）'} /><Fact label="Mandatory" value={baseline.mandatory ? '是' : '否'} /><Fact label="保留量" value={String(baseline.effective_reserve_bytes)} /><Fact label="Revision" value={String(baseline.revision)} /><Fact label="Source" value={baseline.source} mono /><Fact label="配置来源" value={baseline.config_source ?? 'rule_versions:development'} mono />{baseline.reason ? <Fact label="说明" value={baseline.reason} /> : null}</div>}</section>
+  return <div className="settings-layout">
+    <details className="setting-group" open><summary>常规</summary><section className="panel cron-panel"><div className="panel-heading"><div><span className="kicker">单一全局 Crontab</span><h1>无人值守调度</h1></div><StatusDot ok={Boolean(scheduler?.engine.active)} label={scheduler?.engine.active ? '运行中' : '未运行'} /></div><div className="facts"><Fact label="引擎" value={scheduler ? `${scheduler.engine.managed_by} · ${scheduler.engine.backend}` : '检测中'} /><Fact label="下次执行" value={scheduler?.schedule.next_run_at ?? '尚未计算'} /><Fact label="Fencing" value={String(scheduler?.runtime.fencing_token ?? 0)} /><Fact label="最近 Tick" value={scheduler?.runtime.last_tick_at ?? '尚未执行'} /></div><button className="primary" disabled={busy} onClick={onTick}><Play size={16} />立即运行 Tick</button></section></details>
+    <details className="setting-group"><summary>管家与 Provider</summary><section className="panel"><div className="panel-heading"><div><span className="kicker">智能入口与故障转移</span><h1>默认路由</h1></div></div>{settings ? <div className="facts"><Fact label="全局/项目管家" value={`${settings.values.default_butler_provider} · ${settings.sources?.default_butler_provider ?? 'global'}`} /><Fact label="默认策略" value={`${settings.values.default_provider_policy} · ${settings.sources?.default_provider_policy ?? 'global'}`} /><Fact label="顺序" value={settings.values.default_provider_order.join(' → ')} /><Fact label="大陆网络" value="DeepSeek / Kimi" /><Fact label="海外网络" value="Codex / Cursor" /></div> : null}<div className="provider-compact">{providers.map((provider) => <div key={provider.name}><strong>{provider.display_name}</strong><StatusDot ok={providerFullyReady(provider)} label={`${provider.status} · ${String((provider as unknown as Record<string, unknown>).network_zone ?? 'zone 未知')}`} /></div>)}</div><p className="form-help">Task 创建时冻结 auto/preferred/pinned、fallback 和顺序。Pinned Provider 不可用时进入 provider_suspended，不会静默换模型。</p></section><ProvidersView providers={providers} busy={busy} onProbe={onProbeProvider} onToggle={onToggleProvider} /></details>
+    <details className="setting-group"><summary>持续执行与保护</summary><section className="panel form-panel"><div className="panel-heading"><div><span className="kicker">Task + 角色 ＞ 项目 ＞ 全局</span><h1>{projectId ? '当前项目有效设置' : '全局继承预览'}</h1></div></div>{settingsError ? <div className="error-banner"><p>{settingsError}</p></div> : null}{projectId && effectiveSettings ? <form onSubmit={saveProjectOverride}><div className="facts"><Fact label="Context" value={`${effectiveSettings.values.context_max_bytes} · ${effectiveSettings.sources?.context_max_bytes ?? 'global'}`} /><Fact label="Checkpoint" value={`${effectiveSettings.values.checkpoint_max_bytes} · ${effectiveSettings.sources?.checkpoint_max_bytes ?? 'global'}`} /><Fact label="Handoff" value={`${effectiveSettings.values.handoff_max_bytes} · ${effectiveSettings.sources?.handoff_max_bytes ?? 'global'}`} /></div>{projectOverride ? <div className="form-grid"><NumberField label="项目同类失败熔断" value={projectOverride.values.max_same_failure ?? effectiveSettings.values.max_same_failure} onChange={(value) => setProjectOverride({ ...projectOverride, values: { ...projectOverride.values, max_same_failure: value } })} /><NumberField label="项目无进展熔断" value={projectOverride.values.max_no_progress ?? effectiveSettings.values.max_no_progress} onChange={(value) => setProjectOverride({ ...projectOverride, values: { ...projectOverride.values, max_no_progress: value } })} /><NumberField label="项目 Context 字节" value={projectOverride.values.context_max_bytes ?? effectiveSettings.values.context_max_bytes} onChange={(value) => setProjectOverride({ ...projectOverride, values: { ...projectOverride.values, context_max_bytes: value } })} /></div> : null}<p className="form-help">这里只写项目覆盖，不修改全局值或角色模板。有效来源由后端逐项返回。</p><button className="primary" disabled={busy || !projectOverride}>保存项目覆盖</button></form> : <p className="form-help">选择具体项目后显示逐项有效值与来源；全局值在下方高级表单修改。</p>}</section></details>
+    <details className="setting-group"><summary>角色、规则与模板</summary><section className="panel" data-testid="behavior-baseline-panel"><div className="panel-heading"><div><span className="kicker">开发角色行为基线</span><h1>四原则来源与适用性</h1></div></div><div className="form-grid two"><Field label="预览角色"><select value={baselineRole} onChange={(event) => setBaselineRole(event.target.value)}><option value="backend">backend</option><option value="frontend">frontend</option><option value="ui">ui</option><option value="fullstack">fullstack</option><option value="devops_sre">devops_sre</option><option value="verification">verification</option><option value="butler">butler（非开发）</option><option value="coordination">coordination（非开发）</option></select></Field></div>{baseline && <div className="facts" data-testid="behavior-baseline-facts"><Fact label="适用性" value={baseline.not_applicable ? '不适用' : '适用（开发角色）'} /><Fact label="Mandatory" value={baseline.mandatory ? '是' : '否'} /><Fact label="保留量" value={String(baseline.effective_reserve_bytes)} /><Fact label="Revision" value={String(baseline.revision)} /><Fact label="Source" value={baseline.source} mono /><Fact label="配置来源" value={baseline.config_source ?? 'rule_versions:development'} mono />{baseline.reason ? <Fact label="说明" value={baseline.reason} /> : null}</div>}{projectId ? <div className="role-snapshot"><h2>tmpl.frontend@1 · RoleInstance 快照</h2>{frontendInstances.length ? frontendInstances.map((instance) => <div className="facts" key={instance.id}><Fact label="Template" value={`${instance.template_id}@${instance.template_revision}`} mono /><Fact label="Template hash" value={instance.template_hash} mono /><Fact label="Ruleset hash" value={instance.ruleset_hash} mono /><Fact label="Instance revision" value={String(instance.revision)} /><Fact label="Source" value="role_template" /><Fact label="TaskSpec" value={`r${instance.task_spec_revision}`} /></div>) : <p className="form-help">当前项目尚无 frontend RoleInstance。</p>}<ul className="rule-list"><li>dev.think_before_coding@1 · role_template</li><li>dev.simplicity_first@1 · role_template</li><li>dev.surgical_changes@1 · role_template</li><li>dev.goal_driven_execution@1 · role_template</li></ul></div> : null}</section>
     {settings && <form className="panel form-panel" onSubmit={onSaveSettings}><div className="panel-heading"><div><span className="kicker">设置修订 {settings.revision}</span><h1>无人值守、Token 节省与快速续接</h1></div><span className="muted">优先级：Task + 角色 ＞ 项目 ＞ 全局</span></div><h2>调度</h2><div className="form-grid"><Field label="Cron 表达式"><input value={settings.values.cron_expression} onChange={(event) => setSettings({ ...settings, values: { ...settings.values, cron_expression: event.target.value } })} /></Field><Field label="时区"><input value={settings.values.cron_timezone} onChange={(event) => setSettings({ ...settings, values: { ...settings.values, cron_timezone: event.target.value } })} /></Field><Field label="错过执行"><select value={settings.values.cron_misfire_policy} onChange={(event) => setSettings({ ...settings, values: { ...settings.values, cron_misfire_policy: event.target.value as 'catch_up_once' | 'skip' } })}><option value="catch_up_once">恢复后只补跑一次</option><option value="skip">跳过</option></select></Field><NumberField label="最大并行 Worker" value={settings.values.max_parallel_workers} onChange={(value) => setSettings({ ...settings, values: { ...settings.values, max_parallel_workers: value } })} /></div><h2>统一连续性阈值</h2><div className="form-grid"><NumberField label="同类失败熔断" value={settings.values.max_same_failure} onChange={(value) => setSettings({ ...settings, values: { ...settings.values, max_same_failure: value } })} /><NumberField label="无进展熔断" value={settings.values.max_no_progress} onChange={(value) => setSettings({ ...settings, values: { ...settings.values, max_no_progress: value } })} /><NumberField label="Context 最大字节" value={settings.values.context_max_bytes} onChange={(value) => setSettings({ ...settings, values: { ...settings.values, context_max_bytes: value } })} /><NumberField label="Checkpoint 最大字节" value={settings.values.checkpoint_max_bytes} onChange={(value) => setSettings({ ...settings, values: { ...settings.values, checkpoint_max_bytes: value } })} /><NumberField label="Handoff 最大字节" value={settings.values.handoff_max_bytes} onChange={(value) => setSettings({ ...settings, values: { ...settings.values, handoff_max_bytes: value } })} /><NumberField label="观察日志行数" value={settings.values.observation_tail_lines} onChange={(value) => setSettings({ ...settings, values: { ...settings.values, observation_tail_lines: value } })} /><NumberField label="观察最大字节" value={settings.values.observation_max_bytes} onChange={(value) => setSettings({ ...settings, values: { ...settings.values, observation_max_bytes: value } })} /><NumberField label="文件轮转字节" value={settings.values.rotation_max_bytes} onChange={(value) => setSettings({ ...settings, values: { ...settings.values, rotation_max_bytes: value } })} /></div><p className="form-help">当前来源：Context {settings.sources?.context_max_bytes ?? 'global'} · Checkpoint {settings.sources?.checkpoint_max_bytes ?? 'global'} · Handoff {settings.sources?.handoff_max_bytes ?? 'global'} · 观察 {settings.sources?.observation_max_bytes ?? 'global'} · 轮转 {settings.sources?.rotation_max_bytes ?? 'global'}</p>{settings.warnings?.length ? <div className="error-banner">{settings.warnings.map((warning) => <p key={warning}>阈值冲突：{warning}</p>)}</div> : null}<p className="form-help">提交时后端会校验 Checkpoint、Handoff、Context 与轮转/观察阈值；不会用固定 8 KiB 覆盖项目或 Task 特例。</p><label className="toggle-row"><input type="checkbox" checked={settings.values.cron_enabled} onChange={(event) => setSettings({ ...settings, values: { ...settings.values, cron_enabled: event.target.checked } })} /><span>启用容器内 Crontab</span></label><label className="toggle-row"><input type="checkbox" checked={settings.values.auto_dispatch} onChange={(event) => setSettings({ ...settings, values: { ...settings.values, auto_dispatch: event.target.checked } })} /><span>自动派发待执行任务</span></label><button className="primary" disabled={busy}>保存并检查冲突</button></form>}
     {convention && <form className="panel convention-panel" onSubmit={onSaveConvention}><div className="panel-heading"><div><span className="kicker">全局 · 项目 · Task</span><h1>Convention 编辑器</h1></div><span className="revision">修订 {convention.revision}</span></div><div className="form-grid two"><Field label="作用域"><select value={convention.scope} onChange={(event) => { const scope = event.target.value as Convention['scope']; const id = scope === 'global' ? 'global' : scope === 'project' ? projects[0]?.id ?? '' : tasks[0]?.id ?? ''; onLoadConvention(scope, id) }}><option value="global">全局</option><option value="project">项目</option><option value="task">Task</option></select></Field><Field label="目标"><select disabled={convention.scope === 'global'} value={convention.scope_id} onChange={(event) => onLoadConvention(convention.scope, event.target.value)}>{convention.scope === 'global' ? <option value="global">全局</option> : convention.scope === 'project' ? projects.map((project) => <option value={project.id} key={project.id}>{project.name}</option>) : tasks.map((task) => <option value={task.id} key={task.id}>{task.title}</option>)}</select></Field></div>{conventionFacts && <div className="facts" data-testid="convention-baseline-facts"><Fact label="内置基线适用性" value={conventionFacts.not_applicable ? '不适用' : '适用（开发角色）'} /><Fact label="Mandatory" value={conventionFacts.mandatory ? '是' : '否'} /><Fact label="保留量" value={String(conventionFacts.effective_reserve_bytes)} /><Fact label="Source" value={conventionFacts.source} mono /><Fact label="配置来源" value={conventionFacts.config_source ?? 'rule_versions:development'} mono /></div>}<div className="editor-grid"><div><label>当前 Convention</label><textarea value={convention.content} onChange={(event) => setConvention({ ...convention, content: event.target.value })} placeholder="写下质量门、权限边界和必须验证的完成条件。" /></div><div><label>{suggestion ? `${suggestion.provider} 精炼建议` : 'Worker 精炼建议'}</label><textarea value={suggestion?.suggestion ?? ''} readOnly placeholder="点击“模型精炼”后在这里审阅建议；不会自动覆盖原文。" /></div></div><div className="detail-actions"><select className="inline-select" value={refineProvider} onChange={(event) => setRefineProvider(event.target.value)}>{providers.filter((provider) => provider.enabled && provider.capabilities.includes('refine_convention')).map((provider) => <option value={provider.name} key={provider.name}>{provider.display_name}{provider.status === 'available' ? '' : '（当前不可用）'}</option>)}</select><button type="button" disabled={busy || !convention.content.trim()} onClick={onRefine}><MagicWand size={16} />模型精炼（计 Token）</button>{suggestion && <button type="button" onClick={() => { setConvention({ ...convention, content: suggestion.suggestion }); setSuggestion(null) }}><CheckCircle size={16} />采用建议</button>}<button className="primary" disabled={busy}>保存 Convention</button></div><p className="form-help">精炼是明确的模型动作，会记录 Token；保存仍需人工确认。内置开发角色四原则与可变 Convention 分层展示，只通过同一套 ContextCompiler 汇总。</p></form>}
     {effectiveBaseline && <section className="panel" data-testid="effective-context-panel"><div className="panel-heading"><div><span className="kicker">Effective Context</span><h1>编译预览中的四原则</h1></div><span className="muted">来自 /api/conventions/effective</span></div><div className="facts" data-testid="effective-context-baseline-facts"><Fact label="适用性" value={effectiveBaseline.not_applicable ? '不适用' : '适用（开发角色）'} /><Fact label="Mandatory" value={effectiveBaseline.mandatory ? '是' : '否'} /><Fact label="保留量" value={String(effectiveBaseline.effective_reserve_bytes)} /><Fact label="Revision" value={String(effectiveBaseline.revision)} /><Fact label="Source" value={effectiveBaseline.source} mono /><Fact label="配置来源" value={effectiveBaseline.config_source ?? 'rule_versions:development'} mono />{effectiveBaseline.reason ? <Fact label="说明" value={effectiveBaseline.reason} /> : null}</div></section>}
+    </details>
+    <details className="setting-group"><summary>安全与运行时</summary><section className="panel progressive-note"><div className="facts">{settings ? <><Fact label="Episode wall" value={`${settings.values.episode_wall_limit_seconds}s · ${settings.sources?.episode_wall_limit_seconds ?? 'global'}`} /><Fact label="无进展窗口" value={`${settings.values.no_progress_seconds}s · ${settings.sources?.no_progress_seconds ?? 'global'}`} /><Fact label="最大 Host 进程" value={`${settings.values.max_host_processes} · ${settings.sources?.max_host_processes ?? 'global'}`} /><Fact label="网络失败/恢复" value={`${settings.values.network_failure_threshold} / ${settings.values.network_recovery_successes}`} /><Fact label="Provider 失败/恢复" value={`${settings.values.provider_failure_threshold} / ${settings.values.provider_recovery_successes}`} /><Fact label="告警抑制窗口" value={`${settings.values.alert_debounce_seconds}s`} /></> : null}</div><p>Episode 上限会与 Task sizing 的 hard deadline 取最小值；有可核验证据进展才允许有界续期，且永不越过 hard deadline。网络和 Provider 故障进入 suspended 状态，不伪装成业务验证失败。</p></section><WorkersView items={workers} providers={providers} busy={busy} onRebind={onRebindWorker} /></details>
+    <details className="setting-group"><summary>高级与审计</summary><section className="panel progressive-note"><p>Convention、Effective Context、迁移与审计记录均显示 revision、来源和最终有效值；项目覆盖不会改写全局模板。危险运行参数保持显式，不提供“一键放宽全部限制”。</p></section><AuditView audit={audit} permissions={permissions} onRefresh={onRefreshAudit} /></details>
   </div>
 }
 
@@ -961,7 +1186,7 @@ function EstimateCard({ estimate }: { estimate: TaskSizingEstimate }) {
 }
 
 function Metric({ icon: Icon, label, value, hint, onClick }: { icon: typeof Kanban; label: string; value: number; hint: string; onClick?: () => void }) {
-  const content = <><div className="metric-icon"><Icon size={18} /></div><div><span>{label}</span><strong>{value.toLocaleString()}</strong></div><small>{hint}</small></>
+  const content = <><div className="metric-icon"><Icon size={18} /></div><div><span>{label}</span><strong className="metric-number" title={value.toLocaleString()}>{value.toLocaleString()}</strong></div><small>{hint}</small></>
   return onClick
     ? <button type="button" className="metric-card" aria-label={`查看${label}详情`} onClick={onClick}>{content}</button>
     : <article className="metric-card">{content}</article>
@@ -989,6 +1214,21 @@ function summary(value: unknown, keys: string[]) {
   const item = recordValue(value)
   const parts = keys.flatMap((key) => item[key] === null || item[key] === undefined ? [] : [`${key}=${String(item[key])}`])
   return parts.join(' · ') || '暂无（API 未提供）'
+}
+function networkStatusSummary(network?: Record<string, unknown>) {
+  if (!network) return '暂无（API 未提供）'
+  if (typeof network.connectivity === 'string') return network.connectivity
+  const zones = network.zones && typeof network.zones === 'object'
+    ? network.zones as Record<string, Record<string, unknown>>
+    : {}
+  const domestic = zones.domestic?.state
+  const overseas = zones.overseas?.state
+  if (network.global_offline === true) return '全局断网'
+  if (domestic === 'available' && overseas === 'available') return '在线 · 国内/海外可用'
+  const available = [domestic === 'available' ? '国内' : '', overseas === 'available' ? '海外' : ''].filter(Boolean)
+  const unavailable = [domestic === 'unavailable' ? '国内' : '', overseas === 'unavailable' ? '海外' : ''].filter(Boolean)
+  if (unavailable.length) return `${available.length ? `${available.join('/')}可用 · ` : ''}${unavailable.join('/')}不可用`
+  return '探测中'
 }
 function executionSummary(item: Record<string, unknown>) {
   const policy = recordValue(item.execution_policy)

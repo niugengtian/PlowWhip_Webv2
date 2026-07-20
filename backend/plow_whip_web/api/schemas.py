@@ -28,18 +28,34 @@ class CommandSpec(BaseModel):
 
 
 class VerificationSpec(BaseModel):
-    kind: Literal["exit_code", "file_exists", "file_contains"]
+    kind: Literal[
+        "exit_code", "command", "file_exists", "file_contains", "browser_evidence"
+    ]
+    acceptance_id: Annotated[str | None, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")] = None
     expected: int | None = None
     path: str | None = None
     contains: str | None = None
+    required_viewports: list[str] | None = None
+    argv: Annotated[list[str] | None, Field(min_length=1, max_length=64)] = None
+    cwd: str | None = None
+    timeout_seconds: Annotated[int, Field(ge=1, le=4800)] = 600
 
     @model_validator(mode="after")
     def validate_shape(self) -> "VerificationSpec":
-        if self.kind in {"file_exists", "file_contains"}:
+        if self.kind in {"file_exists", "file_contains", "browser_evidence"}:
             if not self.path or Path(self.path).is_absolute() or ".." in Path(self.path).parts:
                 raise ValueError("file verification requires a safe relative path")
         if self.kind == "file_contains" and self.contains is None:
             raise ValueError("file_contains requires contains")
+        if self.kind == "browser_evidence" and not self.required_viewports:
+            self.required_viewports = ["1440x900", "1024x768"]
+        if self.kind == "command":
+            if not self.argv or any(not item or "\x00" in item for item in self.argv):
+                raise ValueError("command verification requires safe non-empty argv")
+            if self.cwd and (
+                Path(self.cwd).is_absolute() or ".." in Path(self.cwd).parts
+            ):
+                raise ValueError("command verification cwd must stay inside the project")
         return self
 
 
@@ -103,6 +119,11 @@ class TaskCreate(BaseModel):
     resource_key: Annotated[str | None, Field(max_length=300)] = None
     network_requirement: Literal["none", "any", "domestic", "overseas"] = "none"
     provider: Annotated[str, Field(pattern=r"^[a-z][a-z0-9-]{1,63}$")] = "generic-command"
+    provider_policy: Literal["auto", "preferred", "pinned"] = "auto"
+    fallback_enabled: bool = True
+    provider_order: Annotated[list[str], Field(min_length=1, max_length=16)] = [
+        "codex", "cursor", "deepseek", "kimi"
+    ]
     # Deprecated compatibility input. Every accepted value has one deterministic
     # runtime meaning; legacy names are not separate quality commitments.
     quality_profile: Literal["fast", "balanced", "strict", "deterministic"] = "deterministic"
@@ -139,6 +160,15 @@ class TaskCreate(BaseModel):
             raise ValueError("project_id or project_path is required")
         if self.provider == "generic-command" and not self.command.argv:
             raise ValueError("generic-command requires command.argv")
+        if self.provider_policy in {"preferred", "pinned"}:
+            if not self.provider_order or self.provider_order[0] != self.provider:
+                raise ValueError(
+                    "preferred or pinned provider must be first in provider_order"
+                )
+        if self.provider_policy == "pinned":
+            self.fallback_enabled = False
+        if len(self.provider_order) != len(set(self.provider_order)):
+            raise ValueError("provider_order cannot contain duplicates")
         return self
 
     @field_validator("artifacts")
@@ -224,8 +254,15 @@ class TaskView(BaseModel):
     last_error: str | None
     created_at: str
     updated_at: str
+    completed_at: str | None
     sizing: dict[str, Any]
     execution_policy: dict[str, Any] | None
+    provider_policy: Literal["auto", "preferred", "pinned"] = "auto"
+    fallback_enabled: bool = True
+    provider_order: list[str] = Field(default_factory=list)
+    suspended_from_status: str | None = None
+    suspension_reason: str | None = None
+    suspension_incident_id: str | None = None
     goal_id: str | None = None
     parent_task_id: str | None = None
     depends_on: list[str] | None = None
@@ -249,6 +286,11 @@ class GoalCreate(BaseModel):
     objective: Annotated[str, Field(min_length=1, max_length=4000)]
     project_id: str
     provider: Annotated[str, Field(pattern=r"^[a-z][a-z0-9-]{1,63}$")] = "generic-command"
+    provider_policy: Literal["auto", "preferred", "pinned"] = "auto"
+    fallback_enabled: bool = True
+    provider_order: Annotated[list[str], Field(min_length=1, max_length=16)] = [
+        "codex", "cursor", "deepseek", "kimi"
+    ]
     network_requirement: Literal["none", "any", "domestic", "overseas"] = "none"
     verification: Annotated[list[VerificationSpec], Field(min_length=1, max_length=32)]
     scope: Annotated[list[str], Field(max_length=64)] = Field(default_factory=list)
@@ -258,13 +300,27 @@ class GoalCreate(BaseModel):
     deadline: TaskDeadline | None = None
     sizing_inputs: TaskSizingEstimateRequest
     command: CommandSpec | None = None
-    # Optional bounded structured plan. Model PM is not implemented this sprint;
-    # when omitted, a deterministic template (sizing flags only) is used.
+    # Optional bounded structured plan. Without a verified planner receipt,
+    # deterministic routing remains the source.
     plan_items: list[dict[str, Any]] | None = None
+    planner_call_id: str | None = None
     role_providers: dict[
         Literal["backend", "frontend", "ui", "devops_sre", "verification", "fullstack"],
         Annotated[str, Field(pattern=r"^[a-z][a-z0-9-]{1,63}$")],
     ] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def provider_routing_is_coherent(self) -> "GoalCreate":
+        if len(self.provider_order) != len(set(self.provider_order)):
+            raise ValueError("provider_order cannot contain duplicates")
+        if self.provider_policy in {"preferred", "pinned"}:
+            if self.provider_order[0] != self.provider:
+                raise ValueError(
+                    "preferred or pinned provider must be first in provider_order"
+                )
+        if self.provider_policy == "pinned":
+            self.fallback_enabled = False
+        return self
 
     @field_validator("artifacts")
     @classmethod
@@ -289,6 +345,7 @@ class GoalView(BaseModel):
     parent_task_id: str | None
     created_at: str
     updated_at: str
+    completed_at: str | None
     work_items: list[dict[str, Any]]
     spec_revision: int
     spec: dict[str, Any]
@@ -307,7 +364,12 @@ class ButlerConversationStart(BaseModel):
     scope: Annotated[list[str], Field(max_length=64)] = Field(default_factory=list)
     artifacts: Annotated[list[str], Field(max_length=64)] = Field(default_factory=list)
     constraints: Annotated[list[str], Field(max_length=64)] = Field(default_factory=list)
-    provider: Annotated[str, Field(pattern=r"^[a-z][a-z0-9-]{1,63}$")] = "cursor"
+    provider: Annotated[str, Field(pattern=r"^[a-z][a-z0-9-]{1,63}$")] = "codex"
+    provider_policy: Literal["auto", "preferred", "pinned"] = "auto"
+    fallback_enabled: bool = True
+    provider_order: Annotated[list[str], Field(min_length=1, max_length=16)] = [
+        "codex", "cursor", "deepseek", "kimi"
+    ]
     role_providers: dict[
         Literal["backend", "frontend", "ui", "devops_sre", "verification", "fullstack"],
         Annotated[str, Field(pattern=r"^[a-z][a-z0-9-]{1,63}$")],
@@ -335,6 +397,18 @@ class ButlerConversationStart(BaseModel):
 class GlobalButlerRoute(ButlerConversationStart):
     project_id: str
     source_type: Literal["human", "agent"] = "human"
+
+
+class GlobalButlerConversationStart(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    instruction: Annotated[str, Field(min_length=1, max_length=10_000)]
+    source_type: Literal["human", "agent"] = "human"
+    source_id: Annotated[str | None, Field(max_length=200)] = None
+    provider: Annotated[
+        str, Field(pattern=r"^[a-z][a-z0-9-]{1,63}$")
+    ] = "codex"
+    workspace_root: Annotated[str | None, Field(max_length=1000)] = None
 
 
 class ButlerAnswer(BaseModel):
@@ -384,6 +458,11 @@ class ButlerConversationView(BaseModel):
     auto_dispatch: bool = False
     structured_goal_spec: bool = False
     semantic: dict[str, Any] | None = None
+    planner: dict[str, Any] | None = None
+    provider: str = "codex"
+    external_session_id: str | None = None
+    session_generation: int = 1
+    archived_at: str | None = None
 
 
 class TaskEventView(BaseModel):
@@ -470,6 +549,24 @@ class RuntimeSettingsValues(BaseModel):
     handoff_max_bytes: Annotated[int, Field(ge=256, le=131_072)] = 2_048
     observation_tail_lines: Annotated[int, Field(ge=1, le=500)] = 20
     observation_max_bytes: Annotated[int, Field(ge=1024, le=262_144)] = 8_192
+    episode_wall_limit_seconds: Annotated[int, Field(ge=60, le=86_400)] = 4_800
+    checkpoint_interval_seconds: Annotated[int, Field(ge=10, le=7_200)] = 120
+    no_progress_seconds: Annotated[int, Field(ge=10, le=86_400)] = 300
+    max_host_processes: Annotated[int, Field(ge=1, le=16)] = 2
+    progress_extension_seconds: Annotated[int, Field(ge=0, le=7_200)] = 120
+    provider_failure_threshold: Annotated[int, Field(ge=1, le=20)] = 3
+    provider_recovery_successes: Annotated[int, Field(ge=1, le=20)] = 1
+    provider_open_seconds: Annotated[int, Field(ge=5, le=86_400)] = 60
+    network_failure_threshold: Annotated[int, Field(ge=1, le=20)] = 2
+    network_recovery_successes: Annotated[int, Field(ge=1, le=20)] = 3
+    resume_batch_size: Annotated[int, Field(ge=1, le=64)] = 2
+    alert_debounce_seconds: Annotated[int, Field(ge=0, le=86_400)] = 30
+    default_provider_policy: Literal["auto", "preferred", "pinned"] = "auto"
+    default_provider_order: Annotated[list[str], Field(min_length=1, max_length=16)] = [
+        "codex", "cursor", "deepseek", "kimi"
+    ]
+    default_butler_provider: Annotated[str, Field(min_length=1, max_length=80)] = "codex"
+
     @model_validator(mode="after")
     def lease_must_exceed_interval(self) -> "RuntimeSettingsValues":
         if self.scheduler_lease_seconds < self.scheduler_interval_seconds * 2:
@@ -483,6 +580,20 @@ class RuntimeSettingsValues(BaseModel):
             raise ValueError(
                 "checkpoint + handoff + mandatory reserve exceeds context limit"
             )
+        if self.checkpoint_interval_seconds >= self.episode_wall_limit_seconds:
+            raise ValueError(
+                "checkpoint interval must be below the Episode wall limit"
+            )
+        if self.no_progress_seconds < self.checkpoint_interval_seconds:
+            raise ValueError(
+                "no-progress window must be at least the checkpoint interval"
+            )
+        if self.progress_extension_seconds > self.episode_wall_limit_seconds:
+            raise ValueError(
+                "progress extension cannot exceed the Episode wall limit"
+            )
+        if len(self.default_provider_order) != len(set(self.default_provider_order)):
+            raise ValueError("default provider order cannot contain duplicates")
         return self
 
     @field_validator("cron_expression")
@@ -574,7 +685,7 @@ class TaskEscalationCreate(BaseModel):
 
 
 class ConventionRefineRequest(BaseModel):
-    provider: Annotated[str, Field(min_length=1, max_length=80)] = "simple-worker"
+    provider: Annotated[str, Field(min_length=1, max_length=80)] = "codex"
     project_id: Annotated[str | None, Field(max_length=100)] = None
     instruction: Annotated[str, Field(min_length=1, max_length=2000)] = (
         "在不改变原意和权限边界的前提下，删除重复内容，改写成清晰、可执行、可验证的中文约束。"
@@ -608,6 +719,32 @@ class TaskControl(BaseModel):
     ]
     reason: Annotated[str, Field(min_length=1, max_length=500)]
     expected_revision: Annotated[int, Field(ge=0)]
+
+
+class ContinuationGrantCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal[
+        "continue_once", "switch_provider", "replace_session", "cancel"
+    ]
+    operator: Annotated[str, Field(min_length=1, max_length=200)]
+    reason: Annotated[str, Field(min_length=1, max_length=1000)]
+    expected_revision: Annotated[int, Field(ge=0)]
+    budget_delta: dict[str, Annotated[int, Field(ge=0)]] = Field(
+        default_factory=dict
+    )
+    target_provider: Annotated[
+        str | None, Field(pattern=r"^[a-z][a-z0-9-]{1,63}$")
+    ] = None
+    expires_at: Annotated[str | None, Field(max_length=80)] = None
+
+    @model_validator(mode="after")
+    def provider_matches_action(self) -> "ContinuationGrantCreate":
+        if (self.action == "switch_provider") != bool(self.target_provider):
+            raise ValueError(
+                "target_provider is required only for switch_provider"
+            )
+        return self
 
 
 class PermissionGrantCreate(BaseModel):

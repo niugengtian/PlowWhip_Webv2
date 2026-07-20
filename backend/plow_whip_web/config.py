@@ -44,6 +44,8 @@ class Settings:
     container_loopback: bool = False
     host_bridge_url: str = "http://host.docker.internal:8765"
     host_bridge_token: str | None = None
+    butler_planner_provider: str = "codex"
+    butler_planner_timeout_seconds: int = 180
 
     @property
     def database_path(self) -> Path:

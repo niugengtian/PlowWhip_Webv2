@@ -31,6 +31,12 @@ def main() -> None:
         container_loopback=_env_flag("PLOW_WHIP_CONTAINER_LOOPBACK"),
         host_bridge_url=os.environ.get("PLOW_WHIP_BRIDGE_URL", "http://host.docker.internal:8765"),
         host_bridge_token=bridge_token,
+        butler_planner_provider=os.environ.get(
+            "PLOW_WHIP_BUTLER_PLANNER_PROVIDER", "codex"
+        ),
+        butler_planner_timeout_seconds=int(
+            os.environ.get("PLOW_WHIP_BUTLER_PLANNER_TIMEOUT_SECONDS", "180")
+        ),
     )
     app = create_app(settings)
     if args.command == "scheduler-tick":

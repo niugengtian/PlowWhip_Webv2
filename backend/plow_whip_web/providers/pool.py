@@ -13,6 +13,7 @@ from plow_whip_web.runtime.verification import VerificationResult
 from plow_whip_web.runtime.evidence import snapshot_environment
 from plow_whip_web.store.database import Database
 from plow_whip_web.store.provider_repository import ProviderRepository
+from plow_whip_web.store.settings_repository import SettingsRepository
 from plow_whip_web.store.task_repository import (
     TaskRepository,
     task_hard_deadline_seconds,
@@ -31,6 +32,7 @@ class ProviderPool:
         generic: GenericCommandProvider | None = None,
         token_ledger: TokenLedger | None = None,
         model_calls: ModelCallLedger | None = None,
+        settings: SettingsRepository | None = None,
     ) -> None:
         self.database = database
         self.providers = providers
@@ -39,29 +41,45 @@ class ProviderPool:
         self.generic = generic or GenericCommandProvider()
         self.token_ledger = token_ledger
         self.model_calls = model_calls
+        self.settings = settings
+
+    def _limits(self) -> dict[str, Any]:
+        return self.settings.get()["values"] if self.settings else {}
+
+    @staticmethod
+    def _canonical_name(name: str) -> str:
+        # Existing TaskSpecs remain replayable after the provider rename.
+        return "deepseek" if name == "simple-worker" else name
 
     def require_available(self, name: str) -> dict[str, Any]:
-        provider = self.providers.require(name)
+        canonical = self._canonical_name(name)
+        provider = self.providers.require(canonical)
         if not provider["enabled"]:
-            raise ProviderUnavailableError(f"provider 已停用: {name}")
+            raise ProviderUnavailableError(f"provider 已停用: {canonical}")
+        if provider.get("circuit_state") == "open":
+            raise ProviderUnavailableError(
+                f"provider 熔断中: {canonical}; next_probe_at={provider.get('next_probe_at')}"
+            )
         if provider["transport"] == "host-bridge" and not self.bridge.token:
             raise ProviderUnavailableError("Host Bridge 未配置，不能调用本机 CLI")
         return provider
 
     def require_ready(self, name: str) -> dict[str, Any]:
-        provider = self.probe(name)
+        canonical = self._canonical_name(name)
+        provider = self.probe(canonical)
         readiness = provider.get("readiness") or {}
         if provider["status"] != "available":
             raise ProviderUnavailableError(
-                f"provider 未通过就绪探测: {name}: {provider['reason'] or '不可用'}"
+                f"provider 未通过就绪探测: {canonical}: {provider['reason'] or '不可用'}"
             )
         # Host-bridge providers must be CLI-installed; session resume readiness is
         # reported separately and does not block first-bind dispatch.
         if provider["transport"] == "host-bridge" and not readiness.get("installed", True):
-            raise ProviderUnavailableError(f"provider CLI 未安装: {name}")
+            raise ProviderUnavailableError(f"provider CLI 未安装: {canonical}")
         return provider
 
     def probe(self, name: str) -> dict[str, Any]:
+        name = self._canonical_name(name)
         provider = self.providers.require(name)
         if not provider["enabled"]:
             return self.providers.record_probe(
@@ -75,6 +93,13 @@ class ProviderPool:
                     "recent_execution_health": "unknown",
                 },
             )
+        if not self.providers.probe_allowed(name):
+            current = self.providers.require(name)
+            return {
+                **current,
+                "reason": current.get("reason") or "Provider 熔断冷却中",
+            }
+        limits = self._limits()
         if provider["transport"] == "container":
             available = provider["adapter"] == "generic-command"
             detail = "容器内置执行器可用" if available else "容器适配器未安装"
@@ -101,7 +126,14 @@ class ProviderPool:
             # replacement, so historical tool aborts must not create a second
             # dispatch gate here.
         return self.providers.record_probe(
-            name, available=available, detail=detail, readiness=readiness,
+            name,
+            available=available,
+            detail=detail,
+            readiness=readiness,
+            failure_threshold=int(limits.get("provider_failure_threshold", 3)),
+            recovery_successes=int(limits.get("provider_recovery_successes", 1)),
+            open_seconds=int(limits.get("provider_open_seconds", 60)),
+            failure_class=None if available else "provider_probe_failed",
         )
 
     def _recent_execution_health(self, provider_name: str) -> str:
@@ -143,10 +175,64 @@ class ProviderPool:
             return "healthy"
         return "unhealthy"
 
-    def probe_all(self) -> list[dict[str, Any]]:
-        names = [item["name"] for item in self.providers.list() if item["enabled"]]
+    def probe_all(
+        self, *, unavailable_zones: set[str] | None = None
+    ) -> list[dict[str, Any]]:
+        unavailable_zones = unavailable_zones or set()
+        configured = [
+            item for item in self.providers.list()
+            if item["enabled"]
+        ]
+        skipped = [
+            {
+                **item,
+                "status": "unavailable",
+                "reason": f"network_zone_unavailable:{item['network_zone']}",
+                "probe_skipped": True,
+            }
+            for item in configured
+            if item["network_zone"] in unavailable_zones
+        ]
+        names = [
+            item["name"] for item in configured
+            if item["network_zone"] not in unavailable_zones
+        ]
         with ThreadPoolExecutor(max_workers=min(4, max(1, len(names)))) as pool:
-            return list(pool.map(self.probe, names))
+            return [*list(pool.map(self.probe, names)), *skipped]
+
+    def route_task(
+        self,
+        task: TaskRecord,
+        *,
+        zone_availability: dict[str, bool],
+    ) -> dict[str, Any] | None:
+        if task.provider == "generic-command":
+            provider = self.providers.require("generic-command")
+            return provider if provider["enabled"] else None
+        order = list(task.provider_order or [])
+        if task.provider_policy == "pinned" or not task.fallback_enabled:
+            candidates = [task.provider]
+        elif task.provider_policy == "preferred":
+            candidates = [task.provider, *order]
+        else:
+            candidates = [*order]
+            if task.provider not in candidates:
+                candidates.insert(0, task.provider)
+        for name in dict.fromkeys(candidates):
+            provider = self.providers.get(name)
+            if provider is None or not provider["enabled"]:
+                continue
+            if provider["circuit_state"] != "closed":
+                continue
+            zone = str(provider["network_zone"])
+            if zone != "local" and not zone_availability.get(zone, False):
+                continue
+            if provider["status"] != "available":
+                continue
+            if "new_session" not in provider["capabilities"]:
+                continue
+            return provider
+        return None
 
     def execute_task(self, task: TaskRecord, *, prompt: str) -> ExecutionResult:
         provider = self.require_available(task.provider)

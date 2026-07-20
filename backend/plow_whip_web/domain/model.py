@@ -10,11 +10,14 @@ class TaskStatus(StrEnum):
     RUNNING = "running"
     STOPPING = "stopping"
     VERIFYING = "verifying"
+    CANDIDATE_READY = "candidate_ready"
     COMPLETED = "completed"
     TERMINAL_FAILED = "terminal_failed"
     NEEDS_HUMAN = "needs_human"
     CANCELLED = "cancelled"
     PAUSED = "paused"
+    NETWORK_SUSPENDED = "network_suspended"
+    PROVIDER_SUSPENDED = "provider_suspended"
 
 
 TERMINAL_TASK_STATUSES = {
@@ -52,8 +55,17 @@ class TaskRecord:
     last_error: str | None
     created_at: str
     updated_at: str
+    completed_at: str | None
     sizing: dict[str, Any]
     execution_policy: dict[str, Any] | None
+    provider_policy: str = "auto"
+    fallback_enabled: bool = True
+    provider_order: list[str] = field(
+        default_factory=lambda: ["codex", "cursor", "deepseek", "kimi"]
+    )
+    suspended_from_status: str | None = None
+    suspension_reason: str | None = None
+    suspension_incident_id: str | None = None
     goal_id: str | None = None
     parent_task_id: str | None = None
     depends_on: list[str] | None = None

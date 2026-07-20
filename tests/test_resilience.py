@@ -183,3 +183,156 @@ def test_database_lock_becomes_safe_skip_not_recursive_retry() -> None:
         with patch.object(app.state.scheduler_repository, "acquire", side_effect=sqlite3.OperationalError("database is locked")):
             result = app.state.scheduler_service.tick(owner="locked")
         assert result == {"status": "skipped_database_busy", "model_tokens": 0, "reason": "database_locked"}
+
+
+def test_operator_continuation_is_idempotent_and_does_not_consume_attempt() -> None:
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        project = root / "project"
+        project.mkdir()
+        app = create_app(Settings(data_dir=root / "runtime"))
+        with TestClient(app) as client:
+            task = _task(app, project, key="operator-continuation")
+            human = client.post(
+                f"/api/tasks/{task.id}/control",
+                headers={"Idempotency-Key": "operator-continuation-human"},
+                json={
+                    "action": "needs_human",
+                    "reason": "operator decision required",
+                    "expected_revision": task.revision,
+                },
+            ).json()
+            payload = {
+                "action": "continue_once",
+                "operator": "owner",
+                "reason": "network and provider are confirmed healthy",
+                "expected_revision": human["revision"],
+                "budget_delta": {},
+            }
+            first = client.post(
+                f"/api/tasks/{task.id}/continuation",
+                headers={"Idempotency-Key": "operator-continuation-grant"},
+                json=payload,
+            )
+            duplicate = client.post(
+                f"/api/tasks/{task.id}/continuation",
+                headers={"Idempotency-Key": "operator-continuation-grant"},
+                json=payload,
+            )
+
+            assert first.status_code == duplicate.status_code == 200
+            assert first.json()["task"]["status"] == "ready"
+            assert first.json()["task"]["attempts_used"] == 0
+            assert first.json()["grant"]["applied_at"]
+            assert duplicate.json()["grant"]["id"] == first.json()["grant"]["id"]
+
+
+def test_network_alerts_converge_to_one_root_incident_with_debounced_events() -> None:
+    with TemporaryDirectory() as directory:
+        app = create_app(Settings(data_dir=Path(directory) / "runtime"))
+        offline = ConnectivityResult("offline", False, False)
+        online = ConnectivityResult("online", True, True)
+
+        app.state.resilience.record_network(
+            offline,
+            failure_threshold=1,
+            recovery_successes=1,
+            debounce_seconds=300,
+        )
+        app.state.resilience.record_network(
+            offline,
+            failure_threshold=1,
+            recovery_successes=1,
+            debounce_seconds=300,
+        )
+        open_items = app.state.resilience.incidents(status="open")
+        assert [item["fingerprint"] for item in open_items] == ["network:global"]
+        assert open_items[0]["occurrence_count"] == 2
+        detail = app.state.resilience.incident(open_items[0]["id"])
+        assert [event["event_type"] for event in detail["events"]] == ["opened"]
+
+        app.state.resilience.record_network(
+            online,
+            failure_threshold=1,
+            recovery_successes=1,
+            debounce_seconds=300,
+        )
+        assert app.state.resilience.incidents(status="open") == []
+        resolved = app.state.resilience.incident(open_items[0]["id"])
+        assert resolved["status"] == "resolved"
+        assert resolved["events"][0]["event_type"] == "resolved"
+
+
+def test_provider_policy_snapshot_is_immutable_for_each_task_spec_revision() -> None:
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        project_path = root / "project"
+        project_path.mkdir()
+        app = create_app(Settings(data_dir=root / "runtime"))
+        task = app.state.task_repository.create(
+            title="frozen-provider-policy",
+            objective="prove immutable provider routing",
+            project_path=str(project_path),
+            provider="codex",
+            provider_policy="auto",
+            fallback_enabled=True,
+            provider_order=["codex", "cursor", "deepseek", "kimi"],
+            command={"argv": [sys.executable, "-c", "pass"]},
+            verification=[{"kind": "exit_code", "expected": 0}],
+            max_attempts=2,
+            idempotency_key="frozen-provider-policy",
+        )
+        connection = app.state.database.connect()
+        try:
+            frozen = connection.execute(
+                """
+                SELECT provider_policy, fallback_enabled, provider_order_json
+                FROM task_provider_policies
+                WHERE task_id = ? AND spec_revision = ?
+                """,
+                (task.id, task.spec_revision),
+            ).fetchone()
+            assert dict(frozen) == {
+                "provider_policy": "auto",
+                "fallback_enabled": 1,
+                "provider_order_json": '["codex","cursor","deepseek","kimi"]',
+            }
+            with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+                connection.execute(
+                    """
+                    UPDATE task_provider_policies
+                    SET provider_policy = 'pinned'
+                    WHERE task_id = ? AND spec_revision = ?
+                    """,
+                    (task.id, task.spec_revision),
+                )
+        finally:
+            connection.close()
+
+
+def test_watchdog_limit_inheritance_records_source_and_does_not_reintroduce_900_seconds() -> None:
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        project_path = root / "project"
+        project_path.mkdir()
+        app = create_app(Settings(data_dir=root / "runtime"))
+        project = app.state.project_repository.create(
+            name="watchdog-xl",
+            path=str(project_path),
+            host_path=str(project_path),
+        )
+        app.state.runtime_settings.update_override(
+            scope="project",
+            scope_id=project["id"],
+            values={
+                "episode_wall_limit_seconds": 4800,
+                "checkpoint_interval_seconds": 120,
+                "no_progress_seconds": 300,
+                "progress_extension_seconds": 180,
+            },
+            expected_revision=0,
+        )
+        effective = app.state.runtime_settings.effective(project_id=project["id"])
+        assert effective["values"]["episode_wall_limit_seconds"] == 4800
+        assert effective["sources"]["episode_wall_limit_seconds"] == "project"
+        assert effective["values"]["episode_wall_limit_seconds"] != 900

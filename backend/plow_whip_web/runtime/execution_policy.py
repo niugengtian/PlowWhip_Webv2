@@ -3,15 +3,15 @@ from __future__ import annotations
 from typing import Any, Literal
 
 
-POLICY_VERSION = "butler-v1"
+POLICY_VERSION = "butler-v2"
 ExecutionRoute = Literal[
-    "simple-worker", "ephemeral-fullstack", "capability-milestones"
+    "ephemeral-fullstack", "capability-milestones"
 ]
 
 DEFAULT_PROJECT_EXECUTION_POLICY: dict[str, Any] = {
     "version": POLICY_VERSION,
     "routing": {
-        "XS": "simple-worker",
+        "XS": "ephemeral-fullstack",
         "S": "ephemeral-fullstack",
         "M": "ephemeral-fullstack",
         "L": "capability-milestones",
@@ -32,7 +32,7 @@ def project_execution_policy(value: dict[str, Any] | None = None) -> dict[str, A
         and "routing" in value
         and value["routing"] != DEFAULT_PROJECT_EXECUTION_POLICY["routing"]
     ):
-        raise ValueError("execution policy routing is fixed by butler-v1")
+        raise ValueError(f"execution policy routing is fixed by {POLICY_VERSION}")
     policy = {
         **DEFAULT_PROJECT_EXECUTION_POLICY,
         **(value or {}),
@@ -52,7 +52,7 @@ def project_execution_policy(value: dict[str, Any] | None = None) -> dict[str, A
 def route_for_size(size_class: str, policy: dict[str, Any]) -> ExecutionRoute:
     route = policy["routing"].get(size_class)
     if route not in {
-        "simple-worker", "ephemeral-fullstack", "capability-milestones"
+        "ephemeral-fullstack", "capability-milestones"
     }:
         raise ValueError(f"unsupported execution route for {size_class}: {route}")
     return route

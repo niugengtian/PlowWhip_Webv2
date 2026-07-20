@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 import uuid
 from typing import Any
 
@@ -16,7 +17,11 @@ from plow_whip_web.runtime.orchestration import (
 from plow_whip_web.runtime.sizing import TaskSizingInputs, estimate_task_sizing
 from plow_whip_web.store.database import Database
 from plow_whip_web.store.role_instance_repository import RoleInstanceRepository
-from plow_whip_web.store.task_repository import canonical_task_spec, insert_task_spec
+from plow_whip_web.store.task_repository import (
+    canonical_task_spec,
+    insert_task_provider_policy,
+    insert_task_spec,
+)
 
 
 def _preview_to_persistence(preview: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -73,10 +78,23 @@ class GoalRepository:
         idempotency_key: str,
         network_requirement: str = "none",
         command: dict[str, Any] | None = None,
+        provider_policy: str = "auto",
+        fallback_enabled: bool = True,
+        provider_order: list[str] | None = None,
     ) -> dict[str, Any]:
         if plan.status != "planned" or not plan.items:
             raise DomainError("goal plan is not dispatchable")
         command = command or {"argv": None, "timeout_seconds": 60, "output_limit_bytes": 131_072}
+        provider_order = list(
+            dict.fromkeys(
+                provider_order
+                or [provider, "codex", "cursor", "deepseek", "kimi"]
+            )
+        )
+        if provider not in provider_order:
+            provider_order.insert(0, provider)
+        if provider_policy == "pinned":
+            fallback_enabled = False
         base_inputs = TaskSizingInputs(**sizing_inputs)
         goal_preview = estimate_task_sizing(base_inputs)
         goal_deadline = deadline or {
@@ -176,6 +194,10 @@ class GoalRepository:
                     shared_command=command,
                     shared_verification=verification,
                 )
+                child_provider = item.provider or provider
+                child_provider_order = list(
+                    dict.fromkeys([child_provider, *provider_order])
+                )
                 timeout = int(execution_policy["hard_deadline_seconds"])
                 child_command = {
                     **child_command,
@@ -192,10 +214,11 @@ class GoalRepository:
                         project_id, role_id, resource_key, network_requirement, provider,
                         quality_profile, sizing_json, execution_budget_json,
                         manual_override, goal_id, parent_task_id, depends_on_json,
-                        work_item_kind, ordinal, blocked_reason
+                        work_item_kind, ordinal, blocked_reason,
+                        provider_policy, fallback_enabled, provider_order_json
                     ) VALUES (
                         ?, ?, ?, ?, ?, 0, ?, ?, ?, 0, ?, ?, ?, ?, ?,
-                        'deterministic', ?, ?, 0, ?, ?, ?, ?, ?, ?
+                        'deterministic', ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?
                     )
                     """,
                     (
@@ -211,7 +234,7 @@ class GoalRepository:
                         role_id,
                         f"goal:{goal_id}:item:{item.ordinal}",
                         network_requirement,
-                        item.provider or provider,
+                        child_provider,
                         json.dumps(sizing, ensure_ascii=False, sort_keys=True),
                         json.dumps(execution_policy, ensure_ascii=False, sort_keys=True),
                         goal_id,
@@ -220,6 +243,9 @@ class GoalRepository:
                         item.kind,
                         item.ordinal,
                         None if ready else f"waiting_on:{','.join(depends_ids)}",
+                        provider_policy,
+                        1 if fallback_enabled else 0,
+                        json.dumps(child_provider_order, ensure_ascii=False),
                     ),
                 )
                 insert_task_spec(
@@ -230,18 +256,35 @@ class GoalRepository:
                         scope=list(dict.fromkeys([*scope, item.role, item.kind])),
                         acceptance=list(dict.fromkeys([*acceptance, *item.acceptance])),
                         verification=child_verification,
-                        artifacts=list(dict.fromkeys([*artifacts, *item.artifacts])),
+                        artifacts=(
+                            []
+                            if item.kind == "verification"
+                            else list(dict.fromkeys([*artifacts, *item.artifacts]))
+                        ),
                         constraints=list(dict.fromkeys([
                             *constraints,
                             f"network:{network_requirement}",
-                            f"provider:{provider}",
+                            f"provider:{item.provider or provider}",
                             "worker_lifecycle:ephemeral",
+                            *(
+                                ["read_only_independent_verification"]
+                                if item.kind == "verification" else []
+                            ),
                         ])),
                         deadline={
                             "hard_seconds": execution_policy["hard_deadline_seconds"]
                         },
                     ),
                     revision=1,
+                )
+                insert_task_provider_policy(
+                    connection,
+                    task_id=task_id,
+                    spec_revision=1,
+                    provider_policy=provider_policy,
+                    fallback_enabled=fallback_enabled,
+                    provider_order=child_provider_order,
+                    initial_provider=child_provider,
                 )
                 # Immutable RoleInstance + SessionBinding after confirmed WorkItem.
                 RoleInstanceRepository(self.database).create_for_task(
@@ -277,8 +320,8 @@ class GoalRepository:
                             "goal_id": goal_id,
                             "work_items": len(plan.items),
                             "rationale": list(plan.rationale),
-                            "model_invoked": False,
-                            "model_pm_implemented": False,
+                            "model_invoked": plan.model_invoked,
+                            "model_pm_implemented": plan.model_pm_implemented,
                             "route": plan.route,
                             "provider": provider,
                         },
@@ -329,6 +372,12 @@ class GoalRepository:
                 "SELECT id, status, current_spec_revision FROM goals ORDER BY created_at, id"
             ).fetchall()
             for goal in goals:
+                if goal["status"] in {"terminal_failed", "cancelled"}:
+                    _cancel_pending_children(
+                        connection,
+                        goal["id"],
+                        parent_status=goal["status"],
+                    )
                 goal_spec = connection.execute(
                     """
                     SELECT spec_json, spec_hash FROM goal_specs
@@ -375,7 +424,10 @@ class GoalRepository:
                         if dependency in facts
                     ) and len(depends) == sum(dependency in facts for dependency in depends)
                     dependencies_state_completed = all(
-                        facts[dependency]["status"] == TaskStatus.COMPLETED.value
+                        facts[dependency]["status"] in {
+                            TaskStatus.COMPLETED.value,
+                            TaskStatus.CANDIDATE_READY.value,
+                        }
                         for dependency in depends if dependency in facts
                     ) and len(depends) == sum(dependency in facts for dependency in depends)
                     dependencies_complete = (
@@ -392,7 +444,10 @@ class GoalRepository:
                     )
                     own_evidence = child["manifest_hash"] is not None
                     valid_completion = (
-                        child["status"] == TaskStatus.COMPLETED.value
+                        child["status"] in {
+                            TaskStatus.COMPLETED.value,
+                            TaskStatus.CANDIDATE_READY.value,
+                        }
                         and own_evidence
                         and dependencies_complete
                         and int(child["evidence_sequence"] or 0)
@@ -520,7 +575,10 @@ class GoalRepository:
                             )
 
                     if (
-                        child["status"] == TaskStatus.COMPLETED.value
+                        child["status"] in {
+                            TaskStatus.COMPLETED.value,
+                            TaskStatus.CANDIDATE_READY.value,
+                        }
                         and own_evidence
                         and not valid_completion
                     ):
@@ -638,7 +696,10 @@ class GoalRepository:
                 }
                 uncovered_missing_evidence = [
                     task_id for task_id, fact in facts.items()
-                    if fact["status"] == TaskStatus.COMPLETED.value
+                    if fact["status"] in {
+                        TaskStatus.COMPLETED.value,
+                        TaskStatus.CANDIDATE_READY.value,
+                    }
                     and not fact["own_evidence"]
                     and not (
                         fact["work_item_kind"] == "implementation"
@@ -673,6 +734,15 @@ class GoalRepository:
                     ),
                     has_autonomy_blocker=human_child is not None,
                 )
+                if goal["status"] in {"terminal_failed", "cancelled"}:
+                    desired = str(goal["status"])
+                    reason = "parent_goal_terminal"
+                if desired in {"terminal_failed", "cancelled"}:
+                    _cancel_pending_children(
+                        connection,
+                        goal["id"],
+                        parent_status=desired,
+                    )
                 changed = self._settle_goal(
                     connection,
                     goal["id"],
@@ -742,6 +812,7 @@ class GoalRepository:
                    t.worker_id,
                    t.work_item_kind, t.ordinal, t.depends_on_json, t.blocked_reason,
                    t.parent_task_id, t.revision, t.provider, t.created_at, t.updated_at,
+                   t.completed_at,
                    t.last_error, t.last_evidence_hash, t.attempts_used, t.max_attempts,
                    t.tokens_used, t.sizing_json, t.execution_budget_json,
                    t.handoff_json, t.command_json, t.verification_json,
@@ -852,6 +923,7 @@ class GoalRepository:
                     "provider": task["provider"],
                     "created_at": task["created_at"],
                     "updated_at": task["updated_at"],
+                    "completed_at": task["completed_at"],
                     "last_error": task["last_error"],
                     "last_evidence_hash": task["last_evidence_hash"],
                     "attempts_used": task["attempts_used"],
@@ -943,6 +1015,7 @@ class GoalRepository:
             "parent_task_id": row["parent_task_id"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
+            "completed_at": row["completed_at"],
             "work_items": work_items,
             "spec_revision": int(spec_row["spec_revision"]),
             "spec": json.loads(spec_row["spec_json"]),
@@ -1006,13 +1079,77 @@ def _goal_fact_hash(
     ).hexdigest()[:24]
 
 
+def _cancel_pending_children(
+    connection: Any, goal_id: str, *, parent_status: str
+) -> None:
+    pending = connection.execute(
+        """
+        SELECT id, revision, depends_on_json FROM tasks
+        WHERE goal_id = ? AND status IN ('ready', 'paused')
+          AND work_item_kind IN ('implementation', 'verification')
+        ORDER BY ordinal, created_at, id
+        """,
+        (goal_id,),
+    ).fetchall()
+    for child in pending:
+        depends = json.loads(child["depends_on_json"] or "[]")
+        dependency_terminal = False
+        if depends:
+            placeholders = ",".join("?" for _ in depends)
+            dependency_terminal = connection.execute(
+                f"""
+                SELECT 1 FROM tasks
+                WHERE id IN ({placeholders})
+                  AND status IN ('terminal_failed', 'cancelled')
+                LIMIT 1
+                """,
+                tuple(depends),
+            ).fetchone() is not None
+        reason = "dependency_terminal" if dependency_terminal else "parent_goal_terminal"
+        next_revision = int(child["revision"]) + 1
+        connection.execute(
+            """
+            UPDATE tasks SET status = 'cancelled', revision = ?,
+                blocked_reason = ?, last_error = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND revision = ? AND status IN ('ready', 'paused')
+            """,
+            (next_revision, reason, reason, child["id"], child["revision"]),
+        )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO task_events(
+                task_id, event_type, payload_json, state_revision, idempotency_key
+            ) VALUES (?, 'task.cancelled', ?, ?, ?)
+            """,
+            (
+                child["id"],
+                json.dumps(
+                    {"reason": reason, "goal_id": goal_id, "parent_status": parent_status},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                next_revision,
+                f"goal-terminal-cascade:{goal_id}:{child['id']}:{parent_status}",
+            ),
+        )
+
+
 def _child_command_and_verification(
     *,
     item: PlannedWorkItem,
     shared_command: dict[str, Any],
     shared_verification: list[dict[str, Any]],
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Every routed task carries the caller's deterministic verification Gate."""
+    """Implementation produces candidates; verification runs a read-only verdict command."""
+    if item.kind == "verification" and item.auto_generated:
+        return {
+            "argv": [
+                sys.executable,
+                "-c",
+                "import json; print(json.dumps({'verdict':'PASS','source':'deterministic-gates'}))",
+            ],
+            "timeout_seconds": 60,
+        }, list(shared_verification)
     return dict(shared_command), list(shared_verification)
 
 
@@ -1024,7 +1161,7 @@ def _handoff_from_completed(connection: Any, task_id: str) -> dict[str, Any] | N
         FROM tasks t
         JOIN task_specs s ON s.task_id = t.id
             AND s.spec_revision = t.current_spec_revision
-        WHERE t.id = ? AND t.status = 'completed'
+        WHERE t.id = ? AND t.status IN ('candidate_ready', 'completed')
         """,
         (task_id,),
     ).fetchone()

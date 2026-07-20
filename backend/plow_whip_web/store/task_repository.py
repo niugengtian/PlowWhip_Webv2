@@ -4,6 +4,7 @@ import hashlib
 import json
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from plow_whip_web.domain.model import (
@@ -23,6 +24,7 @@ from plow_whip_web.store.project_repository import rotate_worker_in_transaction
 from plow_whip_web.store.settings_repository import resolve_effective_settings
 from plow_whip_web.runtime.evidence import manifest_hash
 from plow_whip_web.runtime.token_ledger import TokenLedger
+from plow_whip_web.store.resilience_repository import checkpoint_hash
 
 # XL bootstrap tier hard deadline; single safety cap for Host dispatch and leases.
 MAX_HARD_DEADLINE_SECONDS = 4800
@@ -81,7 +83,18 @@ class TaskRepository:
         artifacts: list[str] | None = None,
         constraints: list[str] | None = None,
         deadline: dict[str, Any] | None = None,
+        provider_policy: str = "auto",
+        fallback_enabled: bool = True,
+        provider_order: list[str] | None = None,
     ) -> TaskRecord:
+        provider_order = _normalize_provider_routing(
+            provider=provider,
+            provider_policy=provider_policy,
+            fallback_enabled=fallback_enabled,
+            provider_order=provider_order,
+        )
+        if provider_policy == "pinned":
+            fallback_enabled = False
         if sizing is None:
             if execution_policy is not None:
                 raise DomainError("execution_policy requires an explicit sizing record")
@@ -116,8 +129,12 @@ class TaskRepository:
                     id, title, objective, project_path, status, revision,
                     command_json, verification_json, max_attempts, token_budget,
                     project_id, role_id, resource_key, network_requirement, provider, quality_profile,
-                    sizing_json, execution_budget_json
-                ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
+                    sizing_json, execution_budget_json, provider_policy,
+                    fallback_enabled, provider_order_json
+                ) VALUES (
+                    ?, ?, ?, ?, ?, 0, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?
+                )
                 """,
                 (
                     task_id,
@@ -136,9 +153,21 @@ class TaskRepository:
                     quality_profile,
                     _dump(sizing),
                     _dump(execution_policy) if execution_policy is not None else None,
+                    provider_policy,
+                    1 if fallback_enabled else 0,
+                    _dump(provider_order),
                 ),
             )
             spec_hash = insert_task_spec(connection, task_id, spec, revision=1)
+            insert_task_provider_policy(
+                connection,
+                task_id=task_id,
+                spec_revision=1,
+                provider_policy=provider_policy,
+                fallback_enabled=fallback_enabled,
+                provider_order=provider_order,
+                initial_provider=provider,
+            )
             self._event(
                 connection,
                 task_id=task_id,
@@ -406,6 +435,87 @@ class TaskRepository:
                     (external_session_id, worker_id, task_id),
                 )
 
+    def switch_provider(
+        self,
+        task_id: str,
+        *,
+        provider: str,
+        expected_revision: int,
+        reason: str,
+        idempotency_key: str,
+    ) -> TaskRecord:
+        """Record one cross-provider replacement without creating a new attempt."""
+        with self.database.transaction(immediate=True) as connection:
+            duplicate = connection.execute(
+                "SELECT task_id FROM task_events WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if duplicate:
+                return self._get_with_connection(connection, duplicate["task_id"])
+            task = self._get_with_connection(connection, task_id)
+            if task.revision != expected_revision:
+                raise RevisionConflictError(
+                    f"expected revision {expected_revision}, current {task.revision}"
+                )
+            if task.status not in {
+                TaskStatus.READY,
+                TaskStatus.NETWORK_SUSPENDED,
+                TaskStatus.PROVIDER_SUSPENDED,
+                TaskStatus.NEEDS_HUMAN,
+            }:
+                raise InvalidTransitionError(
+                    f"cannot switch provider in state {task.status}"
+                )
+            if task.provider_policy == "pinned" or not task.fallback_enabled:
+                raise InvalidTransitionError("TaskSpec pins the Provider")
+            if provider == task.provider:
+                return task
+            old_provider = task.provider
+            revision = task.revision + 1
+            connection.execute(
+                """
+                UPDATE tasks
+                SET provider = ?, status = 'ready', revision = ?,
+                    suspended_from_status = NULL, suspension_reason = NULL,
+                    suspension_incident_id = NULL, next_eligible_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (provider, revision, task.id),
+            )
+            connection.execute(
+                """
+                UPDATE task_sessions
+                SET provider = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE task_id = ?
+                """,
+                (provider, task.id),
+            )
+            if task.worker_id:
+                connection.execute(
+                    """
+                    UPDATE workers
+                    SET provider = ?, external_session_id = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (provider, task.worker_id),
+                )
+            self._event(
+                connection,
+                task_id=task.id,
+                event_type="task.provider_switched",
+                payload={
+                    "from": old_provider,
+                    "to": provider,
+                    "reason": reason,
+                    "attempt_incremented": False,
+                },
+                revision=revision,
+                idempotency_key=idempotency_key,
+            )
+            return self._get_with_connection(connection, task.id)
+
     def events(self, task_id: str, *, after: int = 0) -> list[dict[str, Any]]:
         connection = self.database.connect()
         try:
@@ -478,7 +588,18 @@ class TaskRepository:
             if task.status is not TaskStatus.READY:
                 raise InvalidTransitionError(f"task is not ready: {task.status}")
             _assert_task_spec(task)
-            if task.attempts_used >= _authoritative_max_attempts(task):
+            recovery = connection.execute(
+                """
+                SELECT * FROM task_recovery_checkpoints
+                WHERE task_id = ? AND status = 'pending'
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (task.id,),
+            ).fetchone()
+            if (
+                recovery is None
+                and task.attempts_used >= _authoritative_max_attempts(task)
+            ):
                 raise InvalidTransitionError("task attempt budget exhausted")
             limits, _, _ = resolve_effective_settings(
                 connection,
@@ -489,13 +610,27 @@ class TaskRepository:
             if self._in_flight_count(connection) >= int(limits["max_parallel_workers"]):
                 raise ResourceBusyError("global parallel worker limit reached")
             worker_id, lease_token, fencing_token = self._acquire_worker_and_lock(connection, task)
-            attempt_id = str(uuid.uuid4())
+            attempt_id = (
+                str(recovery["attempt_id"])
+                if recovery is not None else str(uuid.uuid4())
+            )
             run_id = str(uuid.uuid4())
             next_revision = task.revision + 1
-            attempt_number = int(connection.execute(
-                "SELECT COALESCE(MAX(attempt_number), 0) + 1 FROM task_attempts WHERE task_id = ?",
-                (task.id,),
-            ).fetchone()[0])
+            attempt_number = (
+                int(
+                    connection.execute(
+                        """
+                        SELECT attempt_number FROM task_attempts WHERE id = ?
+                        """,
+                        (attempt_id,),
+                    ).fetchone()["attempt_number"]
+                )
+                if recovery is not None
+                else int(connection.execute(
+                    "SELECT COALESCE(MAX(attempt_number), 0) + 1 FROM task_attempts WHERE task_id = ?",
+                    (task.id,),
+                ).fetchone()[0])
+            )
             cursor = connection.execute(
                 """
                 UPDATE tasks SET status = ?, revision = ?, attempts_used = ?, worker_id = ?, updated_at = CURRENT_TIMESTAMP
@@ -504,7 +639,7 @@ class TaskRepository:
                 (
                     TaskStatus.RUNNING.value,
                     next_revision,
-                    task.attempts_used + 1,
+                    task.attempts_used + (0 if recovery is not None else 1),
                     worker_id,
                     task.id,
                     task.revision,
@@ -527,14 +662,32 @@ class TaskRepository:
                 """,
                 (worker_id, task.id),
             )
-            connection.execute(
-                """
-                INSERT INTO task_attempts(
-                    id, task_id, attempt_number, status, spec_revision
-                ) VALUES (?, ?, ?, 'running', ?)
-                """,
-                (attempt_id, task.id, attempt_number, task.spec_revision),
-            )
+            if recovery is None:
+                connection.execute(
+                    """
+                    INSERT INTO task_attempts(
+                        id, task_id, attempt_number, status, spec_revision
+                    ) VALUES (?, ?, ?, 'running', ?)
+                    """,
+                    (attempt_id, task.id, attempt_number, task.spec_revision),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE task_attempts
+                    SET status = 'running', finished_at = NULL
+                    WHERE id = ? AND task_id = ?
+                    """,
+                    (attempt_id, task.id),
+                )
+                connection.execute(
+                    """
+                    UPDATE task_recovery_checkpoints
+                    SET status = 'consumed', consumed_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND status = 'pending'
+                    """,
+                    (recovery["id"],),
+                )
             connection.execute(
                 """
                 INSERT INTO task_runs(
@@ -546,11 +699,18 @@ class TaskRepository:
             self._event(
                 connection,
                 task_id=task.id,
-                event_type="attempt.started",
+                event_type=(
+                    "execution.resumed"
+                    if recovery is not None else "attempt.started"
+                ),
                 payload={
                     "attempt_id": attempt_id, "run_id": run_id, "attempt_number": attempt_number,
                     "worker_id": worker_id, "lease_token": lease_token, "fencing_token": fencing_token,
                     "spec_revision": task.spec_revision,
+                    "checkpoint_id": (
+                        recovery["id"] if recovery is not None else None
+                    ),
+                    "attempt_incremented": recovery is None,
                 },
                 revision=next_revision,
                 idempotency_key=idempotency_key,
@@ -677,6 +837,143 @@ class TaskRepository:
         finally:
             connection.close()
 
+    def evidence_execution_context(self, run_id: str) -> dict[str, Any]:
+        connection = self.database.connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT r.id run_id, r.started_at,
+                       CURRENT_TIMESTAMP finished_at, t.project_path,
+                       t.command_json, ts.session_generation,
+                       COALESCE(h.external_session_id, ts.external_session_id)
+                           external_session_id,
+                       h.job_id host_job_id,
+                       COALESCE(h.fencing_token, l.fencing_token) fencing_token
+                FROM task_runs r
+                JOIN tasks t ON t.id = r.task_id
+                LEFT JOIN task_sessions ts ON ts.task_id = t.id
+                LEFT JOIN host_jobs h ON h.run_id = r.id
+                LEFT JOIN task_leases l ON l.task_id = t.id
+                WHERE r.id = ?
+                ORDER BY h.created_at DESC LIMIT 1
+                """,
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise DomainError(f"execution context missing for run: {run_id}")
+            command = json.loads(row["command_json"])
+            return {
+                "run_id": row["run_id"],
+                "argv": list(command.get("argv") or []),
+                "cwd": row["project_path"],
+                "started_at": row["started_at"],
+                "finished_at": row["finished_at"],
+                "session_generation": row["session_generation"],
+                "external_session_id": row["external_session_id"],
+                "host_job_id": row["host_job_id"],
+                "fencing_token": row["fencing_token"],
+            }
+        finally:
+            connection.close()
+
+    def inheritable_artifacts(
+        self,
+        task_id: str,
+        *,
+        session_generation: int | None,
+        spec_revision: int | None = None,
+        current_artifacts: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return bounded, hash-bound provenance for this Task generation only."""
+        if session_generation is None:
+            return []
+        connection = self.database.connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT manifest_json, manifest_hash, spec_revision, run_id
+                FROM evidence_manifests
+                WHERE task_id = ?
+                ORDER BY created_at DESC, rowid DESC LIMIT 20
+                """,
+                (task_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+        inherited: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            manifest = json.loads(row["manifest_json"])
+            environment = manifest.get("environment") or {}
+            if (
+                manifest.get("task_id") != task_id
+                or environment.get("session_generation") != session_generation
+            ):
+                continue
+            for artifact in manifest.get("artifacts") or []:
+                relative_path = str(artifact.get("relative_path") or "")
+                after = artifact.get("after") or {}
+                if (
+                    not relative_path
+                    or not after.get("sha256")
+                    or artifact.get("provenance", "current_run")
+                    not in {"current_run", "same_task_session_generation"}
+                ):
+                    continue
+                inherited.setdefault(relative_path, {
+                    "relative_path": relative_path,
+                    "sha256": after["sha256"],
+                    "task_id": task_id,
+                    "session_generation": session_generation,
+                    "manifest_hash": row["manifest_hash"],
+                    "spec_revision": row["spec_revision"],
+                    "run_id": row["run_id"],
+                })
+        current_by_path = {
+            str(item.get("relative_path") or ""): item
+            for item in (current_artifacts or [])
+            if item.get("relative_path") and item.get("sha256")
+        }
+        if current_by_path and spec_revision is not None:
+            connection = self.database.connect()
+            try:
+                baselines = connection.execute(
+                    """
+                    SELECT b.run_id, b.spec_revision, b.baseline_json,
+                           b.baseline_hash
+                    FROM run_evidence_baselines b
+                    WHERE b.task_id = ? AND b.spec_revision = ?
+                    ORDER BY b.created_at, b.rowid LIMIT 20
+                    """,
+                    (task_id, spec_revision),
+                ).fetchall()
+            finally:
+                connection.close()
+            for row in baselines:
+                baseline = json.loads(row["baseline_json"])
+                if (
+                    (baseline.get("environment") or {}).get("session_generation")
+                    != session_generation
+                ):
+                    continue
+                before_by_path = {
+                    str(item.get("relative_path") or ""): item
+                    for item in baseline.get("artifacts") or []
+                }
+                for relative_path, current in current_by_path.items():
+                    before = before_by_path.get(relative_path) or {}
+                    if before.get("sha256") == current.get("sha256"):
+                        continue
+                    inherited.setdefault(relative_path, {
+                        "relative_path": relative_path,
+                        "sha256": current["sha256"],
+                        "task_id": task_id,
+                        "session_generation": session_generation,
+                        "baseline_hash": row["baseline_hash"],
+                        "spec_revision": row["spec_revision"],
+                        "run_id": row["run_id"],
+                    })
+        return list(inherited.values())
+
     def finish(
         self,
         task_id: str,
@@ -715,7 +1012,7 @@ class TaskRepository:
                 )
             if task.status is not TaskStatus.VERIFYING:
                 raise InvalidTransitionError(f"task is not verifying: {task.status}")
-            _validate_evidence_manifest(task, evidence_manifest)
+            _validate_evidence_manifest(task, evidence_manifest, execution)
             binding = connection.execute(
                 """
                 SELECT a.task_id AS attempt_task_id,
@@ -773,7 +1070,15 @@ class TaskRepository:
                 and task.attempts_used < _authoritative_max_attempts(task)
                 and same_failure_count <= max_same_failure
             )
-            target = TaskStatus.COMPLETED if passed else (
+            target = (
+                TaskStatus.CANDIDATE_READY
+                if (
+                    passed
+                    and task.goal_id is not None
+                    and task.work_item_kind == "implementation"
+                )
+                else TaskStatus.COMPLETED
+            ) if passed else (
                 TaskStatus.READY if can_retry else TaskStatus.TERMINAL_FAILED
             )
             next_revision = task.revision + 1
@@ -816,7 +1121,10 @@ class TaskRepository:
                 execution,
                 reason=_context_pressure_reason(connection, execution),
             )
-            run_status = "completed" if target is TaskStatus.COMPLETED else (
+            run_status = "completed" if target in {
+                TaskStatus.COMPLETED,
+                TaskStatus.CANDIDATE_READY,
+            } else (
                 "failed"
             )
             connection.execute(
@@ -832,14 +1140,18 @@ class TaskRepository:
                 INSERT INTO evidence_manifests(
                     id, task_id, attempt_id, run_id, call_id, spec_revision,
                     task_revision, environment_hash, passed,
-                    manifest_json, manifest_hash
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    manifest_json, manifest_hash, verdict, reason_codes_json,
+                    failed_acceptance_ids_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(uuid.uuid4()), task.id, attempt_id, run_id,
                     evidence_manifest["call_id"], task.spec_revision, task.revision,
                     evidence_manifest["environment_hash"], 1 if passed else 0,
                     _dump(evidence_manifest), evidence_hash,
+                    evidence_manifest["verdict"],
+                    _dump(evidence_manifest["reason_codes"]),
+                    _dump(evidence_manifest["failed_acceptance_ids"]),
                 ),
             )
             connection.execute(
@@ -869,7 +1181,14 @@ class TaskRepository:
             self._event(
                 connection,
                 task_id=task.id,
-                event_type="task.completed" if target is TaskStatus.COMPLETED else (
+                event_type=(
+                    "task.candidate_ready"
+                    if target is TaskStatus.CANDIDATE_READY
+                    else "task.completed"
+                ) if target in {
+                    TaskStatus.COMPLETED,
+                    TaskStatus.CANDIDATE_READY,
+                } else (
                     "task.retry_scheduled" if can_retry else "task.terminal_failed"
                 ),
                 payload=event_payload,
@@ -932,7 +1251,13 @@ class TaskRepository:
         episode: dict[str, Any] | None = None,
         rotate_worker_reason: str | None = None,
     ) -> TaskRecord:
-        if action not in {"defer", "resume", "needs_human"}:
+        if action not in {
+            "defer",
+            "resume",
+            "needs_human",
+            "network_suspended",
+            "provider_suspended",
+        }:
             raise ValueError(f"unsupported Host fault action: {action}")
         idempotency_key = f"host-job:{job_id}:fault"
         with self.database.transaction(immediate=True) as connection:
@@ -968,10 +1293,11 @@ class TaskRepository:
             token_total = int(execution.get("input_tokens", 0)) + int(
                 execution.get("output_tokens", 0)
             )
-            target = (
-                TaskStatus.NEEDS_HUMAN
-                if action == "needs_human" else TaskStatus.READY
-            )
+            target = {
+                "needs_human": TaskStatus.NEEDS_HUMAN,
+                "network_suspended": TaskStatus.NETWORK_SUSPENDED,
+                "provider_suspended": TaskStatus.PROVIDER_SUSPENDED,
+            }.get(action, TaskStatus.READY)
             revision = task.revision + 1
             if token_total:
                 TokenLedger.record_in_transaction(
@@ -987,9 +1313,14 @@ class TaskRepository:
             connection.execute(
                 """
                 UPDATE tasks SET status = ?, revision = ?,
-                    attempts_used = MAX(0, attempts_used - 1),
                     worker_id = NULL,
                     last_error = ?,
+                    suspended_from_status = CASE
+                        WHEN ? IN ('network_suspended', 'provider_suspended')
+                        THEN 'running' ELSE suspended_from_status END,
+                    suspension_reason = CASE
+                        WHEN ? IN ('network_suspended', 'provider_suspended')
+                        THEN ? ELSE suspension_reason END,
                     next_eligible_at = CASE
                         WHEN ? = 'defer' THEN datetime('now', ?)
                         WHEN ? = 'resume' THEN CURRENT_TIMESTAMP
@@ -999,6 +1330,9 @@ class TaskRepository:
                 """,
                 (
                     target.value, revision, reason[:1000],
+                    action,
+                    action,
+                    reason[:1000],
                     action, backoff, action, task.id,
                 ),
             )
@@ -1058,10 +1392,16 @@ class TaskRepository:
                 "defer": "deferred",
                 "resume": "interrupted",
                 "needs_human": "needs_human",
+                "network_suspended": "network_suspended",
+                "provider_suspended": "provider_suspended",
             }[action]
             connection.execute(
-                "UPDATE task_attempts SET status = ?, finished_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (run_status, attempt_id),
+                """
+                UPDATE task_attempts
+                SET status = ?, finished_at = NULL
+                WHERE id = ?
+                """,
+                ("suspended", attempt_id),
             )
             connection.execute(
                 """
@@ -1098,15 +1438,75 @@ class TaskRepository:
                 """,
                 (reason[:1000], retained_session_id, job_id),
             )
+            checkpoint = {
+                **dict(episode or {}),
+                "task_id": task.id,
+                "attempt_id": attempt_id,
+                "spec_revision": task.spec_revision,
+                "session_generation": (
+                    connection.execute(
+                        """
+                        SELECT session_generation FROM task_sessions
+                        WHERE task_id = ?
+                        """,
+                        (task.id,),
+                    ).fetchone() or {"session_generation": 1}
+                )["session_generation"],
+                "failure_class": failure_class,
+                "reason": reason,
+                "completed_steps": list(
+                    (episode or {}).get("completed_steps") or []
+                ),
+                "verified_artifacts": list(
+                    (episode or {}).get("verified_artifacts") or []
+                ),
+                "invalidated_steps": list(
+                    (episode or {}).get("invalidated_steps") or []
+                ),
+                "next_action": (
+                    (episode or {}).get("next_action")
+                    or "reconcile workspace and run the smallest deterministic probe"
+                ),
+            }
+            checkpoint_id = str(uuid.uuid4())
+            connection.execute(
+                """
+                INSERT INTO task_recovery_checkpoints(
+                    id, task_id, attempt_id, session_generation,
+                    spec_revision, checkpoint_json, checkpoint_hash, reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(task_id) WHERE status = 'pending' DO UPDATE SET
+                    attempt_id = excluded.attempt_id,
+                    session_generation = excluded.session_generation,
+                    spec_revision = excluded.spec_revision,
+                    checkpoint_json = excluded.checkpoint_json,
+                    checkpoint_hash = excluded.checkpoint_hash,
+                    reason = excluded.reason,
+                    created_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    checkpoint_id,
+                    task.id,
+                    attempt_id,
+                    int(checkpoint["session_generation"]),
+                    task.spec_revision,
+                    _dump(checkpoint),
+                    checkpoint_hash(checkpoint),
+                    reason[:1000],
+                ),
+            )
             self._event(
                 connection,
                 task_id=task.id,
                 event_type=(
-                    "task.terminal_failed"
-                    if target is TaskStatus.TERMINAL_FAILED else (
-                        "task.needs_human"
-                        if target is TaskStatus.NEEDS_HUMAN else "task.retry_scheduled"
-                    )
+                    "task.needs_human"
+                    if target is TaskStatus.NEEDS_HUMAN
+                    else f"task.{target.value}"
+                    if target in {
+                        TaskStatus.NETWORK_SUSPENDED,
+                        TaskStatus.PROVIDER_SUSPENDED,
+                    }
+                    else "task.execution_resume_scheduled"
                 ),
                 payload={
                     "host_job_id": job_id,
@@ -1116,10 +1516,16 @@ class TaskRepository:
                     "tokens": token_total,
                     "session_retained": bool(retained_session_id),
                     "execution_episode": episode,
+                    "checkpoint_id": checkpoint_id,
+                    "attempt_incremented": False,
                 },
                 revision=revision, idempotency_key=idempotency_key,
             )
-            if target in {TaskStatus.NEEDS_HUMAN, TaskStatus.TERMINAL_FAILED}:
+            if target in {
+                TaskStatus.NEEDS_HUMAN,
+                TaskStatus.NETWORK_SUSPENDED,
+                TaskStatus.PROVIDER_SUSPENDED,
+            }:
                 connection.execute(
                     """
                     INSERT INTO outbox_events(topic, aggregate_id, event_type, payload_json)
@@ -1305,6 +1711,23 @@ class TaskRepository:
             raise InvalidTransitionError("active dependent must stop before amendment")
         spec_revision = task.spec_revision + 1
         insert_task_spec(connection, task.id, spec, revision=spec_revision)
+        insert_task_provider_policy(
+            connection,
+            task_id=task.id,
+            spec_revision=spec_revision,
+            provider_policy=task.provider_policy,
+            fallback_enabled=task.fallback_enabled,
+            provider_order=task.provider_order,
+            initial_provider=task.provider,
+        )
+        connection.execute(
+            """
+            UPDATE task_recovery_checkpoints
+            SET status = 'invalidated', consumed_at = CURRENT_TIMESTAMP
+            WHERE task_id = ? AND status = 'pending'
+            """,
+            (task.id,),
+        )
         ready = _dependencies_satisfied(connection, task)
         revision = task.revision + 1
         connection.execute(
@@ -1527,7 +1950,7 @@ class TaskRepository:
             ).fetchone()
             if lifecycle and lifecycle["role_status"] in {"ephemeral", "draining"} and lifecycle[
                 "task_status"
-            ] in {"completed", "terminal_failed", "cancelled"}:
+            ] in {"candidate_ready", "completed", "terminal_failed", "cancelled"}:
                 connection.execute(
                     """
                     INSERT INTO worker_session_archives(
@@ -1543,7 +1966,8 @@ class TaskRepository:
                 connection.execute(
                     """
                     UPDATE workers SET status = 'released', active_task_id = NULL,
-                        released_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+                        active_fencing_token = NULL, released_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
                     WHERE id = ? AND active_task_id = ?
                     """,
                     (worker_id, task_id),
@@ -1551,6 +1975,14 @@ class TaskRepository:
                 connection.execute(
                     "UPDATE roles SET status = 'released' WHERE id = ?",
                     (lifecycle["role_id"],),
+                )
+                connection.execute(
+                    """
+                    UPDATE session_bindings
+                    SET status = 'archived', updated_at = CURRENT_TIMESTAMP
+                    WHERE task_id = ? AND status = 'bound'
+                    """,
+                    (task_id,),
                 )
             else:
                 connection.execute(
@@ -1681,11 +2113,24 @@ def _task_from_row(row: Any) -> TaskRecord:
         last_error=row["last_error"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        completed_at=_optional(row, "completed_at"),
         sizing=(
             json.loads(row["sizing_json"]) if row["sizing_json"]
             else {"status": "legacy_fallback"}
         ),
         execution_policy=execution_policy,
+        provider_policy=_optional(row, "provider_policy") or "auto",
+        fallback_enabled=bool(
+            1 if _optional(row, "fallback_enabled") is None
+            else _optional(row, "fallback_enabled")
+        ),
+        provider_order=json.loads(
+            _optional(row, "provider_order_json")
+            or '["codex","cursor","deepseek","kimi"]'
+        ),
+        suspended_from_status=_optional(row, "suspended_from_status"),
+        suspension_reason=_optional(row, "suspension_reason"),
+        suspension_incident_id=_optional(row, "suspension_incident_id"),
         goal_id=_optional(row, "goal_id"),
         parent_task_id=_optional(row, "parent_task_id"),
         depends_on=json.loads(_optional(row, "depends_on_json") or "[]"),
@@ -1844,13 +2289,69 @@ def insert_task_spec(
     return digest
 
 
+def insert_task_provider_policy(
+    connection: Any,
+    *,
+    task_id: str,
+    spec_revision: int,
+    provider_policy: str,
+    fallback_enabled: bool,
+    provider_order: list[str],
+    initial_provider: str,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO task_provider_policies(
+            task_id, spec_revision, provider_policy, fallback_enabled,
+            provider_order_json, initial_provider
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            task_id,
+            spec_revision,
+            provider_policy,
+            1 if fallback_enabled else 0,
+            _dump(provider_order),
+            initial_provider,
+        ),
+    )
+
+
+def _normalize_provider_routing(
+    *,
+    provider: str,
+    provider_policy: str,
+    fallback_enabled: bool,
+    provider_order: list[str] | None,
+) -> list[str]:
+    if provider_policy not in {"auto", "preferred", "pinned"}:
+        raise DomainError("invalid provider policy")
+    order = list(
+        dict.fromkeys(
+            provider_order
+            or [provider, "codex", "cursor", "deepseek", "kimi"]
+        )
+    )
+    if provider not in order:
+        order.insert(0, provider)
+    if provider_policy in {"preferred", "pinned"} and order[0] != provider:
+        raise DomainError("preferred or pinned provider must be first in provider order")
+    if provider_policy == "pinned" and fallback_enabled:
+        fallback_enabled = False
+    if not order or any(not item for item in order):
+        raise DomainError("provider order must contain non-empty provider names")
+    return order
+
+
 def _assert_task_spec(task: TaskRecord) -> None:
     if set(task.spec) != TASK_SPEC_FIELDS:
         raise DomainError("claim requires one complete immutable task spec")
 
 
 def _validate_evidence_manifest(
-    task: TaskRecord, evidence_manifest: dict[str, Any]
+    task: TaskRecord,
+    evidence_manifest: dict[str, Any],
+    execution: dict[str, Any],
 ) -> None:
     commands = evidence_manifest.get("verification_commands")
     artifacts = evidence_manifest.get("artifacts")
@@ -1859,21 +2360,132 @@ def _validate_evidence_manifest(
         raise DomainError("EvidenceManifest verification/artifact records are required")
     if [item.get("spec") for item in commands] != task.verification:
         raise DomainError("EvidenceManifest verification contract mismatch")
+    required_gate_fields = {
+        "acceptance_id", "argv", "cwd", "started_at", "finished_at",
+        "exit_code", "host_job_id", "run_id", "session", "summary",
+        "artifact_evidence", "check",
+    }
+    for item in commands:
+        spec = item.get("spec") if isinstance(item.get("spec"), dict) else {}
+        command_gate = spec.get("kind") == "command"
+        exact_argv = list(
+            spec.get("argv") if command_gate else task.command.get("argv") or []
+        )
+        exact_cwd = (
+            str((Path(task.project_path) / str(spec.get("cwd") or "")).resolve())
+            if command_gate
+            else task.project_path
+        )
+        exact_exit_code = (
+            int(item.get("check", {}).get("actual", -1))
+            if command_gate
+            else int(execution.get("returncode", -1))
+        )
+        if not required_gate_fields.issubset(item):
+            raise DomainError("EvidenceManifest command evidence is incomplete")
+        if (
+            not item.get("acceptance_id")
+            or not exact_argv
+            or item.get("argv") != exact_argv
+            or str(item.get("cwd") or "") != exact_cwd
+            or not item.get("started_at")
+            or not item.get("finished_at")
+            or not isinstance(item.get("exit_code"), int)
+            or item.get("exit_code") != exact_exit_code
+            or item.get("run_id") != evidence_manifest.get("run_id")
+            or not isinstance(item.get("session"), dict)
+            or not {"external_session_id", "session_generation", "fencing_token"}.issubset(
+                item["session"]
+            )
+            or not isinstance(item.get("artifact_evidence"), list)
+        ):
+            raise DomainError("EvidenceManifest exact command evidence mismatch")
+        for artifact in item["artifact_evidence"]:
+            if (
+                not artifact.get("path")
+                or (
+                    not artifact.get("sha256")
+                    and evidence_manifest.get("verdict") == "PASS"
+                )
+            ):
+                raise DomainError("EvidenceManifest command artifact hash is missing")
+
     checks_passed = bool(commands) and all(
-        item.get("exit_code") == 0
-        and isinstance(item.get("check"), dict)
+        isinstance(item.get("check"), dict)
         and item["check"].get("passed") is True
         for item in commands
     )
     artifact_paths = [item.get("relative_path") for item in artifacts]
+    if evidence_manifest.get("verdict") == "PASS" and any(
+        not item.get("relative_path")
+        or not item.get("after", {}).get("sha256")
+        for item in artifacts
+    ):
+        raise DomainError("EvidenceManifest artifact path/hash is missing")
     artifact_passed = artifact_paths == task.spec["artifacts"] and all(
-        item.get("produced_by_run") is True for item in artifacts
+        item.get("provenance") in {
+            "current_run", "same_task_session_generation",
+        }
+        and item.get("after", {}).get("sha256")
+        and (
+            item.get("provenance") != "same_task_session_generation"
+            or (
+                isinstance(item.get("inherited_from"), dict)
+                and item["inherited_from"].get("task_id") == task.id
+                and item["inherited_from"].get("session_generation")
+                == evidence_manifest.get("environment", {}).get("session_generation")
+                and item["inherited_from"].get("sha256")
+                == item.get("after", {}).get("sha256")
+            )
+        )
+        for item in artifacts
+    )
+    verdict = evidence_manifest.get("verdict")
+    reason_codes = evidence_manifest.get("reason_codes")
+    failed_acceptance_ids = evidence_manifest.get("failed_acceptance_ids")
+    required_acceptance_ids = evidence_manifest.get("required_acceptance_ids")
+    if (
+        verdict not in {"PASS", "CHANGES_REQUIRED"}
+        or not isinstance(reason_codes, list)
+        or not isinstance(failed_acceptance_ids, list)
+        or not isinstance(required_acceptance_ids, list)
+        or any(not isinstance(item, str) or not item for item in required_acceptance_ids)
+        or any(not isinstance(item, str) or not item for item in failed_acceptance_ids)
+    ):
+        raise DomainError("EvidenceManifest canonical verdict fields are invalid")
+    gate_acceptance_ids = {item["acceptance_id"] for item in commands}
+    if not set(required_acceptance_ids).issubset(gate_acceptance_ids):
+        if verdict == "PASS":
+            raise DomainError("EvidenceManifest required acceptance id is missing")
+    browser_required = any(
+        marker in str(value).lower()
+        for value in [
+            *(task.spec.get("acceptance") or []),
+            *(task.spec.get("constraints") or []),
+        ]
+        for marker in ("browser", "浏览器", "e2e")
+    )
+    if browser_required and not (
+        isinstance(evidence_manifest.get("browser_evidence"), list)
+        and evidence_manifest["browser_evidence"]
+        and all(item.get("passed") is True for item in evidence_manifest["browser_evidence"])
+    ):
+        if verdict == "PASS":
+            raise DomainError("EvidenceManifest required browser evidence is missing")
+    verifier_passed = bool(report and report.get("passed"))
+    expected_passed = (
+        checks_passed
+        and verifier_passed
+        and artifact_passed
+        and verdict == "PASS"
+        and not reason_codes
+        and not failed_acceptance_ids
     )
     if (
         not isinstance(report, dict)
-        or bool(report.get("passed")) != checks_passed
         or bool(evidence_manifest.get("artifact_contract_passed")) != artifact_passed
-        or bool(evidence_manifest.get("passed")) != (checks_passed and artifact_passed)
+        or bool(evidence_manifest.get("passed")) != expected_passed
+        or (bool(evidence_manifest.get("passed")) != (verdict == "PASS"))
     ):
         raise DomainError("EvidenceManifest completion verdict is inconsistent")
 
@@ -1979,6 +2591,46 @@ def _rotate_task_session(
         """,
         (reason, task_id),
     )
+    next_generation = int(current["session_generation"]) + 1
+    if current["session_binding_id"]:
+        from plow_whip_web.store.role_instance_repository import _binding_hash
+
+        binding = connection.execute(
+            "SELECT * FROM session_bindings WHERE id = ?",
+            (current["session_binding_id"],),
+        ).fetchone()
+        if binding and binding["status"] == "bound":
+            connection.execute(
+                """
+                UPDATE session_bindings
+                SET session_generation = ?, external_session_id = NULL,
+                    fencing_token = 0, binding_hash = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND session_generation = ? AND status = 'bound'
+                """,
+                (
+                    next_generation,
+                    _binding_hash(
+                        project_id=binding["project_id"],
+                        role_instance_id=binding["role_instance_id"],
+                        task_id=binding["task_id"],
+                        provider=binding["provider"],
+                        session_generation=next_generation,
+                    ),
+                    binding["id"],
+                    binding["session_generation"],
+                ),
+            )
+    if current["worker_id"]:
+        connection.execute(
+            """
+            UPDATE workers
+            SET external_session_id = NULL, session_generation = ?,
+                active_fencing_token = NULL, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND active_task_id = ?
+            """,
+            (next_generation, current["worker_id"], task_id),
+        )
 
 
 def _dump(value: Any) -> str:

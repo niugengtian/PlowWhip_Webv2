@@ -7,8 +7,6 @@ from typing import Any
 
 from plow_whip_web.runtime.execution_episode import (
     ExecutionEpisodeWatchdog,
-    MAX_EPISODE_HOST_PROCESSES,
-    MAX_EPISODE_WALL_SECONDS,
     next_recovery_action,
 )
 from plow_whip_web.runtime.host_reconciliation import (
@@ -27,15 +25,62 @@ class HostJobRepository:
         self.database = database
 
     def prepare(
-        self, *, task_id: str, attempt_id: str, run_id: str, provider: str
+        self,
+        *,
+        task_id: str,
+        attempt_id: str,
+        run_id: str,
+        provider: str,
+        effective_limits: dict[str, Any] | None = None,
+        limit_sources: dict[str, str] | None = None,
     ) -> dict[str, Any]:
+        limits = effective_limits or {}
+        sources = limit_sources or {}
         with self.database.transaction(immediate=True) as connection:
             existing = connection.execute(
-                "SELECT * FROM host_jobs WHERE task_id = ? AND attempt_id = ?",
-                (task_id, attempt_id),
+                "SELECT * FROM host_jobs WHERE run_id = ?",
+                (run_id,),
             ).fetchone()
             if existing:
                 return dict(existing)
+            previous = connection.execute(
+                """
+                SELECT * FROM host_jobs
+                WHERE task_id = ? AND attempt_id = ?
+                """,
+                (task_id, attempt_id),
+            ).fetchone()
+            if previous is not None:
+                if previous["consumed_at"] is None:
+                    raise ValueError(
+                        "previous Host Job for this attempt is not terminal"
+                    )
+                previous_payload = dict(previous)
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO host_job_archives(
+                        job_id, task_id, attempt_id, run_id, episode_id,
+                        snapshot_json
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        previous["job_id"],
+                        previous["task_id"],
+                        previous["attempt_id"],
+                        previous["run_id"],
+                        previous["episode_id"],
+                        json.dumps(
+                            previous_payload,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    ),
+                )
+                connection.execute(
+                    "DELETE FROM host_jobs WHERE job_id = ?",
+                    (previous["job_id"],),
+                )
             context = connection.execute(
                 """
                 SELECT t.worker_id, t.current_spec_revision, l.fencing_token,
@@ -71,6 +116,30 @@ class HostJobRepository:
                 task_id=task_id,
                 spec_revision=int(context["current_spec_revision"]),
                 deadline_seconds=deadline_seconds,
+                wall_limit_seconds=int(
+                    limits.get("episode_wall_limit_seconds", deadline_seconds)
+                ),
+                max_host_processes=int(limits.get("max_host_processes", 2)),
+                effective_limits={
+                    key: {
+                        "value": limits.get(key),
+                        "source": sources.get(key, "task_spec" if key == "hard_deadline_seconds" else "global_default"),
+                    }
+                    for key in (
+                        "episode_wall_limit_seconds",
+                        "checkpoint_interval_seconds",
+                        "no_progress_seconds",
+                        "max_host_processes",
+                        "progress_extension_seconds",
+                    )
+                    if key in limits
+                }
+                | {
+                    "hard_deadline_seconds": {
+                        "value": deadline_seconds,
+                        "source": "task_spec",
+                    }
+                },
             )
             job_id = str(uuid.uuid4())
             connection.execute(
@@ -102,6 +171,8 @@ class HostJobRepository:
         fault_class: str | None,
         same_fault_limit: int,
         zero_progress_limit: int,
+        no_progress_seconds: int | None = None,
+        progress_extension_seconds: int = 0,
     ) -> dict[str, Any]:
         with self.database.transaction(immediate=True) as connection:
             row = connection.execute(
@@ -112,7 +183,12 @@ class HostJobRepository:
                            * 86400 AS INTEGER
                        )) AS elapsed_seconds,
                        CURRENT_TIMESTAMP >= e.deadline_at AS deadline_reached,
-                       CURRENT_TIMESTAMP >= e.wall_deadline_at AS wall_clock_reached
+                       CURRENT_TIMESTAMP >= e.wall_deadline_at AS wall_clock_reached,
+                       MAX(0, CAST(
+                           (julianday(CURRENT_TIMESTAMP) - julianday(
+                               COALESCE(e.last_progress_at, e.started_at)
+                           )) * 86400 AS INTEGER
+                       )) AS seconds_since_progress
                 FROM host_jobs h
                 JOIN execution_episodes e ON e.id = h.episode_id
                 WHERE h.job_id = ?
@@ -131,6 +207,11 @@ class HostJobRepository:
                 wall_clock_reached=bool(row["wall_clock_reached"]),
                 same_fault_limit=max(1, same_fault_limit),
                 zero_progress_limit=max(1, zero_progress_limit),
+                seconds_since_progress=int(row["seconds_since_progress"]),
+                no_progress_seconds=(
+                    max(1, int(no_progress_seconds))
+                    if no_progress_seconds is not None else None
+                ),
             )
             previous_alert = bool(row["burn_rate_alert"])
             burn_rate_alert = previous_alert or decision.burn_rate_alert
@@ -147,6 +228,10 @@ class HostJobRepository:
                 int(snapshot.get("input_tokens") or 0)
                 + int(snapshot.get("output_tokens") or 0),
             )
+            extension = (
+                max(0, int(progress_extension_seconds))
+                if decision.verifiable_progress else 0
+            )
             connection.execute(
                 """
                 UPDATE execution_episodes
@@ -154,7 +239,23 @@ class HostJobRepository:
                     same_fault_count = ?, zero_progress_rounds = ?,
                     progress_bytes = ?, observed_tokens = ?,
                     burn_rate_tokens_per_minute = ?,
-                    burn_rate_alert = ?, updated_at = CURRENT_TIMESTAMP
+                    burn_rate_alert = ?,
+                    progress_evidence_json = ?,
+                    last_progress_at = CASE
+                        WHEN ? THEN CURRENT_TIMESTAMP ELSE last_progress_at
+                    END,
+                    wall_deadline_at = CASE
+                        WHEN ? > 0 THEN MIN(
+                            deadline_at,
+                            datetime(
+                                MAX(CURRENT_TIMESTAMP, wall_deadline_at),
+                                '+' || ? || ' seconds'
+                            )
+                        )
+                        ELSE wall_deadline_at
+                    END,
+                    extension_seconds = extension_seconds + ?,
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE id = ? AND status = 'active'
                 """,
                 (
@@ -165,6 +266,16 @@ class HostJobRepository:
                     observed_tokens,
                     decision.burn_rate_tokens_per_minute,
                     1 if burn_rate_alert else 0,
+                    json.dumps(
+                        decision.progress_evidence,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    1 if decision.verifiable_progress else 0,
+                    extension,
+                    extension,
+                    extension,
                     row["id"],
                 ),
             )
@@ -175,6 +286,10 @@ class HostJobRepository:
                 "recovery_count": int(row["recovery_count"]),
                 "recovery_stage": row["recovery_stage"],
                 "alert_raised": decision.burn_rate_alert and not previous_alert,
+                "effective_limits": json.loads(
+                    row["effective_limits_json"] or "{}"
+                ),
+                "extension_seconds": int(row["extension_seconds"]) + extension,
             }
 
     def terminate_episode(
@@ -188,7 +303,8 @@ class HostJobRepository:
         with self.database.transaction(immediate=True) as connection:
             row = connection.execute(
                 """
-                SELECT e.*, h.run_id, h.external_session_id
+                SELECT e.*, h.task_id, h.attempt_id, h.run_id,
+                       h.session_generation, h.external_session_id
                 FROM host_jobs h
                 JOIN execution_episodes e ON e.id = h.episode_id
                 WHERE h.job_id = ?
@@ -202,16 +318,25 @@ class HostJobRepository:
                 if force_circuit
                 else next_recovery_action(int(row["recovery_count"]))
             )
+            progress = _parse_json_object(row["progress_evidence_json"])
+            artifacts = progress.get("artifacts")
             checkpoint = {
+                "task_id": row["task_id"],
+                "attempt_id": row["attempt_id"],
                 "episode_id": row["id"],
                 "host_job_id": job_id,
                 "run_id": row["run_id"],
+                "session_generation": row["session_generation"],
                 "recovery_action": recovery_action,
                 "reason": reason,
                 "fault_class": snapshot.get("failure_class"),
-                "progress_bytes": int(row["progress_bytes"]),
-                "output_ref": snapshot.get("output_ref"),
-                "carry_forward_ref": snapshot.get("carry_forward_ref"),
+                "completed_steps": progress.get("completed_steps", []),
+                "verified_artifacts": (
+                    artifacts if isinstance(artifacts, list) else []
+                ),
+                "invalidated_steps": progress.get("invalidated_steps", []),
+                "next_action": progress.get("next_action") or recovery_action,
+                "workspace_fingerprint": progress.get("fingerprint"),
                 "external_session_id": (
                     snapshot.get("session_id")
                     or snapshot.get("external_session_id")
@@ -309,18 +434,37 @@ class HostJobRepository:
             if row is None:
                 raise ValueError(f"host job not found: {job_id}")
             if row["worker_id"]:
-                connection.execute(
+                binding = connection.execute(
+                    """
+                    SELECT b.* FROM task_sessions ts
+                    LEFT JOIN session_bindings b ON b.id = ts.session_binding_id
+                    WHERE ts.task_id = ?
+                    """,
+                    (row["task_id"],),
+                ).fetchone()
+                if binding and binding["status"] == "archived":
+                    if not (
+                        binding["external_session_id"] == session_id
+                        and binding["session_generation"] == row["session_generation"]
+                        and binding["fencing_token"] == row["fencing_token"]
+                    ):
+                        raise ValueError(
+                            "Host Job archived SessionBinding reconciliation mismatch"
+                        )
+                    return dict(row)
+                worker_cursor = connection.execute(
                     """
                     UPDATE workers SET external_session_id = COALESCE(?, external_session_id),
-                        last_seen_at = CURRENT_TIMESTAMP, last_error = ?, updated_at = CURRENT_TIMESTAMP
+                        active_fencing_token = ?, last_seen_at = CURRENT_TIMESTAMP,
+                        last_error = ?, updated_at = CURRENT_TIMESTAMP
                     WHERE id = ? AND session_generation IS ?
                     """,
                     (
-                        session_id, error_summary, row["worker_id"],
+                        session_id, row["fencing_token"], error_summary, row["worker_id"],
                         row["session_generation"],
                     ),
                 )
-                connection.execute(
+                session_cursor = connection.execute(
                     """
                     UPDATE task_sessions
                     SET external_session_id = COALESCE(?, external_session_id),
@@ -334,6 +478,38 @@ class HostJobRepository:
                         row["session_generation"],
                     ),
                 )
+                if worker_cursor.rowcount != 1 or session_cursor.rowcount != 1:
+                    raise ValueError("Host Job Worker/TaskSession reconciliation mismatch")
+                if session_id and status in {
+                    "accepted", "dispatching", "running", "orphan_running",
+                    "cancelling", "completed", "failed", "cancelled",
+                }:
+                    cursor = connection.execute(
+                        """
+                        UPDATE session_bindings
+                        SET external_session_id = ?, fencing_token = ?,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = (
+                            SELECT session_binding_id FROM task_sessions
+                            WHERE task_id = ? AND session_generation IS ?
+                        )
+                          AND task_id = ? AND session_generation IS ?
+                          AND status = 'bound'
+                        """,
+                        (
+                            session_id, row["fencing_token"], row["task_id"],
+                            row["session_generation"], row["task_id"],
+                            row["session_generation"],
+                        ),
+                    )
+                    binding_id = connection.execute(
+                        "SELECT session_binding_id FROM task_sessions WHERE task_id = ?",
+                        (row["task_id"],),
+                    ).fetchone()
+                    if binding_id and binding_id[0] and cursor.rowcount != 1:
+                        raise ValueError(
+                            "Host Job SessionBinding reconciliation mismatch"
+                        )
             return dict(row)
 
     def dispatch_rejected(self, job_id: str, error: str) -> dict[str, Any]:
@@ -492,6 +668,9 @@ class HostJobRepository:
         task_id: str,
         spec_revision: int,
         deadline_seconds: int,
+        wall_limit_seconds: int,
+        max_host_processes: int,
+        effective_limits: dict[str, Any],
     ) -> dict[str, Any]:
         latest = connection.execute(
             """
@@ -527,10 +706,10 @@ class HostJobRepository:
                 INSERT INTO execution_episodes(
                     id, task_id, spec_revision, ordinal, recovery_count,
                     recovery_stage, deadline_at, wall_deadline_at,
-                    max_host_processes
+                    max_host_processes, effective_limits_json
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?,
-                    datetime('now', ?), datetime('now', ?), ?
+                    datetime('now', ?), datetime('now', ?), ?, ?
                 )
                 """,
                 (
@@ -541,8 +720,14 @@ class HostJobRepository:
                     recovery_count,
                     recovery_stage,
                     f"+{max(1, deadline_seconds)} seconds",
-                    f"+{MAX_EPISODE_WALL_SECONDS} seconds",
-                    MAX_EPISODE_HOST_PROCESSES,
+                    f"+{max(1, min(deadline_seconds, wall_limit_seconds))} seconds",
+                    max(1, max_host_processes),
+                    json.dumps(
+                        effective_limits,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
                 ),
             )
         else:
@@ -576,6 +761,7 @@ def _compact_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
         "failure_class", "input_tokens", "cached_input_tokens", "output_tokens",
         "cancel_requested",
         "output_ref", "carry_forward_ref",
+        "workspace_revision", "checkpoint_ref", "verified_acceptance_ids",
     }
     compact = {key: snapshot[key] for key in scalar_fields if key in snapshot}
     raw_segments = snapshot.get("output_segments")
@@ -601,4 +787,35 @@ def _compact_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     compact["stdout_len"] = int(compact["output_bytes"].get("stdout") or 0)
     compact["stderr_len"] = int(compact["output_bytes"].get("stderr") or 0)
     compact["segment_count"] = len(compact["output_segments"])
+    raw_progress = snapshot.get("progress_evidence")
+    compact["progress_evidence"] = (
+        {
+            key: raw_progress[key]
+            for key in (
+                "available",
+                "kind",
+                "fingerprint",
+                "changed_files",
+                "artifacts",
+                "completed_steps",
+                "invalidated_steps",
+                "next_action",
+            )
+            if key in raw_progress
+        }
+        if isinstance(raw_progress, dict)
+        else {}
+    )
     return compact
+
+
+def _parse_json_object(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if not raw:
+        return {}
+    try:
+        value = json.loads(str(raw))
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}

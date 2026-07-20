@@ -27,6 +27,7 @@ from plow_whip_web.host_bridge import (
 from plow_whip_web.providers.generic_command import ExecutionResult
 from plow_whip_web.providers.host_bridge import HostBridgeClient
 from plow_whip_web.runtime.sizing import TaskSizingInputs, estimate_task_sizing
+from plow_whip_web.runtime.connectivity import ConnectivityResult
 from plow_whip_web.runtime.verification import VerificationEngine
 from plow_whip_web.store.task_repository import (
     EXECUTION_DEADLINE_GRACE_SECONDS,
@@ -610,6 +611,11 @@ def test_scheduler_parallel_limit_counts_existing_host_jobs_across_ticks() -> No
         )
         bridge = FakeAsyncBridge()
         app.state.provider_pool.bridge = bridge
+        app.state.scheduler_service.connectivity = type(
+            "AlwaysOnline",
+            (),
+            {"check": lambda self: ConnectivityResult("online", True, True)},
+        )()
         _codex_task(app, root, "parallel-first")
         _codex_task(app, root, "parallel-second")
 
@@ -648,6 +654,49 @@ def test_container_reconciles_completion_and_retains_active_lease() -> None:
         assert job["host_pid"] == 4242
         assert job["external_session_id"] == "cli-session-1"
         assert bridge.starts == 1
+
+        connection = app.state.database.connect()
+        try:
+            reconciled = connection.execute(
+                """
+                SELECT h.external_session_id host_session,
+                       h.session_generation host_generation,
+                       h.fencing_token host_fencing,
+                       w.external_session_id worker_session,
+                       w.session_generation worker_generation,
+                       w.active_fencing_token worker_fencing,
+                       b.external_session_id binding_session,
+                       b.session_generation binding_generation,
+                       b.fencing_token binding_fencing,
+                       b.task_id binding_task
+                FROM host_jobs h
+                JOIN workers w ON w.id = h.worker_id
+                JOIN task_sessions ts ON ts.task_id = h.task_id
+                JOIN session_bindings b ON b.id = ts.session_binding_id
+                WHERE h.job_id = ?
+                """,
+                (job["job_id"],),
+            ).fetchone()
+        finally:
+            connection.close()
+        assert reconciled is not None
+        assert {
+            reconciled["host_session"],
+            reconciled["worker_session"],
+            reconciled["binding_session"],
+        } == {"cli-session-1"}
+        assert {
+            reconciled["host_generation"],
+            reconciled["worker_generation"],
+            reconciled["binding_generation"],
+        } == {1}
+        assert {
+            reconciled["host_fencing"],
+            reconciled["worker_fencing"],
+            reconciled["binding_fencing"],
+        } == {reconciled["host_fencing"]}
+        assert reconciled["host_fencing"] > 0
+        assert reconciled["binding_task"] == task.id
 
         connection = app.state.database.connect()
         try:
@@ -877,7 +926,7 @@ def test_interrupted_host_job_reuses_session_without_spending_attempt() -> None:
         app.state.task_service.reconcile_host_jobs()
         resumed = app.state.task_repository.get(task.id)
         assert resumed.status.value == "ready"
-        assert resumed.attempts_used == 0
+        assert resumed.attempts_used == 1
         assert resumed.tokens_used == 5
         continuation = app.state.context_compiler.compile(task.id)["content"]
         assert "previous host process was externally interrupted" in continuation
@@ -932,7 +981,7 @@ def test_timeout_completed_snapshot_resumes_same_session_without_verification() 
         assert app.state.host_jobs.active() == []
         resumed = app.state.task_repository.get(task.id)
         assert resumed.status.value == "ready"
-        assert resumed.attempts_used == 0
+        assert resumed.attempts_used == 1
         assert resumed.tokens_used == 10
         connection = app.state.database.connect()
         try:

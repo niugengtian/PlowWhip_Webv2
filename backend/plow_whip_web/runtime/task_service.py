@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +52,7 @@ class TaskService:
         projects: ProjectRepository | None = None,
         model_calls: ModelCallLedger | None = None,
         role_instances: Any | None = None,
+        resilience: Any | None = None,
     ) -> None:
         self.repository = repository
         self.provider = provider or GenericCommandProvider()
@@ -65,6 +67,7 @@ class TaskService:
         self.projects = projects
         self.model_calls = model_calls
         self.role_instances = role_instances
+        self.resilience = resilience
 
     def drive(
         self, task_id: str, *, expected_revision: int, idempotency_key: str
@@ -130,9 +133,19 @@ class TaskService:
             and self.host_jobs
             and self.provider_pool
         ):
+            effective = (
+                self.settings.effective(
+                    project_id=claim.task.project_id,
+                    task_id=claim.task.id,
+                    role_id=claim.task.role_id,
+                )
+                if self.settings else {"values": {}, "sources": {}}
+            )
             job = self.host_jobs.prepare(
                 task_id=task_id, attempt_id=claim.attempt_id,
                 run_id=claim.run_id, provider=claim.task.provider,
+                effective_limits=effective["values"],
+                limit_sources=effective["sources"],
             )
             try:
                 snapshot = self.provider_pool.start_task_job(
@@ -595,16 +608,21 @@ class TaskService:
         fault_class: str | None = None,
     ) -> dict[str, Any]:
         assert self.host_jobs is not None
-        limits = (
-            self.settings.effective(task_id=str(job["task_id"]))["values"]
-            if self.settings else {}
+        effective = (
+            self.settings.effective(task_id=str(job["task_id"]))
+            if self.settings else {"values": {}, "sources": {}}
         )
+        limits = effective["values"]
         return self.host_jobs.observe_episode(
             job["job_id"],
             snapshot,
             fault_class=fault_class,
             same_fault_limit=int(limits.get("max_same_failure", 2)),
             zero_progress_limit=int(limits.get("max_no_progress", 3)),
+            no_progress_seconds=int(limits.get("no_progress_seconds", 300)),
+            progress_extension_seconds=int(
+                limits.get("progress_extension_seconds", 120)
+            ),
         )
 
     def _record_host_usage(
@@ -684,6 +702,189 @@ class TaskService:
             ),
         )
 
+    def switch_provider(
+        self,
+        task: TaskRecord,
+        *,
+        provider: str,
+        reason: str,
+        idempotency_key: str,
+    ) -> TaskRecord:
+        """Create a fresh provider session generation, then switch canonical Task."""
+        if provider == task.provider:
+            return task
+        if self.role_instances is not None:
+            active = self.role_instances.list_instances(
+                task_id=task.id, status="active"
+            )
+            if active:
+                self.role_instances.replace_instance_for_amend(
+                    task_id=task.id,
+                    task_spec_revision=task.spec_revision,
+                    provider=provider,
+                )
+        return self.repository.switch_provider(
+            task.id,
+            provider=provider,
+            expected_revision=task.revision,
+            reason=reason,
+            idempotency_key=idempotency_key,
+        )
+
+    def apply_continuation_grant(
+        self,
+        task_id: str,
+        *,
+        action: str,
+        operator: str,
+        reason: str,
+        expected_revision: int,
+        budget_delta: dict[str, int],
+        target_provider: str | None,
+        expires_at: str | None,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        if self.resilience is None:
+            raise InvalidTransitionError("resilience control is not configured")
+        grant = self.resilience.grant_continuation(
+            task_id,
+            action=action,
+            operator=operator,
+            reason=reason,
+            expected_revision=expected_revision,
+            budget_delta=budget_delta,
+            target_provider=target_provider,
+            expires_at=expires_at,
+            idempotency_key=idempotency_key,
+        )
+        if grant.get("applied_at"):
+            return {"grant": grant, "task": self.repository.get(task_id)}
+
+        task = self.repository.get(task_id)
+        if budget_delta:
+            if self.settings is None or task.role_id is None:
+                raise InvalidTransitionError(
+                    "continuation budget requires a task-role settings scope"
+                )
+            current = self.settings.effective(
+                project_id=task.project_id,
+                task_id=task.id,
+                role_id=task.role_id,
+            )
+            override = self.settings.get_override(
+                scope="task_role", scope_id=task.id
+            )
+            absolute = {
+                key: int(current["values"][key]) + int(delta)
+                for key, delta in budget_delta.items()
+            }
+            self.settings.update_override(
+                scope="task_role",
+                scope_id=task.id,
+                values=absolute,
+                expected_revision=int(override["revision"]),
+            )
+
+        action_key = f"operator-grant:{grant['id']}:{action}"
+        if action == "continue_once":
+            self.resilience.operator_resume(
+                task.id,
+                expected_revision=task.revision,
+                reason=reason,
+                idempotency_key=action_key,
+            )
+        elif action == "switch_provider":
+            if not target_provider:
+                raise InvalidTransitionError(
+                    "switch_provider requires target_provider"
+                )
+            if self.provider_pool is not None:
+                self.provider_pool.require_ready(target_provider)
+            self.switch_provider(
+                task,
+                provider=target_provider,
+                reason=reason,
+                idempotency_key=action_key,
+            )
+        elif action == "replace_session":
+            if self.role_instances is None:
+                raise InvalidTransitionError("role instances are not configured")
+            self.role_instances.replace_instance_for_amend(
+                task_id=task.id,
+                task_spec_revision=task.spec_revision,
+                provider=task.provider,
+            )
+            self.resilience.operator_resume(
+                task.id,
+                expected_revision=task.revision,
+                reason=reason,
+                idempotency_key=action_key,
+            )
+        elif action == "cancel":
+            self.resilience.operator_cancel(
+                task.id,
+                expected_revision=task.revision,
+                reason=reason,
+                idempotency_key=action_key,
+            )
+        else:
+            raise InvalidTransitionError(
+                f"unsupported continuation action: {action}"
+            )
+        applied = self.resilience.mark_grant_applied(str(grant["id"]))
+        return {"grant": applied, "task": self.repository.get(task_id)}
+
+    def suspend_active_provider_jobs(
+        self,
+        *,
+        providers: set[str],
+        kind: str,
+        reason: str,
+    ) -> list[dict[str, str]]:
+        """Stop proven Host processes before moving active Tasks to suspension."""
+        if not self.host_jobs or not self.provider_pool:
+            return []
+        settled: list[dict[str, str]] = []
+        for job in self.host_jobs.active():
+            if str(job["provider"]) not in providers:
+                continue
+            task = self.repository.get(str(job["task_id"]))
+            if task.status not in {TaskStatus.RUNNING, TaskStatus.VERIFYING}:
+                continue
+            try:
+                snapshot = self.provider_pool.cancel_task_job(str(job["job_id"]))
+                self.host_jobs.record(str(job["job_id"]), snapshot)
+            except ProviderUnavailableError as error:
+                self.host_jobs.hold(str(job["job_id"]), str(error))
+                continue
+            checkpoint = self.host_jobs.terminate_episode(
+                str(job["job_id"]),
+                reason=reason,
+                snapshot={
+                    **snapshot,
+                    "failure_class": (
+                        "network_unavailable"
+                        if kind == "network_suspended"
+                        else "provider_unavailable"
+                    ),
+                },
+            )
+            result = self._finalize_host_fault(
+                task,
+                job,
+                snapshot,
+                action=kind,
+                failure_class=(
+                    "network_unavailable"
+                    if kind == "network_suspended"
+                    else "provider_unavailable"
+                ),
+                reason=reason,
+                episode=checkpoint,
+            )
+            settled.append({"task_id": result.id, "status": result.status.value})
+        return settled
+
     def control(
         self, task_id: str, *, action: str, reason: str,
         expected_revision: int, idempotency_key: str,
@@ -736,7 +937,13 @@ class TaskService:
                 self.model_calls.dispatched(verify_call["call_id"])
             try:
                 verification = self.verifier.verify(
-                    project_path, execution, task.verification
+                    project_path,
+                    execution,
+                    task.verification,
+                    acceptance=list(task.spec.get("acceptance") or []),
+                    require_structured_verdict=(
+                        task.work_item_kind == "verification"
+                    ),
                 )
             except Exception as error:
                 if verify_call:
@@ -748,6 +955,14 @@ class TaskService:
             if verify_call:
                 self.model_calls.settle(verify_call["call_id"])
         baseline = self.repository.evidence_baseline(run_id)
+        execution_context = self.repository.evidence_execution_context(run_id)
+        after = self._evidence_snapshot(task)
+        inherited_artifacts = self.repository.inheritable_artifacts(
+            task.id,
+            session_generation=execution_context.get("session_generation"),
+            spec_revision=task.spec_revision,
+            current_artifacts=list(after.get("artifacts") or []),
+        )
         manifest = build_evidence_manifest(
             task=task,
             attempt_id=attempt_id,
@@ -755,9 +970,11 @@ class TaskService:
             call_id=run_id,
             task_revision=verifying.revision,
             baseline=baseline,
-            after=self._evidence_snapshot(task),
+            after=after,
             execution=execution,
             verification=verification,
+            execution_context=execution_context,
+            inherited_artifacts=inherited_artifacts,
         )
         limits = (
             self.settings.effective(
@@ -789,15 +1006,14 @@ class TaskService:
     def _evidence_snapshot(self, task: TaskRecord) -> dict[str, Any]:
         paths = [str(path) for path in task.spec["artifacts"]]
         transport = "container"
-        worker_context: dict[str, Any] = {}
+        worker_context: dict[str, Any] = (
+            self.repository.worker_execution_context(task.worker_id, task_id=task.id)
+            if task.worker_id else {}
+        )
         if self.provider_pool:
             provider = self.provider_pool.require_available(task.provider)
             transport = str(provider["transport"])
             if provider["transport"] == "host-bridge":
-                if task.worker_id:
-                    worker_context = self.repository.worker_execution_context(
-                        task.worker_id, task_id=task.id
-                    )
                 snapshot = self.provider_pool.snapshot_task_evidence(task, paths=paths)
             else:
                 snapshot = snapshot_environment(Path(task.project_path), paths)
@@ -808,6 +1024,7 @@ class TaskService:
             "session_generation": worker_context.get("session_generation"),
             "external_session_id": worker_context.get("external_session_id"),
         }
+        snapshot.setdefault("captured_at", datetime.now(timezone.utc).isoformat())
         return snapshot
 
     def _rotate_local_journal(self, task: TaskRecord) -> None:

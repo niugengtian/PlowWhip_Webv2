@@ -15,7 +15,10 @@ class ProviderRepository:
         connection = self.database.connect()
         try:
             rows = connection.execute(
-                "SELECT * FROM provider_configs ORDER BY enabled DESC, name"
+                """
+                SELECT * FROM provider_configs
+                ORDER BY enabled DESC, priority, name
+                """
             ).fetchall()
             return [self._view(row) for row in rows]
         finally:
@@ -101,15 +104,44 @@ class ProviderRepository:
         available: bool,
         detail: str,
         readiness: dict[str, Any] | None = None,
+        failure_threshold: int = 3,
+        recovery_successes: int = 1,
+        open_seconds: int = 60,
+        failure_class: str | None = None,
     ) -> dict[str, Any]:
         with self.database.transaction(immediate=True) as connection:
             row = connection.execute(
-                "SELECT enabled, config_json FROM provider_configs WHERE name = ?",
+                "SELECT * FROM provider_configs WHERE name = ?",
                 (name,),
             ).fetchone()
             if row is None:
                 raise NotFoundError(f"provider not found: {name}")
-            status = "available" if available else ("unavailable" if row["enabled"] else "disabled")
+            failures = (
+                0
+                if available
+                else int(row["consecutive_failures"]) + 1
+            )
+            successes = (
+                int(row["consecutive_successes"]) + 1
+                if available else 0
+            )
+            circuit_state = str(row["circuit_state"])
+            if not row["enabled"]:
+                circuit_state = "closed"
+            elif available and successes >= max(1, recovery_successes):
+                circuit_state = "closed"
+                failures = 0
+            elif not available and failures >= max(1, failure_threshold):
+                circuit_state = "open"
+            elif circuit_state == "open":
+                circuit_state = "half_open"
+            status = (
+                "disabled"
+                if not row["enabled"]
+                else "available"
+                if available and circuit_state == "closed"
+                else "unavailable"
+            )
             config = json.loads(row["config_json"] or "{}")
             if readiness is not None:
                 config["readiness"] = readiness
@@ -117,12 +149,71 @@ class ProviderRepository:
                 """
                 UPDATE provider_configs SET status = ?, reason = ?,
                     config_json = ?, last_probed_at = CURRENT_TIMESTAMP,
+                    circuit_state = ?, consecutive_failures = ?,
+                    consecutive_successes = ?,
+                    circuit_opened_at = CASE
+                        WHEN ? = 'open' AND circuit_state != 'open'
+                        THEN CURRENT_TIMESTAMP
+                        WHEN ? = 'closed' THEN NULL
+                        ELSE circuit_opened_at END,
+                    next_probe_at = CASE
+                        WHEN ? = 'open' THEN datetime('now', ?)
+                        WHEN ? = 'closed' THEN NULL
+                        ELSE next_probe_at END,
+                    last_failure_class = CASE
+                        WHEN ? THEN NULL ELSE ? END,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE name = ?
                 """,
-                (status, detail, _dump(config), name),
+                (
+                    status,
+                    detail,
+                    _dump(config),
+                    circuit_state,
+                    failures,
+                    successes,
+                    circuit_state,
+                    circuit_state,
+                    circuit_state,
+                    f"+{max(5, open_seconds)} seconds",
+                    circuit_state,
+                    int(available),
+                    failure_class,
+                    name,
+                ),
             )
         return self.require(name)
+
+    def probe_allowed(self, name: str) -> bool:
+        """Reserve the one half-open probe after a circuit cool-down."""
+        with self.database.transaction(immediate=True) as connection:
+            row = connection.execute(
+                """
+                SELECT enabled, circuit_state,
+                       next_probe_at IS NULL
+                       OR next_probe_at <= CURRENT_TIMESTAMP AS due
+                FROM provider_configs WHERE name = ?
+                """,
+                (name,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"provider not found: {name}")
+            if not row["enabled"]:
+                return False
+            state = str(row["circuit_state"])
+            if state == "closed":
+                return True
+            if state == "open" and row["due"]:
+                cursor = connection.execute(
+                    """
+                    UPDATE provider_configs
+                    SET circuit_state = 'half_open', updated_at = CURRENT_TIMESTAMP
+                    WHERE name = ? AND circuit_state = 'open'
+                    """,
+                    (name,),
+                )
+                return cursor.rowcount == 1
+            return False
 
     @staticmethod
     def _view(row: Any) -> dict[str, Any]:
@@ -150,9 +241,21 @@ class ProviderRepository:
             "revision": int(row["revision"]),
             "last_probed_at": row["last_probed_at"],
             "model": config.get("model") or (
-                "deepseek-chat" if row["name"] == "simple-worker" else "provider-managed"
+                "deepseek-chat"
+                if row["name"] in {"simple-worker", "deepseek"}
+                else "moonshot-v1"
+                if row["name"] == "kimi"
+                else "provider-managed"
             ),
             "readiness": readiness,
+            "network_zone": row["network_zone"],
+            "priority": int(row["priority"]),
+            "circuit_state": row["circuit_state"],
+            "consecutive_failures": int(row["consecutive_failures"]),
+            "consecutive_successes": int(row["consecutive_successes"]),
+            "circuit_opened_at": row["circuit_opened_at"],
+            "next_probe_at": row["next_probe_at"],
+            "last_failure_class": row["last_failure_class"],
         }
 
 

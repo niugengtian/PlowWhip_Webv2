@@ -47,6 +47,7 @@ class ModelCallLedger:
         session_generation: int | None = None,
         host_job_id: str | None = None,
         call_id: str | None = None,
+        proposal_revision: int | None = None,
     ) -> dict[str, Any]:
         if call_kind not in CALL_KINDS:
             raise ValueError(f"unsupported model call kind: {call_kind}")
@@ -81,8 +82,8 @@ class ModelCallLedger:
                 INSERT INTO model_calls(
                     call_id, idempotency_key, project_id, task_id, worker_id,
                     host_job_id, provider, model, call_kind, session_id,
-                    session_generation
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    session_generation, proposal_revision
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     resolved_call_id,
@@ -96,6 +97,7 @@ class ModelCallLedger:
                     call_kind,
                     session_id,
                     session_generation,
+                    proposal_revision,
                 ),
             )
             return dict(
@@ -111,12 +113,14 @@ class ModelCallLedger:
         *,
         host_job_id: str | None = None,
         session_id: str | None = None,
+        raw_status: str | None = None,
     ) -> dict[str, Any]:
         return self._transition(
             call_id,
             status="dispatched",
             host_job_id=host_job_id,
             session_id=session_id,
+            raw_status=raw_status,
         )
 
     def unknown(self, call_id: str, *, error_class: str) -> dict[str, Any]:
@@ -130,6 +134,7 @@ class ModelCallLedger:
         failed: bool = False,
         error_class: str | None = None,
         session_id: str | None = None,
+        raw_status: str | None = None,
     ) -> dict[str, Any]:
         usage = execution or {}
         input_tokens = max(0, int(usage.get("input_tokens") or 0))
@@ -181,6 +186,7 @@ class ModelCallLedger:
                     raw_cached_input_tokens = ?, raw_output_tokens = ?,
                     usage_semantics = 'delta', normalized_usage_json = ?,
                     error_class = ?, session_id = COALESCE(?, session_id),
+                    raw_status = COALESCE(?, raw_status),
                     dispatched_at = COALESCE(dispatched_at, CURRENT_TIMESTAMP),
                     settled_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
                 WHERE call_id = ?
@@ -196,6 +202,7 @@ class ModelCallLedger:
                     json.dumps(normalized, sort_keys=True, separators=(",", ":")),
                     error_class,
                     session_id,
+                    raw_status,
                     call_id,
                 ),
             )
@@ -256,32 +263,43 @@ class ModelCallLedger:
             ).fetchone()
         return None
 
-    def summary(self) -> dict[str, Any]:
+    def summary(self, *, project_id: str | None = None) -> dict[str, Any]:
         connection = self.database.connect()
         try:
+            where, params = (
+                (" WHERE project_id = ?", (project_id,))
+                if project_id
+                else ("", ())
+            )
             total = connection.execute(
-                """
+                f"""
                 SELECT COALESCE(SUM(input_tokens), 0) input_tokens,
                        COALESCE(SUM(cached_input_tokens), 0) cached_input_tokens,
                        COALESCE(SUM(output_tokens), 0) output_tokens
                 FROM model_calls
-                """
+                {where}
+                """,
+                params,
             ).fetchone()
             raw = connection.execute(
-                """
+                f"""
                 SELECT COALESCE(SUM(raw_input_tokens), 0) input_tokens,
                        COALESCE(SUM(raw_cached_input_tokens), 0) cached_input_tokens,
                        COALESCE(SUM(raw_output_tokens), 0) output_tokens
                 FROM model_calls
-                """
+                {where}
+                """,
+                params,
             ).fetchone()
             quality_rows = connection.execute(
-                """
+                f"""
                 SELECT usage_semantics, COUNT(*) calls,
                        COALESCE(SUM(input_tokens + output_tokens), 0) tokens
                 FROM model_calls
+                {where}
                 GROUP BY usage_semantics ORDER BY usage_semantics
-                """
+                """,
+                params,
             ).fetchall()
             quality_total_calls = sum(int(row["calls"]) for row in quality_rows)
             quality_total_tokens = sum(int(row["tokens"]) for row in quality_rows)
@@ -319,14 +337,18 @@ class ModelCallLedger:
             calls = [
                 self._view(row)
                 for row in connection.execute(
-                    """
+                    f"""
                     SELECT * FROM model_calls
+                    {"WHERE project_id = ?" if project_id else ""}
                     ORDER BY created_at DESC, call_id DESC LIMIT 200
-                    """
+                    """,
+                    params,
                 ).fetchall()
             ]
             dimensions = {
-                name: self._dimension(connection, column)
+                name: self._dimension(
+                    connection, column, project_id=project_id
+                )
                 for name, column in (
                     ("projects", "project_id"),
                     ("tasks", "task_id"),
@@ -339,7 +361,9 @@ class ModelCallLedger:
             }
             today = self._local_today()
             today_totals = self._aggregate_rows(
-                self._settled_rows_for_dates(connection, today, today)
+                self._settled_rows_for_dates(
+                    connection, today, today, project_id=project_id
+                )
             )
             input_tokens = int(total["input_tokens"])
             cached_input_tokens = int(total["cached_input_tokens"])
@@ -353,7 +377,8 @@ class ModelCallLedger:
                 "output_tokens": output_tokens,
                 "total_tokens": input_tokens + output_tokens,
                 "total_formula": "input_tokens + output_tokens",
-                "scope": "all_history",
+                "scope": "project" if project_id else "all_history",
+                "project_id": project_id,
                 "usage_semantics": (
                     "mixed_exact_and_legacy_inferred_delta"
                     if has_legacy_inference
@@ -392,12 +417,31 @@ class ModelCallLedger:
         finally:
             connection.close()
 
+    def is_completed_butler_planner(
+        self, call_id: str | None, *, project_id: str
+    ) -> bool:
+        if not call_id:
+            return False
+        connection = self.database.connect()
+        try:
+            return connection.execute(
+                """
+                SELECT 1 FROM model_calls
+                WHERE call_id = ? AND project_id = ?
+                  AND call_kind = 'butler_planner' AND status = 'completed'
+                """,
+                (call_id, project_id),
+            ).fetchone() is not None
+        finally:
+            connection.close()
+
     def daily_series(
         self,
         *,
         start: date | None = None,
         end: date | None = None,
         days: int | None = None,
+        project_id: str | None = None,
     ) -> dict[str, Any]:
         end_day = end or self._local_today()
         if start is not None:
@@ -409,7 +453,9 @@ class ModelCallLedger:
         start_day, end_day = self._bounded_range(start_day, end_day)
         connection = self.database.connect()
         try:
-            rows = self._settled_rows_for_dates(connection, start_day, end_day)
+            rows = self._settled_rows_for_dates(
+                connection, start_day, end_day, project_id=project_id
+            )
             by_day: dict[str, list[dict[str, Any]]] = {}
             for row in rows:
                 day_key = self._local_day_key(row)
@@ -425,6 +471,7 @@ class ModelCallLedger:
                 cursor += timedelta(days=1)
             return {
                 "timezone": USAGE_TIMEZONE,
+                "project_id": project_id,
                 "from": start_day.isoformat(),
                 "to": end_day.isoformat(),
                 "days": series,
@@ -435,10 +482,14 @@ class ModelCallLedger:
         finally:
             connection.close()
 
-    def day_breakdown(self, day: date) -> dict[str, Any]:
+    def day_breakdown(
+        self, day: date, *, project_id: str | None = None
+    ) -> dict[str, Any]:
         connection = self.database.connect()
         try:
-            rows = self._settled_rows_for_dates(connection, day, day)
+            rows = self._settled_rows_for_dates(
+                connection, day, day, project_id=project_id
+            )
             project_names = {
                 str(item["id"]): str(item["name"])
                 for item in connection.execute(
@@ -471,6 +522,7 @@ class ModelCallLedger:
             return {
                 "date": day.isoformat(),
                 "timezone": USAGE_TIMEZONE,
+                "project_id": project_id,
                 **totals,
                 "total_formula": "input_tokens + output_tokens",
                 "cached_input_tokens_in_total": True,
@@ -548,7 +600,12 @@ class ModelCallLedger:
         return stamp.astimezone(ZoneInfo(USAGE_TIMEZONE)).date().isoformat()
 
     def _settled_rows_for_dates(
-        self, connection: Any, start: date, end: date
+        self,
+        connection: Any,
+        start: date,
+        end: date,
+        *,
+        project_id: str | None = None,
     ) -> list[dict[str, Any]]:
         # Pad UTC bounds so Asia/Shanghai day edges are fully covered.
         zone = ZoneInfo(USAGE_TIMEZONE)
@@ -561,17 +618,24 @@ class ModelCallLedger:
         ).astimezone(timezone.utc)
         start_text = start_utc.strftime("%Y-%m-%d %H:%M:%S")
         end_text = end_utc.strftime("%Y-%m-%d %H:%M:%S")
+        project_clause = " AND project_id = ?" if project_id else ""
+        params: tuple[Any, ...] = (
+            (start_text, end_text, project_id)
+            if project_id
+            else (start_text, end_text)
+        )
         rows = connection.execute(
-            """
+            f"""
             SELECT call_id, project_id, task_id, input_tokens, cached_input_tokens,
                    output_tokens, settled_at, created_at, status
             FROM model_calls
             WHERE status IN ('completed', 'failed')
               AND COALESCE(settled_at, created_at) >= ?
               AND COALESCE(settled_at, created_at) < ?
+              {project_clause}
             ORDER BY COALESCE(settled_at, created_at), call_id
             """,
-            (start_text, end_text),
+            params,
         ).fetchall()
         result = []
         for row in rows:
@@ -680,6 +744,7 @@ class ModelCallLedger:
         host_job_id: str | None = None,
         session_id: str | None = None,
         error_class: str | None = None,
+        raw_status: str | None = None,
     ) -> dict[str, Any]:
         with self.database.transaction(immediate=True) as connection:
             connection.execute(
@@ -687,11 +752,19 @@ class ModelCallLedger:
                 UPDATE model_calls
                 SET status = ?, host_job_id = COALESCE(?, host_job_id),
                     session_id = COALESCE(?, session_id), error_class = ?,
+                    raw_status = COALESCE(?, raw_status),
                     dispatched_at = COALESCE(dispatched_at, CURRENT_TIMESTAMP),
                     updated_at = CURRENT_TIMESTAMP
                 WHERE call_id = ? AND status NOT IN ('completed', 'failed')
                 """,
-                (status, host_job_id, session_id, error_class, call_id),
+                (
+                    status,
+                    host_job_id,
+                    session_id,
+                    error_class,
+                    raw_status,
+                    call_id,
+                ),
             )
             row = connection.execute(
                 "SELECT * FROM model_calls WHERE call_id = ?", (call_id,)
@@ -701,7 +774,10 @@ class ModelCallLedger:
             return dict(row)
 
     @staticmethod
-    def _dimension(connection: Any, column: str) -> list[dict[str, Any]]:
+    def _dimension(
+        connection: Any, column: str, *, project_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        where = "WHERE project_id = ?" if project_id else ""
         rows = connection.execute(
             f"""
             SELECT {column}, SUM(input_tokens) input_tokens,
@@ -710,9 +786,10 @@ class ModelCallLedger:
                    SUM(output_tokens) output_tokens,
                    SUM(input_tokens + output_tokens) tokens,
                    COUNT(*) calls
-            FROM model_calls GROUP BY {column}
+            FROM model_calls {where} GROUP BY {column}
             ORDER BY tokens DESC, calls DESC, {column}
-            """
+            """,
+            (project_id,) if project_id else (),
         ).fetchall()
         return [dict(row) for row in rows]
 

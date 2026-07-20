@@ -135,6 +135,31 @@ export type ButlerConversation = {
   auto_dispatch?: boolean
   structured_goal_spec?: boolean
   semantic?: Record<string, unknown> | null
+  planner?: Record<string, unknown> | null
+  provider: string
+  external_session_id: string | null
+  session_generation: number
+  archived_at: string | null
+}
+
+export type AlertIncident = {
+  id: string
+  fingerprint: string
+  root_kind: string
+  scope_key: string
+  severity: 'critical' | 'error' | 'warning' | 'info'
+  title: string
+  status: 'open' | 'recovering' | 'resolved'
+  occurrence_count: number
+  first_seen_at: string
+  last_seen_at: string
+  resolved_at: string | null
+  detail: Record<string, unknown>
+}
+
+export type Alerts = {
+  items: AlertIncident[]
+  network: Record<string, unknown>
 }
 
 export type BehaviorBaseline = {
@@ -325,6 +350,21 @@ export type RuntimeSettingsValues = {
   handoff_max_bytes: number
   observation_tail_lines: number
   observation_max_bytes: number
+  episode_wall_limit_seconds: number
+  checkpoint_interval_seconds: number
+  no_progress_seconds: number
+  max_host_processes: number
+  progress_extension_seconds: number
+  provider_failure_threshold: number
+  provider_recovery_successes: number
+  provider_open_seconds: number
+  network_failure_threshold: number
+  network_recovery_successes: number
+  resume_batch_size: number
+  alert_debounce_seconds: number
+  default_provider_policy: 'auto' | 'preferred' | 'pinned'
+  default_provider_order: string[]
+  default_butler_provider: string
 }
 export type RuntimeSettings = {
   revision: number
@@ -620,16 +660,23 @@ export const api = {
       idempotencyKey: crypto.randomUUID(),
       body: JSON.stringify({ provider, project_id: projectId }),
     }),
-  usage: () => request<Usage>('/api/usage'),
-  usageDaily: (params?: { start?: string; end?: string; days?: number }) => {
+  usage: (projectId?: string) => request<Usage>(
+    `/api/usage${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ''}`,
+  ),
+  usageDaily: (params?: { start?: string; end?: string; days?: number; projectId?: string }) => {
     const query = new URLSearchParams()
     if (params?.start) query.set('start', params.start)
     if (params?.end) query.set('end', params.end)
     if (params?.days != null) query.set('days', String(params.days))
+    if (params?.projectId) query.set('project_id', params.projectId)
     const suffix = query.toString() ? `?${query.toString()}` : ''
     return request<UsageDailySeries>(`/api/usage/daily${suffix}`)
   },
-  usageDailyDay: (day: string) => request<UsageDailyBreakdown>(`/api/usage/daily/${day}`),
+  usageDailyDay: (day: string, projectId?: string) => request<UsageDailyBreakdown>(
+    `/api/usage/daily/${day}${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ''}`,
+  ),
+  alerts: (status?: AlertIncident['status']) =>
+    request<Alerts>(`/api/alerts${status ? `?status=${status}` : ''}`),
   settings: () => request<RuntimeSettings>('/api/settings'),
   updateSettings: (settings: RuntimeSettings) =>
     request<RuntimeSettings>('/api/settings', {
@@ -660,6 +707,38 @@ export const api = {
     request<GlobalButlerOverview>(
       `/api/butlers/global/overview${workspaceRoot ? `?workspace_root=${encodeURIComponent(workspaceRoot)}` : ''}`,
     ),
+  globalButlerConversations: () =>
+    request<ButlerConversation[]>('/api/butlers/global/conversations'),
+  startGlobalButler: (payload: { instruction: string; provider?: string; workspace_root?: string | null }) =>
+    request<ButlerConversation>('/api/butlers/global/conversations', {
+      method: 'POST',
+      idempotencyKey: crypto.randomUUID(),
+      body: JSON.stringify({
+        source_type: 'human',
+        source_id: 'owner',
+        provider: payload.provider ?? 'codex',
+        ...payload,
+      }),
+    }),
+  sendGlobalButlerMessage: (conversation: ButlerConversation, content: string) =>
+    request<ButlerConversation>(
+      `/api/butlers/global/conversations/${conversation.id}/messages`,
+      {
+        method: 'POST',
+        idempotencyKey: crypto.randomUUID(),
+        body: JSON.stringify({
+          expected_revision: conversation.revision,
+          content,
+          sender_type: 'human',
+        }),
+      },
+    ),
+  routeGlobalButler: (projectId: string, payload: Record<string, unknown>) =>
+    request<ButlerConversation>('/api/butlers/global/route', {
+      method: 'POST',
+      idempotencyKey: crypto.randomUUID(),
+      body: JSON.stringify({ ...payload, project_id: projectId }),
+    }),
   startProjectButler: (projectId: string, payload: Record<string, unknown>) =>
     request<ButlerConversation>(`/api/projects/${projectId}/butler/conversations`, {
       method: 'POST',

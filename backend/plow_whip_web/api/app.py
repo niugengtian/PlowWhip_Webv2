@@ -24,6 +24,7 @@ from plow_whip_web.api.schemas import (
     GoalCreate,
     GoalView,
     GlobalButlerRoute,
+    GlobalButlerConversationStart,
     ProjectCreate,
     ProjectView,
     ProviderPut,
@@ -36,6 +37,7 @@ from plow_whip_web.api.schemas import (
     RebindWorkerRequest,
     TaskCreate,
     TaskControl,
+    ContinuationGrantCreate,
     TaskDeleteRequest,
     TaskDeletionEligibilityView,
     TaskDeletionView,
@@ -52,6 +54,7 @@ from plow_whip_web.api.schemas import (
 )
 from plow_whip_web.runtime.sizing import TaskSizingInputs, estimate_task_sizing
 from plow_whip_web.runtime.orchestration import plan_goal_work_items
+from plow_whip_web.runtime.butler import ButlerPlanner
 from dataclasses import replace
 from plow_whip_web.config import Settings
 from plow_whip_web.domain.model import (
@@ -88,6 +91,7 @@ from plow_whip_web.store.butler_repository import ButlerRepository
 from plow_whip_web.store.host_job_repository import HostJobRepository
 from plow_whip_web.store.worker_help_repository import WorkerHelpRepository
 from plow_whip_web.store.role_instance_repository import RoleInstanceRepository
+from plow_whip_web.store.resilience_repository import ResilienceRepository
 from plow_whip_web.runtime.legacy_rules import legacy_rules_matrix
 from plow_whip_web.providers.host_bridge import HostBridgeClient
 from plow_whip_web.providers.pool import ProviderPool
@@ -120,11 +124,19 @@ def create_app(settings: Settings) -> FastAPI:
     audit = AuditRepository(database)
     permissions = PermissionRepository(database)
     providers = ProviderRepository(database)
+    resilience = ResilienceRepository(database)
     provider_pool = ProviderPool(
         database, providers, task_repository,
         HostBridgeClient(settings.host_bridge_url, settings.host_bridge_token),
         token_ledger=token_ledger,
         model_calls=model_calls,
+        settings=runtime_settings,
+    )
+    butler_planner = ButlerPlanner(
+        provider_pool,
+        model_calls,
+        provider=settings.butler_planner_provider,
+        timeout_seconds=settings.butler_planner_timeout_seconds,
     )
     maintenance = MaintenanceService(
         settings.data_dir, database, runtime_settings, health_repository, providers
@@ -135,12 +147,14 @@ def create_app(settings: Settings) -> FastAPI:
         provider_pool=provider_pool, host_jobs=host_jobs, projects=project_repository,
         model_calls=model_calls,
         role_instances=role_instance_repository,
+        resilience=resilience,
     )
     scheduler_repository = SchedulerRepository(database)
     scheduler_service = SchedulerService(
         scheduler_repository, runtime_settings, task_repository, task_service,
         connectivity=ConnectivityProbe(), health=health_repository, recovery=recovery,
         provider_pool=provider_pool, goals=goal_repository,
+        resilience=resilience,
     )
     embedded_cron_runner = EmbeddedCronRunner(
         scheduler_service, scheduler_repository, runtime_settings
@@ -156,6 +170,7 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.task_repository = task_repository
     app.state.goal_repository = goal_repository
     app.state.butler_repository = butler_repository
+    app.state.butler_planner = butler_planner
     app.state.worker_help_repository = worker_help_repository
     app.state.role_instance_repository = role_instance_repository
     app.state.host_jobs = host_jobs
@@ -168,6 +183,7 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.conventions = conventions
     app.state.token_ledger = token_ledger
     app.state.model_calls = model_calls
+    app.state.resilience = resilience
     app.state.context_compiler = context_compiler
     app.state.journal = journal
     app.state.health_repository = health_repository
@@ -600,9 +616,13 @@ def create_app(settings: Settings) -> FastAPI:
         return compiler.compile(task_id)
 
     @app.get("/api/usage", tags=["usage"])
-    def usage(request: Request) -> dict[str, object]:
+    def usage(
+        request: Request, project_id: str | None = None
+    ) -> dict[str, object]:
         ledger: ModelCallLedger = request.app.state.model_calls
-        return ledger.summary()
+        if project_id:
+            request.app.state.project_repository.get(project_id)
+        return ledger.summary(project_id=project_id)
 
     @app.get("/api/usage/daily", tags=["usage"])
     def usage_daily(
@@ -610,6 +630,7 @@ def create_app(settings: Settings) -> FastAPI:
         start: str | None = None,
         end: str | None = None,
         days: int | None = None,
+        project_id: str | None = None,
     ) -> dict[str, object]:
         ledger: ModelCallLedger = request.app.state.model_calls
         try:
@@ -618,16 +639,24 @@ def create_app(settings: Settings) -> FastAPI:
             )
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
-        return ledger.daily_series(start=start_day, end=end_day)
+        if project_id:
+            request.app.state.project_repository.get(project_id)
+        return ledger.daily_series(
+            start=start_day, end=end_day, project_id=project_id
+        )
 
     @app.get("/api/usage/daily/{day}", tags=["usage"])
-    def usage_daily_day(request: Request, day: str) -> dict[str, object]:
+    def usage_daily_day(
+        request: Request, day: str, project_id: str | None = None
+    ) -> dict[str, object]:
         ledger: ModelCallLedger = request.app.state.model_calls
         try:
             target = ModelCallLedger.resolve_history_range(start=day, end=day)[0]
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
-        return ledger.day_breakdown(target)
+        if project_id:
+            request.app.state.project_repository.get(project_id)
+        return ledger.day_breakdown(target, project_id=project_id)
 
     @app.get("/api/system/health", tags=["system"])
     def runtime_health(request: Request) -> dict[str, object]:
@@ -880,6 +909,101 @@ def create_app(settings: Settings) -> FastAPI:
         return repository.global_overview(workspace_root=workspace_root)
 
     @app.post(
+        "/api/butlers/global/conversations",
+        response_model=ButlerConversationView,
+        status_code=201,
+        tags=["butlers"],
+    )
+    def start_global_butler_conversation(
+        request: Request,
+        payload: GlobalButlerConversationStart,
+        idempotency_key: str = Header(
+            alias="Idempotency-Key", min_length=8, max_length=200
+        ),
+    ) -> ButlerConversationView:
+        repository: ButlerRepository = request.app.state.butler_repository
+        record = repository.start_global_conversation(
+            source_type=payload.source_type,
+            source_id=payload.source_id,
+            instruction=payload.instruction,
+            provider=payload.provider,
+            idempotency_key=idempotency_key,
+        )
+        if len(record["messages"]) == 1:
+            record = _reply_global_butler(
+                request,
+                record,
+                instruction=payload.instruction,
+                workspace_root=payload.workspace_root,
+                idempotency_key=f"{idempotency_key}:call:r{record['revision']}",
+            )
+        return ButlerConversationView(**record)
+
+    @app.get(
+        "/api/butlers/global/conversations",
+        response_model=list[ButlerConversationView],
+        tags=["butlers"],
+    )
+    def list_global_butler_conversations(
+        request: Request,
+    ) -> list[ButlerConversationView]:
+        repository: ButlerRepository = request.app.state.butler_repository
+        return [
+            ButlerConversationView(**record)
+            for record in repository.list_global()
+        ]
+
+    @app.get(
+        "/api/butlers/global/conversations/{conversation_id}",
+        response_model=ButlerConversationView,
+        tags=["butlers"],
+    )
+    def get_global_butler_conversation(
+        request: Request, conversation_id: str
+    ) -> ButlerConversationView:
+        repository: ButlerRepository = request.app.state.butler_repository
+        record = repository.get(conversation_id)
+        if record["scope"] != "global":
+            raise NotFoundError(
+                f"global butler conversation not found: {conversation_id}"
+            )
+        return ButlerConversationView(**record)
+
+    @app.post(
+        "/api/butlers/global/conversations/{conversation_id}/messages",
+        response_model=ButlerConversationView,
+        tags=["butlers"],
+    )
+    def post_global_butler_message(
+        request: Request,
+        conversation_id: str,
+        payload: ButlerMessageCreate,
+        idempotency_key: str = Header(
+            alias="Idempotency-Key", min_length=8, max_length=200
+        ),
+    ) -> ButlerConversationView:
+        repository: ButlerRepository = request.app.state.butler_repository
+        current = repository.get(conversation_id)
+        if current["scope"] != "global":
+            raise NotFoundError(
+                f"global butler conversation not found: {conversation_id}"
+            )
+        record = repository.post_global_user_message(
+            conversation_id,
+            expected_revision=payload.expected_revision,
+            content=payload.content,
+            sender_type=payload.sender_type,
+        )
+        record = _reply_global_butler(
+            request,
+            record,
+            instruction=payload.content,
+            workspace_root=None,
+            idempotency_key=f"{idempotency_key}:call:r{record['revision']}",
+        )
+        return ButlerConversationView(**record)
+
+    @app.post(
         "/api/butlers/global/route",
         response_model=ButlerConversationView,
         status_code=201,
@@ -901,6 +1025,20 @@ def create_app(settings: Settings) -> FastAPI:
             instruction=payload.instruction,
             draft=draft,
             idempotency_key=idempotency_key,
+            butler_provider=str(
+                request.app.state.runtime_settings.get()["values"][
+                    "default_butler_provider"
+                ]
+            ),
+        )
+        record = _maybe_plan_butler(
+            request,
+            record,
+            instruction=payload.instruction,
+            idempotency_key=f"{idempotency_key}:planner:r{record['revision']}",
+            structured_input=bool(
+                payload.objective and payload.boundaries and payload.acceptance
+            ),
         )
         return ButlerConversationView(**record)
 
@@ -927,6 +1065,20 @@ def create_app(settings: Settings) -> FastAPI:
             instruction=payload.instruction,
             draft=draft,
             idempotency_key=idempotency_key,
+            butler_provider=str(
+                request.app.state.runtime_settings.get()["values"][
+                    "default_butler_provider"
+                ]
+            ),
+        )
+        record = _maybe_plan_butler(
+            request,
+            record,
+            instruction=payload.instruction,
+            idempotency_key=f"{idempotency_key}:planner:r{record['revision']}",
+            structured_input=bool(
+                payload.objective and payload.boundaries and payload.acceptance
+            ),
         )
         record = _maybe_auto_dispatch_butler(request, project_id, record)
         return ButlerConversationView(**record)
@@ -974,16 +1126,25 @@ def create_app(settings: Settings) -> FastAPI:
         current = repository.get(conversation_id)
         if current["project_id"] != project_id:
             raise NotFoundError(f"butler conversation not found: {conversation_id}")
-        return ButlerConversationView(**_maybe_auto_dispatch_butler(
-            request,
-            project_id,
-            repository.post_message(
+        record = repository.post_message(
                 conversation_id,
                 expected_revision=payload.expected_revision,
                 content=payload.content,
                 sender_type=payload.sender_type,
                 field=payload.field,
+            )
+        record = _maybe_plan_butler(
+            request,
+            record,
+            instruction=payload.content,
+            idempotency_key=(
+                f"butler-message:{conversation_id}:planner:r{record['revision']}"
             ),
+            structured_input=False,
+            allow_replan=True,
+        )
+        return ButlerConversationView(**_maybe_auto_dispatch_butler(
+            request, project_id, record
         ))
 
     @app.post(
@@ -1001,16 +1162,25 @@ def create_app(settings: Settings) -> FastAPI:
         current = repository.get(conversation_id)
         if current["project_id"] != project_id:
             raise NotFoundError(f"butler conversation not found: {conversation_id}")
-        return ButlerConversationView(**_maybe_auto_dispatch_butler(
-            request,
-            project_id,
-            repository.answer(
+        record = repository.answer(
                 conversation_id,
                 expected_revision=payload.expected_revision,
                 field=payload.field,
                 values=payload.values,
                 sender_type=payload.sender_type,
+            )
+        record = _maybe_plan_butler(
+            request,
+            record,
+            instruction="\n".join(payload.values),
+            idempotency_key=(
+                f"butler-answer:{conversation_id}:planner:r{record['revision']}"
             ),
+            structured_input=False,
+            allow_replan=True,
+        )
+        return ButlerConversationView(**_maybe_auto_dispatch_butler(
+            request, project_id, record
         ))
 
     @app.post(
@@ -1032,27 +1202,17 @@ def create_app(settings: Settings) -> FastAPI:
         if current["project_id"] != project_id:
             raise NotFoundError(f"butler conversation not found: {conversation_id}")
         spec = current["spec"]
-        sizing_inputs = spec.get("sizing_inputs") or {
-            "layers_touched": 1,
-            "components_touched": 1,
-            "estimated_files_changed": 1,
-            "has_migration": False,
-            "has_deploy": False,
-            "verification_commands_count": max(1, len(spec.get("verification") or [])),
-            "estimated_verification_seconds": 60,
-            "external_dependencies_count": 0,
-            "risk_level": "low",
-            "independent_review_required": False,
-            "gate_artifact": True,
-            "gate_boundary": True,
-            "gate_verification": True,
-            "gate_dependency": True,
-        }
+        sizing_inputs = spec["sizing_inputs"]
         goal_payload = GoalCreate.model_validate({
             "title": spec["title"],
             "objective": spec["objective"],
             "project_id": project_id,
-            "provider": spec.get("provider") or "cursor",
+            "provider": spec.get("provider") or "codex",
+            "provider_policy": spec.get("provider_policy") or "auto",
+            "fallback_enabled": spec.get("fallback_enabled", True),
+            "provider_order": spec.get("provider_order") or [
+                "codex", "cursor", "deepseek", "kimi"
+            ],
             "role_providers": spec.get("role_providers") or {},
             "network_requirement": spec.get("network_requirement") or "none",
             "verification": spec.get("verification") or [
@@ -1069,6 +1229,7 @@ def create_app(settings: Settings) -> FastAPI:
             "sizing_inputs": sizing_inputs,
             "command": spec.get("command"),
             "plan_items": spec.get("plan_items"),
+            "planner_call_id": spec.get("planner_call_id"),
         })
         goal = _create_goal_record(
             request, goal_payload, f"butler-confirm:{conversation_id}:goal"
@@ -1147,6 +1308,9 @@ def create_app(settings: Settings) -> FastAPI:
             "resource_key": payload.resource_key,
             "network_requirement": payload.network_requirement,
             "provider": payload.provider,
+            "provider_policy": payload.provider_policy,
+            "fallback_enabled": payload.fallback_enabled,
+            "provider_order": payload.provider_order,
             "quality_profile": payload.quality_profile,
         }
 
@@ -1313,6 +1477,51 @@ def create_app(settings: Settings) -> FastAPI:
             expected_revision=payload.expected_revision, idempotency_key=idempotency_key,
         ))
 
+    @app.post("/api/tasks/{task_id}/continuation", tags=["tasks", "alerts"])
+    def grant_task_continuation(
+        request: Request,
+        task_id: str,
+        payload: ContinuationGrantCreate,
+        idempotency_key: str = Header(
+            alias="Idempotency-Key", min_length=8, max_length=200
+        ),
+    ) -> dict[str, object]:
+        service: TaskService = request.app.state.task_service
+        result = service.apply_continuation_grant(
+            task_id,
+            action=payload.action,
+            operator=payload.operator,
+            reason=payload.reason,
+            expected_revision=payload.expected_revision,
+            budget_delta=payload.budget_delta,
+            target_provider=payload.target_provider,
+            expires_at=payload.expires_at,
+            idempotency_key=idempotency_key,
+        )
+        return {
+            "grant": result["grant"],
+            "task": TaskView.from_record(result["task"]).model_dump(mode="json"),
+        }
+
+    @app.get("/api/alerts", tags=["alerts"])
+    def list_alerts(
+        request: Request, status: str | None = None
+    ) -> dict[str, object]:
+        if status not in {None, "open", "recovering", "resolved"}:
+            raise HTTPException(status_code=400, detail="invalid incident status")
+        resilience: ResilienceRepository = request.app.state.resilience
+        return {
+            "items": resilience.incidents(status=status),
+            "network": resilience.network_state(),
+        }
+
+    @app.get("/api/alerts/{incident_id}", tags=["alerts"])
+    def get_alert(
+        request: Request, incident_id: str, limit: int = 100
+    ) -> dict[str, object]:
+        resilience: ResilienceRepository = request.app.state.resilience
+        return resilience.incident(incident_id, limit=limit)
+
     package_static = Path(__file__).resolve().parents[1] / "static"
     source_static = Path(__file__).resolve().parents[3] / "web" / "dist"
     web_dist = package_static if package_static.is_dir() else source_static
@@ -1349,15 +1558,7 @@ def _create_goal_record(
         model="butler-v2",
         project_id=payload.project_id,
     )
-    plan_call = model_calls.prepare(
-        idempotency_key=f"{idempotency_key}:planner",
-        call_kind="butler_planner",
-        provider="internal",
-        model="butler-v2",
-        project_id=payload.project_id,
-    )
     model_calls.dispatched(route_call["call_id"])
-    model_calls.dispatched(plan_call["call_id"])
     try:
         plan = plan_goal_work_items(
             title=payload.title,
@@ -1366,6 +1567,10 @@ def _create_goal_record(
             structured_items=payload.plan_items,
             execution_policy=project["execution_policy"],
             role_providers=payload.role_providers,
+            model_invoked=model_calls.is_completed_butler_planner(
+                payload.planner_call_id,
+                project_id=payload.project_id,
+            ),
         )
         providers = {
             item.provider or payload.provider
@@ -1377,12 +1582,8 @@ def _create_goal_record(
         model_calls.settle(
             route_call["call_id"], failed=True, error_class=type(error).__name__
         )
-        model_calls.settle(
-            plan_call["call_id"], failed=True, error_class=type(error).__name__
-        )
         raise
     model_calls.settle(route_call["call_id"])
-    model_calls.settle(plan_call["call_id"])
     if plan.status == "needs_planning":
         raise HTTPException(
             status_code=400,
@@ -1398,6 +1599,9 @@ def _create_goal_record(
         project_id=payload.project_id,
         project_path=project["path"],
         provider=payload.provider,
+        provider_policy=payload.provider_policy,
+        fallback_enabled=payload.fallback_enabled,
+        provider_order=payload.provider_order,
         plan=plan,
         sizing_inputs=payload.sizing_inputs.model_dump(),
         verification=[
@@ -1423,6 +1627,94 @@ def _create_goal_record(
     return GoalView(**record)
 
 
+def _reply_global_butler(
+    request: Request,
+    record: dict,
+    *,
+    instruction: str,
+    workspace_root: str | None,
+    idempotency_key: str,
+) -> dict:
+    repository: ButlerRepository = request.app.state.butler_repository
+    overview = repository.global_overview(workspace_root=workspace_root)
+    if workspace_root:
+        root = Path(workspace_root).expanduser().resolve()
+        if not root.is_dir():
+            raise NotFoundError(f"workspace root not found: {workspace_root}")
+        project_path = str(root)
+    elif overview["projects"]:
+        project_path = str(overview["projects"][0]["resource_path"])
+    else:
+        project_path = str(request.app.state.settings.data_dir)
+    planner: ButlerPlanner = request.app.state.butler_planner
+    result = planner.chat_global(
+        provider_name=str(record["provider"]),
+        project_path=project_path,
+        instruction=instruction,
+        overview=overview,
+        conversation_revision=int(record["revision"]),
+        idempotency_key=idempotency_key,
+        session_id=record.get("external_session_id"),
+    )
+    return repository.append_global_reply(
+        record["id"],
+        expected_revision=int(record["revision"]),
+        content=result.content,
+        call_id=result.call_id,
+        external_session_id=result.external_session_id,
+        error_class=result.error_class,
+    )
+
+
+def _maybe_plan_butler(
+    request: Request,
+    record: dict,
+    *,
+    instruction: str,
+    idempotency_key: str,
+    structured_input: bool,
+    allow_replan: bool = False,
+) -> dict:
+    """Invoke the configured planner only for natural-language intake."""
+    if structured_input or record.get("status") == "dispatched":
+        return record
+    # A successful proposal increments the conversation revision. Replaying the
+    # original intake key must reuse that proposal/call instead of deriving a
+    # second planner key from the newer revision.
+    planner_receipt = record.get("planner") or {}
+    if planner_receipt.get("call_id") and not allow_replan:
+        return record
+    projects: ProjectRepository = request.app.state.project_repository
+    role_instances: RoleInstanceRepository = request.app.state.role_instance_repository
+    planner: ButlerPlanner = request.app.state.butler_planner
+    result = planner.plan(
+        project=projects.get(record["project_id"]),
+        instruction=instruction,
+        current_draft=record["spec"],
+        proposal_revision=int(record["revision"]),
+        idempotency_key=idempotency_key,
+        templates=role_instances.list_templates(),
+        rules=role_instances.list_rules(),
+        session_id=record.get("external_session_id"),
+        provider_name=str(record.get("provider") or "codex"),
+    )
+    if result.external_session_id:
+        record = request.app.state.butler_repository.bind_provider_session(
+            record["id"],
+            provider=str(record.get("provider") or "codex"),
+            external_session_id=result.external_session_id,
+        )
+    if result.draft is None or result.call_id is None:
+        return record
+    repository: ButlerRepository = request.app.state.butler_repository
+    return repository.apply_planner_proposal(
+        record["id"],
+        expected_revision=record["revision"],
+        draft=result.draft,
+        call_id=result.call_id,
+    )
+
+
 def _maybe_auto_dispatch_butler(
     request: Request,
     project_id: str,
@@ -1437,27 +1729,17 @@ def _maybe_auto_dispatch_butler(
         return record
     repository: ButlerRepository = request.app.state.butler_repository
     spec = record["spec"]
-    sizing_inputs = spec.get("sizing_inputs") or {
-        "layers_touched": 1,
-        "components_touched": 1,
-        "estimated_files_changed": 1,
-        "has_migration": False,
-        "has_deploy": False,
-        "verification_commands_count": max(1, len(spec.get("verification") or [])),
-        "estimated_verification_seconds": 60,
-        "external_dependencies_count": 0,
-        "risk_level": "low",
-        "independent_review_required": False,
-        "gate_artifact": True,
-        "gate_boundary": True,
-        "gate_verification": True,
-        "gate_dependency": True,
-    }
+    sizing_inputs = spec["sizing_inputs"]
     goal_payload = GoalCreate.model_validate({
         "title": spec["title"],
         "objective": spec["objective"],
         "project_id": project_id,
-        "provider": spec.get("provider") or "cursor",
+        "provider": spec.get("provider") or "codex",
+        "provider_policy": spec.get("provider_policy") or "auto",
+        "fallback_enabled": spec.get("fallback_enabled", True),
+        "provider_order": spec.get("provider_order") or [
+            "codex", "cursor", "deepseek", "kimi"
+        ],
         "role_providers": spec.get("role_providers") or {},
         "network_requirement": spec.get("network_requirement") or "none",
         "verification": spec.get("verification") or [
@@ -1474,6 +1756,7 @@ def _maybe_auto_dispatch_butler(
         "sizing_inputs": sizing_inputs,
         "command": spec.get("command"),
         "plan_items": spec.get("plan_items"),
+        "planner_call_id": spec.get("planner_call_id"),
     })
     goal = _create_goal_record(
         request,

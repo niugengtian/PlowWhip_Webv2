@@ -17,6 +17,7 @@ from plow_whip_web.runtime.goal_semantics import (
     next_semantic_gap,
     structured_fields_provided,
 )
+from plow_whip_web.runtime.butler import deterministic_goal_draft
 from plow_whip_web.runtime.sizing import TaskSizingInputs, estimate_task_sizing
 from plow_whip_web.store.database import Database
 
@@ -36,6 +37,7 @@ class ButlerRepository:
         instruction: str,
         draft: dict[str, Any],
         idempotency_key: str,
+        butler_provider: str = "codex",
     ) -> dict[str, Any]:
         conversation_id = str(uuid.uuid4())
         normalized = _normalize_draft(instruction, draft)
@@ -68,8 +70,8 @@ class ButlerRepository:
                 INSERT INTO butler_conversations(
                     id, scope, project_id, source_type, source_id, status,
                     confidence, expected_field, spec_json, proposal_hash,
-                    idempotency_key
-                ) VALUES (?, 'project', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    idempotency_key, provider
+                ) VALUES (?, 'project', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     conversation_id,
@@ -87,6 +89,7 @@ class ButlerRepository:
                     }}),
                     proposal_hash,
                     idempotency_key,
+                    butler_provider,
                 ),
             )
             self._append(
@@ -119,6 +122,167 @@ class ButlerRepository:
             result["auto_dispatch"] = auto_dispatch
             result["structured_goal_spec"] = structured
             return result
+
+    def start_global_conversation(
+        self,
+        *,
+        source_type: str,
+        source_id: str | None,
+        instruction: str,
+        provider: str,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        conversation_id = str(uuid.uuid4())
+        with self.database.transaction(immediate=True) as connection:
+            duplicate = connection.execute(
+                "SELECT id FROM butler_conversations WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if duplicate:
+                return self._get_with_connection(connection, duplicate["id"])
+            connection.execute(
+                """
+                INSERT INTO butler_conversations(
+                    id, scope, project_id, source_type, source_id, status,
+                    confidence, expected_field, spec_json, proposal_hash,
+                    idempotency_key, provider
+                ) VALUES (
+                    ?, 'global', NULL, ?, ?, 'clarifying',
+                    100, 'objective', ?, NULL, ?, ?
+                )
+                """,
+                (
+                    conversation_id,
+                    source_type,
+                    source_id,
+                    _json(
+                        {
+                            "objective": instruction,
+                            "_intake": {"mode": "global_chat"},
+                        }
+                    ),
+                    idempotency_key,
+                    provider,
+                ),
+            )
+            self._append(
+                connection,
+                conversation_id,
+                source_type,
+                "instruction",
+                instruction,
+                {"source_id": source_id, "mode": "global_chat"},
+            )
+            return self._get_with_connection(connection, conversation_id)
+
+    def post_global_user_message(
+        self,
+        conversation_id: str,
+        *,
+        expected_revision: int,
+        content: str,
+        sender_type: str,
+    ) -> dict[str, Any]:
+        clean = content.strip()
+        if not clean:
+            raise InvalidTransitionError("message must not be empty")
+        with self.database.transaction(immediate=True) as connection:
+            row = self._row(connection, conversation_id)
+            if row["scope"] != "global" or row["archived_at"]:
+                raise InvalidTransitionError("global conversation is not active")
+            if int(row["revision"]) != expected_revision:
+                raise RevisionConflictError(
+                    f"expected revision {expected_revision}, current {row['revision']}"
+                )
+            connection.execute(
+                """
+                UPDATE butler_conversations
+                SET revision = revision + 1, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (conversation_id,),
+            )
+            self._append(
+                connection,
+                conversation_id,
+                sender_type,
+                "answer",
+                clean,
+                {"mode": "global_chat"},
+            )
+            return self._get_with_connection(connection, conversation_id)
+
+    def append_global_reply(
+        self,
+        conversation_id: str,
+        *,
+        expected_revision: int,
+        content: str,
+        call_id: str | None,
+        external_session_id: str | None,
+        error_class: str | None = None,
+    ) -> dict[str, Any]:
+        with self.database.transaction(immediate=True) as connection:
+            row = self._row(connection, conversation_id)
+            if row["scope"] != "global":
+                raise InvalidTransitionError("conversation is not global")
+            if int(row["revision"]) != expected_revision:
+                raise RevisionConflictError(
+                    f"expected revision {expected_revision}, current {row['revision']}"
+                )
+            connection.execute(
+                """
+                UPDATE butler_conversations
+                SET revision = revision + 1,
+                    external_session_id = COALESCE(?, external_session_id),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (external_session_id, conversation_id),
+            )
+            self._append(
+                connection,
+                conversation_id,
+                "global_butler",
+                "answer",
+                content.strip() or "当前无法生成答复，请稍后重试。",
+                {
+                    "mode": "global_chat",
+                    "call_id": call_id,
+                    "error_class": error_class,
+                },
+            )
+            return self._get_with_connection(connection, conversation_id)
+
+    def bind_provider_session(
+        self,
+        conversation_id: str,
+        *,
+        provider: str,
+        external_session_id: str | None,
+    ) -> dict[str, Any]:
+        if not external_session_id:
+            return self.get(conversation_id)
+        with self.database.transaction(immediate=True) as connection:
+            row = self._row(connection, conversation_id)
+            if row["provider"] != provider:
+                raise InvalidTransitionError(
+                    "provider session does not match the conversation"
+                )
+            current = row["external_session_id"]
+            if current and current != external_session_id:
+                raise InvalidTransitionError(
+                    "provider session changed without a new session generation"
+                )
+            connection.execute(
+                """
+                UPDATE butler_conversations
+                SET external_session_id = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (external_session_id, conversation_id),
+            )
+            return self._get_with_connection(connection, conversation_id)
 
     def answer(
         self,
@@ -357,6 +521,7 @@ class ButlerRepository:
                 """
                 UPDATE butler_conversations
                 SET status = 'dispatched', revision = revision + 1, goal_id = ?,
+                    archived_at = CURRENT_TIMESTAMP,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
@@ -370,6 +535,80 @@ class ButlerRepository:
                 "已确认目标、边界、验收标准与拆分方案",
                 {"proposal_hash": proposal_hash, "goal_id": goal_id},
             )
+            return self._get_with_connection(connection, conversation_id)
+
+    def apply_planner_proposal(
+        self,
+        conversation_id: str,
+        *,
+        expected_revision: int,
+        draft: dict[str, Any],
+        call_id: str,
+    ) -> dict[str, Any]:
+        """Persist one validated model proposal without treating it as confirmation."""
+        with self.database.transaction(immediate=True) as connection:
+            row = self._row(connection, conversation_id)
+            if int(row["revision"]) != expected_revision:
+                raise RevisionConflictError(
+                    f"expected revision {expected_revision}, current {row['revision']}"
+                )
+            if row["status"] not in {"clarifying", "awaiting_confirmation"}:
+                raise InvalidTransitionError("conversation is no longer accepting a proposal")
+            current = json.loads(row["spec_json"])
+            intake = dict(current.pop("_intake", {}) or {})
+            normalized = _normalize_draft(
+                str(draft.get("objective") or current.get("objective") or ""),
+                {**current, **draft},
+            )
+            normalized["planner_call_id"] = call_id
+            assessment = assess_goal_semantics(normalized)
+            expected = None if assessment["ready"] else next_semantic_gap(normalized)
+            proposal_hash = _proposal_hash(normalized) if expected is None else None
+            intake.update({
+                "semantic": assessment,
+                "auto_dispatch": False,
+                "model_planned": True,
+                "planner": {
+                    "status": "planned",
+                    "call_id": call_id,
+                    "proposal_revision": expected_revision,
+                },
+            })
+            connection.execute(
+                """
+                UPDATE butler_conversations
+                SET status = ?, revision = revision + 1, confidence = ?,
+                    expected_field = ?, spec_json = ?, proposal_hash = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    "clarifying" if expected else "awaiting_confirmation",
+                    int(assessment["confidence"]),
+                    expected,
+                    _json({**normalized, "_intake": intake}),
+                    proposal_hash,
+                    conversation_id,
+                ),
+            )
+            if expected:
+                self._append(
+                    connection,
+                    conversation_id,
+                    "project_butler",
+                    "question",
+                    gap_question(expected, normalized),
+                    {"field": expected, "planner_call_id": call_id},
+                )
+            else:
+                self._append_proposal(
+                    connection,
+                    conversation_id,
+                    normalized,
+                    proposal_hash,
+                    auto_dispatch=False,
+                    structured=False,
+                )
             return self._get_with_connection(connection, conversation_id)
 
     def get(self, conversation_id: str) -> dict[str, Any]:
@@ -391,6 +630,23 @@ class ButlerRepository:
                     ORDER BY updated_at DESC, id DESC
                     """,
                     (project_id,),
+                )
+            ]
+            return [self._get_with_connection(connection, item) for item in ids]
+        finally:
+            connection.close()
+
+    def list_global(self) -> list[dict[str, Any]]:
+        connection = self.database.connect()
+        try:
+            ids = [
+                row["id"]
+                for row in connection.execute(
+                    """
+                    SELECT id FROM butler_conversations
+                    WHERE scope = 'global'
+                    ORDER BY updated_at DESC, id DESC
+                    """
                 )
             ]
             return [self._get_with_connection(connection, item) for item in ids]
@@ -476,6 +732,7 @@ class ButlerRepository:
         result["auto_dispatch"] = bool(intake.get("auto_dispatch"))
         result["structured_goal_spec"] = bool(intake.get("structured"))
         result["semantic"] = intake.get("semantic")
+        result["planner"] = intake.get("planner")
         result["messages"] = [
             {**dict(message), "payload": json.loads(message["payload_json"])}
             for message in messages
@@ -556,6 +813,7 @@ class ButlerRepository:
 
 
 def _normalize_draft(instruction: str, draft: dict[str, Any]) -> dict[str, Any]:
+    draft = deterministic_goal_draft(instruction, draft)
     objective = str(draft.get("objective") or instruction).strip()
     title = str(draft.get("title") or objective[:120]).strip()
     return {

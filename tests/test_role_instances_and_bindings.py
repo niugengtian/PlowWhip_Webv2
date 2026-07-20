@@ -13,7 +13,7 @@ from plow_whip_web.runtime.rule_library import (
     AGENCY_AGENTS_ZH_SOURCE,
     bundled_role_templates,
     bundled_rules,
-    is_local_deterministic_simple_worker,
+    is_local_deterministic_worker,
     seed_templates,
 )
 from plow_whip_web.store.database import Database
@@ -203,7 +203,7 @@ def test_goal_creates_role_instances_and_session_bindings_preserving_identity() 
             assert created.status_code == 201, created.text
             goal = created.json()
             roles = [item["role"] for item in goal["work_items"]]
-            assert roles == ["backend", "frontend", "devops_sre"]
+            assert roles == ["backend", "frontend", "devops_sre", "verification"]
             assert goal["work_items"][0]["status"] == "ready"
             assert goal["work_items"][1]["status"] == "paused"
             assert goal["work_items"][2]["status"] == "paused"
@@ -212,9 +212,11 @@ def test_goal_creates_role_instances_and_session_bindings_preserving_identity() 
                 "/api/role-instances",
                 params={"goal_id": goal["id"]},
             ).json()["items"]
-            assert len(instances) == 3
+            assert len(instances) == 4
             by_role = {item["role_kind"]: item for item in instances}
-            assert set(by_role) == {"backend", "frontend", "devops_sre"}
+            assert set(by_role) == {
+                "backend", "frontend", "devops_sre", "verification"
+            }
             for role, item in by_role.items():
                 assert item["template_id"].startswith("tmpl.")
                 assert item["instance_hash"]
@@ -227,34 +229,34 @@ def test_goal_creates_role_instances_and_session_bindings_preserving_identity() 
                 "/api/session-bindings",
                 params={"project_id": project["id"]},
             ).json()["items"]
-            assert len(bindings) == 3
+            assert len(bindings) == 4
             assert {item["task_id"] for item in bindings} == {
                 item["id"] for item in goal["work_items"]
             }
 
 
-def test_dispatch_rejects_missing_role_instance_unless_simple_worker() -> None:
-    assert is_local_deterministic_simple_worker(
+def test_dispatch_rejects_missing_role_instance_unless_local_deterministic_worker() -> None:
+    assert is_local_deterministic_worker(
         provider="generic-command",
         command={"argv": ["python3", "-c", "print(1)"]},
         model_invoked=False,
     )
-    assert not is_local_deterministic_simple_worker(
+    assert not is_local_deterministic_worker(
         provider="cursor",
         command={"argv": ["python3", "-c", "print(1)"]},
         model_invoked=False,
     )
-    assert not is_local_deterministic_simple_worker(
+    assert not is_local_deterministic_worker(
         provider="simple-worker",
         command={"argv": ["python3", "-c", "print(1)"]},
         model_invoked=True,
     )
-    assert not is_local_deterministic_simple_worker(
+    assert not is_local_deterministic_worker(
         provider="simple-worker",
         command={"argv": ["cursor", "agent"]},
         model_invoked=False,
     )
-    assert not is_local_deterministic_simple_worker(
+    assert not is_local_deterministic_worker(
         provider="generic-command",
         command={"argv": []},
         model_invoked=False,
@@ -310,7 +312,7 @@ def test_dispatch_rejects_missing_role_instance_unless_simple_worker() -> None:
             model_invoked=False,
             expected_task_spec_revision=local.spec_revision,
         )
-        assert allowed["exception"] == "local_deterministic_simple_worker"
+        assert allowed["exception"] == "local_deterministic_worker"
 
 
 def test_amend_replaces_role_instance_and_session_generation() -> None:

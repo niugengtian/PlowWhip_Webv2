@@ -24,6 +24,21 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "handoff_max_bytes": 2_048,
     "observation_tail_lines": 20,
     "observation_max_bytes": 8_192,
+    "episode_wall_limit_seconds": 4_800,
+    "checkpoint_interval_seconds": 120,
+    "no_progress_seconds": 300,
+    "max_host_processes": 2,
+    "progress_extension_seconds": 120,
+    "provider_failure_threshold": 3,
+    "provider_recovery_successes": 1,
+    "provider_open_seconds": 60,
+    "network_failure_threshold": 2,
+    "network_recovery_successes": 3,
+    "resume_batch_size": 2,
+    "alert_debounce_seconds": 30,
+    "default_provider_policy": "auto",
+    "default_provider_order": ["codex", "cursor", "deepseek", "kimi"],
+    "default_butler_provider": "codex",
 }
 
 CONTINUITY_SETTING_KEYS = {
@@ -35,6 +50,18 @@ CONTINUITY_SETTING_KEYS = {
     "handoff_max_bytes",
     "observation_tail_lines",
     "observation_max_bytes",
+    "episode_wall_limit_seconds",
+    "checkpoint_interval_seconds",
+    "no_progress_seconds",
+    "max_host_processes",
+    "progress_extension_seconds",
+    "provider_failure_threshold",
+    "provider_recovery_successes",
+    "provider_open_seconds",
+    "network_failure_threshold",
+    "network_recovery_successes",
+    "resume_batch_size",
+    "alert_debounce_seconds",
 }
 
 
@@ -322,6 +349,34 @@ def _validate_settings(values: dict[str, Any]) -> None:
         raise DomainError("observation_tail_lines must be positive")
     if int(values["observation_max_bytes"]) < 1024:
         raise DomainError("observation_max_bytes must be at least 1024")
+    if int(values["episode_wall_limit_seconds"]) < 60:
+        raise DomainError("episode_wall_limit_seconds must be at least 60")
+    if int(values["checkpoint_interval_seconds"]) >= int(
+        values["episode_wall_limit_seconds"]
+    ):
+        raise DomainError(
+            "checkpoint_interval_seconds must be below episode_wall_limit_seconds"
+        )
+    if int(values["no_progress_seconds"]) < int(values["checkpoint_interval_seconds"]):
+        raise DomainError(
+            "no_progress_seconds must be at least checkpoint_interval_seconds"
+        )
+    if int(values["progress_extension_seconds"]) > int(
+        values["episode_wall_limit_seconds"]
+    ):
+        raise DomainError(
+            "progress_extension_seconds cannot exceed episode_wall_limit_seconds"
+        )
+    if values["default_provider_policy"] not in {"auto", "preferred", "pinned"}:
+        raise DomainError("default_provider_policy must be auto, preferred, or pinned")
+    order = values["default_provider_order"]
+    if (
+        not isinstance(order, list)
+        or not order
+        or any(not isinstance(item, str) or not item for item in order)
+        or len(order) != len(set(order))
+    ):
+        raise DomainError("default_provider_order must be a non-empty unique string list")
 
 
 def _setting_warnings(values: dict[str, Any]) -> list[str]:
@@ -333,4 +388,8 @@ def _setting_warnings(values: dict[str, Any]) -> list[str]:
         warnings.append("checkpoint 与 handoff 已占用超过一半的 Context 上限")
     if int(values["observation_max_bytes"]) >= int(values["rotation_max_bytes"]):
         warnings.append("单次观察字节上限不应达到或超过文件轮转阈值")
+    if int(values["no_progress_seconds"]) * 2 > int(
+        values["episode_wall_limit_seconds"]
+    ):
+        warnings.append("无进展窗口超过 Episode wall limit 的一半，故障收敛可能偏慢")
     return warnings

@@ -216,7 +216,7 @@ def test_socket_hang_up_replays_to_ready_without_spending_attempt() -> None:
 
         assert first["settled"] == [{"task_id": running.id, "status": "ready"}]
         assert recovered.status.value == "ready"
-        assert recovered.attempts_used == 0
+        assert recovered.attempts_used == 1
         assert recovered.tokens_used == 0
         assert recovered.last_error == "transient_provider_transport"
         assert recovered.next_eligible_at is not None
@@ -245,7 +245,7 @@ def test_socket_hang_up_replays_to_ready_without_spending_attempt() -> None:
         finally:
             connection.close()
         assert replayed.revision == revision
-        assert replayed.attempts_used == 0
+        assert replayed.attempts_used == 1
         assert replayed.tokens_used == 0
         assert replay_counts == (event_count, 0)
         assert replay_worker["last_error"] == "transient_provider_transport"
@@ -313,8 +313,12 @@ def test_capacity_text_overrides_command_failed_and_retains_session() -> None:
         assert bridge.verify_calls == 0
         connection = app.state.database.connect()
         try:
-            jobs = connection.execute(
+            hot_jobs = connection.execute(
                 "SELECT COUNT(*) FROM host_jobs WHERE task_id = ?", (current.id,)
+            ).fetchone()[0]
+            archived_jobs = connection.execute(
+                "SELECT COUNT(*) FROM host_job_archives WHERE task_id = ?",
+                (current.id,),
             ).fetchone()[0]
             episodes = connection.execute(
                 """
@@ -325,7 +329,8 @@ def test_capacity_text_overrides_command_failed_and_retains_session() -> None:
             ).fetchall()
         finally:
             connection.close()
-        assert jobs == 8
+        assert hot_jobs == 1
+        assert archived_jobs == 7
         assert [row["status"] for row in episodes] == [
             "terminated", "terminated", "terminated", "circuit_open",
         ]
@@ -689,7 +694,7 @@ def test_real_taskspec_deadline_cancels_only_current_episode() -> None:
         assert result["settled"] == [{"task_id": running.id, "status": "ready"}]
         assert recovered.status.value == "ready"
         assert recovered.last_error == "execution_episode_resume:deadline"
-        assert recovered.attempts_used == 0
+        assert recovered.attempts_used == 1
         assert episode["status"] == "terminated"
         assert episode["end_reason"] == "deadline"
     finally:
@@ -747,7 +752,7 @@ def test_nonzero_transient_tokens_are_settled_exactly_once() -> None:
             connection.close()
 
         assert recovered.status.value == "ready"
-        assert recovered.attempts_used == 0
+        assert recovered.attempts_used == 1
         assert recovered.tokens_used == 10
         assert [(row["input_tokens"], row["output_tokens"]) for row in usage] == [(7, 3)]
     finally:
@@ -773,7 +778,7 @@ def test_auth_and_permission_faults_need_human_without_model_retry(
         failed = app.state.task_repository.get(running.id)
 
         assert failed.status.value == "needs_human"
-        assert failed.attempts_used == 0
+        assert failed.attempts_used == 1
         assert failed.last_error == failure_class
         assert failed.next_eligible_at is None
         assert bridge.verify_calls == 0

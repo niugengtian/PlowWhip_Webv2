@@ -1,4 +1,5 @@
-import { useMemo } from 'react'
+import { useMemo, type CSSProperties } from 'react'
+import { tokenMagnitude } from '../tokenMagnitude'
 
 export type DailyUsagePoint = {
   date: string
@@ -25,10 +26,16 @@ export type UsageSlice = {
 
 const LINE_COLORS = {
   total: '#7dd3fc',
+  project: '#a78bfa',
   input: '#86efac',
   cached: '#fbbf24',
   uncached: '#c4b5fd',
   output: '#fb7185',
+}
+
+export function TokenMagnitudeBadge({ tokens }: { tokens: number }) {
+  const magnitude = tokenMagnitude(tokens)
+  return <span className="token-magnitude" style={{ '--magnitude-color': magnitude.color } as CSSProperties}>{magnitude.label}</span>
 }
 
 const PIE_PALETTE = [
@@ -43,10 +50,14 @@ function truncateLabel(label: string, max = 28): string {
 
 export function TokenTrendChart({
   days,
+  comparisonDays,
+  comparisonLabel,
   selectedDate,
   onSelect,
 }: {
   days: DailyUsagePoint[]
+  comparisonDays?: DailyUsagePoint[]
+  comparisonLabel?: string
   selectedDate: string | null
   onSelect: (date: string) => void
 }) {
@@ -55,15 +66,33 @@ export function TokenTrendChart({
   const pad = { top: 18, right: 16, bottom: 36, left: 48 }
   const innerW = width - pad.left - pad.right
   const innerH = height - pad.top - pad.bottom
-  const maxTotal = Math.max(1, ...days.map((day) => day.total_tokens))
-  const points = days.map((day, index) => {
+  const maxTotal = Math.max(1, ...days.map((day) => day.total_tokens), ...(comparisonDays ?? []).map((day) => day.total_tokens))
+  const localToday = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).format(new Date())
+  const completed = (items: DailyUsagePoint[]) => items.filter((item) => item.date < localToday)
+  const average = (items: DailyUsagePoint[]) => {
+    const history = completed(items)
+    return {
+      days: history.length,
+      value: history.length ? history.reduce((sum, item) => sum + item.total_tokens, 0) / history.length : null,
+    }
+  }
+  const globalAverage = average(days)
+  const comparisonAverage = comparisonDays ? average(comparisonDays) : null
+  const makePoints = (items: DailyUsagePoint[]) => items.map((day, index) => {
     const x = pad.left + (days.length <= 1 ? innerW / 2 : (index / (days.length - 1)) * innerW)
     const y = pad.top + innerH - (day.total_tokens / maxTotal) * innerH
     return { ...day, x, y }
   })
-  const path = points
-    .map((point, index) => `${index === 0 ? 'M' : 'L'}${point.x.toFixed(1)},${point.y.toFixed(1)}`)
-    .join(' ')
+  const points = makePoints(days)
+  const comparisonPoints = comparisonDays ? makePoints(comparisonDays) : []
+  const segments = (items: typeof points, baseline: { value: number | null; days: number }) =>
+    items.slice(1).map((point, index) => ({
+      from: items[index],
+      to: point,
+      magnitude: tokenMagnitude(point.total_tokens, baseline.value, baseline.days),
+    }))
 
   if (!days.length) {
     return <p className="muted" data-testid="token-trend-empty">所选范围内暂无 Token 记录。</p>
@@ -85,19 +114,22 @@ export function TokenTrendChart({
             </g>
           )
         })}
-        {points.length > 1 ? <path d={path} fill="none" stroke={LINE_COLORS.total} strokeWidth="2.5" /> : null}
+        {segments(points, globalAverage).map((segment) => <line key={`global-${segment.to.date}`} x1={segment.from.x} y1={segment.from.y} x2={segment.to.x} y2={segment.to.y} stroke={segment.magnitude.color} strokeWidth={comparisonPoints.length ? 2 : 3} strokeDasharray={comparisonPoints.length ? '5 4' : undefined}><title>{`全部项目 ${segment.to.date}: ${segment.to.total_tokens} Token · ${segment.magnitude.label}`}</title></line>)}
+        {comparisonAverage ? segments(comparisonPoints, comparisonAverage).map((segment) => <line key={`project-${segment.to.date}`} x1={segment.from.x} y1={segment.from.y} x2={segment.to.x} y2={segment.to.y} stroke={segment.magnitude.color} strokeWidth="3"><title>{`${comparisonLabel} ${segment.to.date}: ${segment.to.total_tokens} Token · ${segment.magnitude.label}`}</title></line>) : null}
         {points.map((point) => {
+          const magnitude = tokenMagnitude(point.total_tokens, globalAverage.value, globalAverage.days)
           const active = point.date === selectedDate
           return (
-            <g key={point.date}>
+            <g key={`global-point-${point.date}`}>
               <circle
                 cx={point.x}
                 cy={point.y}
                 r={active ? 6 : 4}
-                fill={active ? '#f8fafc' : LINE_COLORS.total}
-                stroke={active ? LINE_COLORS.total : 'transparent'}
+                fill={active ? '#f8fafc' : magnitude.color}
+                stroke={magnitude.color}
                 strokeWidth={2}
-              />
+              ><title>{`全部项目 ${point.date}: ${point.total_tokens} Token · input ${point.input_tokens} / cached ${point.cached_input_tokens} / uncached ${point.uncached_input_tokens} / output ${point.output_tokens}`}</title></circle>
+              <text x={point.x} y={Math.max(11, point.y - 9)} textAnchor="middle" fill={magnitude.color} fontSize="9">{point.total_tokens.toLocaleString()}</text>
               <text
                 x={point.x}
                 y={height - 12}
@@ -115,7 +147,7 @@ export function TokenTrendChart({
                 fill="transparent"
                 role="button"
                 tabIndex={0}
-                aria-label={`查看 ${point.date} 明细，共 ${point.total_tokens} tokens`}
+                aria-label={`查看 ${point.date} 明细，全部项目 ${point.total_tokens} tokens`}
                 data-testid={`token-day-${point.date}`}
                 onClick={() => onSelect(point.date)}
                 onKeyDown={(event) => {
@@ -129,14 +161,20 @@ export function TokenTrendChart({
             </g>
           )
         })}
+        {comparisonPoints.map((point) => {
+          const magnitude = tokenMagnitude(point.total_tokens, comparisonAverage?.value, comparisonAverage?.days ?? 0)
+          return <g key={`project-point-${point.date}`}><circle cx={point.x} cy={point.y} r={point.date === selectedDate ? 6 : 4} fill={point.date === selectedDate ? '#f8fafc' : magnitude.color} stroke={magnitude.color} strokeWidth="2"><title>{`${comparisonLabel} ${point.date}: ${point.total_tokens} Token · input ${point.input_tokens} / cached ${point.cached_input_tokens} / uncached ${point.uncached_input_tokens} / output ${point.output_tokens}`}</title></circle><text x={point.x} y={Math.max(11, point.y - 9)} textAnchor="middle" fill={magnitude.color} fontSize="9">{point.total_tokens.toLocaleString()}</text></g>
+        })}
       </svg>
       <div className="token-legend">
-        <span><i style={{ background: LINE_COLORS.total }} />每日 total（input + output）</span>
+        <span><i style={{ background: LINE_COLORS.total }} />全部项目：历史均值 {globalAverage.value === null ? '不足' : Math.round(globalAverage.value).toLocaleString()}（{globalAverage.days} 完整日）</span>
+        {comparisonPoints.length ? <span><i style={{ background: LINE_COLORS.project }} />{comparisonLabel}：历史均值 {comparisonAverage?.value === null ? '不足' : Math.round(comparisonAverage?.value ?? 0).toLocaleString()}（{comparisonAverage?.days ?? 0} 完整日）</span> : null}
         <span><i style={{ background: LINE_COLORS.input }} />input 含 cached</span>
         <span><i style={{ background: LINE_COLORS.cached }} />cached ⊂ input</span>
         <span><i style={{ background: LINE_COLORS.uncached }} />uncached</span>
         <span><i style={{ background: LINE_COLORS.output }} />output</span>
       </div>
+      {(globalAverage.days > 0 && globalAverage.days < 3) || (comparisonAverage && comparisonAverage.days > 0 && comparisonAverage.days < 3) ? <p className="token-history-warning">仅有 1–2 个完整历史日，动态颜色仅作趋势提示；每日 00:00（Asia/Shanghai）重新计算基线。</p> : null}
     </div>
   )
 }

@@ -17,6 +17,8 @@ services:
       PLOW_WHIP_CONTAINER_LOOPBACK: "1"
       PLOW_WHIP_BRIDGE_URL: "${PLOW_WHIP_BRIDGE_URL:-http://host.docker.internal:8765}"
       PLOW_WHIP_BRIDGE_TOKEN: "${PLOW_WHIP_BRIDGE_TOKEN:-}"
+      PLOW_WHIP_BUTLER_PLANNER_PROVIDER: "${PLOW_WHIP_BUTLER_PLANNER_PROVIDER:-codex}"
+      PLOW_WHIP_BUTLER_PLANNER_TIMEOUT_SECONDS: "${PLOW_WHIP_BUTLER_PLANNER_TIMEOUT_SECONDS:-180}"
       TZ: "${TZ:-Asia/Shanghai}"
     extra_hosts:
       - "host.docker.internal:host-gateway"

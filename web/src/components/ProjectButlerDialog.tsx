@@ -1,9 +1,10 @@
-import { FormEvent, useEffect, useState } from 'react'
+import { FormEvent, useEffect, useMemo, useState } from 'react'
 import { ChatCircleDots, CheckCircle, PaperPlaneTilt, Plus, Robot, X } from '@phosphor-icons/react'
 import { api, ButlerConversation, Project, Provider } from '../api'
 
 type ProjectButlerDialogProps = {
   initialProjectId: string
+  globalScope?: boolean
   projects: Project[]
   providers: Provider[]
   onClose: () => void
@@ -28,17 +29,23 @@ const sizingPresets: Record<SizePreference, Record<string, unknown>> = {
 
 export function ProjectButlerDialog({
   initialProjectId,
+  globalScope = false,
   projects,
   providers,
   onClose,
   onDispatched,
 }: ProjectButlerDialogProps) {
-  const activeProjects = projects.filter((project) => project.status === 'active')
+  const activeProjects = useMemo(
+    () => projects.filter((project) => project.status === 'active'),
+    [projects],
+  )
   const [projectId, setProjectId] = useState(
     initialProjectId || activeProjects[0]?.id || '',
   )
   const [provider, setProvider] = useState(
-    providers.find((item) => item.enabled)?.name ?? 'cursor',
+    providers.find((item) => item.name === 'codex' && item.enabled)?.name
+      ?? providers.find((item) => item.enabled)?.name
+      ?? 'codex',
   )
   const [sizePreference, setSizePreference] = useState<SizePreference>('medium')
   const [conversations, setConversations] = useState<ButlerConversation[]>([])
@@ -50,8 +57,10 @@ export function ProjectButlerDialog({
 
   useEffect(() => {
     let current = true
-    if (!projectId) return () => { current = false }
-    api.projectButlerConversations(projectId)
+    const load = globalScope
+      ? api.globalButlerConversations()
+      : projectId ? api.projectButlerConversations(projectId) : Promise.resolve([])
+    load
       .then((items) => {
         if (!current) return
         setConversations(items)
@@ -65,19 +74,22 @@ export function ProjectButlerDialog({
         if (current) setError(messageOf(reason))
       })
     return () => { current = false }
-  }, [projectId])
+  }, [activeProjects, globalScope, projectId])
 
   async function startConversation(event: FormEvent) {
     event.preventDefault()
     const instruction = content.trim()
-    if (!projectId || !instruction) return
+    if ((!globalScope && !projectId) || !instruction) return
     await run(async () => {
-      const created = await api.startProjectButler(projectId, {
-        instruction,
-        source_type: 'human',
-        provider,
-        sizing_inputs: sizingPresets[sizePreference],
-      })
+      const created = globalScope
+        ? await api.startGlobalButler({ instruction, provider })
+        : await api.startProjectButler(projectId, {
+          instruction,
+          source_type: 'human',
+          source_id: 'owner',
+          provider,
+          sizing_inputs: sizingPresets[sizePreference],
+        })
       setConversation(created)
       setConversations((items) => [created, ...items])
       setContent('')
@@ -88,14 +100,16 @@ export function ProjectButlerDialog({
     event.preventDefault()
     const message = content.trim()
     if (!conversation || !message) return
-    if (conversation.status === 'awaiting_confirmation' && !revisionField) return
+    if (!globalScope && conversation.status === 'awaiting_confirmation' && !revisionField) return
     await run(async () => {
-      const updated = await api.sendProjectButlerMessage(
-        projectId,
-        conversation,
-        message,
-        revisionField ?? undefined,
-      )
+      const updated = globalScope
+        ? await api.sendGlobalButlerMessage(conversation, message)
+        : await api.sendProjectButlerMessage(
+          projectId,
+          conversation,
+          message,
+          revisionField ?? undefined,
+        )
       replaceConversation(updated)
       setContent('')
       setRevisionField(null)
@@ -132,18 +146,18 @@ export function ProjectButlerDialog({
     ])
   }
 
-  const canWrite = conversation?.status === 'clarifying'
+  const canWrite = globalScope || conversation?.status === 'clarifying'
     || (conversation?.status === 'awaiting_confirmation' && revisionField !== null)
 
   return <div className="drawer-backdrop" onMouseDown={onClose}>
     <aside className="drawer butler-dialog" onMouseDown={(event) => event.stopPropagation()}>
       <div className="drawer-head">
-        <div><span className="kicker">项目隔离 · 持久化会话</span><h1>直接与项目管家对话</h1></div>
+        <div><span className="kicker">{globalScope ? '跨项目路由 · 持久化会话' : '项目隔离 · 持久化会话'}</span><h1>{globalScope ? '与全局管家对话' : '直接与项目管家对话'}</h1></div>
         <button aria-label="关闭" onClick={onClose}><X size={18} /></button>
       </div>
       <div className="butler-project-bar">
-        <label>项目
-          <select disabled={busy} value={projectId} onChange={(event) => {
+        {!globalScope && <label>当前项目
+          <select disabled={busy || !globalScope} value={projectId} onChange={(event) => {
             setProjectId(event.target.value)
             setConversation(null)
             setConversations([])
@@ -152,8 +166,9 @@ export function ProjectButlerDialog({
             <option value="">选择项目</option>
             {activeProjects.map((project) => <option value={project.id} key={project.id}>{project.name}</option>)}
           </select>
-        </label>
-        <button type="button" disabled={busy || !projectId} onClick={() => {
+        </label>}
+        {globalScope && <div className="butler-scope-copy"><strong>全局工作区</strong><small>只读查询、跨项目汇总与路由；项目执行请切换项目范围后直接对话。</small></div>}
+        <button type="button" disabled={busy || (!globalScope && !projectId)} onClick={() => {
           setConversation(null)
           setContent('')
           setRevisionField(null)
@@ -161,17 +176,17 @@ export function ProjectButlerDialog({
       </div>
       {error && <div className="butler-error">{error}</div>}
       <div className="butler-layout">
-        <nav className="butler-history" aria-label="项目管家历史会话">
+        <nav className="butler-history" aria-label={`${globalScope ? '全局' : '项目'}管家历史会话`}>
           <span className="kicker">历史会话</span>
           {conversations.length ? conversations.map((item) => <button
             type="button"
             className={conversation?.id === item.id ? 'selected' : ''}
             key={item.id}
-            onClick={() => { setConversation(item); setRevisionField(null); setContent('') }}
+            onClick={() => { setConversation(item); if (item.project_id) setProjectId(item.project_id); setRevisionField(null); setContent('') }}
           >
             <strong>{String(item.spec.title || item.spec.objective || '未命名目标')}</strong>
             <small>{statusName(item.status)} · r{item.revision}</small>
-          </button>) : <p>这个项目还没有对话。</p>}
+          </button>) : <p>{globalScope ? '还没有全局管家对话。' : '这个项目还没有对话。'}</p>}
         </nav>
         <section className="butler-chat">
           {conversation ? <>
@@ -195,21 +210,23 @@ export function ProjectButlerDialog({
                 <p>{message.content}</p>
               </article>)}
             </div>
-            {conversation.status === 'awaiting_confirmation' && <ProposalCard
+            {!globalScope && conversation.status === 'awaiting_confirmation' && <ProposalCard
               conversation={conversation}
               selectedField={revisionField}
               onSelectField={setRevisionField}
               onConfirm={confirmProposal}
               busy={busy}
             />}
-            {conversation.status === 'dispatched' && <div className="butler-dispatched"><CheckCircle size={18} weight="fill" />方案已由人确认，Goal 已创建并交给调度链。</div>}
-            {conversation.status !== 'dispatched' && <form className="butler-composer" onSubmit={sendMessage}>
+            {!globalScope && conversation.status === 'dispatched' && <div className="butler-dispatched"><CheckCircle size={18} weight="fill" />方案已由人确认，Goal 已创建并交给调度链。</div>}
+            {(globalScope || conversation.status !== 'dispatched') && <form className="butler-composer" onSubmit={sendMessage}>
               <textarea
                 aria-label="回复项目管家"
                 disabled={busy || !canWrite}
                 value={content}
                 onChange={(event) => setContent(event.target.value)}
-                placeholder={conversation.status === 'clarifying'
+                placeholder={globalScope
+                  ? '继续查询所有项目的规范化状态，或要求路由到指定项目'
+                  : conversation.status === 'clarifying'
                   ? '直接回答管家当前的问题；多条内容可分行输入'
                   : revisionField
                     ? `说明新的${fieldNames[revisionField]}`
@@ -219,11 +236,11 @@ export function ProjectButlerDialog({
             </form>}
           </> : <form className="butler-welcome" onSubmit={startConversation}>
             <Robot size={38} />
-            <h2>告诉项目管家你要完成什么</h2>
-            <p>可以直接发自然语言。目标、边界或验收不清楚时，管家一次只追问一个问题；方案得到你的明确确认前不会创建 Goal 或唤醒 Worker。</p>
+            <h2>告诉{globalScope ? '全局' : '项目'}管家你要完成什么</h2>
+            <p>{globalScope ? '全局管家使用独立 Codex 会话，负责查询全部工作区资源、汇总状态和把工作引导到项目管家；它不会替项目直接修改代码。' : '可以直接发自然语言。目标、边界或验收不清楚时，管家一次只追问一个问题；方案得到你的明确确认前不会创建 Goal 或唤醒 Worker。'}</p>
             <textarea
               aria-label="给项目管家的指令"
-              disabled={busy || !projectId}
+              disabled={busy || (!globalScope && !projectId)}
               value={content}
               onChange={(event) => setContent(event.target.value)}
               placeholder="例如：基于最新 main 完成一次全面审查，并提出可执行改进方案；只审查，不修改项目文件……"
@@ -234,16 +251,16 @@ export function ProjectButlerDialog({
                   {providers.filter((item) => item.enabled).map((item) => <option value={item.name} key={item.name}>{item.display_name}</option>)}
                 </select>
               </label>
-              <label>目标体量
+              {!globalScope && <label>目标体量
                 <select disabled={busy} value={sizePreference} onChange={(event) => setSizePreference(event.target.value as SizePreference)}>
                   <option value="small">小型 · 单角色</option>
                   <option value="medium">中型 · 单角色</option>
                   <option value="large">大型 · 语义角色并行</option>
                   <option value="extra_large">超大型 · 语义角色并行</option>
                 </select>
-              </label>
+              </label>}
             </div>
-            <button className="primary" disabled={busy || !projectId || !content.trim()}><PaperPlaneTilt size={16} />发送给项目管家</button>
+            <button className="primary" disabled={busy || (!globalScope && !projectId) || !content.trim()}><PaperPlaneTilt size={16} />发送给{globalScope ? '全局' : '项目'}管家</button>
           </form>}
         </section>
       </div>

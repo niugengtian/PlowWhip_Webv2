@@ -214,7 +214,9 @@ def test_structured_plan_preserves_named_roles_and_serializes_shared_tree() -> N
             },
         ],
     )
-    assert [item.role for item in plan.items] == ["backend", "frontend", "devops_sre"]
+    assert [item.role for item in plan.items] == [
+        "backend", "frontend", "devops_sre", "verification"
+    ]
     assert plan.route == "capability-milestones"
     assert plan.items[0].depends_on_ordinals == ()
     assert plan.items[1].depends_on_ordinals == (1,)
@@ -296,7 +298,7 @@ def test_goal_persist_and_context_keep_named_roles() -> None:
             assert created.status_code == 201, created.text
             goal = created.json()
             roles = [item["role"] for item in goal["work_items"]]
-            assert roles == ["backend", "frontend", "devops_sre"]
+            assert roles == ["backend", "frontend", "devops_sre", "verification"]
             assert goal["work_items"][0]["status"] == "ready"
             assert goal["work_items"][1]["status"] == "paused"
             assert goal["work_items"][2]["status"] == "paused"

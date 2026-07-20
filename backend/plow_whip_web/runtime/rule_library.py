@@ -302,7 +302,7 @@ def provider_invokes_model(
     return True
 
 
-def is_local_deterministic_simple_worker(
+def is_local_deterministic_worker(
     *,
     provider: str,
     command: dict[str, Any] | None,
@@ -311,9 +311,7 @@ def is_local_deterministic_simple_worker(
     """Narrow exception: model_invoked=false + restricted local CommandSpec only."""
     if model_invoked:
         return False
-    if provider in {"cursor", "codex", "claude"}:
-        return False
-    if provider not in {"generic-command", "simple-worker"}:
+    if provider != "generic-command":
         return False
     argv = (command or {}).get("argv")
     if not isinstance(argv, list) or not argv:
@@ -358,7 +356,7 @@ __all__ = [
     "bundled_rules",
     "capability_key_for_role",
     "content_hash",
-    "is_local_deterministic_simple_worker",
+    "is_local_deterministic_worker",
     "provider_invokes_model",
     "seed_rules",
     "seed_templates",

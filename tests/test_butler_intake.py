@@ -169,10 +169,10 @@ def test_project_butler_asks_one_question_then_requires_human_confirmation() -> 
             assert dispatched["status"] == "dispatched"
             goal = client.get(f"/api/goals/{dispatched['goal_id']}").json()
             assert [item["role"] for item in goal["work_items"]] == [
-                "backend", "frontend", "ui", "devops_sre"
+                "backend", "frontend", "ui", "devops_sre", "verification"
             ]
             assert [item["provider"] for item in goal["work_items"]] == [
-                "codex", "cursor", "cursor", "codex"
+                "codex", "cursor", "cursor", "codex", "cursor"
             ]
             by_role = {item["role"]: item for item in goal["work_items"]}
             assert by_role["backend"]["status"] == "ready"

@@ -266,10 +266,16 @@ test('renders historical token trend and drills into day pies', async () => {
   fireEvent.click(await screen.findByTestId('token-day-2026-07-18'))
   await waitFor(() => expect(screen.getByTestId('token-day-pies')).toBeInTheDocument())
   expect(screen.getByTestId('token-pie-项目占比')).toBeInTheDocument()
-  expect(screen.getByTestId('token-pie-任务占比')).toBeInTheDocument()
+  expect(screen.queryByTestId('token-pie-任务占比')).not.toBeInTheDocument()
   expect(screen.getByTestId('token-pie-项目占比')).toHaveTextContent('Console')
+  expect(screen.getByText(/分片合计 45 \/ 当日 45/)).toBeInTheDocument()
+
+  fireEvent.change(screen.getByLabelText('项目范围'), { target: { value: 'project-1' } })
+  fireEvent.click(await screen.findByRole('button', { name: 'Token' }))
+  fireEvent.click(await screen.findByTestId('token-day-2026-07-18'))
+  await waitFor(() => expect(screen.getByTestId('token-pie-任务占比')).toBeInTheDocument())
+  expect(screen.queryByTestId('token-pie-项目占比')).not.toBeInTheDocument()
   expect(screen.getByTestId('token-pie-任务占比')).toHaveTextContent('history-task')
-  expect(screen.getAllByText(/分片合计 45 \/ 当日 45/).length).toBe(2)
 })
 
 test('shows empty day pies when selected day has no consumption', async () => {
@@ -290,7 +296,7 @@ test('shows empty day pies when selected day has no consumption', async () => {
   await openUsage()
   fireEvent.click(await screen.findByTestId('token-day-2026-07-17'))
   await waitFor(() => expect(screen.getByText('该日无项目消费。')).toBeInTheDocument())
-  expect(screen.getByText('该日无任务消费。')).toBeInTheDocument()
+  expect(screen.queryByText('该日无任务消费。')).not.toBeInTheDocument()
 })
 
 test('shows history request failure state', async () => {

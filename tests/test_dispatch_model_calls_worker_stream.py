@@ -284,7 +284,7 @@ def test_missing_pre_execution_baseline_reschedules_a_fresh_run() -> None:
             "status": "ready",
         }]
         assert rescheduled.status.value == "ready"
-        assert rescheduled.attempts_used == 0
+        assert rescheduled.attempts_used == 1
         assert rescheduled.last_error == "evidence_baseline_missing_requires_fresh_run"
         assert app.state.host_jobs.active() == []
 
@@ -297,8 +297,12 @@ def test_missing_pre_execution_baseline_reschedules_a_fresh_run() -> None:
         connection = app.state.database.connect()
         try:
             jobs = connection.execute(
-                "SELECT run_id FROM host_jobs WHERE task_id = ?",
-                (running.id,),
+                """
+                SELECT run_id FROM host_jobs WHERE task_id = ?
+                UNION ALL
+                SELECT run_id FROM host_job_archives WHERE task_id = ?
+                """,
+                (running.id, running.id),
             ).fetchall()
             fresh_run_id = next(
                 item["run_id"]
@@ -436,7 +440,7 @@ def test_all_component_calls_have_idempotent_receipts_and_dimension_lists() -> N
                 task.id, expected_revision=task.revision,
                 idempotency_key="ledger-executor-drive",
             )
-            assert completed.status.value == "completed"
+            assert completed.status.value == "candidate_ready"
             refined = client.post(
                 "/api/conventions/global/global/refine",
                 headers={"Idempotency-Key": "ledger-convention-refine"},
@@ -450,9 +454,9 @@ def test_all_component_calls_have_idempotent_receipts_and_dimension_lists() -> N
 
         kinds = {call["call_kind"] for call in usage["calls"]}
         assert kinds >= {
-            "executor", "butler_planner", "router", "verifier",
-            "convention_refinement",
+            "executor", "router", "verifier", "convention_refinement",
         }
+        assert "butler_planner" not in kinds
         assert all(call["status"] in {"completed", "failed"} for call in usage["calls"])
         assert len([call for call in usage["calls"] if call["call_kind"] == "router"]) == 1
         assert usage["total_tokens"] == 16

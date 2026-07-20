@@ -19,9 +19,7 @@ SHARED_WORKTREE_SERIAL_ROLES: tuple[str, ...] = (
     "devops_sre",
 )
 
-# Model PM is not safely wired this sprint. Deterministic validation + optional
-# structured plan input only. Do not claim model PM completion.
-MODEL_PM_IMPLEMENTED = False
+MODEL_PM_IMPLEMENTED = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +33,7 @@ class PlannedWorkItem:
     acceptance: tuple[str, ...] = ()
     artifacts: tuple[str, ...] = ()
     provider: str | None = None
+    auto_generated: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,8 +43,8 @@ class GoalPlan:
     rationale: tuple[str, ...]
     items: tuple[PlannedWorkItem, ...]
     route: ExecutionRoute | None = None
-    model_invoked: Literal[False] = False
-    model_pm_implemented: Literal[False] = False
+    model_invoked: bool = False
+    model_pm_implemented: bool = True
 
 
 def plan_goal_work_items(
@@ -56,6 +55,7 @@ def plan_goal_work_items(
     structured_items: list[dict[str, Any]] | None = None,
     execution_policy: dict[str, Any] | None = None,
     role_providers: dict[str, str] | None = None,
+    model_invoked: bool = False,
 ) -> GoalPlan:
     """Build a bounded semantic role DAG; completion still uses task-local Gates."""
     gate_inputs = replace(sizing_inputs, independent_review_required=False)
@@ -73,9 +73,9 @@ def plan_goal_work_items(
     if structured_items is not None:
         items = _parse_structured_items(structured_items, route=route)
         # Multi-role structured plans keep named roles; force milestone route
-        # semantics instead of collapsing every lane to fullstack/simple-worker.
+        # semantics instead of collapsing every lane to one full-stack role.
         distinct_roles = {item.role for item in items}
-        if len(items) > 1 or distinct_roles - {"simple-worker", "fullstack"}:
+        if len(items) > 1 or distinct_roles - {"fullstack"}:
             route = "capability-milestones"
         if route != "capability-milestones" and len(items) != 1:
             raise DomainError(f"{route} requires exactly one ephemeral work item")
@@ -106,10 +106,15 @@ def plan_goal_work_items(
             replace(item, provider=role_providers.get(item.role, item.provider))
             for item in items
         ]
+    items = _ensure_independent_verification(
+        items,
+        title=title,
+        provider=(role_providers or {}).get("verification"),
+    )
     validated = validate_goal_plan(
         items,
         available_roles={
-            "simple-worker", "fullstack", "backend", "frontend", "ui",
+            "fullstack", "backend", "frontend", "ui",
             "devops_sre", "verification", "web3",
         },
         sizing_preview=preview,
@@ -120,6 +125,7 @@ def plan_goal_work_items(
         rationale=tuple(rationale) + validated["rationale"],
         items=tuple(validated["items"]),
         route=route,
+        model_invoked=model_invoked,
     )
 
 
@@ -132,8 +138,8 @@ def validate_goal_plan(
     """Schema, capability, dependency, and verification checks. 0 Token."""
     if not items:
         raise DomainError("goal plan must contain at least one work item")
-    if len(items) > 7:
-        raise DomainError("goal plan exceeds 7 work items")
+    if len(items) > 6:
+        raise DomainError("goal plan exceeds 6 work items")
     ordinals = [item.ordinal for item in items]
     if len(set(ordinals)) != len(ordinals):
         raise DomainError("goal plan ordinals must be unique")
@@ -144,8 +150,10 @@ def validate_goal_plan(
     for item in items:
         if item.role not in available_roles:
             raise DomainError(f"unknown or unavailable role capability: {item.role}")
-        if item.kind != "implementation":
+        if item.kind not in {"implementation", "verification"}:
             raise DomainError(f"invalid work item kind: {item.kind}")
+        if (item.role == "verification") != (item.kind == "verification"):
+            raise DomainError("verification role and work item kind must match")
         if not item.title.strip() or not item.objective.strip():
             raise DomainError("work item title/objective required")
         for dep in item.depends_on_ordinals:
@@ -201,7 +209,7 @@ def plan_to_dict(plan: GoalPlan) -> dict[str, Any]:
         "status": plan.status,
         "missing_gates": list(plan.missing_gates),
         "rationale": list(plan.rationale),
-        "model_invoked": False,
+        "model_invoked": plan.model_invoked,
         "model_pm_implemented": MODEL_PM_IMPLEMENTED,
         "route": plan.route,
         "items": [
@@ -215,6 +223,7 @@ def plan_to_dict(plan: GoalPlan) -> dict[str, Any]:
                 "acceptance": list(item.acceptance),
                 "artifacts": list(item.artifacts),
                 "provider": item.provider,
+                "auto_generated": item.auto_generated,
             }
             for item in plan.items
         ],
@@ -229,9 +238,7 @@ def _default_items(
     route: ExecutionRoute,
     max_milestones: int,
 ) -> list[PlannedWorkItem]:
-    if route == "simple-worker":
-        count, role = 1, "simple-worker"
-    elif route == "ephemeral-fullstack":
+    if route == "ephemeral-fullstack":
         count, role = 1, "fullstack"
     else:
         roles = ["backend"]
@@ -285,8 +292,8 @@ def _parse_structured_items(
     items: list[PlannedWorkItem] = []
     for raw in raw_items:
         kind = str(raw.get("kind") or "")
-        if kind != "implementation":
-            raise DomainError("verification is a task-local Gate, not a reviewer work item")
+        if kind not in {"implementation", "verification"}:
+            raise DomainError("structured work item kind must be implementation or verification")
         depends = raw.get("depends_on_ordinals") or []
         if not isinstance(depends, list):
             raise DomainError("depends_on_ordinals must be a list")
@@ -328,3 +335,55 @@ def _enforce_shared_worktree_serial(
         if item.role in serial_set:
             last_serial_ordinal = item.ordinal
     return rewritten
+
+
+def _ensure_independent_verification(
+    items: list[PlannedWorkItem],
+    *,
+    title: str,
+    provider: str | None,
+) -> list[PlannedWorkItem]:
+    implementations = [
+        item for item in items if item.kind == "implementation"
+    ]
+    if not implementations:
+        return items
+    verifications = [
+        item for item in items if item.kind == "verification"
+    ]
+    implementation_ordinals = {
+        item.ordinal for item in implementations
+    }
+    if not verifications:
+        if len(items) >= 6:
+            raise DomainError(
+                "plan must reserve one of six work-item slots for independent verification"
+            )
+        items = [
+            *items,
+            PlannedWorkItem(
+                ordinal=len(items) + 1,
+                role="verification",
+                kind="verification",
+                title=f"{title} · 独立验收",
+                objective=(
+                    "只读复验所有候选实现及声明的验收项；"
+                    "输出结构化 PASS 或 CHANGES_REQUIRED，禁止补代码。"
+                ),
+                depends_on_ordinals=tuple(sorted(implementation_ordinals)),
+                provider=provider,
+                auto_generated=True,
+            ),
+        ]
+        return items
+    verifier = verifications[-1]
+    if verifier.ordinal <= max(implementation_ordinals):
+        raise DomainError("independent verification must follow every implementation item")
+    required_dependencies = tuple(
+        sorted(set(verifier.depends_on_ordinals) | implementation_ordinals)
+    )
+    return [
+        replace(item, depends_on_ordinals=required_dependencies)
+        if item.ordinal == verifier.ordinal else item
+        for item in items
+    ]

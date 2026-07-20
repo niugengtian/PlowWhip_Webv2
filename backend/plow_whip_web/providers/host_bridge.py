@@ -122,6 +122,11 @@ class HostBridgeClient:
             checks=checks,
             evidence_hash=str(payload.get("evidence_hash") or ""),
             summary=str(payload.get("summary") or ""),
+            verdict=str(payload.get("verdict") or "CHANGES_REQUIRED"),
+            reason_codes=list(payload.get("reason_codes") or []),
+            failed_acceptance_ids=list(
+                payload.get("failed_acceptance_ids") or []
+            ),
         )
 
     def inspect_artifacts(

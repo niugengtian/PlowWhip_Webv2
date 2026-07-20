@@ -90,9 +90,9 @@ def test_fresh_project_has_one_butler_and_policy(butler_app) -> None:
     _, _, project = butler_app
     assert [role["kind"] for role in project["roles"]] == ["butler"]
     assert project["execution_policy"] == {
-        "version": "butler-v1",
+        "version": "butler-v2",
         "routing": {
-            "XS": "simple-worker",
+            "XS": "ephemeral-fullstack",
             "S": "ephemeral-fullstack",
             "M": "ephemeral-fullstack",
             "L": "capability-milestones",
@@ -106,8 +106,8 @@ def test_fresh_project_has_one_butler_and_policy(butler_app) -> None:
 
 def test_canonical_butler_facade_returns_project_route() -> None:
     decision = route_goal("XS")
-    assert decision.route == "simple-worker"
-    assert decision.policy["version"] == "butler-v1"
+    assert decision.route == "ephemeral-fullstack"
+    assert decision.policy["version"] == "butler-v2"
 
 
 def test_diagnostic_role_is_ephemeral_not_a_new_permanent_pool(butler_app) -> None:
@@ -125,7 +125,7 @@ def test_diagnostic_role_is_ephemeral_not_a_new_permanent_pool(butler_app) -> No
 @pytest.mark.parametrize(
     ("size", "route", "count", "role_prefix"),
     [
-        ("XS", "simple-worker", 1, "simple-worker:"),
+        ("XS", "ephemeral-fullstack", 1, "fullstack:"),
         ("M", "ephemeral-fullstack", 1, "fullstack:"),
         ("L", "capability-milestones", 3, None),
     ],
@@ -139,29 +139,39 @@ def test_butler_routes_fixtures_with_parallel_semantic_roles(
     goal = response.json()
     assert goal["parent_task_id"] is None
     assert goal["plan"]["route"] == route
-    assert len(goal["work_items"]) == count
+    assert len(goal["work_items"]) == count + 1
     assert all(item["verification"] for item in goal["work_items"])
     assert all(item["parent_task_id"] is None for item in goal["work_items"])
+    implementation_items = [
+        item for item in goal["work_items"]
+        if item["work_item_kind"] == "implementation"
+    ]
+    verifier = goal["work_items"][-1]
+    assert verifier["role"] == "verification"
+    assert verifier["work_item_kind"] == "verification"
+    assert set(verifier["depends_on"]) == {
+        item["id"] for item in implementation_items
+    }
     state = client.get(f"/api/projects/{project['id']}").json()
     role_kinds = {item["role"] for item in goal["work_items"]}
     project_kinds = {role["kind"] for role in state["roles"]}
     assert role_kinds <= project_kinds
     if role_prefix:
         expected = role_prefix.rstrip(":")
-        assert role_kinds == {expected}
-        assert all(item["role"] == expected for item in goal["work_items"])
+        assert {item["role"] for item in implementation_items} == {expected}
+        assert all(item["role"] == expected for item in implementation_items)
     else:
-        assert role_kinds == {"backend", "frontend", "ui"}
-        assert [item["role"] for item in goal["work_items"]] == [
+        assert role_kinds == {"backend", "frontend", "ui", "verification"}
+        assert [item["role"] for item in implementation_items] == [
             "backend", "frontend", "ui"
         ]
-        by_role = {item["role"]: item for item in goal["work_items"]}
+        by_role = {item["role"]: item for item in implementation_items}
         assert by_role["backend"]["status"] == "ready"
         assert by_role["frontend"]["status"] == "paused"
         assert by_role["ui"]["status"] == "ready"
 
 
-def test_simple_worker_is_released_only_after_verified_terminal(butler_app) -> None:
+def test_ephemeral_fullstack_is_released_only_after_verified_terminal(butler_app) -> None:
     _, client, project = butler_app
     goal = _create_goal(client, project["id"], "XS").json()
     task_id = goal["work_items"][0]["id"]
@@ -178,7 +188,7 @@ def test_simple_worker_is_released_only_after_verified_terminal(butler_app) -> N
     state = client.get(f"/api/projects/{project['id']}").json()
     worker = next(
         worker for worker in state["workers"]
-        if worker["role"] == "simple-worker" or worker["role"].startswith("simple-worker:")
+        if worker["role"] == "fullstack" or worker["role"].startswith("fullstack:")
     )
     assert worker["status"] == "released"
     assert worker["released_at"] is not None

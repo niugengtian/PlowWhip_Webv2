@@ -62,7 +62,10 @@ def _goal(app, project_path: Path, *, include_verifier: bool = False):
         constraints=[],
         deadline={"hard_seconds": 60},
         idempotency_key="goal-reducer-create",
-        command={"argv": [sys.executable, "-c", "pass"], "timeout_seconds": 60},
+        command={
+            "argv": [sys.executable, "-c", "print('{\"verdict\":\"PASS\"}')"],
+            "timeout_seconds": 60,
+        },
     )
 
 
@@ -80,7 +83,7 @@ def _event_count(app, goal_id: str) -> int:
         connection.close()
 
 
-def test_terminal_child_amend_restores_goal_and_tick_is_idempotent() -> None:
+def test_terminal_goal_cancels_amended_pending_children_and_tick_is_idempotent() -> None:
     with TemporaryDirectory() as directory:
         root = Path(directory)
         project_path = root / "project"
@@ -112,7 +115,9 @@ def test_terminal_child_amend_restores_goal_and_tick_is_idempotent() -> None:
         event_count = _event_count(app, goal["id"])
         again = app.state.goal_repository.advance()
 
-        assert app.state.goal_repository.get(goal["id"])["status"] == "running"
+        assert app.state.goal_repository.get(goal["id"])["status"] == "terminal_failed"
+        assert app.state.task_repository.get(first.id).status.value == "cancelled"
+        assert app.state.task_repository.get(first.id).last_error == "parent_goal_terminal"
         assert result["completed_goals"] == []
         assert again["unblocked"] == []
         assert _event_count(app, goal["id"]) == event_count
@@ -158,8 +163,9 @@ def test_resume_and_restart_cannot_bypass_dependencies() -> None:
         app.state.goal_repository.advance()
         assert restarted.status.value == "ready"
         assert restarted.spec_revision == 2
-        assert app.state.task_repository.get(second.id).status.value == "paused"
-        assert app.state.goal_repository.get(goal["id"])["status"] == "running"
+        assert app.state.task_repository.get(first.id).status.value == "cancelled"
+        assert app.state.task_repository.get(second.id).status.value == "cancelled"
+        assert app.state.goal_repository.get(goal["id"])["status"] == "cancelled"
 
 
 def test_all_goals_recompute_and_legacy_parent_projection_is_cleared() -> None:
@@ -293,9 +299,10 @@ def test_episode_exhaustion_replans_once_then_converges_without_job_loop() -> No
         first = app.state.goal_repository.advance()
         recovered = app.state.task_repository.get(first_id)
         assert first["replanned"] == [first_id]
-        assert recovered.status.value == "ready"
+        assert recovered.status.value == "cancelled"
+        assert recovered.last_error == "parent_goal_terminal"
         assert recovered.spec_revision == 2
-        assert app.state.goal_repository.get(goal["id"])["status"] == "running"
+        assert app.state.goal_repository.get(goal["id"])["status"] == "terminal_failed"
 
         with app.state.database.transaction(immediate=True) as connection:
             connection.execute(

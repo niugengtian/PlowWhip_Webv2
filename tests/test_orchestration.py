@@ -61,9 +61,9 @@ def test_butler_routing_is_deterministic_and_bounded() -> None:
     assert [item.role for item in first.items] == [item.role for item in second.items]
     assert first.route == "capability-milestones"
     assert [item.role for item in first.items] == [
-        "backend", "frontend", "ui", "devops_sre"
+        "backend", "frontend", "ui", "devops_sre", "verification"
     ]
-    assert {item.kind for item in first.items} == {"implementation"}
+    assert {item.kind for item in first.items} == {"implementation", "verification"}
     assert 2 <= len(first.items) <= 6
     assert all(item.acceptance == () for item in first.items)
     assert first.items[0].depends_on_ordinals == ()
@@ -72,6 +72,7 @@ def test_butler_routing_is_deterministic_and_bounded() -> None:
     assert first.items[2].role == "ui"
     assert first.items[2].depends_on_ordinals == ()
     assert first.items[3].depends_on_ordinals == (2,)
+    assert first.items[4].depends_on_ordinals == (1, 2, 3, 4)
 
 
 def test_fresh_and_idempotent_migration_adds_goals() -> None:
@@ -199,18 +200,28 @@ def test_goal_to_auto_advance_e2e_with_real_http() -> None:
 
             assert goal["status"] == "completed"
             kinds = {item["work_item_kind"] for item in goal["work_items"]}
-            assert kinds == {"implementation"}
+            assert kinds == {"implementation", "verification"}
             assert goal["parent_task_id"] is None
             assert all(
-                item["status"] == "completed"
+                (
+                    item["status"] == "candidate_ready"
+                    if item["work_item_kind"] == "implementation"
+                    else item["status"] == "completed"
+                )
                 for item in goal["work_items"]
             )
 
             # The task-local worker is released at verified terminal state.
             project_state = client.get(f"/api/projects/{project['id']}").json()
-            assert len(project_state["workers"]) == 1
-            assert project_state["workers"][0]["status"] == "released"
-            assert project_state["workers"][0]["rotation_reason"] == "task_terminal"
+            assert len(project_state["workers"]) == 2
+            assert all(
+                worker["status"] == "released"
+                for worker in project_state["workers"]
+            )
+            assert all(
+                worker["rotation_reason"] == "task_terminal"
+                for worker in project_state["workers"]
+            )
 
             # SQLite must not store full stdout/stderr/prompt blobs for these tasks.
             connection = app.state.database.connect()
@@ -244,8 +255,10 @@ def test_reviewer_item_is_not_a_dispatch_dependency() -> None:
     )
     assert plan.status == "planned"
     assert plan.route == "ephemeral-fullstack"
-    assert [item.role for item in plan.items] == ["fullstack"]
-    assert [item.kind for item in plan.items] == ["implementation"]
+    assert [item.role for item in plan.items] == ["fullstack", "verification"]
+    assert [item.kind for item in plan.items] == [
+        "implementation", "verification"
+    ]
 
 
 def test_goal_uses_one_provider_decision_and_probes_before_write() -> None:

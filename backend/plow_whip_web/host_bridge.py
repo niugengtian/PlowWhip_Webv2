@@ -262,7 +262,18 @@ class HostJobManager:
 
     def status(self, job_id: str) -> dict[str, object]:
         with self._lock:
-            return self._refresh(self._read(_job_id(job_id)))
+            record = self._refresh(self._read(_job_id(job_id)))
+            result = dict(record)
+        project_path = result.get("project_path")
+        result["progress_evidence"] = (
+            _workspace_progress(
+                Path(str(project_path)),
+                excluded_roots=(self.root,),
+            )
+            if project_path
+            else {"kind": "workspace", "available": False}
+        )
+        return result
 
     def output(
         self,
@@ -843,6 +854,9 @@ def verify(payload: dict[str, Any], roots: tuple[Path, ...]) -> dict[str, object
     result = VerificationEngine().verify(project_path, execution, specs)
     return {
         "passed": result.passed,
+        "verdict": result.verdict,
+        "reason_codes": result.reason_codes,
+        "failed_acceptance_ids": result.failed_acceptance_ids,
         "checks": result.checks,
         "evidence_hash": result.evidence_hash,
         "summary": result.summary,
@@ -897,6 +911,69 @@ def evidence_snapshot(
     if not isinstance(paths, list) or len(paths) > 64:
         raise ValueError("paths must contain at most 64 relative artifact paths")
     return snapshot_environment(project_path, [str(path) for path in paths])
+
+
+def _workspace_progress(
+    project_path: Path,
+    *,
+    excluded_roots: tuple[Path, ...] = (),
+) -> dict[str, object]:
+    """Small content-bound workspace fingerprint; output volume is excluded."""
+    try:
+        status = subprocess.run(
+            ["git", "-C", str(project_path), "status", "--porcelain=v1", "-z"],
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {"kind": "workspace", "available": False}
+    if status.returncode != 0:
+        return {"kind": "workspace", "available": False}
+    paths: list[str] = []
+    for entry in status.stdout.decode("utf-8", errors="replace").split("\0"):
+        if len(entry) < 4:
+            continue
+        path = entry[3:]
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        if path and path not in paths:
+            paths.append(path)
+    digest = hashlib.sha256()
+    hashed = 0
+    records: list[dict[str, object]] = []
+    for relative in sorted(paths)[:256]:
+        target = (project_path / relative).resolve()
+        if not target.is_relative_to(project_path.resolve()):
+            continue
+        if any(
+            target == excluded.resolve()
+            or target.is_relative_to(excluded.resolve())
+            for excluded in excluded_roots
+        ):
+            continue
+        exists = target.is_file()
+        item: dict[str, object] = {"path": relative, "exists": exists}
+        if exists:
+            size = target.stat().st_size
+            item["bytes"] = size
+            if hashed + size <= 16 * 1024 * 1024:
+                file_hash = _sha256_file(target)
+                item["sha256"] = file_hash
+                hashed += size
+        encoded = json.dumps(
+            item, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        digest.update(encoded)
+        records.append(item)
+    return {
+        "kind": "workspace",
+        "available": True,
+        "fingerprint": digest.hexdigest(),
+        "changed_files": len(paths),
+        "sample": records[:20],
+        "truncated": len(paths) > len(records),
+    }
 
 
 def open_artifact(

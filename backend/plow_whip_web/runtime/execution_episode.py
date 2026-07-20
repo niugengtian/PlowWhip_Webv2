@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 from typing import Any
 
 
-MAX_EPISODE_WALL_SECONDS = 900
-MAX_EPISODE_HOST_PROCESSES = 2
 TOKEN_BURN_RATE_ALERT_PER_MINUTE = 100_000
 
 
@@ -18,6 +18,8 @@ class EpisodeDecision:
     same_fault_count: int
     burn_rate_tokens_per_minute: float
     burn_rate_alert: bool
+    verifiable_progress: bool
+    progress_evidence: dict[str, Any]
 
 
 class ExecutionEpisodeWatchdog:
@@ -36,6 +38,8 @@ class ExecutionEpisodeWatchdog:
         wall_clock_reached: bool,
         same_fault_limit: int,
         zero_progress_limit: int,
+        seconds_since_progress: int | None = None,
+        no_progress_seconds: int | None = None,
     ) -> EpisodeDecision:
         output = snapshot.get("output_bytes")
         output_bytes = (
@@ -45,7 +49,16 @@ class ExecutionEpisodeWatchdog:
         running = str(snapshot.get("status") or "") in {
             "dispatching", "running", "orphan_running", "cancelling",
         }
-        progressed = output_bytes > previous_progress
+        progress_evidence = _progress_evidence(snapshot)
+        previous_evidence = _parse_evidence(
+            episode.get("progress_evidence_json")
+        )
+        progressed = bool(
+            progress_evidence
+            and previous_evidence
+            and progress_evidence.get("fingerprint")
+            != previous_evidence.get("fingerprint")
+        )
         zero_progress = (
             0
             if progressed
@@ -76,7 +89,13 @@ class ExecutionEpisodeWatchdog:
             reason = "host_processes"
         elif fault_class and same_faults >= same_fault_limit:
             reason = "same_fault"
-        elif zero_progress >= zero_progress_limit:
+        elif (
+            no_progress_seconds is not None
+            and seconds_since_progress is not None
+            and seconds_since_progress >= no_progress_seconds
+        ):
+            reason = "zero_progress"
+        elif no_progress_seconds is None and zero_progress >= zero_progress_limit:
             reason = "zero_progress"
         return EpisodeDecision(
             bounded=reason is not None,
@@ -86,6 +105,8 @@ class ExecutionEpisodeWatchdog:
             same_fault_count=same_faults,
             burn_rate_tokens_per_minute=burn_rate,
             burn_rate_alert=burn_rate >= TOKEN_BURN_RATE_ALERT_PER_MINUTE,
+            verifiable_progress=progressed,
+            progress_evidence=progress_evidence or previous_evidence,
         )
 
 
@@ -95,3 +116,39 @@ def next_recovery_action(recovery_count: int) -> str:
         1: "replan",
         2: "replacement",
     }.get(recovery_count, "circuit_open")
+
+
+def _parse_evidence(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw:
+        try:
+            value = json.loads(raw)
+            return value if isinstance(value, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def _progress_evidence(snapshot: dict[str, Any]) -> dict[str, Any]:
+    supplied = snapshot.get("progress_evidence")
+    if isinstance(supplied, dict) and supplied.get("available") is not False:
+        fingerprint = supplied.get("fingerprint")
+        if fingerprint:
+            return {**supplied, "fingerprint": str(fingerprint)}
+    payload = {
+        "workspace_revision": snapshot.get("workspace_revision"),
+        "artifact_hashes": snapshot.get("artifact_hashes"),
+        "verified_acceptance_ids": snapshot.get("verified_acceptance_ids"),
+        "checkpoint_ref": snapshot.get("checkpoint_ref"),
+    }
+    if not any(value for value in payload.values()):
+        return {}
+    canonical = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return {
+        "kind": "structured",
+        "fingerprint": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        **payload,
+    }
