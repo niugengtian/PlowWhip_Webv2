@@ -125,6 +125,87 @@ def test_project_host_path_can_change_only_without_active_work() -> None:
             assert "tasks or workers are active" in rejected.json()["detail"]
 
 
+def test_project_create_rejects_duplicate_control_and_host_paths() -> None:
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        first_control = root / "control-one"
+        second_control = root / "control-two"
+        host_path = root / "host"
+        other_host = root / "other-host"
+        for path in (first_control, second_control, host_path, other_host):
+            path.mkdir()
+        app = create_app(Settings(data_dir=root / "runtime"))
+        with TestClient(app) as client:
+            created = client.post("/api/projects", json={
+                "name": "canonical",
+                "path": str(first_control),
+                "host_path": str(host_path),
+            })
+            assert created.status_code == 201
+
+            duplicate_control = client.post("/api/projects", json={
+                "name": "duplicate-control",
+                "path": str(first_control),
+                "host_path": str(other_host),
+            })
+            assert duplicate_control.status_code == 409
+            assert (
+                "控制面内部路径已由项目"
+                in duplicate_control.json()["detail"]
+            )
+
+            duplicate_host = client.post("/api/projects", json={
+                "name": "duplicate-host",
+                "path": str(second_control),
+                "host_path": str(host_path),
+            })
+            assert duplicate_host.status_code == 409
+            assert (
+                "本机 Git 仓库根目录已由项目"
+                in duplicate_host.json()["detail"]
+            )
+            assert len(client.get("/api/projects").json()) == 1
+
+
+def test_project_host_path_update_rejects_another_project_root() -> None:
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        first_control = root / "control-one"
+        second_control = root / "control-two"
+        first_host = root / "host-one"
+        second_host = root / "host-two"
+        for path in (first_control, second_control, first_host, second_host):
+            path.mkdir()
+        app = create_app(Settings(data_dir=root / "runtime"))
+        with TestClient(app) as client:
+            first = client.post("/api/projects", json={
+                "name": "first",
+                "path": str(first_control),
+                "host_path": str(first_host),
+            }).json()
+            second = client.post("/api/projects", json={
+                "name": "second",
+                "path": str(second_control),
+                "host_path": str(second_host),
+            }).json()
+
+            rejected = client.patch(
+                f"/api/projects/{second['id']}/host-path",
+                json={"host_path": str(first_host)},
+            )
+            assert rejected.status_code == 409
+            assert (
+                "本机 Git 仓库根目录已由项目"
+                in rejected.json()["detail"]
+            )
+            assert client.get(
+                f"/api/projects/{first['id']}"
+            ).json()["host_path"] == str(first_host)
+            assert client.get(
+                f"/api/projects/{second['id']}"
+            ).json()["host_path"] == str(second_host)
+
+
 def test_completed_project_can_update_host_path_and_reopen() -> None:
     with TemporaryDirectory() as directory:
         root = Path(directory)

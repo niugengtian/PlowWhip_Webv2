@@ -5,13 +5,35 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from plow_whip_web.domain.model import InvalidTransitionError, NotFoundError
+from plow_whip_web.domain.model import (
+    InvalidTransitionError,
+    NotFoundError,
+    RevisionConflictError,
+)
 from plow_whip_web.roles import DEFAULT_PROJECT_ROLES, ROLE_KINDS
 from plow_whip_web.runtime.butler import project_execution_policy
 from plow_whip_web.store.database import Database
 
 
 DEFAULT_ROLES = DEFAULT_PROJECT_ROLES
+
+
+def _project_using_host_path(
+    connection: Any,
+    host_path: str,
+    *,
+    excluding_project_id: str | None = None,
+) -> Any | None:
+    target = Path(host_path).expanduser().resolve()
+    query = "SELECT id, name, status, host_path FROM projects WHERE host_path IS NOT NULL"
+    parameters: tuple[str, ...] = ()
+    if excluding_project_id:
+        query += " AND id != ?"
+        parameters = (excluding_project_id,)
+    for project in connection.execute(query, parameters).fetchall():
+        if Path(project["host_path"]).expanduser().resolve() == target:
+            return project
+    return None
 
 
 def rotate_worker_in_transaction(
@@ -94,15 +116,38 @@ class ProjectRepository:
     ) -> dict[str, Any]:
         project_id = str(uuid.uuid4())
         resolved = str(Path(path).expanduser().resolve())
+        submitted_host = str(Path(host_path).expanduser()) if host_path else None
         policy = project_execution_policy(execution_policy)
         with self.database.transaction(immediate=True) as connection:
+            existing_path = connection.execute(
+                """
+                SELECT id, name, status FROM projects WHERE path = ?
+                """,
+                (resolved,),
+            ).fetchone()
+            if existing_path is not None:
+                raise RevisionConflictError(
+                    "控制面内部路径已由项目"
+                    f"“{existing_path['name']}”（{existing_path['status']}）注册；"
+                    "请使用或重新启用该项目，不要重复创建"
+                )
+            if submitted_host:
+                existing_host = _project_using_host_path(
+                    connection, submitted_host
+                )
+                if existing_host is not None:
+                    raise RevisionConflictError(
+                        "本机 Git 仓库根目录已由项目"
+                        f"“{existing_host['name']}”（{existing_host['status']}）注册；"
+                        "请使用或重新启用该项目，不要重复创建"
+                    )
             connection.execute(
                 """
                 INSERT INTO projects(id, name, path, host_path, execution_policy_json)
                 VALUES (?, ?, ?, ?, ?)
                 """,
                 (
-                    project_id, name, resolved, host_path,
+                    project_id, name, resolved, submitted_host,
                     json.dumps(policy, ensure_ascii=False, sort_keys=True),
                 ),
             )
@@ -199,6 +244,7 @@ class ProjectRepository:
     def update_host_path(
         self, *, project_id: str, host_path: str
     ) -> dict[str, Any]:
+        submitted_host = str(Path(host_path).expanduser())
         with self.database.transaction(immediate=True) as connection:
             project = connection.execute(
                 "SELECT status FROM projects WHERE id = ?", (project_id,)
@@ -228,9 +274,20 @@ class ProjectRepository:
                 raise InvalidTransitionError(
                     "cannot change host path while tasks or workers are active"
                 )
+            existing_host = _project_using_host_path(
+                connection,
+                submitted_host,
+                excluding_project_id=project_id,
+            )
+            if existing_host is not None:
+                raise RevisionConflictError(
+                    "本机 Git 仓库根目录已由项目"
+                    f"“{existing_host['name']}”（{existing_host['status']}）注册；"
+                    "请使用或重新启用该项目，不要重复创建"
+                )
             connection.execute(
                 "UPDATE projects SET host_path = ? WHERE id = ?",
-                (host_path, project_id),
+                (submitted_host, project_id),
             )
         return self.get(project_id)
 
