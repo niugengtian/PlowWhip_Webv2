@@ -65,7 +65,7 @@ export function ProjectButlerDialog({
         if (!current) return
         setConversations(items)
         setConversation(
-          items.find((item) => ['clarifying', 'awaiting_confirmation'].includes(item.status))
+          items.find((item) => ['clarifying', 'awaiting_confirmation', 'provider_suspended'].includes(item.status))
           ?? items[0]
           ?? null,
         )
@@ -100,7 +100,6 @@ export function ProjectButlerDialog({
     event.preventDefault()
     const message = content.trim()
     if (!conversation || !message) return
-    if (!globalScope && conversation.status === 'awaiting_confirmation' && !revisionField) return
     await run(async () => {
       const updated = globalScope
         ? await api.sendGlobalButlerMessage(conversation, message)
@@ -126,6 +125,13 @@ export function ProjectButlerDialog({
     })
   }
 
+  async function resumePlanner() {
+    if (!conversation || globalScope) return
+    await run(async () => {
+      replaceConversation(await api.resumeProjectButler(projectId, conversation))
+    })
+  }
+
   async function run(operation: () => Promise<void>) {
     setBusy(true)
     setError(null)
@@ -147,7 +153,7 @@ export function ProjectButlerDialog({
   }
 
   const canWrite = globalScope || conversation?.status === 'clarifying'
-    || (conversation?.status === 'awaiting_confirmation' && revisionField !== null)
+    || conversation?.status === 'awaiting_confirmation'
 
   return <div className="drawer-backdrop" onMouseDown={onClose}>
     <aside className="drawer butler-dialog" onMouseDown={(event) => event.stopPropagation()}>
@@ -200,6 +206,7 @@ export function ProjectButlerDialog({
               {conversation.expected_field && <span>当前问题：{fieldNames[conversation.expected_field]}</span>}
               {conversation.status === 'clarifying' && <span>一次只问一个最有价值的问题</span>}
               {conversation.status === 'awaiting_confirmation' && <span>等待主人确认后才会派发</span>}
+              {conversation.status === 'provider_suspended' && <span>模型调用失败，已停止机械降级</span>}
             </div>
             <div className="butler-messages" aria-live="polite">
               {conversation.messages.map((message) => <article
@@ -218,6 +225,10 @@ export function ProjectButlerDialog({
               busy={busy}
             />}
             {!globalScope && conversation.status === 'dispatched' && <div className="butler-dispatched"><CheckCircle size={18} weight="fill" />方案已由人确认，Goal 已创建并交给调度链。</div>}
+            {!globalScope && conversation.status === 'provider_suspended' && <div className="butler-error">
+              <p>项目管家没有获得有效模型结果。本会话已暂停，不会把你的回复机械写入目标、边界或验收标准。</p>
+              <button type="button" className="primary" disabled={busy} onClick={resumePlanner}>恢复 Provider 并续接本会话</button>
+            </div>}
             {(globalScope || conversation.status !== 'dispatched') && <form className="butler-composer" onSubmit={sendMessage}>
               <textarea
                 aria-label="回复项目管家"
@@ -227,10 +238,12 @@ export function ProjectButlerDialog({
                 placeholder={globalScope
                   ? '继续查询所有项目的规范化状态，或要求路由到指定项目'
                   : conversation.status === 'clarifying'
-                  ? '直接回答管家当前的问题；多条内容可分行输入'
+                  ? '直接回复、质疑或纠正项目管家；模型会理解后更新方案'
+                  : conversation.status === 'provider_suspended'
+                    ? '先恢复 Provider；暂停期间不会接受机械问卷回复'
                   : revisionField
                     ? `说明新的${fieldNames[revisionField]}`
-                    : '方案已形成：确认执行，或先选择要修改的部分'}
+                    : '可直接质疑或纠正方案；也可选择目标、边界或验收标准进行精准修改'}
               />
               <button className="primary" disabled={busy || !canWrite || !content.trim()}><PaperPlaneTilt size={16} />发送</button>
             </form>}
@@ -248,7 +261,7 @@ export function ProjectButlerDialog({
             <div className="butler-intake-options">
               <label>默认 Worker Provider
                 <select disabled={busy} value={provider} onChange={(event) => setProvider(event.target.value)}>
-                  {providers.filter((item) => item.enabled).map((item) => <option value={item.name} key={item.name}>{item.display_name}</option>)}
+                  {providers.filter((item) => item.enabled && item.transport === 'host-bridge' && item.capabilities.includes('new_session')).map((item) => <option value={item.name} key={item.name}>{item.display_name}</option>)}
                 </select>
               </label>
               {!globalScope && <label>目标体量
@@ -312,6 +325,7 @@ function listValue(value: unknown) {
 function statusName(status: ButlerConversation['status']) {
   return status === 'clarifying' ? '澄清中'
     : status === 'awaiting_confirmation' ? '待确认'
+      : status === 'provider_suspended' ? 'Provider 已挂起'
       : status === 'dispatched' ? '已执行'
         : '已拒绝'
 }

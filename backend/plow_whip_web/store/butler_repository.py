@@ -38,10 +38,13 @@ class ButlerRepository:
         draft: dict[str, Any],
         idempotency_key: str,
         butler_provider: str = "codex",
+        defer_question_to_planner: bool = False,
     ) -> dict[str, Any]:
         conversation_id = str(uuid.uuid4())
-        normalized = _normalize_draft(instruction, draft)
         structured = structured_fields_provided(draft)
+        normalized = _normalize_draft(
+            instruction, draft, deterministic_defaults=structured
+        )
         assessment = assess_goal_semantics(normalized)
         expected = None if assessment["ready"] else next_semantic_gap(normalized)
         confidence = int(assessment["confidence"])
@@ -85,7 +88,11 @@ class ButlerRepository:
                         "structured": structured,
                         "auto_dispatch": auto_dispatch,
                         "semantic": assessment,
-                        "questions_asked": 0 if expected is None else 1,
+                        "questions_asked": (
+                            0
+                            if defer_question_to_planner or expected is None
+                            else 1
+                        ),
                     }}),
                     proposal_hash,
                     idempotency_key,
@@ -101,14 +108,20 @@ class ButlerRepository:
                 {"source_id": source_id, "structured": structured},
             )
             if expected:
-                self._append(
-                    connection,
-                    conversation_id,
-                    "project_butler",
-                    "question",
-                    gap_question(expected, normalized),
-                    {"field": expected, "gap": assessment["gaps"][0] if assessment["gaps"] else None},
-                )
+                if not defer_question_to_planner:
+                    self._append(
+                        connection,
+                        conversation_id,
+                        "project_butler",
+                        "question",
+                        gap_question(expected, normalized),
+                        {
+                            "field": expected,
+                            "gap": assessment["gaps"][0]
+                            if assessment["gaps"]
+                            else None,
+                        },
+                    )
             else:
                 self._append_proposal(
                     connection,
@@ -172,6 +185,128 @@ class ButlerRepository:
                 "instruction",
                 instruction,
                 {"source_id": source_id, "mode": "global_chat"},
+            )
+            return self._get_with_connection(connection, conversation_id)
+
+    def append_conversational_message(
+        self,
+        conversation_id: str,
+        *,
+        expected_revision: int,
+        content: str,
+        sender_type: str,
+    ) -> dict[str, Any]:
+        """Persist a natural-language turn without assigning it to a GoalSpec field."""
+        clean_content = content.strip()
+        if not clean_content:
+            raise InvalidTransitionError("message must not be empty")
+        with self.database.transaction(immediate=True) as connection:
+            row = self._row(connection, conversation_id)
+            self._require_planner_active(row)
+            if int(row["revision"]) != expected_revision:
+                raise RevisionConflictError(
+                    f"expected revision {expected_revision}, current {row['revision']}"
+                )
+            if row["status"] not in {"clarifying", "awaiting_confirmation"}:
+                raise InvalidTransitionError("conversation is no longer accepting messages")
+            connection.execute(
+                """
+                UPDATE butler_conversations
+                SET revision = revision + 1, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (conversation_id,),
+            )
+            self._append(
+                connection,
+                conversation_id,
+                sender_type,
+                "answer",
+                clean_content,
+                {"conversational": True, "proposal_revision": False},
+            )
+            return self._get_with_connection(connection, conversation_id)
+
+    def suspend_planner(
+        self,
+        conversation_id: str,
+        *,
+        expected_revision: int,
+        call_id: str | None,
+        error_class: str | None,
+    ) -> dict[str, Any]:
+        """Fail closed when a natural-language Butler model call cannot complete."""
+        with self.database.transaction(immediate=True) as connection:
+            row = self._row(connection, conversation_id)
+            if int(row["revision"]) != expected_revision:
+                raise RevisionConflictError(
+                    f"expected revision {expected_revision}, current {row['revision']}"
+                )
+            draft = json.loads(row["spec_json"])
+            intake = dict(draft.pop("_intake", {}) or {})
+            intake.update({
+                "auto_dispatch": False,
+                "planner": {
+                    "status": "provider_suspended",
+                    "call_id": call_id,
+                    "error_class": error_class or "provider_unavailable",
+                    "proposal_revision": expected_revision,
+                },
+            })
+            connection.execute(
+                """
+                UPDATE butler_conversations
+                SET planner_state = 'provider_suspended',
+                    planner_call_id = ?, planner_error_class = ?,
+                    planner_failure_at = CURRENT_TIMESTAMP,
+                    revision = revision + 1, spec_json = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    call_id,
+                    error_class or "provider_unavailable",
+                    _json({**draft, "_intake": intake}),
+                    conversation_id,
+                ),
+            )
+            self._append(
+                connection,
+                conversation_id,
+                "project_butler",
+                "answer",
+                "项目管家模型调用失败，本会话已暂停；不会使用机械问卷代替理解。恢复 Provider 后可由人继续本会话。",
+                {
+                    "planner_status": "provider_suspended",
+                    "call_id": call_id,
+                    "error_class": error_class or "provider_unavailable",
+                },
+            )
+            return self._get_with_connection(connection, conversation_id)
+
+    def prepare_planner_resume(
+        self,
+        conversation_id: str,
+        *,
+        expected_revision: int,
+    ) -> dict[str, Any]:
+        with self.database.transaction(immediate=True) as connection:
+            row = self._row(connection, conversation_id)
+            if int(row["revision"]) != expected_revision:
+                raise RevisionConflictError(
+                    f"expected revision {expected_revision}, current {row['revision']}"
+                )
+            if row["planner_state"] != "provider_suspended":
+                raise InvalidTransitionError("conversation is not provider suspended")
+            connection.execute(
+                """
+                UPDATE butler_conversations
+                SET planner_state = 'idle', planner_call_id = NULL,
+                    planner_error_class = NULL, planner_failure_at = NULL,
+                    revision = revision + 1, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (conversation_id,),
             )
             return self._get_with_connection(connection, conversation_id)
 
@@ -298,6 +433,7 @@ class ButlerRepository:
             raise InvalidTransitionError("answer must contain at least one non-empty value")
         with self.database.transaction(immediate=True) as connection:
             row = self._row(connection, conversation_id)
+            self._require_planner_active(row)
             if int(row["revision"]) != expected_revision:
                 raise RevisionConflictError(
                     f"expected revision {expected_revision}, current {row['revision']}"
@@ -394,6 +530,7 @@ class ButlerRepository:
             raise InvalidTransitionError("message must not be empty")
         with self.database.transaction(immediate=True) as connection:
             row = self._row(connection, conversation_id)
+            self._require_planner_active(row)
             if int(row["revision"]) != expected_revision:
                 raise RevisionConflictError(
                     f"expected revision {expected_revision}, current {row['revision']}"
@@ -507,6 +644,7 @@ class ButlerRepository:
     ) -> dict[str, Any]:
         with self.database.transaction(immediate=True) as connection:
             row = self._row(connection, conversation_id)
+            self._require_planner_active(row)
             if row["status"] == "dispatched" and row["goal_id"] == goal_id:
                 return self._get_with_connection(connection, conversation_id)
             if int(row["revision"]) != expected_revision:
@@ -548,6 +686,7 @@ class ButlerRepository:
         """Persist one validated model proposal without treating it as confirmation."""
         with self.database.transaction(immediate=True) as connection:
             row = self._row(connection, conversation_id)
+            self._require_planner_active(row)
             if int(row["revision"]) != expected_revision:
                 raise RevisionConflictError(
                     f"expected revision {expected_revision}, current {row['revision']}"
@@ -564,9 +703,15 @@ class ButlerRepository:
             assessment = assess_goal_semantics(normalized)
             expected = None if assessment["ready"] else next_semantic_gap(normalized)
             proposal_hash = _proposal_hash(normalized) if expected is None else None
+            auto_dispatch = _auto_dispatch_eligible(
+                structured=False,
+                assessment=assessment,
+                draft=normalized,
+                asked_questions=int(intake.get("questions_asked") or 0),
+            )
             intake.update({
                 "semantic": assessment,
-                "auto_dispatch": False,
+                "auto_dispatch": auto_dispatch,
                 "model_planned": True,
                 "planner": {
                     "status": "planned",
@@ -579,6 +724,8 @@ class ButlerRepository:
                 UPDATE butler_conversations
                 SET status = ?, revision = revision + 1, confidence = ?,
                     expected_field = ?, spec_json = ?, proposal_hash = ?,
+                    planner_state = 'idle', planner_call_id = ?,
+                    planner_error_class = NULL, planner_failure_at = NULL,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
@@ -588,6 +735,7 @@ class ButlerRepository:
                     expected,
                     _json({**normalized, "_intake": intake}),
                     proposal_hash,
+                    call_id,
                     conversation_id,
                 ),
             )
@@ -606,7 +754,7 @@ class ButlerRepository:
                     conversation_id,
                     normalized,
                     proposal_hash,
-                    auto_dispatch=False,
+                    auto_dispatch=auto_dispatch,
                     structured=False,
                 )
             return self._get_with_connection(connection, conversation_id)
@@ -733,6 +881,8 @@ class ButlerRepository:
         result["structured_goal_spec"] = bool(intake.get("structured"))
         result["semantic"] = intake.get("semantic")
         result["planner"] = intake.get("planner")
+        if result.get("planner_state") == "provider_suspended":
+            result["status"] = "provider_suspended"
         result["messages"] = [
             {**dict(message), "payload": json.loads(message["payload_json"])}
             for message in messages
@@ -745,6 +895,13 @@ class ButlerRepository:
             else None
         )
         return result
+
+    @staticmethod
+    def _require_planner_active(row: Any) -> None:
+        if row["planner_state"] == "provider_suspended":
+            raise InvalidTransitionError(
+                "project Butler provider is suspended; resume the planner before continuing"
+            )
 
     def _append(
         self,
@@ -812,8 +969,17 @@ class ButlerRepository:
         )
 
 
-def _normalize_draft(instruction: str, draft: dict[str, Any]) -> dict[str, Any]:
-    draft = deterministic_goal_draft(instruction, draft)
+def _normalize_draft(
+    instruction: str,
+    draft: dict[str, Any],
+    *,
+    deterministic_defaults: bool = True,
+) -> dict[str, Any]:
+    draft = (
+        deterministic_goal_draft(instruction, draft)
+        if deterministic_defaults
+        else dict(draft)
+    )
     objective = str(draft.get("objective") or instruction).strip()
     title = str(draft.get("title") or objective[:120]).strip()
     return {

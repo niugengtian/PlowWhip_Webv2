@@ -335,8 +335,8 @@ def test_goal_semantics_not_field_nonempty_and_one_gap() -> None:
     assert rich["confidence"] >= 95
 
 
-def test_project_butler_medium_auto_routes_without_owner_confirm() -> None:
-    """Mid/small ready intake auto-dispatches; large still waits for owner confirm."""
+def test_project_butler_never_auto_routes_when_planner_is_unavailable() -> None:
+    """Sizing must not bypass the mandatory natural-language planning model."""
     small_sizing = {
         "layers_touched": 1,
         "components_touched": 1,
@@ -390,10 +390,10 @@ def test_project_butler_medium_auto_routes_without_owner_confirm() -> None:
             assert medium.status_code == 201, medium.text
             medium_body = medium.json()
             assert medium_body["structured_goal_spec"] is False
-            assert medium_body["auto_dispatch"] is True
-            assert medium_body["status"] == "dispatched"
-            assert medium_body["goal_id"]
-            assert "中小型" in medium_body["messages"][1]["content"]
+            assert medium_body["auto_dispatch"] is False
+            assert medium_body["status"] == "provider_suspended"
+            assert medium_body["goal_id"] is None
+            assert medium_body["planner"]["status"] == "provider_suspended"
 
             large = client.post(
                 f"/api/projects/{project['id']}/butler/conversations",
@@ -410,9 +410,8 @@ def test_project_butler_medium_auto_routes_without_owner_confirm() -> None:
             large_body = large.json()
             assert large_body["structured_goal_spec"] is False
             assert large_body["auto_dispatch"] is False
-            assert large_body["status"] == "awaiting_confirmation"
+            assert large_body["status"] == "provider_suspended"
             assert large_body["goal_id"] is None
-            assert large_body["confidence"] >= 95
 
 
 def test_project_butler_structured_passthrough_and_worker_help() -> None:

@@ -123,7 +123,7 @@ export type ButlerConversation = {
   project_id: string | null
   source_type: 'human' | 'global_butler' | 'agent'
   source_id: string | null
-  status: 'clarifying' | 'awaiting_confirmation' | 'dispatched' | 'rejected'
+  status: 'clarifying' | 'awaiting_confirmation' | 'provider_suspended' | 'dispatched' | 'rejected'
   revision: number
   confidence: number
   expected_field: 'objective' | 'boundaries' | 'acceptance' | null
@@ -584,10 +584,31 @@ async function request<T>(path: string, options: FetchOptions = {}): Promise<T> 
   if (options.idempotencyKey) headers.set('Idempotency-Key', options.idempotencyKey)
   const response = await fetch(path, { ...options, headers })
   if (!response.ok) {
-    const payload = (await response.json().catch(() => null)) as { detail?: string } | null
-    throw new Error(payload?.detail ?? `HTTP ${response.status}`)
+    const payload = (await response.json().catch(() => null)) as { detail?: unknown } | null
+    throw new Error(apiErrorMessage(payload?.detail, response.status))
   }
   return response.json() as Promise<T>
+}
+
+function apiErrorMessage(detail: unknown, status: number): string {
+  if (typeof detail === 'string' && detail.trim()) return detail
+  if (Array.isArray(detail)) {
+    const messages = detail.flatMap((item) => {
+      if (!item || typeof item !== 'object') return []
+      const record = item as Record<string, unknown>
+      const message = typeof record.msg === 'string' ? record.msg : ''
+      const location = Array.isArray(record.loc)
+        ? record.loc.filter((part) => part !== 'body').map(String).join('.')
+        : ''
+      return message ? [`${location ? `${location}：` : ''}${message}`] : []
+    })
+    if (messages.length) return messages.join('；')
+  }
+  if (detail && typeof detail === 'object') {
+    const record = detail as Record<string, unknown>
+    if (typeof record.message === 'string') return record.message
+  }
+  return `HTTP ${status}`
 }
 
 export const api = {
@@ -764,6 +785,18 @@ export const api = {
       }),
     },
   ),
+  resumeProjectButler: (projectId: string, conversation: ButlerConversation) =>
+    request<ButlerConversation>(
+      `/api/projects/${projectId}/butler/conversations/${conversation.id}/resume`,
+      {
+        method: 'POST',
+        idempotencyKey: crypto.randomUUID(),
+        body: JSON.stringify({
+          expected_revision: conversation.revision,
+          actor_type: 'human',
+        }),
+      },
+    ),
   confirmProjectButler: (projectId: string, conversation: ButlerConversation) =>
     request<ButlerConversation>(
       `/api/projects/${projectId}/butler/conversations/${conversation.id}/confirm`,

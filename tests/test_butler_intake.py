@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -7,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from plow_whip_web.api.app import create_app
 from plow_whip_web.config import Settings
+from plow_whip_web.providers.generic_command import ExecutionResult
 from plow_whip_web.roles import ROLE_PROMPTS
 
 
@@ -29,12 +31,79 @@ def _large_sizing() -> dict[str, object]:
     }
 
 
-def test_project_butler_asks_one_question_then_requires_human_confirmation() -> None:
+class SmartButlerBridge:
+    def __init__(self, proposal: dict[str, object]) -> None:
+        self.proposal = proposal
+        self.providers: list[str] = []
+        self.token = "test-token-is-long-enough-123"
+
+    def probe(self, _provider: dict[str, object]) -> tuple[bool, str]:
+        return True, "ready"
+
+    def execute(self, **kwargs: object) -> ExecutionResult:
+        provider = kwargs["provider"]
+        assert isinstance(provider, dict)
+        self.providers.append(str(provider["name"]))
+        return ExecutionResult(
+            returncode=0,
+            stdout=json.dumps(self.proposal, ensure_ascii=False),
+            stderr="",
+            duration_ms=5,
+            input_tokens=100,
+            output_tokens=60,
+            external_session_id="smart-butler-session",
+        )
+
+
+def test_project_butler_uses_selected_model_then_requires_human_confirmation() -> None:
     with TemporaryDirectory() as directory:
         root = Path(directory)
         project_path = root / "project"
         project_path.mkdir()
-        app = create_app(Settings(data_dir=root / "runtime"))
+        app = create_app(Settings(
+            data_dir=root / "runtime",
+            host_bridge_token="test-token-is-long-enough-123",
+        ))
+        templates = {
+            item["capability"]: f"{item['template_id']}@{item['revision']}"
+            for item in app.state.role_instance_repository.list_templates()
+        }
+        rules = [
+            "dev.think_before_coding@1",
+            "dev.simplicity_first@1",
+            "dev.surgical_changes@1",
+            "dev.goal_driven_execution@1",
+        ]
+        roles = ["backend", "frontend", "devops_sre", "verification"]
+        role_providers = {role: "cursor" for role in roles}
+        proposal = {
+            "goal_spec": {
+                "title": "分层管家协作",
+                "objective": "实现全局管家和项目管家的分层协作并给出可核验证据",
+                "boundaries": ["只改控制平面和 Web UI", "禁止读取其他项目聊天"],
+                "acceptance": ["后端和前端测试通过", "最终证据包含提交哈希"],
+                "sizing_inputs": _large_sizing(),
+                "provider": "cursor",
+                "role_providers": role_providers,
+                "role_templates": {role: templates[role] for role in roles},
+                "role_rules": {role: rules for role in roles},
+                "plan_items": [
+                    {
+                        "ordinal": ordinal,
+                        "role": role,
+                        "kind": "verification" if role == "verification" else "implementation",
+                        "title": role,
+                        "objective": f"完成 {role} 工作并留下证据",
+                        "depends_on_ordinals": [] if ordinal == 1 else [ordinal - 1],
+                        "provider": role_providers[role],
+                    }
+                    for ordinal, role in enumerate(roles, 1)
+                ],
+            }
+        }
+        bridge = SmartButlerBridge(proposal)
+        app.state.provider_pool.bridge = bridge
+        app.state.butler_planner.provider_pool.bridge = bridge
         app.state.provider_pool.require_ready = lambda _name: {}
         with TestClient(app) as client:
             project = client.post(
@@ -44,111 +113,29 @@ def test_project_butler_asks_one_question_then_requires_human_confirmation() -> 
                 f"/api/projects/{project['id']}/butler/conversations",
                 headers={"Idempotency-Key": "butler-natural-language-1"},
                 json={
-                    "instruction": "实现全局管家和项目管家的分层协作",
-                    "provider": "cursor",
+                    "instruction": "使用 Cursor 实现全局管家和项目管家的分层协作",
+                    "provider": "codex",
                     "sizing_inputs": _large_sizing(),
-                    "role_providers": {
-                        "backend": "codex",
-                        "frontend": "cursor",
-                        "ui": "cursor",
-                        "devops_sre": "codex",
-                    },
                 },
             )
             assert started.status_code == 201, started.text
-            conversation = started.json()
-            assert conversation["status"] == "clarifying"
-            assert conversation["confidence"] == 35
-            assert conversation["expected_field"] == "boundaries"
-            assert [item["kind"] for item in conversation["messages"]] == [
-                "instruction", "question"
+            proposal_view = started.json()
+            assert proposal_view["status"] == "awaiting_confirmation"
+            assert proposal_view["planner"]["status"] == "planned"
+            assert proposal_view["provider"] == "codex"
+            assert proposal_view["spec"]["provider"] == "cursor"
+            assert bridge.providers == ["codex"]
+            assert [item["kind"] for item in proposal_view["messages"]] == [
+                "instruction", "proposal"
             ]
-
-            out_of_order = client.post(
-                f"/api/projects/{project['id']}/butler/conversations/"
-                f"{conversation['id']}/answers",
-                json={
-                    "expected_revision": conversation["revision"],
-                    "field": "acceptance",
-                    "values": ["能通过验收"],
-                },
-            )
-            assert out_of_order.status_code == 409
-
-            boundary_answer = client.post(
-                f"/api/projects/{project['id']}/butler/conversations/"
-                f"{conversation['id']}/messages",
-                json={
-                    "expected_revision": conversation["revision"],
-                    "content": (
-                        "只改控制平面和 Web UI\n"
-                        "不读取其他项目聊天，不共享项目会话"
-                    ),
-                },
-            ).json()
-            assert boundary_answer["confidence"] == 65
-            assert boundary_answer["expected_field"] == "acceptance"
-            assert boundary_answer["messages"][-2]["content"].startswith(
-                "只改控制平面"
-            )
-            assert boundary_answer["messages"][-1]["kind"] == "question"
-
-            proposal_response = client.post(
-                f"/api/projects/{project['id']}/butler/conversations/"
-                f"{conversation['id']}/messages",
-                json={
-                    "expected_revision": boundary_answer["revision"],
-                    "content": (
-                        "未满足三要素时一次只问一个问题\n"
-                        "确认后独立角色可以同时进入 ready"
-                    ),
-                },
-            )
-            assert proposal_response.status_code == 200, proposal_response.text
-            proposal = proposal_response.json()
-            assert proposal["status"] == "awaiting_confirmation"
-            assert proposal["confidence"] == 95
-            assert proposal["expected_field"] is None
-            assert len(proposal["proposal_hash"]) == 64
-            assert proposal["messages"][-1]["kind"] == "proposal"
-
-            revision_without_field = client.post(
-                f"/api/projects/{project['id']}/butler/conversations/"
-                f"{conversation['id']}/messages",
-                json={
-                    "expected_revision": proposal["revision"],
-                    "content": "最后一条验收标准还需要更准确",
-                },
-            )
-            assert revision_without_field.status_code == 409
-            old_proposal_hash = proposal["proposal_hash"]
-            revised = client.post(
-                f"/api/projects/{project['id']}/butler/conversations/"
-                f"{conversation['id']}/messages",
-                json={
-                    "expected_revision": proposal["revision"],
-                    "field": "acceptance",
-                    "content": (
-                        "未满足三要素时一次只问一个问题\n"
-                        "确认后四个独立角色同时进入 ready"
-                    ),
-                },
-            )
-            assert revised.status_code == 200, revised.text
-            proposal = revised.json()
-            assert proposal["status"] == "awaiting_confirmation"
-            assert proposal["messages"][-2]["payload"]["proposal_revision"] is True
-            assert proposal["messages"][-1]["kind"] == "proposal"
-            assert proposal["spec"]["acceptance"][-1].startswith("确认后四个")
-            assert proposal["proposal_hash"] != old_proposal_hash
 
             non_human = client.post(
                 f"/api/projects/{project['id']}/butler/conversations/"
-                f"{conversation['id']}/confirm",
+                f"{proposal_view['id']}/confirm",
                 headers={"Idempotency-Key": "butler-confirm-agent-1"},
                 json={
-                    "expected_revision": proposal["revision"],
-                    "proposal_hash": proposal["proposal_hash"],
+                    "expected_revision": proposal_view["revision"],
+                    "proposal_hash": proposal_view["proposal_hash"],
                     "actor_type": "agent",
                 },
             )
@@ -156,11 +143,11 @@ def test_project_butler_asks_one_question_then_requires_human_confirmation() -> 
 
             confirmed = client.post(
                 f"/api/projects/{project['id']}/butler/conversations/"
-                f"{conversation['id']}/confirm",
+                f"{proposal_view['id']}/confirm",
                 headers={"Idempotency-Key": "butler-confirm-human-1"},
                 json={
-                    "expected_revision": proposal["revision"],
-                    "proposal_hash": proposal["proposal_hash"],
+                    "expected_revision": proposal_view["revision"],
+                    "proposal_hash": proposal_view["proposal_hash"],
                     "actor_type": "human",
                 },
             )
@@ -169,18 +156,17 @@ def test_project_butler_asks_one_question_then_requires_human_confirmation() -> 
             assert dispatched["status"] == "dispatched"
             goal = client.get(f"/api/goals/{dispatched['goal_id']}").json()
             assert [item["role"] for item in goal["work_items"]] == [
-                "backend", "frontend", "ui", "devops_sre", "verification"
+                "backend", "frontend", "devops_sre", "verification"
             ]
             assert [item["provider"] for item in goal["work_items"]] == [
-                "codex", "cursor", "cursor", "codex", "cursor"
+                "cursor", "cursor", "cursor", "cursor"
             ]
             by_role = {item["role"]: item for item in goal["work_items"]}
             assert by_role["backend"]["status"] == "ready"
             assert by_role["frontend"]["status"] == "paused"
-            assert by_role["ui"]["status"] == "ready"
             assert by_role["devops_sre"]["status"] == "paused"
-            assert goal["spec"]["acceptance"] == proposal["spec"]["acceptance"]
-            assert goal["spec"]["scope"] == proposal["spec"]["boundaries"]
+            assert goal["spec"]["acceptance"] == proposal_view["spec"]["acceptance"]
+            assert goal["spec"]["scope"] == proposal_view["spec"]["boundaries"]
             for item in goal["work_items"]:
                 context = app.state.context_compiler.compile(item["id"])
                 assert context["role"] == item["role"]
@@ -195,11 +181,11 @@ def test_project_butler_asks_one_question_then_requires_human_confirmation() -> 
 
             retried = client.post(
                 f"/api/projects/{project['id']}/butler/conversations/"
-                f"{conversation['id']}/confirm",
+                f"{proposal_view['id']}/confirm",
                 headers={"Idempotency-Key": "butler-confirm-human-retry"},
                 json={
-                    "expected_revision": proposal["revision"],
-                    "proposal_hash": proposal["proposal_hash"],
+                    "expected_revision": proposal_view["revision"],
+                    "proposal_hash": proposal_view["proposal_hash"],
                     "actor_type": "human",
                 },
             )

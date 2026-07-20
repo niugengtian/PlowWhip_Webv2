@@ -28,6 +28,7 @@ PLANNER_ROLES = {
     "backend", "frontend", "ui", "devops_sre", "verification", "fullstack",
 }
 MAX_PLAN_ITEMS = 6
+KNOWN_PROVIDERS = ("codex", "cursor", "deepseek", "kimi")
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,8 +83,10 @@ class ButlerPlanner:
         rules: list[dict[str, Any]],
         session_id: str | None = None,
         provider_name: str | None = None,
+        required_worker_provider: str | None = None,
     ) -> ButlerPlanningResult:
         planner_provider = provider_name or self.provider
+        worker_provider = required_worker_provider or planner_provider
         try:
             provider = self.provider_pool.require_available(planner_provider)
         except Exception as error:
@@ -94,91 +97,114 @@ class ButlerPlanner:
                 error_class=type(error).__name__,
                 external_session_id=session_id,
             )
-        receipt = self.model_calls.prepare(
-            idempotency_key=idempotency_key,
-            call_kind="butler_planner",
-            provider=planner_provider,
-            model=str(provider.get("model") or planner_provider),
-            project_id=str(project["id"]),
-            proposal_revision=proposal_revision,
-            session_id=session_id,
+        base_prompt = _planner_prompt(
+            instruction=instruction,
+            current_draft=current_draft,
+            project=project,
+            templates=templates,
+            rules=rules,
+            butler_provider=planner_provider,
+            required_worker_provider=worker_provider,
         )
-        if receipt["status"] in {"completed", "failed"}:
-            return ButlerPlanningResult(
-                draft=None,
-                status="duplicate",
-                call_id=str(receipt["call_id"]),
-                error_class=receipt.get("error_class"),
-                external_session_id=session_id,
+        active_session = session_id
+        contract_error: str | None = None
+        for attempt in range(2):
+            call_key = (
+                idempotency_key
+                if attempt == 0
+                else f"{idempotency_key}:contract-repair:1"
             )
-        self.model_calls.dispatched(
-            receipt["call_id"], raw_status="dispatched"
-        )
-        result = None
-        try:
-            result = self.provider_pool.bridge.execute(
-                provider=provider,
-                project_path=str(project.get("host_path") or project["path"]),
-                prompt=_planner_prompt(
-                    instruction=instruction,
-                    current_draft=current_draft,
-                    project=project,
+            receipt = self.model_calls.prepare(
+                idempotency_key=call_key,
+                call_kind="butler_planner",
+                provider=planner_provider,
+                model=str(provider.get("model") or planner_provider),
+                project_id=str(project["id"]),
+                proposal_revision=proposal_revision,
+                session_id=active_session,
+            )
+            if receipt["status"] in {"completed", "failed"}:
+                return ButlerPlanningResult(
+                    draft=None,
+                    status="duplicate",
+                    call_id=str(receipt["call_id"]),
+                    error_class=receipt.get("error_class"),
+                    external_session_id=active_session,
+                )
+            self.model_calls.dispatched(
+                receipt["call_id"], raw_status="dispatched"
+            )
+            result = None
+            try:
+                result = self.provider_pool.bridge.execute(
+                    provider=provider,
+                    project_path=str(project.get("host_path") or project["path"]),
+                    prompt=(
+                        base_prompt
+                        if contract_error is None
+                        else _planner_contract_repair_prompt(contract_error)
+                    ),
+                    session_id=active_session,
+                    timeout_seconds=self.timeout_seconds,
+                )
+                active_session = result.external_session_id or active_session
+                if result.returncode != 0:
+                    raise ProviderUnavailableError(
+                        result.stderr or "project Butler planning failed"
+                    )
+                proposal = _parse_model_proposal(result.stdout)
+                draft = validate_planner_proposal(
+                    proposal,
+                    provider_pool=self.provider_pool,
                     templates=templates,
                     rules=rules,
-                    provider=planner_provider,
-                ),
-                session_id=session_id,
-                timeout_seconds=self.timeout_seconds,
-            )
-            if result.returncode != 0:
-                raise ProviderUnavailableError(
-                    result.stderr or "project Butler planning failed"
+                    required_worker_provider=worker_provider,
                 )
-            proposal = _parse_model_proposal(result.stdout)
-            draft = validate_planner_proposal(
-                proposal,
-                provider_pool=self.provider_pool,
-                templates=templates,
-                rules=rules,
-            )
-        except Exception as error:
+            except Exception as error:
+                self.model_calls.settle(
+                    receipt["call_id"],
+                    result.as_dict() if result is not None else None,
+                    failed=True,
+                    error_class=(
+                        result.failure_class
+                        if result is not None and result.failure_class
+                        else type(error).__name__
+                    ),
+                    session_id=active_session,
+                    raw_status=(
+                        f"returncode:{result.returncode}"
+                        if result is not None
+                        else "exception"
+                    ),
+                )
+                if (
+                    attempt == 0
+                    and result is not None
+                    and result.returncode == 0
+                    and isinstance(error, (DomainError, TypeError, ValueError))
+                ):
+                    contract_error = str(error)
+                    continue
+                return ButlerPlanningResult(
+                    draft=None,
+                    status="fallback",
+                    call_id=str(receipt["call_id"]),
+                    error_class=type(error).__name__,
+                    external_session_id=active_session,
+                )
             self.model_calls.settle(
                 receipt["call_id"],
-                result.as_dict() if result is not None else None,
-                failed=True,
-                error_class=(
-                    result.failure_class
-                    if result is not None and result.failure_class
-                    else type(error).__name__
-                ),
-                session_id=result.external_session_id if result is not None else None,
-                raw_status=(
-                    f"returncode:{result.returncode}"
-                    if result is not None
-                    else "exception"
-                ),
+                result.as_dict(),
+                session_id=active_session,
+                raw_status=f"returncode:{result.returncode}",
             )
             return ButlerPlanningResult(
-                draft=None,
-                status="fallback",
+                draft=draft,
+                status="planned",
                 call_id=str(receipt["call_id"]),
-                error_class=type(error).__name__,
-                external_session_id=(
-                    result.external_session_id if result is not None else session_id
-                ),
+                external_session_id=active_session,
             )
-        self.model_calls.settle(
-            receipt["call_id"],
-            result.as_dict(),
-            session_id=result.external_session_id,
-            raw_status=f"returncode:{result.returncode}",
-        )
-        return ButlerPlanningResult(
-            draft=draft,
-            status="planned",
-            call_id=str(receipt["call_id"]),
-            external_session_id=result.external_session_id,
-        )
+        raise AssertionError("bounded planner repair loop exhausted")
 
     def chat_global(
         self,
@@ -342,6 +368,7 @@ def deterministic_goal_draft(
         result["sizing_inputs"] = sizing
     if not result.get("provider"):
         result["provider"] = "codex"
+    default_provider = str(result["provider"])
     roles = ["backend"] if backend or not frontend else []
     if frontend:
         roles.append("frontend")
@@ -352,7 +379,7 @@ def deterministic_goal_draft(
     title = str(result.get("title") or objective[:120]).strip()
     supplied_role_providers = bool(result.get("role_providers"))
     if not supplied_role_providers:
-        result["role_providers"] = {role: "codex" for role in roles}
+        result["role_providers"] = {role: default_provider for role in roles}
     if not result.get("plan_items") and not supplied_role_providers:
         result["plan_items"] = [
             {
@@ -366,11 +393,20 @@ def deterministic_goal_draft(
                 "depends_on_ordinals": [] if ordinal == 1 else [ordinal - 1],
                 "acceptance": list(result.get("acceptance") or []),
                 "artifacts": list(result.get("artifacts") or []),
-                "provider": "codex",
+                "provider": default_provider,
             }
             for ordinal, role in enumerate(roles[:MAX_PLAN_ITEMS], 1)
         ]
     return result
+
+
+def explicit_provider(instruction: str, fallback: str) -> str:
+    """Honor a provider named by the owner before any model call is attempted."""
+    lowered = instruction.lower()
+    for provider in KNOWN_PROVIDERS:
+        if re.search(rf"(?<![a-z0-9-]){re.escape(provider)}(?![a-z0-9-])", lowered):
+            return provider
+    return fallback
 
 
 def validate_planner_proposal(
@@ -379,8 +415,13 @@ def validate_planner_proposal(
     provider_pool: ProviderPool,
     templates: list[dict[str, Any]],
     rules: list[dict[str, Any]],
+    required_worker_provider: str,
 ) -> dict[str, Any]:
     draft = dict(proposal.get("goal_spec") or proposal)
+    if draft.get("provider") != required_worker_provider:
+        raise DomainError(
+            "planner changed the owner-selected default Worker provider"
+        )
     missing_semantic: list[str] = []
     for field in ("objective", "boundaries", "acceptance"):
         value = draft.get(field)
@@ -404,6 +445,7 @@ def validate_planner_proposal(
         raise DomainError("planner must return 1..6 bounded plan_items")
     seen: set[int] = set()
     providers: set[str] = set()
+    planned_roles: set[str] = set()
     for expected, item in enumerate(items, 1):
         if not isinstance(item, dict) or int(item.get("ordinal") or 0) != expected:
             raise DomainError("planner ordinals must be contiguous from 1")
@@ -422,10 +464,20 @@ def validate_planner_proposal(
             if expected - 1 not in {int(dep) for dep in dependencies}:
                 raise DomainError("shared worktree lanes must be serial")
         seen.add(expected)
-        providers.add(str(item.get("provider") or draft.get("provider") or ""))
+        planned_roles.add(role)
     role_providers = draft.get("role_providers")
     if not isinstance(role_providers, dict):
         raise DomainError("planner role_providers are required")
+    if set(role_providers) != planned_roles:
+        raise DomainError("planner role_providers must match planned roles exactly")
+    for item in items:
+        role = str(item["role"])
+        item_provider = str(item.get("provider") or "")
+        if item_provider != str(role_providers[role]):
+            raise DomainError(
+                f"planner provider mismatch between role and work item: {role}"
+            )
+        providers.add(item_provider)
     providers.update(str(value) for value in role_providers.values())
     if not providers or "" in providers:
         raise DomainError("planner providers are incomplete")
@@ -449,8 +501,12 @@ def validate_planner_proposal(
         refs = rule_refs.get(role)
         if not isinstance(refs, list) or any(ref not in rule_catalog for ref in refs):
             raise DomainError(f"planner rule references invalid for {role}")
-        if role == "frontend" and tuple(refs) != PLANNER_RULES:
-            raise DomainError("frontend planner rules must use the mandatory four-rule snapshot")
+        # The four development conventions are control-plane invariants, not
+        # optional text the planning model must remember to reproduce.
+        rule_refs[role] = [
+            *PLANNER_RULES,
+            *(ref for ref in refs if ref not in PLANNER_RULES),
+        ]
     return draft
 
 
@@ -461,7 +517,8 @@ def _planner_prompt(
     project: dict[str, Any],
     templates: list[dict[str, Any]],
     rules: list[dict[str, Any]],
-    provider: str,
+    butler_provider: str,
+    required_worker_provider: str,
 ) -> str:
     facts = {
         "project": {
@@ -476,27 +533,65 @@ def _planner_prompt(
                 "ref": f"{item['template_id']}@{item['revision']}",
             }
             for item in templates
+            if item["capability"] in PLANNER_ROLES
         ],
         "available_rules": [
             f"{item['rule_id']}@{item['revision']}" for item in rules
         ],
-        "required_provider": provider,
+        "mandatory_development_rules": list(PLANNER_RULES),
+        "butler_provider": butler_provider,
+        "required_worker_provider": required_worker_provider,
         "max_plan_items": MAX_PLAN_ITEMS,
     }
     return (
         "You are the project Butler planning model. Return one JSON object only. "
-        "Generate goal_spec with objective, boundaries, acceptance, sizing_inputs, "
-        "plan_items, provider, role_providers, role_templates, and role_rules. "
+        "The top-level object must be {\"goal_spec\": {...}}. goal_spec must contain "
+        "title:string, objective:string, boundaries:list[string], "
+        "acceptance:list[string], sizing_inputs:object, plan_items:list[object], "
+        "provider:string, role_providers:object, role_templates:object, and "
+        "role_rules:object. Acceptance entries must be plain strings, never objects. "
+        "Each plan item must contain exactly ordinal:int, role:string, "
+        "kind:\"implementation\"|\"verification\", title:string, objective:string, "
+        "depends_on_ordinals:list[int], and provider:string. Ordinals are contiguous "
+        "from 1; dependencies refer only to earlier ordinals. Use only roles listed "
+        "in available_templates; never create global_butler or project_butler work "
+        "items. The verification role must use kind=verification and every other "
+        "role must use kind=implementation. role_providers keys must exactly match "
+        "planned roles, and every plan item provider must equal its role provider. "
+        "role_templates and role_rules use the same planned role keys. The "
+        "control plane will always prepend mandatory_development_rules to every "
+        "planned role, so role_rules should list only additional relevant rules. "
+        "sizing_inputs must contain only these keys: layers_touched, "
+        "components_touched, estimated_files_changed, has_migration, has_deploy, "
+        "verification_commands_count, estimated_verification_seconds, "
+        "external_dependencies_count, risk_level, independent_review_required, "
+        "gate_artifact, gate_boundary, gate_verification, gate_dependency. "
         "Use real estimates from the instruction and facts, never the placeholder "
         "1 layer/1 component/1 file/low sizing. Plan at most 6 items. Shared worktree "
         "implementation lanes and the final verification lane must form a serial DAG. "
         "Every role/provider/template/rule must reference the supplied catalog. "
         "If a material ambiguity prevents a safe proposal, omit only that semantic "
         "field so deterministic intake asks exactly one question. Do not claim "
-        "dispatch or completion.\n\n"
+        "dispatch or completion. Treat objections, corrections, and questions about "
+        "your reasoning as conversational input; never copy them blindly into a "
+        "goal field. The owner-selected required_worker_provider must remain the "
+        "default for Goal provider, role_providers, and plan_items unless the "
+        "instruction explicitly assigns another provider to a named role. "
+        "butler_provider identifies only your own planning runtime and must not "
+        "silently replace the Worker provider.\n\n"
         f"Instruction:\n{instruction}\n\n"
         f"Current draft:\n{json.dumps(current_draft, ensure_ascii=False, sort_keys=True)}\n\n"
         f"Canonical facts:\n{json.dumps(facts, ensure_ascii=False, sort_keys=True)}"
+    )
+
+
+def _planner_contract_repair_prompt(error: str) -> str:
+    return (
+        "Your previous proposal was semantically useful but violated the exact "
+        f"control-plane JSON contract: {error}. Correct only the structure and "
+        "contract mismatch. Preserve the owner's objective, boundaries, acceptance "
+        "meaning, selected Worker provider, and intended serial dependencies. Return "
+        "one corrected {\"goal_spec\": {...}} JSON object only, with no commentary."
     )
 
 
@@ -535,11 +630,22 @@ def _parse_model_proposal(output: str) -> dict[str, Any]:
     raise DomainError("planner returned no valid JSON proposal")
 
 
-def _find_nested(value: dict[str, Any]) -> Any | None:
-    for key in ("result", "output_text", "text", "content", "message"):
-        nested = value.get(key)
-        if nested is not None:
-            return nested
+def _find_nested(value: Any) -> Any | None:
+    if isinstance(value, dict):
+        for key in ("result", "output_text", "text", "content", "message"):
+            nested = value.get(key)
+            if nested is not None:
+                return nested
+        # Codex CLI JSONL wraps the final agent message under item.text.
+        for nested in reversed(list(value.values())):
+            found = _find_nested(nested)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for nested in reversed(value):
+            found = _find_nested(nested)
+            if found is not None:
+                return found
     return None
 
 
@@ -549,6 +655,7 @@ __all__ = [
     "ButlerPlanningResult",
     "ButlerRoute",
     "deterministic_goal_draft",
+    "explicit_provider",
     "project_execution_policy",
     "route_goal",
     "validate_planner_proposal",

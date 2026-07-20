@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from plow_whip_web.api.app import create_app
 from plow_whip_web.config import Settings
 from plow_whip_web.providers.generic_command import ExecutionResult
+from plow_whip_web.runtime.butler import _parse_model_proposal
 
 
 class PlannerBridge:
@@ -37,8 +38,9 @@ class PlannerBridge:
 
 
 class InvalidPlannerBridge(PlannerBridge):
-    def execute(self, **_kwargs: object) -> ExecutionResult:
+    def execute(self, **kwargs: object) -> ExecutionResult:
         self.execute_calls += 1
+        self.session_ids.append(kwargs.get("session_id"))  # type: ignore[arg-type]
         return ExecutionResult(
             returncode=0,
             stdout="not-json",
@@ -47,6 +49,48 @@ class InvalidPlannerBridge(PlannerBridge):
             input_tokens=30,
             output_tokens=5,
         )
+
+
+class RepairingPlannerBridge(PlannerBridge):
+    def execute(self, **kwargs: object) -> ExecutionResult:
+        if self.execute_calls == 0:
+            self.execute_calls += 1
+            self.session_ids.append(kwargs.get("session_id"))  # type: ignore[arg-type]
+            return ExecutionResult(
+                returncode=0,
+                stdout=json.dumps({
+                    "goal_spec": {
+                        "objective": "语义正确但结构不完整的初稿",
+                    }
+                }, ensure_ascii=False),
+                stderr="",
+                duration_ms=5,
+                input_tokens=90,
+                output_tokens=20,
+                external_session_id="planner-session-1",
+            )
+        return super().execute(**kwargs)
+
+
+def test_planner_extracts_goal_spec_from_real_codex_jsonl_shape() -> None:
+    proposal = {
+        "goal_spec": {
+            "objective": "从 Codex JSONL 提取方案",
+        }
+    }
+    output = "\n".join([
+        json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
+        json.dumps({
+            "type": "item.completed",
+            "item": {
+                "id": "item-1",
+                "type": "agent_message",
+                "text": json.dumps(proposal, ensure_ascii=False),
+            },
+        }, ensure_ascii=False),
+        json.dumps({"type": "turn.completed", "usage": {"input_tokens": 10}}),
+    ])
+    assert _parse_model_proposal(output) == proposal
 
 
 def test_natural_language_planner_creates_reviewable_three_task_codex_dag() -> None:
@@ -231,6 +275,226 @@ def test_natural_language_planner_creates_reviewable_three_task_codex_dag() -> N
             assert len({item["task_id"] for item in bindings}) == 3
 
 
+def test_model_planned_small_goal_auto_dispatches_without_mechanical_shortcut() -> None:
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        project_path = root / "project"
+        project_path.mkdir()
+        app = create_app(Settings(
+            data_dir=root / "runtime",
+            host_bridge_token="test-token-is-long-enough-123",
+        ))
+        templates = {
+            item["capability"]: f"{item['template_id']}@{item['revision']}"
+            for item in app.state.role_instance_repository.list_templates()
+        }
+        sizing = {
+            "layers_touched": 1,
+            "components_touched": 1,
+            "estimated_files_changed": 2,
+            "has_migration": False,
+            "has_deploy": False,
+            "verification_commands_count": 1,
+            "estimated_verification_seconds": 30,
+            "external_dependencies_count": 0,
+            "risk_level": "low",
+            "independent_review_required": False,
+            "gate_artifact": True,
+            "gate_boundary": True,
+            "gate_verification": True,
+            "gate_dependency": True,
+        }
+        bridge = PlannerBridge({
+            "goal_spec": {
+                "title": "小型 Cursor 审查",
+                "objective": "使用 Cursor 完成小型代码审查并给出证据",
+                "boundaries": ["只读审查当前项目", "禁止修改和部署"],
+                "acceptance": ["输出审查证据", "结论包含具体代码位置"],
+                "sizing_inputs": sizing,
+                "provider": "cursor",
+                "role_providers": {
+                    "backend": "cursor",
+                    "verification": "cursor",
+                },
+                "role_templates": {
+                    role: templates[role] for role in ("backend", "verification")
+                },
+                "role_rules": {
+                    "backend": [],
+                    "verification": [],
+                },
+                "plan_items": [
+                    {
+                        "ordinal": 1,
+                        "role": "backend",
+                        "kind": "implementation",
+                        "title": "审查",
+                        "objective": "只读检查代码并形成证据",
+                        "depends_on_ordinals": [],
+                        "provider": "cursor",
+                    },
+                    {
+                        "ordinal": 2,
+                        "role": "verification",
+                        "kind": "verification",
+                        "title": "核验",
+                        "objective": "核验报告中的代码证据",
+                        "depends_on_ordinals": [1],
+                        "provider": "cursor",
+                    },
+                ],
+            }
+        })
+        app.state.provider_pool.bridge = bridge
+        app.state.butler_planner.provider_pool.bridge = bridge
+        with TestClient(app) as client:
+            project = client.post(
+                "/api/projects",
+                json={"name": "small-auto", "path": str(project_path)},
+            ).json()
+            response = client.post(
+                f"/api/projects/{project['id']}/butler/conversations",
+                headers={"Idempotency-Key": "model-small-auto-route"},
+                json={
+                    "instruction": "交给 Cursor 做一次小型只读代码审查",
+                    "provider": "codex",
+                    "sizing_inputs": sizing,
+                },
+            )
+            assert response.status_code == 201, response.text
+            conversation = response.json()
+            assert conversation["provider"] == "codex"
+            assert conversation["spec"]["provider"] == "cursor"
+            assert set(conversation["spec"]["role_providers"].values()) == {"cursor"}
+            assert conversation["planner"]["status"] == "planned"
+            assert conversation["auto_dispatch"] is True
+            assert conversation["status"] == "dispatched"
+            assert conversation["goal_id"]
+            calls = client.get(
+                "/api/usage", params={"project_id": project["id"]}
+            ).json()["calls"]
+            planner_call = next(
+                call for call in calls if call["call_kind"] == "butler_planner"
+            )
+            assert planner_call["status"] == "completed"
+            assert planner_call["provider"] == "codex"
+
+
+def test_planner_repairs_one_contract_error_in_the_same_provider_session() -> None:
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        project_path = root / "project"
+        project_path.mkdir()
+        app = create_app(Settings(
+            data_dir=root / "runtime",
+            host_bridge_token="test-token-is-long-enough-123",
+        ))
+        templates = {
+            item["capability"]: f"{item['template_id']}@{item['revision']}"
+            for item in app.state.role_instance_repository.list_templates()
+        }
+        sizing = {
+            "layers_touched": 3,
+            "components_touched": 7,
+            "estimated_files_changed": 10,
+            "has_migration": False,
+            "has_deploy": False,
+            "verification_commands_count": 4,
+            "estimated_verification_seconds": 300,
+            "external_dependencies_count": 0,
+            "risk_level": "medium",
+            "independent_review_required": True,
+            "gate_artifact": True,
+            "gate_boundary": True,
+            "gate_verification": True,
+            "gate_dependency": True,
+        }
+        bridge = RepairingPlannerBridge({
+            "goal_spec": {
+                "title": "修复规划合同",
+                "objective": "在同一会话修复模型输出合同并形成可确认方案",
+                "boundaries": ["只形成方案", "禁止自动确认"],
+                "acceptance": ["保留语义", "结构通过确定性校验"],
+                "sizing_inputs": sizing,
+                "provider": "cursor",
+                "role_providers": {
+                    "backend": "cursor",
+                    "verification": "cursor",
+                },
+                "role_templates": {
+                    role: templates[role] for role in ("backend", "verification")
+                },
+                "role_rules": {
+                    "backend": [],
+                    "verification": [],
+                },
+                "plan_items": [
+                    {
+                        "ordinal": 1,
+                        "role": "backend",
+                        "kind": "implementation",
+                        "title": "审查",
+                        "objective": "形成证据",
+                        "depends_on_ordinals": [],
+                        "provider": "cursor",
+                    },
+                    {
+                        "ordinal": 2,
+                        "role": "verification",
+                        "kind": "verification",
+                        "title": "验证",
+                        "objective": "核验证据",
+                        "depends_on_ordinals": [1],
+                        "provider": "cursor",
+                    },
+                ],
+            }
+        })
+        app.state.provider_pool.bridge = bridge
+        app.state.butler_planner.provider_pool.bridge = bridge
+        with TestClient(app) as client:
+            project = client.post(
+                "/api/projects",
+                json={"name": "contract-repair", "path": str(project_path)},
+            ).json()
+            response = client.post(
+                f"/api/projects/{project['id']}/butler/conversations",
+                headers={"Idempotency-Key": "planner-contract-repair"},
+                json={
+                    "instruction": "交给 Cursor 做大型只读审查并等待确认",
+                    "provider": "cursor",
+                    "sizing_inputs": sizing,
+                },
+            )
+            assert response.status_code == 201, response.text
+            conversation = response.json()
+            assert conversation["status"] == "awaiting_confirmation"
+            assert conversation["planner"]["status"] == "planned"
+            mandatory = {
+                "dev.think_before_coding@1",
+                "dev.simplicity_first@1",
+                "dev.surgical_changes@1",
+                "dev.goal_driven_execution@1",
+            }
+            assert all(
+                mandatory.issubset(refs)
+                for refs in map(
+                    set, conversation["spec"]["role_rules"].values()
+                )
+            )
+            assert bridge.execute_calls == 2
+            assert bridge.session_ids == [None, "planner-session-1"]
+            calls = client.get(
+                "/api/usage", params={"project_id": project["id"]}
+            ).json()["calls"]
+            assert {call["status"] for call in calls} == {"failed", "completed"}
+            repaired = next(
+                call for call in calls
+                if call["idempotency_key"].endswith(":contract-repair:1")
+            )
+            assert repaired["status"] == "completed"
+
+
 def test_global_butler_keeps_one_scrollable_history_and_resumes_same_session() -> None:
     with TemporaryDirectory() as directory:
         root = Path(directory)
@@ -313,7 +577,7 @@ def test_project_usage_filter_does_not_leak_other_project_calls() -> None:
             assert {call["project_id"] for call in filtered["calls"]} == {first["id"]}
 
 
-def test_invalid_planner_output_is_ledgered_and_falls_back_without_dispatch() -> None:
+def test_invalid_planner_output_fails_closed_and_human_can_resume() -> None:
     with TemporaryDirectory() as directory:
         root = Path(directory)
         project_path = root / "project"
@@ -340,19 +604,115 @@ def test_invalid_planner_output_is_ledgered_and_falls_back_without_dispatch() ->
             )
             assert response.status_code == 201
             conversation = response.json()
-            assert conversation["status"] == "clarifying"
+            assert conversation["status"] == "provider_suspended"
             assert conversation["expected_field"] == "boundaries"
             assert conversation["goal_id"] is None
-            assert conversation["spec"]["sizing_inputs"]["layers_touched"] == 2
-            assert [item["role"] for item in conversation["spec"]["plan_items"]] == [
-                "backend", "frontend", "verification",
+            assert conversation["planner"]["status"] == "provider_suspended"
+            assert conversation["planner"]["error_class"] == "DomainError"
+            assert conversation["spec"]["plan_items"] is None
+            assert [item["kind"] for item in conversation["messages"]] == [
+                "instruction", "answer",
             ]
             calls = client.get(
                 "/api/usage", params={"project_id": project["id"]}
             ).json()["calls"]
-            assert len(calls) == 1
-            assert calls[0]["call_kind"] == "butler_planner"
-            assert calls[0]["status"] == "failed"
-            assert calls[0]["error_class"] == "DomainError"
-            assert calls[0]["proposal_revision"] == 0
-            assert calls[0]["total_tokens"] == 35
+            assert len(calls) == 2
+            assert {call["call_kind"] for call in calls} == {"butler_planner"}
+            assert {call["status"] for call in calls} == {"failed"}
+            assert {call["error_class"] for call in calls} == {"DomainError"}
+            assert {call["proposal_revision"] for call in calls} == {0}
+            assert sum(call["total_tokens"] for call in calls) == 70
+            assert bridge.execute_calls == 2
+
+            blocked = client.post(
+                f"/api/projects/{project['id']}/butler/conversations/"
+                f"{conversation['id']}/messages",
+                json={
+                    "expected_revision": conversation["revision"],
+                    "content": "不要机械写入边界",
+                },
+            )
+            assert blocked.status_code == 409
+
+            templates = {
+                item["capability"]: f"{item['template_id']}@{item['revision']}"
+                for item in app.state.role_instance_repository.list_templates()
+            }
+            rules = [
+                "dev.think_before_coding@1",
+                "dev.simplicity_first@1",
+                "dev.surgical_changes@1",
+                "dev.goal_driven_execution@1",
+            ]
+            healthy = PlannerBridge({
+                "goal_spec": {
+                    "title": "恢复项目管家",
+                    "objective": "恢复模型规划并生成经过理解的可验证方案",
+                    "boundaries": ["只改当前项目", "禁止机械降级"],
+                    "acceptance": ["Planner Ledger 为 completed", "人工确认后才能派发"],
+                    "sizing_inputs": {
+                        "layers_touched": 4,
+                        "components_touched": 8,
+                        "estimated_files_changed": 12,
+                        "has_migration": True,
+                        "has_deploy": True,
+                        "verification_commands_count": 5,
+                        "estimated_verification_seconds": 420,
+                        "external_dependencies_count": 0,
+                        "risk_level": "high",
+                        "independent_review_required": False,
+                        "gate_artifact": True,
+                        "gate_boundary": True,
+                        "gate_verification": True,
+                        "gate_dependency": True,
+                    },
+                    "provider": "codex",
+                    "role_providers": {
+                        "backend": "codex",
+                        "verification": "codex",
+                    },
+                    "role_templates": {
+                        role: templates[role] for role in ("backend", "verification")
+                    },
+                    "role_rules": {
+                        role: rules for role in ("backend", "verification")
+                    },
+                    "plan_items": [
+                        {
+                            "ordinal": 1,
+                            "role": "backend",
+                            "kind": "implementation",
+                            "title": "Backend",
+                            "objective": "实现 fail-closed",
+                            "depends_on_ordinals": [],
+                            "provider": "codex",
+                        },
+                        {
+                            "ordinal": 2,
+                            "role": "verification",
+                            "kind": "verification",
+                            "title": "Verification",
+                            "objective": "验证恢复合同",
+                            "depends_on_ordinals": [1],
+                            "provider": "codex",
+                        },
+                    ],
+                }
+            })
+            app.state.provider_pool.bridge = healthy
+            app.state.butler_planner.provider_pool.bridge = healthy
+            resumed = client.post(
+                f"/api/projects/{project['id']}/butler/conversations/"
+                f"{conversation['id']}/resume",
+                headers={"Idempotency-Key": "resume-invalid-planner"},
+                json={
+                    "expected_revision": conversation["revision"],
+                    "actor_type": "human",
+                },
+            )
+            assert resumed.status_code == 200, resumed.text
+            current = resumed.json()
+            assert current["status"] == "awaiting_confirmation"
+            assert current["planner"]["status"] == "planned"
+            assert current["id"] == conversation["id"]
+            assert healthy.session_ids == [None]

@@ -429,6 +429,13 @@ class ButlerMessageCreate(BaseModel):
     field: Literal["objective", "boundaries", "acceptance"] | None = None
 
 
+class ButlerResume(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_revision: Annotated[int, Field(ge=0)]
+    actor_type: Literal["human"]
+
+
 class ButlerConfirm(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -443,7 +450,13 @@ class ButlerConversationView(BaseModel):
     project_id: str | None
     source_type: Literal["human", "global_butler", "agent"]
     source_id: str | None
-    status: Literal["clarifying", "awaiting_confirmation", "dispatched", "rejected"]
+    status: Literal[
+        "clarifying",
+        "awaiting_confirmation",
+        "provider_suspended",
+        "dispatched",
+        "rejected",
+    ]
     revision: int
     confidence: int
     expected_field: Literal["objective", "boundaries", "acceptance"] | None

@@ -18,6 +18,7 @@ from plow_whip_web.api.schemas import (
     ButlerConversationStart,
     ButlerConversationView,
     ButlerMessageCreate,
+    ButlerResume,
     ExpectedRevision,
     ConventionPut,
     ConventionRefineRequest,
@@ -54,7 +55,7 @@ from plow_whip_web.api.schemas import (
 )
 from plow_whip_web.runtime.sizing import TaskSizingInputs, estimate_task_sizing
 from plow_whip_web.runtime.orchestration import plan_goal_work_items
-from plow_whip_web.runtime.butler import ButlerPlanner
+from plow_whip_web.runtime.butler import ButlerPlanner, explicit_provider
 from dataclasses import replace
 from plow_whip_web.config import Settings
 from plow_whip_web.domain.model import (
@@ -1058,6 +1059,19 @@ def create_app(settings: Settings) -> FastAPI:
     ) -> ButlerConversationView:
         repository: ButlerRepository = request.app.state.butler_repository
         draft = payload.model_dump(exclude={"source_type", "source_id", "instruction"})
+        structured_input = bool(
+            payload.objective and payload.boundaries and payload.acceptance
+        )
+        configured_provider = str(
+            request.app.state.runtime_settings.get()["values"][
+                "default_butler_provider"
+            ]
+        )
+        worker_provider = explicit_provider(
+            payload.instruction,
+            payload.provider,
+        )
+        draft["provider"] = worker_provider
         record = repository.start_project_conversation(
             project_id=project_id,
             source_type=payload.source_type,
@@ -1065,20 +1079,15 @@ def create_app(settings: Settings) -> FastAPI:
             instruction=payload.instruction,
             draft=draft,
             idempotency_key=idempotency_key,
-            butler_provider=str(
-                request.app.state.runtime_settings.get()["values"][
-                    "default_butler_provider"
-                ]
-            ),
+            butler_provider=configured_provider,
+            defer_question_to_planner=not structured_input,
         )
         record = _maybe_plan_butler(
             request,
             record,
             instruction=payload.instruction,
             idempotency_key=f"{idempotency_key}:planner:r{record['revision']}",
-            structured_input=bool(
-                payload.objective and payload.boundaries and payload.acceptance
-            ),
+            structured_input=structured_input,
         )
         record = _maybe_auto_dispatch_butler(request, project_id, record)
         return ButlerConversationView(**record)
@@ -1126,7 +1135,19 @@ def create_app(settings: Settings) -> FastAPI:
         current = repository.get(conversation_id)
         if current["project_id"] != project_id:
             raise NotFoundError(f"butler conversation not found: {conversation_id}")
-        record = repository.post_message(
+        if current["status"] == "provider_suspended":
+            raise InvalidTransitionError(
+                "project Butler provider is suspended; use the resume action"
+            )
+        if payload.field is None:
+            record = repository.append_conversational_message(
+                conversation_id,
+                expected_revision=payload.expected_revision,
+                content=payload.content,
+                sender_type=payload.sender_type,
+            )
+        else:
+            record = repository.post_message(
                 conversation_id,
                 expected_revision=payload.expected_revision,
                 content=payload.content,
@@ -1140,6 +1161,48 @@ def create_app(settings: Settings) -> FastAPI:
             idempotency_key=(
                 f"butler-message:{conversation_id}:planner:r{record['revision']}"
             ),
+            structured_input=False,
+            allow_replan=True,
+        )
+        return ButlerConversationView(**_maybe_auto_dispatch_butler(
+            request, project_id, record
+        ))
+
+    @app.post(
+        "/api/projects/{project_id}/butler/conversations/{conversation_id}/resume",
+        response_model=ButlerConversationView,
+        tags=["butlers"],
+    )
+    def resume_project_butler(
+        request: Request,
+        project_id: str,
+        conversation_id: str,
+        payload: ButlerResume,
+        idempotency_key: str = Header(
+            alias="Idempotency-Key", min_length=8, max_length=200
+        ),
+    ) -> ButlerConversationView:
+        repository: ButlerRepository = request.app.state.butler_repository
+        current = repository.get(conversation_id)
+        if current["project_id"] != project_id:
+            raise NotFoundError(f"butler conversation not found: {conversation_id}")
+        record = repository.prepare_planner_resume(
+            conversation_id,
+            expected_revision=payload.expected_revision,
+        )
+        last_human_message = next(
+            (
+                str(message["content"])
+                for message in reversed(record["messages"])
+                if message["sender_type"] in {"human", "agent"}
+            ),
+            str(record["spec"].get("objective") or ""),
+        )
+        record = _maybe_plan_butler(
+            request,
+            record,
+            instruction=last_human_message,
+            idempotency_key=f"{idempotency_key}:planner:r{record['revision']}",
             structured_input=False,
             allow_replan=True,
         )
@@ -1697,6 +1760,10 @@ def _maybe_plan_butler(
         rules=role_instances.list_rules(),
         session_id=record.get("external_session_id"),
         provider_name=str(record.get("provider") or "codex"),
+        required_worker_provider=str(
+            record.get("spec", {}).get("provider")
+            or explicit_provider(instruction, "codex")
+        ),
     )
     if result.external_session_id:
         record = request.app.state.butler_repository.bind_provider_session(
@@ -1705,7 +1772,12 @@ def _maybe_plan_butler(
             external_session_id=result.external_session_id,
         )
     if result.draft is None or result.call_id is None:
-        return record
+        return request.app.state.butler_repository.suspend_planner(
+            record["id"],
+            expected_revision=record["revision"],
+            call_id=result.call_id,
+            error_class=result.error_class or result.status,
+        )
     repository: ButlerRepository = request.app.state.butler_repository
     return repository.apply_planner_proposal(
         record["id"],
