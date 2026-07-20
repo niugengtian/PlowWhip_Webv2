@@ -221,28 +221,30 @@ export function ProjectButlerDialog({
               {conversation.status === 'awaiting_confirmation' && <span>等待主人确认后才会派发</span>}
               {conversation.status === 'provider_suspended' && <span>模型调用失败，已停止机械降级</span>}
             </div>
-            <div className="butler-messages" aria-live="polite">
-              {conversation.messages.map((message) => <article
-                className={message.sender_type === 'project_butler' ? 'butler-message' : 'human-message'}
-                key={message.id}
-              >
-                <div>{message.sender_type === 'project_butler' ? <Robot size={16} /> : <ChatCircleDots size={16} />}<strong>{senderName(message.sender_type)}</strong><small>#{message.ordinal}</small></div>
-                <p>{message.content}</p>
-              </article>)}
+            <div className="butler-conversation-scroll">
+              <div className="butler-messages" aria-live="polite">
+                {conversation.messages.map((message) => <article
+                  className={message.sender_type === 'project_butler' ? 'butler-message' : 'human-message'}
+                  key={message.id}
+                >
+                  <div>{message.sender_type === 'project_butler' ? <Robot size={16} /> : <ChatCircleDots size={16} />}<strong>{senderName(message.sender_type)}</strong><small>#{message.ordinal}</small></div>
+                  <p>{message.content}</p>
+                </article>)}
+              </div>
+              {!globalScope && conversation.status === 'awaiting_confirmation' && <ProposalCard
+                conversation={conversation}
+                selectedField={revisionField}
+                onSelectField={setRevisionField}
+                onConfirm={confirmProposal}
+                busy={busy}
+              />}
+              {!globalScope && conversation.status === 'dispatched' && <div className="butler-dispatched"><CheckCircle size={18} weight="fill" />方案已由人确认，Goal 已创建并交给调度链。</div>}
+              {!globalScope && conversation.status === 'provider_suspended' && <div className="butler-error">
+                <p>项目管家没有获得有效模型结果。本会话已暂停，不会把你的回复机械写入目标、边界或验收标准。</p>
+                <small>失败类型：{String(conversation.planner?.error_class ?? 'unknown')}。当前本机目录：{activeProjects.find((item) => item.id === projectId)?.host_path ?? '未配置'}。目录必须精确指向 Git 仓库根目录。</small>
+                <button type="button" className="primary" disabled={busy} onClick={resumePlanner}>恢复 Provider 并续接本会话</button>
+              </div>}
             </div>
-            {!globalScope && conversation.status === 'awaiting_confirmation' && <ProposalCard
-              conversation={conversation}
-              selectedField={revisionField}
-              onSelectField={setRevisionField}
-              onConfirm={confirmProposal}
-              busy={busy}
-            />}
-            {!globalScope && conversation.status === 'dispatched' && <div className="butler-dispatched"><CheckCircle size={18} weight="fill" />方案已由人确认，Goal 已创建并交给调度链。</div>}
-            {!globalScope && conversation.status === 'provider_suspended' && <div className="butler-error">
-              <p>项目管家没有获得有效模型结果。本会话已暂停，不会把你的回复机械写入目标、边界或验收标准。</p>
-              <small>失败类型：{String(conversation.planner?.error_class ?? 'unknown')}。当前本机目录：{activeProjects.find((item) => item.id === projectId)?.host_path ?? '未配置'}。目录必须精确指向 Git 仓库根目录。</small>
-              <button type="button" className="primary" disabled={busy} onClick={resumePlanner}>恢复 Provider 并续接本会话</button>
-            </div>}
             {(globalScope || conversation.status !== 'dispatched') && <form className="butler-composer" onSubmit={sendMessage}>
               <textarea
                 aria-label="回复项目管家"

@@ -183,4 +183,37 @@ describe('ProjectButlerDialog provider suspension', () => {
       )
     })
   })
+
+  it('keeps long proposals inside the conversation scroller while the composer stays fixed', async () => {
+    const proposal = {
+      ...suspended,
+      status: 'awaiting_confirmation',
+      expected_field: null,
+      proposal_hash: 'a'.repeat(64),
+      spec: {
+        objective: '全面审查项目',
+        boundaries: ['只读审查，不修改项目文件'],
+        acceptance: ['提供可复现证据和分级建议'],
+      },
+      planner: { status: 'planned' },
+    } as ButlerConversation
+    vi.spyOn(api, 'projectButlerConversations').mockResolvedValue([proposal])
+
+    const { container } = render(<ProjectButlerDialog
+      initialProjectId={project.id}
+      projects={[project]}
+      providers={[provider]}
+      onClose={() => undefined}
+      onDispatched={async () => undefined}
+    />)
+
+    expect(await screen.findByRole('button', {
+      name: '确认方案并执行',
+    })).toBeInTheDocument()
+    const scroller = container.querySelector<HTMLElement>('.butler-conversation-scroll')
+    const proposalCard = container.querySelector<HTMLElement>('.butler-proposal')
+    const composer = container.querySelector<HTMLElement>('.butler-composer')
+    expect(scroller).toContainElement(proposalCard)
+    expect(scroller).not.toContainElement(composer)
+  })
 })

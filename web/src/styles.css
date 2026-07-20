@@ -343,7 +343,8 @@ textarea { min-height: 84px; resize: vertical; line-height: 1.5; }
 .butler-history strong { color: #bdc9e5; font-size: .7rem; }
 .butler-history small, .butler-history p { margin-top: 4px; color: #64769d; font-size: .62rem; }
 .butler-chat { display: flex; min-width: 0; min-height: 0; flex-direction: column; }
-.butler-messages { overflow-y: auto; min-height: 180px; flex: 1; padding: 18px; }
+.butler-conversation-scroll { min-height: 0; flex: 1; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+.butler-messages { min-height: 180px; padding: 18px; }
 .butler-message, .human-message { width: min(78%, 560px); margin-bottom: 12px; border: 1px solid var(--line); border-radius: 8px; padding: 11px 12px; background: #101521; }
 .human-message { margin-left: auto; border-color: #2d4f85; background: #14233a; }
 .butler-message > div, .human-message > div { display: flex; align-items: center; gap: 6px; color: #7f92b9; font-size: .64rem; }
@@ -356,7 +357,7 @@ textarea { min-height: 84px; resize: vertical; line-height: 1.5; }
 .butler-proposal dl { margin: 12px 0; }
 .butler-proposal dl > div { border-top: 1px solid #243553; padding: 8px 0; }
 .butler-proposal dt { color: #6d80a7; font-size: .63rem; }
-.butler-proposal dd { margin: 4px 0 0; color: #c4d0e9; font-size: .72rem; line-height: 1.5; }
+.butler-proposal dd { margin: 4px 0 0; overflow-wrap: anywhere; color: #c4d0e9; font-size: .72rem; line-height: 1.5; }
 .butler-proposal > p { color: #8192b4; font-size: .65rem; line-height: 1.5; }
 .butler-proposal-actions { display: flex; flex-wrap: wrap; gap: 6px; }
 .butler-proposal-actions button.selected { border-color: #6a9eff; background: #1b3153; color: white; }
