@@ -533,6 +533,18 @@ class ProjectCreate(BaseModel):
         return str(path)
 
 
+class ProjectHostPathUpdate(BaseModel):
+    host_path: str
+
+    @field_validator("host_path")
+    @classmethod
+    def host_path_must_be_absolute(cls, value: str) -> str:
+        path = Path(value).expanduser()
+        if not path.is_absolute() or ".." in path.parts:
+            raise ValueError("host_path must be an absolute path")
+        return str(path)
+
+
 class ProjectView(BaseModel):
     id: str
     name: str

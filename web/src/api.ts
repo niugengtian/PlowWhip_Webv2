@@ -812,8 +812,15 @@ export const api = {
     ),
   createProject: (payload: { name: string; path: string; host_path?: string | null }) =>
     request<Project>('/api/projects', { method: 'POST', body: JSON.stringify(payload) }),
+  updateProjectHostPath: (projectId: string, hostPath: string) =>
+    request<Project>(`/api/projects/${projectId}/host-path`, {
+      method: 'PATCH',
+      body: JSON.stringify({ host_path: hostPath }),
+    }),
   releaseProject: (projectId: string) =>
     request<Project>(`/api/projects/${projectId}/release`, { method: 'POST' }),
+  reopenProject: (projectId: string) =>
+    request<Project>(`/api/projects/${projectId}/reopen`, { method: 'POST' }),
   rebindWorker: (workerId: string, provider: string) =>
     request<Worker>(`/api/workers/${workerId}/rebind`, {
       method: 'POST', body: JSON.stringify({ provider, reason: 'operator_rebind' }),

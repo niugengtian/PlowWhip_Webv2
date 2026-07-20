@@ -27,6 +27,7 @@ from plow_whip_web.api.schemas import (
     GlobalButlerRoute,
     GlobalButlerConversationStart,
     ProjectCreate,
+    ProjectHostPathUpdate,
     ProjectView,
     ProviderPut,
     PermissionGrantCreate,
@@ -897,10 +898,35 @@ def create_app(settings: Settings) -> FastAPI:
         repository: ProjectRepository = request.app.state.project_repository
         return ProjectView(**repository.get(project_id))
 
+    @app.patch(
+        "/api/projects/{project_id}/host-path",
+        response_model=ProjectView,
+        tags=["projects"],
+    )
+    def update_project_host_path(
+        request: Request,
+        project_id: str,
+        payload: ProjectHostPathUpdate,
+    ) -> ProjectView:
+        repository: ProjectRepository = request.app.state.project_repository
+        return ProjectView(**repository.update_host_path(
+            project_id=project_id,
+            host_path=payload.host_path,
+        ))
+
     @app.post("/api/projects/{project_id}/release", response_model=ProjectView, tags=["projects"])
     def release_project(request: Request, project_id: str) -> ProjectView:
         repository: ProjectRepository = request.app.state.project_repository
         return ProjectView(**repository.release(project_id))
+
+    @app.post(
+        "/api/projects/{project_id}/reopen",
+        response_model=ProjectView,
+        tags=["projects"],
+    )
+    def reopen_project(request: Request, project_id: str) -> ProjectView:
+        repository: ProjectRepository = request.app.state.project_repository
+        return ProjectView(**repository.reopen(project_id))
 
     @app.get("/api/butlers/global/overview", tags=["butlers"])
     def global_butler_overview(
@@ -1760,9 +1786,9 @@ def _maybe_plan_butler(
         rules=role_instances.list_rules(),
         session_id=record.get("external_session_id"),
         provider_name=str(record.get("provider") or "codex"),
-        required_worker_provider=str(
-            record.get("spec", {}).get("provider")
-            or explicit_provider(instruction, "codex")
+        required_worker_provider=explicit_provider(
+            instruction,
+            str(record.get("spec", {}).get("provider") or "codex"),
         ),
     )
     if result.external_session_id:

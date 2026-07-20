@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from plow_whip_web.api.app import create_app
 from plow_whip_web.config import Settings
 from plow_whip_web.providers.generic_command import ExecutionResult
-from plow_whip_web.runtime.butler import _parse_model_proposal
+from plow_whip_web.runtime.butler import _parse_model_proposal, explicit_provider
 
 
 class PlannerBridge:
@@ -35,6 +35,17 @@ class PlannerBridge:
             output_tokens=80,
             external_session_id="planner-session-1",
         )
+
+
+def test_explicit_worker_provider_wins_over_butler_provider_mention() -> None:
+    assert explicit_provider(
+        "项目管家使用 Codex 理解需求，但所有后续 Worker 必须使用 Cursor。",
+        "codex",
+    ) == "cursor"
+    assert explicit_provider(
+        "交给 Cursor 全面审核，项目管家保持 Codex。",
+        "codex",
+    ) == "cursor"
 
 
 class InvalidPlannerBridge(PlannerBridge):

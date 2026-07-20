@@ -403,9 +403,29 @@ def deterministic_goal_draft(
 def explicit_provider(instruction: str, fallback: str) -> str:
     """Honor a provider named by the owner before any model call is attempted."""
     lowered = instruction.lower()
+    worker_matches: list[tuple[int, str]] = []
+    worker_terms = r"(?:worker|执行者|执行角色|后续任务|交给)"
     for provider in KNOWN_PROVIDERS:
-        if re.search(rf"(?<![a-z0-9-]){re.escape(provider)}(?![a-z0-9-])", lowered):
-            return provider
+        provider_term = rf"(?<![a-z0-9-]){re.escape(provider)}(?![a-z0-9-])"
+        for pattern in (
+            rf"{worker_terms}[^。；\n]{{0,40}}{provider_term}",
+            rf"{provider_term}[^。；\n]{{0,40}}{worker_terms}",
+        ):
+            worker_matches.extend(
+                (match.start(), provider) for match in re.finditer(pattern, lowered)
+            )
+    if worker_matches:
+        return max(worker_matches)[1]
+    generic_matches = [
+        (match.start(), provider)
+        for provider in KNOWN_PROVIDERS
+        for match in re.finditer(
+            rf"(?<![a-z0-9-]){re.escape(provider)}(?![a-z0-9-])",
+            lowered,
+        )
+    ]
+    if generic_matches:
+        return max(generic_matches)[1]
     return fallback
 
 

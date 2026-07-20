@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useState } from 'react'
+import { FormEvent, useEffect, useMemo, useRef, useState } from 'react'
 import { ChatCircleDots, CheckCircle, PaperPlaneTilt, Plus, Robot, X } from '@phosphor-icons/react'
 import { api, ButlerConversation, Project, Provider } from '../api'
 
@@ -54,6 +54,8 @@ export function ProjectButlerDialog({
   const [revisionField, setRevisionField] = useState<ProposalField | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const operationInFlight = useRef(false)
+  const newConversationMode = useRef(false)
 
   useEffect(() => {
     let current = true
@@ -64,17 +66,22 @@ export function ProjectButlerDialog({
       .then((items) => {
         if (!current) return
         setConversations(items)
-        setConversation(
-          items.find((item) => ['clarifying', 'awaiting_confirmation', 'provider_suspended'].includes(item.status))
-          ?? items[0]
-          ?? null,
-        )
+        setConversation((selected) => {
+          if (newConversationMode.current) return null
+          if (selected) {
+            const refreshed = items.find((item) => item.id === selected.id)
+            if (refreshed) return refreshed
+          }
+          return items.find((item) => ['clarifying', 'awaiting_confirmation', 'provider_suspended'].includes(item.status))
+            ?? items[0]
+            ?? null
+        })
       })
       .catch((reason: unknown) => {
         if (current) setError(messageOf(reason))
       })
     return () => { current = false }
-  }, [activeProjects, globalScope, projectId])
+  }, [globalScope, projectId])
 
   async function startConversation(event: FormEvent) {
     event.preventDefault()
@@ -90,6 +97,7 @@ export function ProjectButlerDialog({
           provider,
           sizing_inputs: sizingPresets[sizePreference],
         })
+      newConversationMode.current = false
       setConversation(created)
       setConversations((items) => [created, ...items])
       setContent('')
@@ -133,6 +141,8 @@ export function ProjectButlerDialog({
   }
 
   async function run(operation: () => Promise<void>) {
+    if (operationInFlight.current) return
+    operationInFlight.current = true
     setBusy(true)
     setError(null)
     try {
@@ -140,6 +150,7 @@ export function ProjectButlerDialog({
     } catch (reason) {
       setError(messageOf(reason))
     } finally {
+      operationInFlight.current = false
       setBusy(false)
     }
   }
@@ -164,6 +175,7 @@ export function ProjectButlerDialog({
       <div className="butler-project-bar">
         {!globalScope && <label>当前项目
           <select disabled={busy || !globalScope} value={projectId} onChange={(event) => {
+            newConversationMode.current = false
             setProjectId(event.target.value)
             setConversation(null)
             setConversations([])
@@ -175,6 +187,7 @@ export function ProjectButlerDialog({
         </label>}
         {globalScope && <div className="butler-scope-copy"><strong>全局工作区</strong><small>只读查询、跨项目汇总与路由；项目执行请切换项目范围后直接对话。</small></div>}
         <button type="button" disabled={busy || (!globalScope && !projectId)} onClick={() => {
+          newConversationMode.current = true
           setConversation(null)
           setContent('')
           setRevisionField(null)
@@ -188,7 +201,7 @@ export function ProjectButlerDialog({
             type="button"
             className={conversation?.id === item.id ? 'selected' : ''}
             key={item.id}
-            onClick={() => { setConversation(item); if (item.project_id) setProjectId(item.project_id); setRevisionField(null); setContent('') }}
+            onClick={() => { newConversationMode.current = false; setConversation(item); if (item.project_id) setProjectId(item.project_id); setRevisionField(null); setContent('') }}
           >
             <strong>{String(item.spec.title || item.spec.objective || '未命名目标')}</strong>
             <small>{statusName(item.status)} · r{item.revision}</small>
@@ -227,6 +240,7 @@ export function ProjectButlerDialog({
             {!globalScope && conversation.status === 'dispatched' && <div className="butler-dispatched"><CheckCircle size={18} weight="fill" />方案已由人确认，Goal 已创建并交给调度链。</div>}
             {!globalScope && conversation.status === 'provider_suspended' && <div className="butler-error">
               <p>项目管家没有获得有效模型结果。本会话已暂停，不会把你的回复机械写入目标、边界或验收标准。</p>
+              <small>失败类型：{String(conversation.planner?.error_class ?? 'unknown')}。当前本机目录：{activeProjects.find((item) => item.id === projectId)?.host_path ?? '未配置'}。目录必须精确指向 Git 仓库根目录。</small>
               <button type="button" className="primary" disabled={busy} onClick={resumePlanner}>恢复 Provider 并续接本会话</button>
             </div>}
             {(globalScope || conversation.status !== 'dispatched') && <form className="butler-composer" onSubmit={sendMessage}>

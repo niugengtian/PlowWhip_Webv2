@@ -92,6 +92,71 @@ def test_manual_task_workers_are_ephemeral_and_released_per_terminal() -> None:
             connection.close()
 
 
+def test_project_host_path_can_change_only_without_active_work() -> None:
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        project_path = root / "container"
+        first_host = root / "host-one"
+        second_host = root / "host-two"
+        for path in (project_path, first_host, second_host):
+            path.mkdir()
+        app = create_app(Settings(data_dir=root / "runtime"))
+        with TestClient(app) as client:
+            project = client.post("/api/projects", json={
+                "name": "path-update",
+                "path": str(project_path),
+                "host_path": str(first_host),
+            }).json()
+            updated = client.patch(
+                f"/api/projects/{project['id']}/host-path",
+                json={"host_path": str(second_host)},
+            )
+            assert updated.status_code == 200
+            assert updated.json()["host_path"] == str(second_host)
+
+            task = _task(
+                client, project["id"], "path-update-active", "active.txt"
+            )
+            rejected = client.patch(
+                f"/api/projects/{project['id']}/host-path",
+                json={"host_path": str(first_host)},
+            )
+            assert rejected.status_code == 409
+            assert "tasks or workers are active" in rejected.json()["detail"]
+
+
+def test_completed_project_can_update_host_path_and_reopen() -> None:
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        project_path = root / "container"
+        host_path = root / "host"
+        corrected_path = root / "corrected"
+        for path in (project_path, host_path, corrected_path):
+            path.mkdir()
+        app = create_app(Settings(data_dir=root / "runtime"))
+        with TestClient(app) as client:
+            project = client.post("/api/projects", json={
+                "name": "reopen",
+                "path": str(project_path),
+                "host_path": str(host_path),
+            }).json()
+            released = client.post(
+                f"/api/projects/{project['id']}/release"
+            )
+            assert released.status_code == 200
+            corrected = client.patch(
+                f"/api/projects/{project['id']}/host-path",
+                json={"host_path": str(corrected_path)},
+            )
+            assert corrected.status_code == 200
+            reopened = client.post(
+                f"/api/projects/{project['id']}/reopen"
+            )
+            assert reopened.status_code == 200
+            assert reopened.json()["status"] == "active"
+            assert reopened.json()["host_path"] == str(corrected_path)
+
+
 def test_sessions_never_cross_project_boundary() -> None:
     with TemporaryDirectory() as directory:
         root = Path(directory)

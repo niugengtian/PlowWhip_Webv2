@@ -98,6 +98,57 @@ describe('ProjectButlerDialog provider suspension', () => {
     })
   })
 
+  it('keeps new-conversation mode across project-list refreshes', async () => {
+    vi.spyOn(api, 'projectButlerConversations').mockResolvedValue([suspended])
+
+    const { rerender } = render(<ProjectButlerDialog
+      initialProjectId={project.id}
+      projects={[project]}
+      providers={[provider]}
+      onClose={() => undefined}
+      onDispatched={async () => undefined}
+    />)
+
+    expect(await screen.findByText('Provider 已挂起')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '新对话' }))
+    expect(screen.getByRole('textbox', { name: '给项目管家的指令' })).toBeEnabled()
+
+    rerender(<ProjectButlerDialog
+      initialProjectId={project.id}
+      projects={[{ ...project }]}
+      providers={[provider]}
+      onClose={() => undefined}
+      onDispatched={async () => undefined}
+    />)
+
+    expect(screen.getByRole('textbox', { name: '给项目管家的指令' })).toBeEnabled()
+    expect(screen.queryByText('Provider 已挂起')).not.toBeInTheDocument()
+  })
+
+  it('allows only one resume request at a time', async () => {
+    vi.spyOn(api, 'projectButlerConversations').mockResolvedValue([suspended])
+    let resolveResume: (value: ButlerConversation) => void = () => undefined
+    vi.spyOn(api, 'resumeProjectButler').mockImplementation(() => new Promise(
+      (resolve) => { resolveResume = resolve },
+    ))
+
+    render(<ProjectButlerDialog
+      initialProjectId={project.id}
+      projects={[project]}
+      providers={[provider]}
+      onClose={() => undefined}
+      onDispatched={async () => undefined}
+    />)
+
+    const resume = await screen.findByRole('button', {
+      name: '恢复 Provider 并续接本会话',
+    })
+    fireEvent.click(resume)
+    fireEvent.click(resume)
+    expect(api.resumeProjectButler).toHaveBeenCalledTimes(1)
+    resolveResume(suspended)
+  })
+
   it('sends proposal objections as conversational input without forcing a field', async () => {
     const proposal = {
       ...suspended,

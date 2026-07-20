@@ -321,6 +321,13 @@ export function App() {
     }, '项目已注册')
   }
 
+  async function updateProjectHostPath(project: Project, hostPath: string) {
+    await action(async () => {
+      await api.updateProjectHostPath(project.id, hostPath)
+      await refreshProjects()
+    }, '本机 Git 仓库目录已更新')
+  }
+
   async function controlTask(task: Task, control: 'pause' | 'resume' | 'cancel' | 'needs_human') {
     await action(async () => { await api.controlTask(task, control, `operator_${control}`); await refreshTasks() })
   }
@@ -424,7 +431,7 @@ export function App() {
           ? <GlobalButlerView overview={globalButler} onOpenConversation={() => { setButlerProjectId(''); setShowProjectButler(true) }} />
           : <ProjectButlerLanding project={projects.find((project) => project.id === selectedProject)} onOpenConversation={() => { setButlerProjectId(selectedProject); setShowProjectButler(true) }} />)}
         {view === 'tasks' && <UnifiedTasksView usage={usage} tasks={visibleTasks} goals={goals.filter((goal) => selectedProject === 'all' || goal.project_id === selectedProject)} workers={workers.filter((item) => selectedProject === 'all' || item.project.id === selectedProject).map((item) => item.worker)} selected={selectedTask} selectedGoal={selectedGoal} events={events} artifacts={artifacts} artifactError={artifactError} deletionEligibility={deletionEligibility} busy={busy} onSelect={selectTask} onSelectGoal={selectGoal} onDrive={driveTask} onDelete={deleteTask} onControl={controlTask} onOpenArtifact={openArtifact} onCopyArtifact={copyArtifactPath} />}
-        {view === 'projects' && <ProjectsView projects={projects} form={projectForm} setForm={setProjectForm} onCreate={createProject} onRelease={(project) => action(async () => { await api.releaseProject(project.id); await refreshProjects() }, '项目已完成并释放 Worker')} busy={busy} />}
+        {view === 'projects' && <ProjectsView projects={projects} form={projectForm} setForm={setProjectForm} onCreate={createProject} onUpdateHostPath={updateProjectHostPath} onReopen={(project) => action(async () => { await api.reopenProject(project.id); await refreshProjects() }, '项目已重新启用')} onRelease={(project) => action(async () => { await api.releaseProject(project.id); await refreshProjects() }, '项目已完成并释放 Worker')} busy={busy} />}
         {view === 'usage' && <UsageView key={selectedProject} usage={usage} projectId={selectedProject === 'all' ? undefined : selectedProject} projects={projects} tasks={visibleTasks} />}
         {view === 'alerts' && <AlertsView alerts={alerts} onRefresh={refreshAlerts} />}
         {view === 'settings' && <SettingsView settings={settings} setSettings={setSettings} scheduler={scheduler} convention={convention} setConvention={setConvention} suggestion={suggestion} setSuggestion={setSuggestion} projects={projects} tasks={visibleTasks} workers={workers.filter(({ project }) => selectedProject === 'all' || project.id === selectedProject)} selectedProject={selectedProject === 'all' ? undefined : selectedProject} providers={providers} audit={audit} permissions={permissions} refineProvider={effectiveRefineProvider} setRefineProvider={setRefineProvider} busy={busy} onSaveSettings={saveSettings} onTick={() => action(async () => { await api.schedulerTick(); setScheduler(await api.schedulerStatus()); await Promise.all([refreshTasks(), refreshGoals()]) }, 'Tick 已完成')} onLoadConvention={loadConvention} onSaveConvention={saveConvention} onRefine={refineConvention} onProbeProvider={probeProvider} onToggleProvider={toggleProvider} onRebindWorker={(worker, provider) => action(async () => { await api.rebindWorker(worker.id, provider); await refreshProjects() }, 'Worker 已轮转并重新绑定')} onRefreshAudit={() => api.audit().then(setAudit)} />}
@@ -708,9 +715,25 @@ function TaskRuntimeFacts({ item }: { item: Record<string, unknown> }) {
   </>
 }
 
-function ProjectsView({ projects, form, setForm, onCreate, onRelease, busy }: { projects: Project[]; form: { name: string; path: string; hostPath: string }; setForm: (value: { name: string; path: string; hostPath: string }) => void; onCreate: (event: FormEvent) => void; onRelease: (project: Project) => void; busy: boolean }) {
-  return <div className="settings-layout"><section className="panel"><div className="panel-heading"><div><span className="kicker">多项目并行</span><h1>项目注册表</h1></div></div><div className="project-grid">{projects.map((project) => <article className="project-card" key={project.id}><div className="project-top"><FolderOpen size={20} /><StatusDot ok={project.status === 'active'} label={project.status === 'active' ? '进行中' : '已完成'} /></div><h2>{project.name}</h2><code>{project.path}</code>{project.host_path && <code className="muted-code">产物源目录 · {project.host_path}</code>}<div className="mini-stats"><span>{project.roles.length} 角色</span><span>{project.workers.length} Worker</span></div>{project.status === 'active' && <button disabled={busy} onClick={() => onRelease(project)}>完成并释放 Worker</button>}</article>)}</div></section>
-    <form className="panel form-panel" onSubmit={onCreate}><div className="panel-heading"><div><span className="kicker">项目 → 角色 → CLI 会话</span><h1>注册项目</h1></div></div><Field label="项目名"><input required value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="例如：支付网关" /></Field><Field label="控制面挂载路径"><input required value={form.path} onChange={(event) => setForm({ ...form, path: event.target.value })} placeholder="/projects/payment" /></Field><Field label="本机项目目录（产物源目录）"><input value={form.hostPath} onChange={(event) => setForm({ ...form, hostPath: event.target.value })} placeholder="/Users/name/work/payment" /></Field><p className="form-help">Worker 只通过 Host Bridge 在本机项目目录工作；报告、代码和其他产物不会复制进容器。控制面只保存任务状态与路径索引。</p><button className="primary" disabled={busy}><Plus size={16} />注册项目</button></form></div>
+function ProjectsView({ projects, form, setForm, onCreate, onUpdateHostPath, onReopen, onRelease, busy }: { projects: Project[]; form: { name: string; path: string; hostPath: string }; setForm: (value: { name: string; path: string; hostPath: string }) => void; onCreate: (event: FormEvent) => void; onUpdateHostPath: (project: Project, hostPath: string) => void; onReopen: (project: Project) => void; onRelease: (project: Project) => void; busy: boolean }) {
+  return <div className="settings-layout"><section className="panel"><div className="panel-heading"><div><span className="kicker">多项目并行</span><h1>项目注册表</h1></div></div><div className="project-grid">{projects.map((project) => <ProjectCard key={`${project.id}:${project.host_path ?? ''}`} project={project} busy={busy} onUpdateHostPath={onUpdateHostPath} onReopen={onReopen} onRelease={onRelease} />)}</div></section>
+    <form className="panel form-panel" onSubmit={onCreate}><div className="panel-heading"><div><span className="kicker">项目 → 角色 → CLI 会话</span><h1>注册项目</h1></div></div><Field label="项目名"><input required value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="例如：支付网关" /></Field><Field label="控制面内部路径"><input required value={form.path} onChange={(event) => setForm({ ...form, path: event.target.value })} placeholder="/projects/payment" /></Field><Field label="本机 Git 仓库根目录"><input value={form.hostPath} onChange={(event) => setForm({ ...form, hostPath: event.target.value })} placeholder="/Users/name/work/payment" /></Field><p className="form-help">本机目录必须精确指向包含 .git 的仓库根目录，不能填写它的上级文件夹。Worker 通过 Host Bridge 在该目录工作；控制面内部路径只保存状态和路径索引。</p><button className="primary" disabled={busy}><Plus size={16} />注册项目</button></form></div>
+}
+
+function ProjectCard({ project, busy, onUpdateHostPath, onReopen, onRelease }: { project: Project; busy: boolean; onUpdateHostPath: (project: Project, hostPath: string) => void; onReopen: (project: Project) => void; onRelease: (project: Project) => void }) {
+  const [hostPath, setHostPath] = useState(project.host_path ?? '')
+  return <article className="project-card">
+    <div className="project-top"><FolderOpen size={20} /><StatusDot ok={project.status === 'active'} label={project.status === 'active' ? '进行中' : '已完成'} /></div>
+    <h2>{project.name}</h2>
+    <code>控制面内部路径 · {project.path}</code>
+    <label>本机 Git 仓库根目录
+      <input aria-label={`${project.name} 本机 Git 仓库根目录`} disabled={busy} value={hostPath} onChange={(event) => setHostPath(event.target.value)} />
+    </label>
+    <small>必须精确指向包含 .git 的目录；仅在没有活动 Task/Worker 时允许修改。</small>
+    <div className="mini-stats"><span>{project.roles.length} 角色</span><span>{project.workers.length} Worker</span></div>
+    {project.status === 'active' && <div className="project-actions"><button disabled={busy || !hostPath.trim() || hostPath.trim() === project.host_path} onClick={() => onUpdateHostPath(project, hostPath.trim())}>保存本机目录</button><button disabled={busy} onClick={() => onRelease(project)}>完成并释放 Worker</button></div>}
+    {project.status === 'completed' && <div className="project-actions"><button disabled={busy || !hostPath.trim() || hostPath.trim() === project.host_path} onClick={() => onUpdateHostPath(project, hostPath.trim())}>保存本机目录</button><button className="primary" disabled={busy} onClick={() => onReopen(project)}>重新启用项目</button></div>}
+  </article>
 }
 
 export function WorkersView({ items, providers, busy, onRebind }: { items: { project: Project; worker: Worker }[]; providers: Provider[]; busy: boolean; onRebind: (worker: Worker, provider: string) => void }) {

@@ -196,6 +196,44 @@ class ProjectRepository:
             connection.close()
         return [self.get(project_id) for project_id in ids]
 
+    def update_host_path(
+        self, *, project_id: str, host_path: str
+    ) -> dict[str, Any]:
+        with self.database.transaction(immediate=True) as connection:
+            project = connection.execute(
+                "SELECT status FROM projects WHERE id = ?", (project_id,)
+            ).fetchone()
+            if project is None:
+                raise NotFoundError(f"project not found: {project_id}")
+            if project["status"] not in {"active", "completed"}:
+                raise InvalidTransitionError(
+                    "project status does not allow changing its host path"
+                )
+            active_tasks = int(connection.execute(
+                """
+                SELECT COUNT(*) FROM tasks
+                WHERE project_id = ?
+                  AND status NOT IN ('completed', 'terminal_failed', 'cancelled')
+                """,
+                (project_id,),
+            ).fetchone()[0])
+            active_workers = int(connection.execute(
+                """
+                SELECT COUNT(*) FROM workers
+                WHERE project_id = ? AND released_at IS NULL
+                """,
+                (project_id,),
+            ).fetchone()[0])
+            if active_tasks or active_workers:
+                raise InvalidTransitionError(
+                    "cannot change host path while tasks or workers are active"
+                )
+            connection.execute(
+                "UPDATE projects SET host_path = ? WHERE id = ?",
+                (host_path, project_id),
+            )
+        return self.get(project_id)
+
     def worker_detail(self, worker_id: str) -> dict[str, Any]:
         connection = self.database.connect()
         try:
@@ -355,6 +393,44 @@ class ProjectRepository:
             )
             connection.execute(
                 "UPDATE projects SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (project_id,),
+            )
+        return self.get(project_id)
+
+    def reopen(self, project_id: str) -> dict[str, Any]:
+        with self.database.transaction(immediate=True) as connection:
+            project = connection.execute(
+                "SELECT status FROM projects WHERE id = ?", (project_id,)
+            ).fetchone()
+            if project is None:
+                raise NotFoundError(f"project not found: {project_id}")
+            if project["status"] != "completed":
+                raise InvalidTransitionError("only a completed project can reopen")
+            unfinished = int(connection.execute(
+                """
+                SELECT COUNT(*) FROM tasks
+                WHERE project_id = ?
+                  AND status NOT IN ('completed', 'terminal_failed', 'cancelled')
+                """,
+                (project_id,),
+            ).fetchone()[0])
+            active_workers = int(connection.execute(
+                """
+                SELECT COUNT(*) FROM workers
+                WHERE project_id = ? AND released_at IS NULL
+                """,
+                (project_id,),
+            ).fetchone()[0])
+            if unfinished or active_workers:
+                raise InvalidTransitionError(
+                    "cannot reopen while tasks or workers are active"
+                )
+            connection.execute(
+                """
+                UPDATE projects
+                SET status = 'active', updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
                 (project_id,),
             )
         return self.get(project_id)
