@@ -82,11 +82,11 @@ test('isolated candidate satisfies the complete browser acceptance', async ({ pa
     await scope.selectOption(alpha.project_id)
     await alphaSeen
     await scope.selectOption(beta.project_id)
-    await expect(metric(page, '今日 Token')).toHaveText(String(beta.today_total))
+    await expect(metric(page, '今日 Token')).toHaveText(beta.today_total.toLocaleString())
     releaseAlpha()
     await page.waitForTimeout(500)
     await expect(scope).toHaveValue(beta.project_id)
-    await expect(metric(page, '今日 Token')).toHaveText(String(beta.today_total))
+    await expect(metric(page, '今日 Token')).toHaveText(beta.today_total.toLocaleString())
     await page.unroute(`**/api/usage?project_id=${alpha.project_id}`)
     pass('BROWSER-02', 'A delayed Alpha response cannot overwrite the selected Beta project scope')
 
@@ -119,15 +119,21 @@ test('isolated candidate satisfies the complete browser acceptance', async ({ pa
     pass('BROWSER-04', 'The Beta terminal task list entry opens canonical cancelled detail and events')
 
     await page.getByRole('button', { name: 'Token', exact: true }).click()
-    await expect(metric(page, '项目 E2E Beta全历史')).toHaveText(String(beta.history_total))
-    await expect(metric(page, '项目 E2E Beta今日')).toHaveText(String(beta.today_total))
+    await expect(metric(page, '项目 E2E Beta全历史')).toHaveText(beta.history_total.toLocaleString())
+    await expect(metric(page, '项目 E2E Beta今日')).toHaveText(beta.today_total.toLocaleString())
     await expect(page.getByTestId('token-trend-chart')).toBeVisible()
     await scope.selectOption(alpha.project_id)
-    await expect(metric(page, '项目 E2E Alpha全历史')).toHaveText(String(alpha.history_total))
-    await expect(metric(page, '项目 E2E Alpha今日')).toHaveText(String(alpha.today_total))
+    await expect(metric(page, '项目 E2E Alpha全历史')).toHaveText(alpha.history_total.toLocaleString())
+    await expect(metric(page, '项目 E2E Alpha今日')).toHaveText(alpha.today_total.toLocaleString())
     await expect(page.getByTestId('token-trend-chart')).toBeVisible()
     await scope.selectOption(beta.project_id)
-    await expect(metric(page, '项目 E2E Beta全历史')).toHaveText(String(beta.history_total))
+    await expect(metric(page, '项目 E2E Beta全历史')).toHaveText(beta.history_total.toLocaleString())
+    for (const viewport of [{ width: 1440, height: 900 }, { width: 1024, height: 768 }, { width: 320, height: 900 }]) {
+      await page.setViewportSize(viewport)
+      const layout = await layoutFacts(page)
+      expect(layout.documentOverflow).toBe(false)
+      expect(layout.metricNumberOverflow).toEqual([])
+    }
     pass('BROWSER-05', 'Today, history, and trend Token views follow round-trip project filtering')
 
     await page.getByRole('button', { name: '设置', exact: true }).click()

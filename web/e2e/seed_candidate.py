@@ -18,7 +18,10 @@ def main() -> None:
     app = create_app(Settings(data_dir=args.data_dir))
     seeded: dict[str, dict[str, object]] = {}
     for index, (name, yesterday_tokens, today_tokens) in enumerate(
-        (("E2E Alpha", (40, 4), (100, 11)), ("E2E Beta", (80, 8), (200, 22))),
+        (
+            ("E2E Alpha", (40_000_000, 85_225), (51_493_925, 164_568)),
+            ("E2E Beta", (91_763_838, 390_240), (75_411_112, 1_620_628)),
+        ),
         start=1,
     ):
         project_dir = args.data_dir / f"project-{index}"

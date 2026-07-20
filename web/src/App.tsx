@@ -1186,7 +1186,8 @@ function EstimateCard({ estimate }: { estimate: TaskSizingEstimate }) {
 }
 
 function Metric({ icon: Icon, label, value, hint, onClick }: { icon: typeof Kanban; label: string; value: number; hint: string; onClick?: () => void }) {
-  const content = <><div className="metric-icon"><Icon size={18} /></div><div><span>{label}</span><strong className="metric-number" title={value.toLocaleString()}>{value.toLocaleString()}</strong></div><small>{hint}</small></>
+  const formatted = value.toLocaleString()
+  const content = <><div className="metric-icon"><Icon size={18} /></div><div className="metric-body"><div className="metric-heading"><span>{label}</span><small title={hint}>{hint}</small></div><strong className="metric-number" title={formatted}>{formatted}</strong></div></>
   return onClick
     ? <button type="button" className="metric-card" aria-label={`查看${label}详情`} onClick={onClick}>{content}</button>
     : <article className="metric-card">{content}</article>
