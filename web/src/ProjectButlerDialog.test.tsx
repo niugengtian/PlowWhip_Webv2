@@ -184,6 +184,41 @@ describe('ProjectButlerDialog provider suspension', () => {
     })
   })
 
+  it('shows durable planning progress while the provider request is in flight', async () => {
+    vi.spyOn(api, 'projectButlerConversations').mockResolvedValue([])
+    let finishPlanning!: (value: ButlerConversation) => void
+    vi.spyOn(api, 'startProjectButler').mockReturnValue(
+      new Promise((resolve) => { finishPlanning = resolve }),
+    )
+
+    render(<ProjectButlerDialog
+      initialProjectId={project.id}
+      projects={[project]}
+      providers={[provider]}
+      onClose={() => undefined}
+      onDispatched={async () => undefined}
+    />)
+
+    const input = await screen.findByRole('textbox', {
+      name: '给项目管家的指令',
+    })
+    fireEvent.change(input, { target: { value: '全面审查并交付报告' } })
+    fireEvent.click(screen.getByRole('button', { name: '发送给项目管家' }))
+
+    expect(await screen.findByRole('status')).toHaveTextContent(
+      '项目管家正在分析并生成可确认方案',
+    )
+    finishPlanning({
+      ...suspended,
+      status: 'awaiting_confirmation',
+      expected_field: null,
+      proposal_hash: 'b'.repeat(64),
+    })
+    await waitFor(() => {
+      expect(screen.queryByRole('status')).not.toBeInTheDocument()
+    })
+  })
+
   it('keeps long proposals inside the conversation scroller while the composer stays fixed', async () => {
     const proposal = {
       ...suspended,
@@ -194,6 +229,7 @@ describe('ProjectButlerDialog provider suspension', () => {
         objective: '全面审查项目',
         boundaries: ['只读审查，不修改项目文件'],
         acceptance: ['提供可复现证据和分级建议'],
+        artifacts: ['reports/engineering-audit-a1b2c3d4e5.md'],
       },
       planner: { status: 'planned' },
     } as ButlerConversation
@@ -210,6 +246,10 @@ describe('ProjectButlerDialog provider suspension', () => {
     expect(await screen.findByRole('button', {
       name: '确认方案并执行',
     })).toBeInTheDocument()
+    expect(screen.getByText('交付产物（管家自动规划）')).toBeInTheDocument()
+    expect(screen.getByText(
+      'reports/engineering-audit-a1b2c3d4e5.md',
+    )).toBeInTheDocument()
     const scroller = container.querySelector<HTMLElement>('.butler-conversation-scroll')
     const proposalCard = container.querySelector<HTMLElement>('.butler-proposal')
     const composer = container.querySelector<HTMLElement>('.butler-composer')

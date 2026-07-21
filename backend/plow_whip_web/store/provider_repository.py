@@ -135,11 +135,20 @@ class ProviderRepository:
                 circuit_state = "open"
             elif circuit_state == "open":
                 circuit_state = "half_open"
+            retain_last_known_good = bool(
+                not available
+                and circuit_state == "closed"
+                and failures < max(1, failure_threshold)
+                and row["status"] == "available"
+            )
             status = (
                 "disabled"
                 if not row["enabled"]
                 else "available"
-                if available and circuit_state == "closed"
+                if (
+                    circuit_state == "closed"
+                    and (available or retain_last_known_good)
+                )
                 else "unavailable"
             )
             config = json.loads(row["config_json"] or "{}")

@@ -94,7 +94,8 @@ LIFECYCLE
     plow-whip-web restart all
     plow-whip-web stop all
 
-    Lifecycle changes are refused while live, unconsumed Host Jobs exist.
+    Lifecycle changes are refused while live Host Jobs or recent in-flight model
+    calls exist.
     --force bypasses that guard and should only be used after operator review.
 
 CONFIGURATION
@@ -588,10 +589,53 @@ def _active_host_jobs(runner: Runner | None = None) -> int | None:
     return active if isinstance(active, int) else None
 
 
+def _active_model_calls(runner: Runner | None = None) -> int | None:
+    """Count recent calls that this lifecycle operation could interrupt."""
+    if runner is None or not runner.which("docker"):
+        return None
+    containers = runner.run(
+        [
+            "docker", "ps", "-q",
+            "--filter", f"label=com.docker.compose.project={PROJECT}",
+            "--filter", f"label=com.docker.compose.service={SERVICE}",
+        ],
+        capture=True,
+        check=False,
+    )
+    ids = [line for line in containers.stdout.splitlines() if line.strip()]
+    if len(ids) != 1:
+        return None
+    query = (
+        "import sqlite3;"
+        "c=sqlite3.connect('/data/plow-whip-web.sqlite3');"
+        "print(c.execute(\"SELECT COUNT(*) FROM model_calls "
+        "WHERE status IN ('prepared','dispatched') "
+        "AND updated_at >= datetime('now','-15 minutes')\").fetchone()[0])"
+    )
+    result = runner.run(
+        ["docker", "exec", ids[0], "python", "-c", query],
+        capture=True,
+        check=False,
+    )
+    if result.returncode == 0 and result.stdout.strip().isdigit():
+        return int(result.stdout.strip())
+    return None
+
+
 def _guard_host_jobs(runner: Runner, *, force: bool) -> None:
-    active = _active_host_jobs(runner)
-    if active and not force:
-        raise OpsError(f"refusing lifecycle change while {active} Host Job(s) are active; use --force only after review")
+    active_jobs = _active_host_jobs(runner)
+    active_calls = _active_model_calls(runner)
+    if not force and (active_jobs or active_calls):
+        parts = []
+        if active_jobs:
+            parts.append(f"{active_jobs} Host Job(s)")
+        if active_calls:
+            parts.append(f"{active_calls} model call(s)")
+        raise OpsError(
+            "refusing lifecycle change while "
+            + " and ".join(parts)
+            + " are active; use --force only after review"
+        )
 
 
 def _source_migration_manifest(source_dir: Path) -> list[tuple[str, str]]:
@@ -1036,6 +1080,7 @@ def _status(paths: RuntimePaths, config: dict[str, object], runner: Runner) -> d
         "migration_compatibility": migration_compatibility,
         "migration_error": migration_error,
         "active_host_jobs": _active_host_jobs(runner),
+        "active_model_calls": _active_model_calls(runner),
         "data_preserved": True,
     }
 
@@ -1170,7 +1215,11 @@ def build_parser() -> argparse.ArgumentParser:
     rebuild.add_argument("--no-cache", action="store_true")
     rebuild.add_argument("--pull", action="store_true", help="pull newer Docker base images")
     rebuild.add_argument("--skip-bridge", action="store_true", help="do not install/restart Bridge with the same release")
-    rebuild.add_argument("--force", action="store_true", help="allow lifecycle change despite reported active Host Jobs")
+    rebuild.add_argument(
+        "--force",
+        action="store_true",
+        help="allow lifecycle change despite reported active Host Jobs or model calls",
+    )
 
     lifecycle_help = {
         "start": "start container, Bridge, or all components",
@@ -1197,7 +1246,10 @@ def build_parser() -> argparse.ArgumentParser:
     uninstall.add_argument("--yes", action="store_true", help="required with destructive purge options")
     uninstall.add_argument("--force", action="store_true")
 
-    subparsers.add_parser("status", help="show release, container, Bridge, and Host Job status")
+    subparsers.add_parser(
+        "status",
+        help="show release, container, Bridge, Host Job, and model-call status",
+    )
     subparsers.add_parser("manual", help="show the full operations manual")
 
     install_cli = subparsers.add_parser(

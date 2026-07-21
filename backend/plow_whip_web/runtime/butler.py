@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -29,6 +30,11 @@ PLANNER_ROLES = {
 }
 MAX_PLAN_ITEMS = 6
 KNOWN_PROVIDERS = ("codex", "cursor", "deepseek", "kimi")
+DELIVERABLE_ARTIFACT_PATTERN = re.compile(
+    r"(?:交付|提交|生成|输出|出具|形成|提供).{0,16}"
+    r"(?:报告|文档|文件|清单|产物|report|document|artifact)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -437,7 +443,9 @@ def validate_planner_proposal(
     rules: list[dict[str, Any]],
     required_worker_provider: str,
 ) -> dict[str, Any]:
-    draft = dict(proposal.get("goal_spec") or proposal)
+    draft = _materialize_planner_artifacts(
+        dict(proposal.get("goal_spec") or proposal)
+    )
     if draft.get("provider") != required_worker_provider:
         raise DomainError(
             "planner changed the owner-selected default Worker provider"
@@ -454,6 +462,14 @@ def validate_planner_proposal(
             missing_semantic.append(field)
     if len(missing_semantic) > 1:
         raise DomainError("planner may leave at most one genuinely ambiguous field")
+    artifacts = draft.get("artifacts") or []
+    if not isinstance(artifacts, list):
+        raise DomainError("planner artifacts must be a list")
+    _validate_artifact_paths(artifacts)
+    if requires_declared_artifact(draft) and not artifacts:
+        raise DomainError(
+            "planner acceptance requires a file deliverable but declares no artifact"
+        )
     sizing = draft.get("sizing_inputs")
     if not isinstance(sizing, dict):
         raise DomainError("planner sizing_inputs are required")
@@ -466,6 +482,7 @@ def validate_planner_proposal(
     seen: set[int] = set()
     providers: set[str] = set()
     planned_roles: set[str] = set()
+    artifact_owners = {str(path): [] for path in artifacts}
     for expected, item in enumerate(items, 1):
         if not isinstance(item, dict) or int(item.get("ordinal") or 0) != expected:
             raise DomainError("planner ordinals must be contiguous from 1")
@@ -483,8 +500,33 @@ def validate_planner_proposal(
         if expected > 1 and role in {"frontend", "devops_sre", "verification"}:
             if expected - 1 not in {int(dep) for dep in dependencies}:
                 raise DomainError("shared worktree lanes must be serial")
+        item_acceptance = item.get("acceptance") or []
+        item_artifacts = item.get("artifacts") or []
+        if not isinstance(item_acceptance, list) or not all(
+            isinstance(value, str) and value.strip() for value in item_acceptance
+        ):
+            raise DomainError("planner work item acceptance must be a string list")
+        if not isinstance(item_artifacts, list):
+            raise DomainError("planner work item artifacts must be a list")
+        _validate_artifact_paths(item_artifacts)
+        if kind == "verification" and item_artifacts:
+            raise DomainError(
+                "verification work item is read-only and cannot produce artifacts"
+            )
+        for path in item_artifacts:
+            normalized = str(path)
+            if normalized not in artifact_owners:
+                raise DomainError(
+                    f"planner work item declares undeclared Goal artifact: {normalized}"
+                )
+            artifact_owners[normalized].append(expected)
         seen.add(expected)
         planned_roles.add(role)
+    for path, owners in artifact_owners.items():
+        if len(owners) != 1:
+            raise DomainError(
+                f"Goal artifact must have exactly one implementation producer: {path}"
+            )
     role_providers = draft.get("role_providers")
     if not isinstance(role_providers, dict):
         raise DomainError("planner role_providers are required")
@@ -567,12 +609,14 @@ def _planner_prompt(
         "You are the project Butler planning model. Return one JSON object only. "
         "The top-level object must be {\"goal_spec\": {...}}. goal_spec must contain "
         "title:string, objective:string, boundaries:list[string], "
-        "acceptance:list[string], sizing_inputs:object, plan_items:list[object], "
+        "acceptance:list[string], artifacts:list[string], sizing_inputs:object, "
+        "plan_items:list[object], "
         "provider:string, role_providers:object, role_templates:object, and "
         "role_rules:object. Acceptance entries must be plain strings, never objects. "
         "Each plan item must contain exactly ordinal:int, role:string, "
         "kind:\"implementation\"|\"verification\", title:string, objective:string, "
-        "depends_on_ordinals:list[int], and provider:string. Ordinals are contiguous "
+        "depends_on_ordinals:list[int], acceptance:list[string], "
+        "artifacts:list[string], and provider:string. Ordinals are contiguous "
         "from 1; dependencies refer only to earlier ordinals. Use only roles listed "
         "in available_templates; never create global_butler or project_butler work "
         "items. The verification role must use kind=verification and every other "
@@ -589,6 +633,12 @@ def _planner_prompt(
         "Use real estimates from the instruction and facts, never the placeholder "
         "1 layer/1 component/1 file/low sizing. Plan at most 6 items. Shared worktree "
         "implementation lanes and the final verification lane must form a serial DAG. "
+        "When the objective or acceptance requires a report, document, file, list, "
+        "or other durable deliverable, declare a safe relative path in goal_spec."
+        "artifacts and assign each declared artifact to exactly one implementation "
+        "plan item. Verification items are read-only and must declare no artifacts; "
+        "they verify the upstream producer's declared artifact. Writing a declared "
+        "report artifact is delivery, not an unauthorized source-code modification. "
         "Every role/provider/template/rule must reference the supplied catalog. "
         "If a material ambiguity prevents a safe proposal, omit only that semantic "
         "field so deterministic intake asks exactly one question. Do not claim "
@@ -650,6 +700,101 @@ def _parse_model_proposal(output: str) -> dict[str, Any]:
     raise DomainError("planner returned no valid JSON proposal")
 
 
+def requires_declared_artifact(draft: dict[str, Any]) -> bool:
+    values = [
+        str(draft.get("objective") or ""),
+        *(str(item) for item in draft.get("acceptance") or []),
+    ]
+    return any(DELIVERABLE_ARTIFACT_PATTERN.search(value) for value in values)
+
+
+def _materialize_planner_artifacts(draft: dict[str, Any]) -> dict[str, Any]:
+    """Make Butler-owned deliverable paths explicit before human confirmation."""
+    result = dict(draft)
+    if not requires_declared_artifact(result) or result.get("artifacts"):
+        return result
+
+    items = result.get("plan_items")
+    if not isinstance(items, list):
+        return result
+
+    normalized_items = [
+        dict(item) if isinstance(item, dict) else item
+        for item in items
+    ]
+    implementation_artifacts = [
+        str(path)
+        for item in normalized_items
+        if isinstance(item, dict) and item.get("kind") == "implementation"
+        for path in (item.get("artifacts") or [])
+    ]
+    if implementation_artifacts:
+        result["artifacts"] = list(dict.fromkeys(implementation_artifacts))
+        result["plan_items"] = normalized_items
+        return result
+
+    fingerprint_source = json.dumps(
+        {
+            "title": result.get("title") or "",
+            "objective": result.get("objective") or "",
+            "acceptance": result.get("acceptance") or [],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()[:10]
+    semantic_text = fingerprint_source.lower()
+    stem = (
+        "engineering-audit"
+        if any(
+            token in semantic_text
+            for token in ("审查", "审核", "audit", "review")
+        )
+        else "deliverable-report"
+    )
+    path = f"reports/{stem}-{digest}.md"
+
+    producer_indexes = [
+        index
+        for index, item in enumerate(normalized_items)
+        if isinstance(item, dict) and item.get("kind") == "implementation"
+    ]
+    if not producer_indexes:
+        return result
+    report_producers = [
+        index
+        for index in producer_indexes
+        if any(
+            token in " ".join(
+                (
+                    str(normalized_items[index].get("title") or ""),
+                    str(normalized_items[index].get("objective") or ""),
+                )
+            ).lower()
+            for token in ("报告", "文档", "report", "document")
+        )
+    ]
+    producer_index = (report_producers or producer_indexes)[-1]
+    normalized_items[producer_index]["artifacts"] = [path]
+    result["artifacts"] = [path]
+    result["plan_items"] = normalized_items
+    return result
+
+
+def _validate_artifact_paths(paths: list[Any]) -> None:
+    for value in paths:
+        path = str(value).strip()
+        parts = path.replace("\\", "/").split("/")
+        if (
+            not path
+            or path.startswith("/")
+            or path.startswith("~")
+            or ".." in parts
+        ):
+            raise DomainError("planner artifacts require safe relative paths")
+
+
 def _find_nested(value: Any) -> Any | None:
     if isinstance(value, dict):
         for key in ("result", "output_text", "text", "content", "message"):
@@ -678,5 +823,6 @@ __all__ = [
     "explicit_provider",
     "project_execution_policy",
     "route_goal",
+    "requires_declared_artifact",
     "validate_planner_proposal",
 ]

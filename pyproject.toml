@@ -34,7 +34,12 @@ package-dir = {"" = "backend"}
 where = ["backend"]
 
 [tool.setuptools.package-data]
-plow_whip_web = ["store/migrations/*.sql", "static/*", "static/assets/*"]
+plow_whip_web = [
+  "defaults/*.md",
+  "store/migrations/*.sql",
+  "static/*",
+  "static/assets/*",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

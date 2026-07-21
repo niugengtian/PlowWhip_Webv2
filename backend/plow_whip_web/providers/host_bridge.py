@@ -100,11 +100,15 @@ class HostBridgeClient:
     def verify(
         self, *, project_path: str, execution: ExecutionResult,
         verification: list[dict[str, object]],
+        acceptance: list[str] | None = None,
+        require_structured_verdict: bool = False,
     ) -> VerificationResult:
         payload = self._post("/v1/verify", {
             "project_path": project_path,
             "execution": {
                 "returncode": execution.returncode,
+                "stdout": execution.stdout,
+                "stderr": execution.stderr,
                 "duration_ms": execution.duration_ms,
                 "failure_class": execution.failure_class,
                 "input_tokens": execution.input_tokens,
@@ -113,6 +117,8 @@ class HostBridgeClient:
                 "external_session_id": execution.external_session_id,
             },
             "verification": verification,
+            "acceptance": acceptance or [],
+            "require_structured_verdict": require_structured_verdict,
         }, timeout=20)
         checks = payload.get("checks")
         if not isinstance(checks, list):

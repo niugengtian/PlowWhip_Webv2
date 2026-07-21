@@ -9,7 +9,10 @@ from typing import Any
 
 from plow_whip_web.domain.model import TaskRecord
 from plow_whip_web.providers.generic_command import ExecutionResult
-from plow_whip_web.runtime.verification import VerificationResult
+from plow_whip_web.runtime.verification import (
+    VerificationResult,
+    authoritative_assistant_text,
+)
 
 
 def snapshot_environment(
@@ -105,6 +108,11 @@ def build_evidence_manifest(
                 or []
             )
         )
+        provider_execution = (
+            dict(execution_context.get("provider_execution") or {})
+            if not gate_argv and task.provider != "generic-command"
+            else None
+        )
         gate_cwd = (
             str(check.get("cwd") or "")
             if command_gate
@@ -164,6 +172,7 @@ def build_evidence_manifest(
                     "gate passed" if check.get("passed") else "gate failed"
                 ),
                 "artifact_evidence": artifact_evidence,
+                "execution_identity": provider_execution,
                 "check": check,
             }
         )
@@ -172,15 +181,52 @@ def build_evidence_manifest(
         for item in artifacts
     )
     required_acceptance_ids = task_acceptance_ids
+    provider_candidate = bool(
+        task.work_item_kind == "implementation"
+        and commands
+        and all(item.get("execution_identity") for item in commands)
+        and verification.verdict == "PASS"
+    )
+    provider_verdict = bool(
+        task.work_item_kind == "verification"
+        and commands
+        and all(item.get("execution_identity") for item in commands)
+        and verification.verdict == "PASS"
+    )
+    acceptance_evidence = [
+        {
+            "acceptance_id": acceptance_id,
+            "evidence_ref": (
+                "artifacts:"
+                + ",".join(str(item["relative_path"]) for item in artifacts)
+                if artifacts
+                else (
+                    "provider_result:assistant_text_sha256"
+                    if provider_candidate or provider_verdict
+                    else "verification_commands:0"
+                )
+            ),
+            "stage": "candidate" if provider_candidate else "verified",
+        }
+        for acceptance_id in (
+            task_acceptance_ids
+            if provider_candidate or provider_verdict
+            else [
+                str(item.get("acceptance_id"))
+                for item in commands
+                if item.get("acceptance_id")
+            ]
+        )
+    ]
     recorded_acceptance_ids = {
-        str(item.get("acceptance_id")) for item in commands if item.get("acceptance_id")
+        str(item["acceptance_id"]) for item in acceptance_evidence
     }
     missing_acceptance_ids = [
         item for item in required_acceptance_ids if item not in recorded_acceptance_ids
     ]
     evidence_fields_complete = bool(commands) and all(
         item.get("acceptance_id")
-        and item.get("argv")
+        and (item.get("argv") or item.get("execution_identity"))
         and item.get("cwd")
         and item.get("started_at")
         and item.get("finished_at")
@@ -259,6 +305,7 @@ def build_evidence_manifest(
         "reason_codes": reason_codes,
         "failed_acceptance_ids": failed_acceptance_ids,
         "required_acceptance_ids": required_acceptance_ids,
+        "acceptance_evidence": acceptance_evidence,
         "browser_evidence": browser_checks,
         "verification_commands": commands,
         "artifacts": artifacts,
@@ -272,6 +319,7 @@ def build_evidence_manifest(
             "verification_evidence_hash": verification.evidence_hash,
             "verdict": verification.verdict,
         },
+        "provider_result": _provider_result(execution.stdout),
         "git_diff_summary": {
             "before": baseline.get("git", {}),
             "after": after.get("git", {}),
@@ -306,6 +354,22 @@ def manifest_hash(manifest: dict[str, Any]) -> str:
     if payload.get("environment_hash") != _digest(payload.get("environment", {})):
         raise ValueError("EvidenceManifest environment checksum mismatch")
     return claimed
+
+
+def _provider_result(stdout: str) -> dict[str, Any]:
+    assistant_text = authoritative_assistant_text(stdout)
+    encoded = assistant_text.encode("utf-8")
+    tail = (
+        encoded[-1_200:].decode("utf-8", errors="ignore")
+        if len(encoded) > 1_200
+        else assistant_text
+    )
+    return {
+        "assistant_text_tail": tail,
+        "assistant_text_sha256": hashlib.sha256(encoded).hexdigest(),
+        "assistant_text_bytes": len(encoded),
+        "stdout_sha256": hashlib.sha256(stdout.encode("utf-8")).hexdigest(),
+    }
 
 
 def _artifact_snapshot(relative_path: str, target: Path) -> dict[str, Any]:

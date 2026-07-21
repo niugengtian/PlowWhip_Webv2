@@ -152,6 +152,99 @@ def test_pass_with_all_gates_completes_task_and_goal_consistently() -> None:
         assert bindings[0]["session_generation"] == 1
 
 
+def test_cursor_stream_json_carries_structured_verdict_without_prose_upgrade() -> None:
+    with TemporaryDirectory() as directory:
+        project = Path(directory)
+        engine = VerificationEngine()
+        wrapped = engine.verify(
+            project,
+            ExecutionResult(
+                0,
+                '{"type":"result","result":"review complete\\n'
+                '{\\"verdict\\":\\"PASS\\"}"}',
+                "",
+                1,
+            ),
+            [{"kind": "exit_code", "expected": 0}],
+            acceptance=["independent verification passed"],
+            require_structured_verdict=True,
+        )
+        implementation_prose = engine.verify(
+            project,
+            ExecutionResult(
+                0,
+                "The final verifier may return CHANGES_REQUIRED; candidate is ready.",
+                "",
+                1,
+            ),
+            [{"kind": "exit_code", "expected": 0}],
+            acceptance=["candidate produced"],
+            require_structured_verdict=False,
+        )
+
+        assert wrapped.verdict == "PASS"
+        assert implementation_prose.verdict == "PASS"
+
+
+def test_only_last_assistant_terminal_verdict_controls_cursor_stream() -> None:
+    engine = VerificationEngine()
+    acceptance = ["independent verification passed"]
+    gate = [{"kind": "exit_code", "expected": 0}]
+    historical_failure_then_pass = "\n".join([
+        '{"type":"tool","output":"{\\"verdict\\":\\"CHANGES_REQUIRED\\"}"}',
+        '{"type":"assistant","message":{"role":"assistant","content":['
+        '{"type":"text","text":"Historical finding: CHANGES_REQUIRED.\\n'
+        'Current evidence is complete.\\n{\\"verdict\\":\\"PASS\\"}"}]}}',
+        '{"type":"turn.completed","usage":{"input_tokens":17,"output_tokens":9}}',
+    ])
+    later_changes_required = "\n".join([
+        '{"type":"assistant","message":{"role":"assistant","content":['
+        '{"type":"text","text":"{\\"verdict\\":\\"PASS\\"}"}]}}',
+        '{"type":"assistant","message":{"role":"assistant","content":['
+        '{"type":"text","text":"Final evidence is incomplete.\\n'
+        '{\\"verdict\\":\\"CHANGES_REQUIRED\\"}"}]}}',
+    ])
+
+    passed = engine.verify(
+        Path("."),
+        ExecutionResult(0, historical_failure_then_pass, "", 1),
+        gate,
+        acceptance=acceptance,
+        require_structured_verdict=True,
+    )
+    failed = engine.verify(
+        Path("."),
+        ExecutionResult(0, later_changes_required, "", 1),
+        gate,
+        acceptance=acceptance,
+        require_structured_verdict=True,
+    )
+
+    assert passed.verdict == "PASS"
+    assert passed.reason_codes == []
+    assert failed.verdict == "CHANGES_REQUIRED"
+    assert "STRUCTURED_VERDICT_NOT_PASS" in failed.reason_codes
+    assert "MODEL_TEXT_CHANGES_REQUIRED" in failed.reason_codes
+
+
+def test_tool_output_or_prose_cannot_supply_structured_pass() -> None:
+    output = "\n".join([
+        '{"type":"tool","output":"{\\"verdict\\":\\"PASS\\"}"}',
+        '{"type":"assistant","message":{"role":"assistant","content":['
+        '{"type":"text","text":"All checks look good; PASS."}]}}',
+    ])
+    result = VerificationEngine().verify(
+        Path("."),
+        ExecutionResult(0, output, "", 1),
+        [{"kind": "exit_code", "expected": 0}],
+        acceptance=["independent verification passed"],
+        require_structured_verdict=True,
+    )
+
+    assert result.verdict == "CHANGES_REQUIRED"
+    assert "STRUCTURED_VERDICT_MISSING" in result.reason_codes
+
+
 def test_command_gate_records_its_real_argv_cwd_exit_and_output_hashes() -> None:
     with TemporaryDirectory() as directory:
         root = Path(directory)

@@ -254,13 +254,19 @@ class GoalRepository:
                     canonical_task_spec(
                         objective=item.objective,
                         scope=list(dict.fromkeys([*scope, item.role, item.kind])),
-                        acceptance=list(dict.fromkeys([*acceptance, *item.acceptance])),
-                        verification=child_verification,
-                        artifacts=(
-                            []
+                        acceptance=list(dict.fromkeys(
+                            [*acceptance, *item.acceptance]
                             if item.kind == "verification"
-                            else list(dict.fromkeys([*artifacts, *item.artifacts]))
-                        ),
+                            else (
+                                item.acceptance
+                                or [
+                                    "完成当前工作项，并提供可由后续独立验证任务"
+                                    "复核的候选证据"
+                                ]
+                            )
+                        )),
+                        verification=child_verification,
+                        artifacts=list(item.artifacts),
                         constraints=list(dict.fromkeys([
                             *constraints,
                             f"network:{network_requirement}",
@@ -1157,7 +1163,22 @@ def _handoff_from_completed(connection: Any, task_id: str) -> dict[str, Any] | N
     row = connection.execute(
         """
         SELECT t.id, t.title, t.last_evidence_hash, t.work_item_kind, t.role_id,
-               s.spec_json
+               s.spec_json,
+               (
+                   SELECT em.manifest_json
+                   FROM evidence_manifests em
+                   WHERE em.task_id = t.id
+                   ORDER BY em.created_at DESC
+                   LIMIT 1
+               ) AS evidence_manifest_json,
+               (
+                   SELECT h.result_json
+                   FROM host_jobs h
+                   WHERE h.task_id = t.id
+                     AND h.status IN ('completed', 'fault_finalized')
+                   ORDER BY h.updated_at DESC
+                   LIMIT 1
+               ) AS host_result_json
         FROM tasks t
         JOIN task_specs s ON s.task_id = t.id
             AND s.spec_revision = t.current_spec_revision
@@ -1168,12 +1189,44 @@ def _handoff_from_completed(connection: Any, task_id: str) -> dict[str, Any] | N
     if row is None:
         return None
     artifact_paths = list(json.loads(row["spec_json"])["artifacts"])
+    host_result = (
+        json.loads(row["host_result_json"])
+        if row["host_result_json"] else {}
+    )
+    evidence_manifest = (
+        json.loads(row["evidence_manifest_json"])
+        if row["evidence_manifest_json"] else {}
+    )
+    provider_result = dict(evidence_manifest.get("provider_result") or {})
+    output_tail = str(
+        provider_result.get("assistant_text_tail")
+        or host_result.get("stdout")
+        or ""
+    )
+    if len(output_tail.encode("utf-8")) > 1_200:
+        output_tail = output_tail.encode("utf-8")[-1_200:].decode(
+            "utf-8", errors="ignore"
+        )
+    output_segments = [
+        {
+            "ref": str(item.get("ref") or ""),
+            "sha256": str(item.get("sha256") or ""),
+        }
+        for item in host_result.get("output_segments") or []
+        if item.get("ref") and item.get("sha256")
+    ][:4]
     return {
         "from_task_id": row["id"],
         "from_title": row["title"],
         "from_kind": row["work_item_kind"],
         "evidence_hash": row["last_evidence_hash"],
         "artifact_paths": artifact_paths[:32],
+        "provider_output_ref": host_result.get("output_ref"),
+        "provider_output_segments": output_segments,
+        "provider_output_tail": output_tail,
+        "provider_output_text_sha256": provider_result.get(
+            "assistant_text_sha256"
+        ),
     }
 
 

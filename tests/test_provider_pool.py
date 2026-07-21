@@ -78,6 +78,80 @@ def test_provider_presets_and_revision_guarded_registration() -> None:
             assert conflict.status_code == 409
 
 
+def test_provider_switches_only_after_three_consecutive_failed_probes() -> None:
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        project_path = root / "project"
+        project_path.mkdir()
+        app = create_app(Settings(
+            data_dir=root / "runtime",
+            host_bridge_token="test-token-is-long-enough-123",
+        ))
+        project = app.state.project_repository.create(
+            name="three-strikes",
+            path=str(project_path),
+            host_path=str(project_path),
+        )
+        role_id = app.state.project_repository.resolve_role(
+            project["id"], "fullstack"
+        )["role_id"]
+        task = app.state.task_repository.create(
+            title="route after threshold",
+            objective="do not switch on a single transient probe",
+            project_path=str(project_path),
+            project_id=project["id"],
+            role_id=role_id,
+            provider="cursor",
+            provider_policy="auto",
+            fallback_enabled=True,
+            provider_order=["cursor", "codex"],
+            command={"argv": [sys.executable, "-c", "pass"]},
+            verification=[{"kind": "exit_code", "expected": 0}],
+            max_attempts=1,
+            idempotency_key="provider-three-strikes",
+        )
+        providers = app.state.provider_pool.providers
+        providers.record_probe(
+            "cursor", available=True, detail="healthy",
+            failure_threshold=3,
+        )
+        providers.record_probe(
+            "codex", available=True, detail="healthy",
+            failure_threshold=3,
+        )
+
+        for failure in (1, 2):
+            cursor = providers.record_probe(
+                "cursor",
+                available=False,
+                detail=f"transient failure {failure}",
+                failure_threshold=3,
+                failure_class="provider_probe_failed",
+            )
+            assert cursor["status"] == "available"
+            assert cursor["circuit_state"] == "closed"
+            assert cursor["consecutive_failures"] == failure
+            assert app.state.provider_pool.route_task(
+                task,
+                zone_availability={"domestic": True, "overseas": True},
+            )["name"] == "cursor"
+
+        cursor = providers.record_probe(
+            "cursor",
+            available=False,
+            detail="transient failure 3",
+            failure_threshold=3,
+            failure_class="provider_probe_failed",
+        )
+        assert cursor["status"] == "unavailable"
+        assert cursor["circuit_state"] == "open"
+        assert cursor["consecutive_failures"] == 3
+        assert app.state.provider_pool.route_task(
+            task,
+            zone_availability={"domestic": True, "overseas": True},
+        )["name"] == "codex"
+
+
 def test_worker_binding_uses_task_provider_and_can_rebind_when_idle() -> None:
     with TemporaryDirectory() as directory:
         root = Path(directory)
@@ -132,7 +206,7 @@ def test_convention_refinement_returns_suggestion_without_overwriting() -> None:
             }).json()
             saved = client.put("/api/conventions", json={
                 "scope": "global", "scope_id": "global", "content": "必须保证质量。必须保证质量。",
-                "expected_revision": 0,
+                "expected_revision": 1,
             }).json()
             response = client.post(
                 "/api/conventions/global/global/refine",
@@ -156,6 +230,12 @@ def test_host_bridge_argv_is_fixed_and_stream_parser_keeps_session_and_usage() -
     cursor = _execution_argv("cursor", "/bin/cursor", project, "chat-1", "do work")
     assert codex[:3] == ["/bin/codex", "exec", "--json"]
     assert "workspace-write" in codex and 'approval_policy="never"' in codex
+    assert codex[codex.index("--disable") + 1] == "multi_agent"
+    resumed_codex = _execution_argv(
+        "codex", "/bin/codex", project, "session-1", "continue"
+    )
+    assert resumed_codex[:4] == ["/bin/codex", "exec", "resume", "--json"]
+    assert resumed_codex[resumed_codex.index("--disable") + 1] == "multi_agent"
     assert cursor[-2:] == ["chat-1", "do work"]
     assert "--sandbox" in cursor and "enabled" in cursor
     parsed = _parse_stream(
@@ -167,6 +247,16 @@ def test_host_bridge_argv_is_fixed_and_stream_parser_keeps_session_and_usage() -
         "input_tokens": 17,
         "cached_input_tokens": 13,
         "output_tokens": 9,
+    }
+    cursor_usage = _parse_stream(
+        '{"type":"result","usage":{"inputTokens":23696,'
+        '"cacheReadTokens":1064192,"outputTokens":10927}}\n'
+    )
+    assert cursor_usage == {
+        "session_id": None,
+        "input_tokens": 1_087_888,
+        "cached_input_tokens": 1_064_192,
+        "output_tokens": 10_927,
     }
     assert _provider_failure_class(
         1, "", "Selected model is at capacity"

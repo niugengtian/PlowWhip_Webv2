@@ -218,6 +218,26 @@ def test_lifecycle_guard_reads_live_unconsumed_host_jobs_from_container() -> Non
         ops._guard_host_jobs(ActiveJobRunner(), force=False)
 
 
+def test_lifecycle_guard_blocks_recent_inflight_model_call() -> None:
+    class ActiveModelCallRunner(ops.Runner):
+        @staticmethod
+        def which(name: str) -> str | None:
+            return "/usr/local/bin/docker" if name == "docker" else None
+
+        def run(self, argv, **_kwargs):
+            command = [str(item) for item in argv]
+            if command[1:3] == ["ps", "-q"]:
+                output = "container-id\n"
+            elif "host_jobs" in command[-1]:
+                output = "0\n"
+            else:
+                output = "1\n"
+            return subprocess.CompletedProcess(command, 0, output, "")
+
+    with pytest.raises(ops.OpsError, match="1 model call"):
+        ops._guard_host_jobs(ActiveModelCallRunner(), force=False)
+
+
 def test_help_uses_public_command_name(capsys: pytest.CaptureFixture[str]) -> None:
     assert ops.main([]) == 0
 

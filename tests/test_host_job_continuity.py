@@ -387,7 +387,32 @@ class FakeAsyncBridge:
         return True, "available for test"
 
     def job_status(self, job_id: str) -> dict[str, object]:
-        return self.snapshots[job_id]
+        snapshot = self.snapshots[job_id]
+        if snapshot.get("status") == "completed":
+            return {
+                **snapshot,
+                "output_ref": f"{job_id}/",
+                "output_segments": snapshot.get("output_segments") or [
+                    {
+                        "ref": f"{job_id}/stdout-000000.log",
+                        "sha256": hashlib.sha256(
+                            str(snapshot.get("stdout") or "provider completed").encode(
+                                "utf-8"
+                            )
+                        ).hexdigest(),
+                        "bytes": max(
+                            1,
+                            len(
+                                str(
+                                    snapshot.get("stdout") or "provider completed"
+                                ).encode("utf-8")
+                            ),
+                        ),
+                        "stream": "stdout",
+                    }
+                ],
+            }
+        return snapshot
 
     def cancel_job(self, job_id: str) -> dict[str, object]:
         self.snapshots[job_id] = {
@@ -399,11 +424,19 @@ class FakeAsyncBridge:
     def verify(
         self, *, project_path: str, execution: ExecutionResult,
         verification: list[dict[str, object]],
+        acceptance: list[str] | None = None,
+        require_structured_verdict: bool = False,
     ):
         self.verify_calls += 1
         if self.verify_error:
             raise ProviderUnavailableError(self.verify_error)
-        return VerificationEngine().verify(Path(project_path), execution, verification)
+        return VerificationEngine().verify(
+            Path(project_path),
+            execution,
+            verification,
+            acceptance=acceptance,
+            require_structured_verdict=require_structured_verdict,
+        )
 
     result = staticmethod(HostBridgeClient.result)
 
@@ -424,6 +457,125 @@ def _codex_task(app: object, root: Path, key: str):
         verification=[{"kind": "exit_code", "expected": 0}],
         max_attempts=2, idempotency_key=key,
     )
+
+
+def test_model_provider_without_shell_argv_finishes_from_typed_provider_evidence() -> None:
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        app = create_app(Settings(
+            data_dir=root / "runtime",
+            host_bridge_token="test-token-is-long-enough-123",
+        ))
+        bridge = FakeAsyncBridge()
+        app.state.provider_pool.bridge = bridge
+        project_path = root / "provider-evidence"
+        project_path.mkdir()
+        project = app.state.project_repository.create(
+            name="provider-evidence",
+            path=str(project_path),
+            host_path=str(project_path),
+        )
+        role_id = app.state.project_repository.resolve_role(
+            project["id"], "backend"
+        )["role_id"]
+        task = app.state.task_repository.create(
+            title="provider evidence",
+            objective="produce a provider-backed candidate",
+            project_path=str(project_path),
+            project_id=project["id"],
+            role_id=role_id,
+            provider="codex",
+            command={"argv": [], "timeout_seconds": 60},
+            verification=[{"kind": "exit_code", "expected": 0}],
+            acceptance=["provider output is bound to this run"],
+            max_attempts=1,
+            idempotency_key="provider-evidence-task",
+        )
+
+        running = app.state.task_service.drive(
+            task.id,
+            expected_revision=task.revision,
+            idempotency_key="provider-evidence-drive",
+        )
+        job = app.state.host_jobs.active()[0]
+        bridge.snapshots[job["job_id"]] = {
+            **bridge.snapshots[job["job_id"]],
+            "status": "completed",
+            "returncode": 0,
+            "stdout": "candidate produced",
+            "stderr": "",
+            "duration_ms": 12,
+            "input_tokens": 5,
+            "output_tokens": 2,
+        }
+
+        result = app.state.task_service.reconcile_host_jobs()
+        completed = app.state.task_repository.get(task.id)
+
+        assert running.status.value == "running"
+        assert result["settled"] == [
+            {"task_id": task.id, "status": "completed"}
+        ]
+        assert completed.status.value == "completed"
+        assert completed.tokens_used == 7
+        identity = completed.evidence_manifest["verification_commands"][0][
+            "execution_identity"
+        ]
+        assert identity["kind"] == "provider_session"
+        assert identity["host_job_id"] == job["job_id"]
+        assert identity["run_id"] == job["run_id"]
+        assert identity["output_segments"][0]["sha256"]
+
+
+def test_invalid_provider_evidence_settles_one_task_without_crashing_scheduler() -> None:
+    class MissingOutputEvidenceBridge(FakeAsyncBridge):
+        def job_status(self, job_id: str) -> dict[str, object]:
+            return self.snapshots[job_id]
+
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        app = create_app(Settings(
+            data_dir=root / "runtime",
+            host_bridge_token="test-token-is-long-enough-123",
+        ))
+        bridge = MissingOutputEvidenceBridge()
+        app.state.provider_pool.bridge = bridge
+        task = _codex_task(app, root, "invalid-provider-evidence")
+        app.state.task_service.drive(
+            task.id,
+            expected_revision=task.revision,
+            idempotency_key="invalid-provider-evidence-drive",
+        )
+        job = app.state.host_jobs.active()[0]
+        connection = app.state.database.connect()
+        try:
+            connection.execute(
+                "UPDATE tasks SET command_json = ? WHERE id = ?",
+                (json.dumps({"argv": [], "timeout_seconds": 60}), task.id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        bridge.snapshots[job["job_id"]] = {
+            **bridge.snapshots[job["job_id"]],
+            "status": "completed",
+            "returncode": 0,
+            "stdout": "unbound output",
+            "stderr": "",
+            "input_tokens": 5,
+            "output_tokens": 2,
+        }
+
+        result = app.state.task_service.reconcile_host_jobs()
+        failed = app.state.task_repository.get(task.id)
+
+        assert result["settled"] == [
+            {"task_id": task.id, "status": "needs_human"}
+        ]
+        assert failed.status.value == "needs_human"
+        assert failed.tokens_used == 7
+        assert "EvidenceManifest" in (failed.last_error or "")
+        assert app.state.host_jobs.active() == []
 
 
 def _estimated_policy_m() -> tuple[dict[str, object], dict[str, object]]:

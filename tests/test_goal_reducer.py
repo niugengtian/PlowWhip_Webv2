@@ -275,6 +275,38 @@ def test_aggregate_verifier_can_attest_legacy_completed_dependencies() -> None:
         assert app.state.goal_repository.get(goal["id"])["status"] == "completed"
 
 
+def test_dependency_handoff_carries_bounded_assistant_result_with_hash() -> None:
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        project_path = root / "project"
+        project_path.mkdir()
+        app = create_app(Settings(data_dir=root / "runtime"))
+        goal = _goal(app, project_path)
+        first_id, second_id = [item["id"] for item in goal["work_items"]]
+        first = app.state.task_repository.get(first_id)
+
+        completed = app.state.task_service.drive(
+            first.id,
+            expected_revision=first.revision,
+            idempotency_key="handoff-assistant-result",
+        )
+        app.state.goal_repository.advance()
+        second = app.state.task_repository.get(second_id)
+
+        assert completed.status.value == "candidate_ready"
+        assert completed.evidence_manifest is not None
+        provider_result = completed.evidence_manifest["provider_result"]
+        assert provider_result["assistant_text_tail"] == '{"verdict":"PASS"}'
+        assert len(provider_result["assistant_text_sha256"]) == 64
+        assert second.status.value == "ready"
+        assert second.handoff is not None
+        assert second.handoff["provider_output_tail"] == '{"verdict":"PASS"}'
+        assert (
+            second.handoff["provider_output_text_sha256"]
+            == provider_result["assistant_text_sha256"]
+        )
+
+
 def test_episode_exhaustion_replans_once_then_converges_without_job_loop() -> None:
     with TemporaryDirectory() as directory:
         root = Path(directory)

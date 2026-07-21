@@ -44,11 +44,19 @@ class FakeHostBridge:
     def verify(
         self, *, project_path: str, execution: ExecutionResult,
         verification: list[dict[str, object]],
+        acceptance: list[str] | None = None,
+        require_structured_verdict: bool = False,
     ):
         self.verify_calls += 1
         if self.verify_unavailable:
             raise ProviderUnavailableError("verification bridge unavailable")
-        return VerificationEngine().verify(Path(project_path), execution, verification)
+        return VerificationEngine().verify(
+            Path(project_path),
+            execution,
+            verification,
+            acceptance=acceptance,
+            require_structured_verdict=require_structured_verdict,
+        )
 
     def probe(self, _provider: dict[str, object]) -> tuple[bool, str]:
         return True, "available"
@@ -108,6 +116,7 @@ def _runtime(key: str):
     "TLS handshake failed",
     "websocket EOF",
     "bridge temporary unavailable",
+    "RetriableError: Connection stalled",
 ])
 def test_fault_policy_classifies_only_known_transport_signatures(marker: str) -> None:
     decision = FaultPolicy.from_host_snapshot({
@@ -468,6 +477,178 @@ def test_provider_capacity_keeps_backoff_at_episode_boundary() -> None:
         directory.cleanup()
 
 
+def test_recovery_episode_inherits_task_spec_hard_deadline() -> None:
+    directory, app, bridge, running, job = _runtime("inherited-hard-deadline")
+    try:
+        connection = app.state.database.connect()
+        try:
+            first_deadline = connection.execute(
+                """
+                SELECT deadline_at FROM execution_episodes
+                WHERE task_id = ? AND spec_revision = ?
+                """,
+                (running.id, running.spec_revision),
+            ).fetchone()["deadline_at"]
+        finally:
+            connection.close()
+
+        for occurrence in range(2):
+            bridge.snapshots[job["job_id"]] = {
+                **bridge.snapshots[job["job_id"]],
+                "status": "completed",
+                "returncode": 1,
+                "failure_class": "command_failed",
+                "stderr": "Selected model is at capacity",
+                "input_tokens": 0,
+                "cached_input_tokens": 0,
+                "output_tokens": 0,
+            }
+            app.state.task_service.reconcile_host_jobs()
+            recovered = app.state.task_repository.get(running.id)
+            assert recovered.status.value == "ready"
+            if occurrence == 0:
+                running = app.state.task_service.drive(
+                    recovered.id,
+                    expected_revision=recovered.revision,
+                    idempotency_key="inherited-hard-deadline-second-process",
+                )
+                job = app.state.host_jobs.active()[0]
+
+        running = app.state.task_service.drive(
+            recovered.id,
+            expected_revision=recovered.revision,
+            idempotency_key="inherited-hard-deadline-recovery-episode",
+        )
+        with app.state.database.transaction(immediate=True) as connection:
+            connection.execute(
+                """
+                UPDATE execution_episodes
+                SET deadline_at = datetime(deadline_at, '+10 minutes'),
+                    wall_deadline_at = datetime(wall_deadline_at, '+10 minutes')
+                WHERE task_id = ? AND spec_revision = ? AND status = 'active'
+                """,
+                (running.id, running.spec_revision),
+            )
+        app.state.task_service.reconcile_host_jobs()
+        connection = app.state.database.connect()
+        try:
+            deadlines = connection.execute(
+                """
+                SELECT deadline_at, wall_deadline_at
+                FROM execution_episodes
+                WHERE task_id = ? AND spec_revision = ?
+                ORDER BY ordinal
+                """,
+                (running.id, running.spec_revision),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        assert len(deadlines) == 2
+        assert {row["deadline_at"] for row in deadlines} == {first_deadline}
+        assert all(row["wall_deadline_at"] <= first_deadline for row in deadlines)
+    finally:
+        directory.cleanup()
+
+
+def test_exhausted_task_deadline_stops_before_provider_and_requires_new_spec() -> None:
+    directory, app, bridge, running, job = _runtime("exhausted-hard-deadline")
+    try:
+        for occurrence in range(2):
+            bridge.snapshots[job["job_id"]] = {
+                **bridge.snapshots[job["job_id"]],
+                "status": "completed",
+                "returncode": 1,
+                "failure_class": "command_failed",
+                "stderr": "Selected model is at capacity",
+                "input_tokens": 0,
+                "cached_input_tokens": 0,
+                "output_tokens": 0,
+            }
+            app.state.task_service.reconcile_host_jobs()
+            recovered = app.state.task_repository.get(running.id)
+            assert recovered.status.value == "ready"
+            if occurrence == 0:
+                running = app.state.task_service.drive(
+                    recovered.id,
+                    expected_revision=recovered.revision,
+                    idempotency_key="exhausted-hard-deadline-second-process",
+                )
+                job = app.state.host_jobs.active()[0]
+
+        with app.state.database.transaction(immediate=True) as connection:
+            connection.execute(
+                """
+                UPDATE execution_episodes
+                SET deadline_at = datetime('now', '-1 second'),
+                    wall_deadline_at = datetime('now', '-1 second')
+                WHERE task_id = ? AND spec_revision = ?
+                """,
+                (recovered.id, recovered.spec_revision),
+            )
+        starts_before = len(bridge.start_sessions)
+        stopped = app.state.task_service.drive(
+            recovered.id,
+            expected_revision=recovered.revision,
+            idempotency_key="exhausted-hard-deadline-blocked",
+        )
+
+        assert stopped.status.value == "needs_human"
+        assert stopped.last_error.startswith("task_hard_deadline_exhausted:")
+        assert len(bridge.start_sessions) == starts_before
+        connection = app.state.database.connect()
+        try:
+            lease_count = connection.execute(
+                "SELECT COUNT(*) FROM task_leases WHERE task_id = ?",
+                (stopped.id,),
+            ).fetchone()[0]
+            lock_count = connection.execute(
+                "SELECT COUNT(*) FROM resource_locks WHERE task_id = ?",
+                (stopped.id,),
+            ).fetchone()[0]
+            active_runs = connection.execute(
+                """
+                SELECT COUNT(*) FROM task_runs
+                WHERE task_id = ? AND status = 'running'
+                """,
+                (stopped.id,),
+            ).fetchone()[0]
+            call = connection.execute(
+                """
+                SELECT status, error_class FROM model_calls
+                WHERE task_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1
+                """,
+                (stopped.id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        assert lease_count == 0
+        assert lock_count == 0
+        assert active_runs == 0
+        assert dict(call) == {
+            "status": "failed",
+            "error_class": "task_hard_deadline_exhausted",
+        }
+
+        restarted = app.state.task_repository.control(
+            stopped.id,
+            action="restart",
+            reason="human approved a fresh hard deadline",
+            expected_revision=stopped.revision,
+            idempotency_key="exhausted-hard-deadline-human-restart",
+        )
+        resumed = app.state.task_service.drive(
+            restarted.id,
+            expected_revision=restarted.revision,
+            idempotency_key="exhausted-hard-deadline-new-spec-drive",
+        )
+        assert resumed.status.value == "running"
+        assert resumed.spec_revision == stopped.spec_revision + 1
+        assert len(bridge.start_sessions) == starts_before + 1
+    finally:
+        directory.cleanup()
+
+
 def test_internal_tool_aborts_rotate_only_at_replacement_episode() -> None:
     directory, app, bridge, running, first_job = _runtime("bounded-no-progress")
     try:
@@ -618,6 +799,89 @@ def test_watchdog_wall_clock_is_a_hard_episode_boundary() -> None:
 
     assert decision.bounded is True
     assert decision.reason == "wall_clock"
+
+
+def test_watchdog_accepts_hashed_provider_output_but_not_raw_byte_growth() -> None:
+    episode = {
+        "progress_bytes": 0,
+        "progress_evidence_json": "{}",
+        "zero_progress_rounds": 0,
+        "last_fault_class": None,
+        "same_fault_count": 0,
+        "host_process_count": 1,
+        "max_host_processes": 2,
+    }
+    first = ExecutionEpisodeWatchdog.evaluate(
+        episode,
+        {
+            "status": "running",
+            "output_bytes": {"total": 1024},
+            "progress_evidence": {
+                "kind": "workspace",
+                "available": True,
+                "changed_files": 0,
+                "fingerprint": "unchanged-workspace",
+            },
+            "output_segments": [{
+                "stream": "stdout",
+                "ref": "job/stdout.000000.log",
+                "sha256": "a" * 64,
+                "bytes": 1024,
+            }],
+        },
+        fault_class=None,
+        elapsed_seconds=60,
+        deadline_reached=False,
+        wall_clock_reached=False,
+        same_fault_limit=2,
+        zero_progress_limit=3,
+    )
+    assert first.verifiable_progress is False
+
+    second = ExecutionEpisodeWatchdog.evaluate(
+        {
+            **episode,
+            "progress_evidence_json": json.dumps(first.progress_evidence),
+            "zero_progress_rounds": first.zero_progress_rounds,
+        },
+        {
+            "status": "running",
+            "output_bytes": {"total": 2048},
+            "progress_evidence": {
+                "kind": "workspace",
+                "available": True,
+                "changed_files": 0,
+                "fingerprint": "unchanged-workspace",
+            },
+            "output_segments": [{
+                "stream": "stdout",
+                "ref": "job/stdout.000000.log",
+                "sha256": "b" * 64,
+                "bytes": 2048,
+            }],
+        },
+        fault_class=None,
+        elapsed_seconds=120,
+        deadline_reached=False,
+        wall_clock_reached=False,
+        same_fault_limit=2,
+        zero_progress_limit=3,
+    )
+    assert second.verifiable_progress is True
+    assert second.zero_progress_rounds == 0
+
+    raw_bytes_only = ExecutionEpisodeWatchdog.evaluate(
+        episode,
+        {"status": "running", "output_bytes": {"total": 4096}},
+        fault_class=None,
+        elapsed_seconds=120,
+        deadline_reached=False,
+        wall_clock_reached=False,
+        same_fault_limit=2,
+        zero_progress_limit=3,
+    )
+    assert raw_bytes_only.verifiable_progress is False
+    assert raw_bytes_only.zero_progress_rounds == 1
 
 
 def test_burn_rate_alert_is_reported_without_stopping_task() -> None:

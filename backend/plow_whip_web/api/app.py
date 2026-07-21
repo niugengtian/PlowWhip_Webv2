@@ -116,6 +116,7 @@ def create_app(settings: Settings) -> FastAPI:
     project_repository = ProjectRepository(database)
     runtime_settings = SettingsRepository(database)
     conventions = ConventionRepository(database)
+    conventions.seed_global_if_absent()
     token_ledger = TokenLedger(database)
     model_calls = ModelCallLedger(database)
     context_compiler = ContextCompiler(settings.data_dir, database, task_repository, conventions, runtime_settings)
@@ -196,6 +197,7 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.providers = providers
     app.state.provider_pool = provider_pool
     app.state.maintenance = maintenance
+    app.state.startup_recovery = recovery.reconcile()
 
     @app.middleware("http")
     async def security_and_audit(request: Request, call_next):
@@ -1656,6 +1658,8 @@ def _create_goal_record(
             structured_items=payload.plan_items,
             execution_policy=project["execution_policy"],
             role_providers=payload.role_providers,
+            goal_artifacts=payload.artifacts,
+            goal_acceptance=payload.acceptance,
             model_invoked=model_calls.is_completed_butler_planner(
                 payload.planner_call_id,
                 project_id=payload.project_id,

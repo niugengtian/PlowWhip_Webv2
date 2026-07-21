@@ -1,0 +1,99 @@
+schema_version = 1
+project_key = "plow-whip-web-v2"
+project_name = "PlowWhip Web control plane"
+ledger_revision = "2026-07-21.5"
+human_view = "docs/ENGINEERING_REQUIREMENTS_AND_INCIDENT_LEDGER.md"
+model_view = "docs/ENGINEERING_MODEL_LEDGER.md"
+always_load = ["R-001", "R-004", "R-007", "R-013"]
+context_max_entries = 16
+context_max_chars = 12000
+
+[[routes]]
+domain = "butler"
+description = "Butler, Planner, clarification, confirmation, roles and project isolation"
+ids = ["R-001", "R-002", "R-003", "R-005", "R-012", "R-013", "I-002", "I-005", "I-006"]
+
+[[routes]]
+domain = "lifecycle"
+description = "Task/Goal state, dependencies, scheduling, retry and concurrency"
+ids = ["R-001", "R-004", "R-006", "R-007", "R-012", "I-003", "I-004", "I-010", "I-013", "I-015"]
+
+[[routes]]
+domain = "provider"
+description = "Provider, SessionBinding, Host Bridge, network and recovery"
+ids = ["R-003", "R-004", "R-005", "R-006", "R-010", "I-006", "I-010", "I-011", "I-015"]
+
+[[routes]]
+domain = "evidence"
+description = "EvidenceManifest, verification, artifacts and reports"
+ids = ["R-007", "R-012", "I-003", "I-004", "I-005", "I-015"]
+
+[[routes]]
+domain = "token"
+description = "Token, Context, usage dashboard and refresh consistency"
+ids = ["R-004", "R-008", "R-009", "I-007", "I-008", "I-013"]
+
+[[routes]]
+domain = "project"
+description = "Project registration, paths, deletion, security and ledger ownership"
+ids = ["R-010", "R-011", "R-013", "I-001", "I-012"]
+
+[[routes]]
+domain = "ui"
+description = "Primary frontend flows, scope, live state, sorting and observability"
+ids = ["R-002", "R-008", "R-009", "R-012", "I-001", "I-002", "I-007", "I-008", "I-009", "I-013", "I-014", "I-015"]
+
+[[routes]]
+domain = "release"
+description = "Migration, release, deployment, restart and reproducible bootstrap"
+ids = ["R-005", "R-010", "R-011", "I-006", "I-011", "I-012"]
+
+[[routes]]
+domain = "ui.sorting"
+description = "Terminal/candidate history ordering and stable timestamps"
+ids = ["R-009", "I-014"]
+
+[[routes]]
+domain = "ui.live"
+description = "Live Task state, model output, refresh generations and unsettled usage"
+ids = ["R-008", "R-009", "I-003", "I-013", "I-015"]
+
+[[routes]]
+domain = "ui.scope"
+description = "Project/global scope switching and stale selection/data prevention"
+ids = ["R-008", "R-009", "I-008", "I-009"]
+
+[[routes]]
+domain = "ui.layout"
+description = "Responsive layout, overflow, labels and Token number readability"
+ids = ["R-009", "I-007", "I-009"]
+
+[[routes]]
+domain = "ui.butler"
+description = "Global/project Butler entry points, chat and model failure recovery"
+ids = ["R-002", "R-009", "I-002"]
+
+[[routes]]
+domain = "task.dependencies"
+description = "DAG validation, evidence-qualified unlocking and revision invalidation"
+ids = ["R-001", "R-007", "R-012", "I-003", "I-004", "I-013"]
+
+[[routes]]
+domain = "task.retry"
+description = "Checkpoint resume, Watchdog, attempts and idempotent replanning"
+ids = ["R-004", "R-006", "I-003", "I-010", "I-015"]
+
+[[routes]]
+domain = "provider.network"
+description = "Network zones, Provider probing, suspension, switching and recovery"
+ids = ["R-005", "R-006", "I-006", "I-011"]
+
+[[routes]]
+domain = "token.dashboard"
+description = "Normalized usage, live settlement, project/day scope and presentation"
+ids = ["R-008", "R-009", "I-007", "I-008", "I-013"]
+
+[[routes]]
+domain = "project.registration"
+description = "Project identity, host/control paths, bootstrap and ledger ownership"
+ids = ["R-010", "R-011", "R-013", "I-001", "I-012"]

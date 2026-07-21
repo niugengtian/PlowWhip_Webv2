@@ -171,6 +171,18 @@ def test_project_butler_uses_selected_model_then_requires_human_confirmation() -
                 context = app.state.context_compiler.compile(item["id"])
                 assert context["role"] == item["role"]
                 assert ROLE_PROMPTS[item["role"]] in context["content"]
+                assert "## Worker orchestration boundary" in context["content"]
+                assert (
+                    "Do not create, spawn, delegate to, or wait for other agents"
+                    in context["content"]
+                )
+                assert (
+                    "Do not load personal memory, old chats, external skills"
+                    in context["content"]
+                )
+                if item["role"] == "verification":
+                    assert "不得自行要求或创建 OS 沙箱" in context["content"]
+                    assert "具备写权限本身不使真实只读证据失效" in context["content"]
                 if item["role"] in {
                     "backend", "frontend", "ui", "devops_sre", "verification", "fullstack",
                 }:

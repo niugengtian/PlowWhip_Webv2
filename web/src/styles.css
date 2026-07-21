@@ -362,6 +362,7 @@ textarea { min-height: 84px; resize: vertical; line-height: 1.5; }
 .butler-proposal-actions { display: flex; flex-wrap: wrap; gap: 6px; }
 .butler-proposal-actions button.selected { border-color: #6a9eff; background: #1b3153; color: white; }
 .butler-proposal-actions button.primary { margin-left: auto; }
+.butler-planning-status { margin: 0 18px 12px; border: 1px solid #365f99; border-radius: 7px; padding: 10px 12px; background: #101a2a; color: #9fbae8; font-size: .7rem; }
 .butler-composer { display: grid; grid-template-columns: 1fr auto; gap: 8px; border-top: 1px solid var(--line); padding: 12px 18px 18px; }
 .butler-composer textarea, .butler-welcome textarea { min-height: 76px; resize: vertical; border: 1px solid var(--line-strong); border-radius: 6px; padding: 10px; background: #0c111b; color: var(--text); line-height: 1.5; }
 .butler-composer button { align-self: end; }

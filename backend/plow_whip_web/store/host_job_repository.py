@@ -15,7 +15,12 @@ from plow_whip_web.runtime.host_reconciliation import (
     requires_reconciliation,
 )
 from plow_whip_web.security import Redactor
+from plow_whip_web.domain.model import DomainError
 from plow_whip_web.store.database import Database
+
+
+class TaskHardDeadlineExceeded(DomainError):
+    """The immutable TaskSpec deadline expired before another Host process."""
 
 
 class HostJobRepository:
@@ -175,6 +180,36 @@ class HostJobRepository:
         progress_extension_seconds: int = 0,
     ) -> dict[str, Any]:
         with self.database.transaction(immediate=True) as connection:
+            connection.execute(
+                """
+                UPDATE execution_episodes
+                SET deadline_at = MIN(
+                        deadline_at,
+                        (
+                            SELECT MIN(prior.deadline_at)
+                            FROM execution_episodes prior
+                            WHERE prior.task_id = execution_episodes.task_id
+                              AND prior.spec_revision =
+                                  execution_episodes.spec_revision
+                        )
+                    ),
+                    wall_deadline_at = MIN(
+                        wall_deadline_at,
+                        (
+                            SELECT MIN(prior.deadline_at)
+                            FROM execution_episodes prior
+                            WHERE prior.task_id = execution_episodes.task_id
+                              AND prior.spec_revision =
+                                  execution_episodes.spec_revision
+                        )
+                    ),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = (
+                    SELECT episode_id FROM host_jobs WHERE job_id = ?
+                ) AND status = 'active'
+                """,
+                (job_id,),
+            )
             row = connection.execute(
                 """
                 SELECT e.*,
@@ -679,6 +714,42 @@ class HostJobRepository:
             """,
             (task_id,),
         ).fetchone()
+        canonical_deadline = connection.execute(
+            """
+            SELECT MIN(deadline_at) AS deadline_at
+            FROM execution_episodes
+            WHERE task_id = ? AND spec_revision = ?
+            """,
+            (task_id, spec_revision),
+        ).fetchone()["deadline_at"]
+        if canonical_deadline is not None:
+            # Older releases restarted the hard deadline for every recovery
+            # episode. Clamp an already-active episode as well as every future
+            # recovery to the first deadline owned by this TaskSpec revision.
+            connection.execute(
+                """
+                UPDATE execution_episodes
+                SET deadline_at = MIN(deadline_at, ?),
+                    wall_deadline_at = MIN(wall_deadline_at, ?),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE task_id = ? AND spec_revision = ? AND status = 'active'
+                """,
+                (
+                    canonical_deadline,
+                    canonical_deadline,
+                    task_id,
+                    spec_revision,
+                ),
+            )
+            expired = connection.execute(
+                "SELECT CURRENT_TIMESTAMP >= ? AS expired",
+                (canonical_deadline,),
+            ).fetchone()["expired"]
+            if int(expired):
+                raise TaskHardDeadlineExceeded(
+                    "task_hard_deadline_exhausted: "
+                    "restart with a new TaskSpec revision to authorize more time"
+                )
         if (
             latest is not None
             and latest["status"] == "circuit_open"
@@ -701,35 +772,67 @@ class HostJobRepository:
             if recovery_stage is None:
                 raise ValueError("execution episode recovery is exhausted")
             episode_id = str(uuid.uuid4())
-            connection.execute(
-                """
-                INSERT INTO execution_episodes(
-                    id, task_id, spec_revision, ordinal, recovery_count,
-                    recovery_stage, deadline_at, wall_deadline_at,
-                    max_host_processes, effective_limits_json
-                ) VALUES (
-                    ?, ?, ?, ?, ?, ?,
-                    datetime('now', ?), datetime('now', ?), ?, ?
-                )
-                """,
-                (
-                    episode_id,
-                    task_id,
-                    spec_revision,
-                    ordinal,
-                    recovery_count,
-                    recovery_stage,
-                    f"+{max(1, deadline_seconds)} seconds",
-                    f"+{max(1, min(deadline_seconds, wall_limit_seconds))} seconds",
-                    max(1, max_host_processes),
-                    json.dumps(
-                        effective_limits,
-                        ensure_ascii=False,
-                        sort_keys=True,
-                        separators=(",", ":"),
+            if canonical_deadline is None:
+                connection.execute(
+                    """
+                    INSERT INTO execution_episodes(
+                        id, task_id, spec_revision, ordinal, recovery_count,
+                        recovery_stage, deadline_at, wall_deadline_at,
+                        max_host_processes, effective_limits_json
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?,
+                        datetime('now', ?), datetime('now', ?), ?, ?
+                    )
+                    """,
+                    (
+                        episode_id,
+                        task_id,
+                        spec_revision,
+                        ordinal,
+                        recovery_count,
+                        recovery_stage,
+                        f"+{max(1, deadline_seconds)} seconds",
+                        f"+{max(1, min(deadline_seconds, wall_limit_seconds))} seconds",
+                        max(1, max_host_processes),
+                        json.dumps(
+                            effective_limits,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
                     ),
-                ),
-            )
+                )
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO execution_episodes(
+                        id, task_id, spec_revision, ordinal, recovery_count,
+                        recovery_stage, deadline_at, wall_deadline_at,
+                        max_host_processes, effective_limits_json
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?,
+                        MIN(?, datetime('now', ?)), ?, ?
+                    )
+                    """,
+                    (
+                        episode_id,
+                        task_id,
+                        spec_revision,
+                        ordinal,
+                        recovery_count,
+                        recovery_stage,
+                        canonical_deadline,
+                        canonical_deadline,
+                        f"+{max(1, wall_limit_seconds)} seconds",
+                        max(1, max_host_processes),
+                        json.dumps(
+                            effective_limits,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    ),
+                )
         else:
             episode_id = str(latest["id"])
         reserved = connection.execute(

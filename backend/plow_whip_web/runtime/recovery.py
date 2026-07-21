@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 from plow_whip_web.store.database import Database
@@ -12,10 +13,36 @@ class RecoveryService:
 
     def __init__(self, database: Database) -> None:
         self.database = database
+        self.process_started_at = datetime.now(timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
 
     def reconcile(self) -> dict[str, Any]:
         recovered: list[str] = []
+        interrupted_model_calls: list[str] = []
         with self.database.transaction(immediate=True) as connection:
+            stale_calls = connection.execute(
+                """
+                SELECT call_id FROM model_calls
+                WHERE status IN ('prepared', 'dispatched')
+                  AND updated_at < ?
+                """,
+                (self.process_started_at,),
+            ).fetchall()
+            for call in stale_calls:
+                connection.execute(
+                    """
+                    UPDATE model_calls
+                    SET status = 'unknown',
+                        error_class = 'control_plane_restarted',
+                        raw_status = 'interrupted_by_control_plane_restart',
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE call_id = ?
+                      AND status IN ('prepared', 'dispatched')
+                    """,
+                    (call["call_id"],),
+                )
+                interrupted_model_calls.append(str(call["call_id"]))
             stale = connection.execute(
                 """
                 SELECT t.* FROM tasks t LEFT JOIN task_leases l ON l.task_id = t.id
@@ -75,4 +102,9 @@ class RecoveryService:
                 )
                 """
             ).rowcount
-        return {"recovered_tasks": recovered, "reset_workers": reset, "model_invoked": False}
+        return {
+            "recovered_tasks": recovered,
+            "reset_workers": reset,
+            "interrupted_model_calls": interrupted_model_calls,
+            "model_invoked": False,
+        }

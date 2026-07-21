@@ -843,12 +843,13 @@ class TaskRepository:
             row = connection.execute(
                 """
                 SELECT r.id run_id, r.started_at,
-                       CURRENT_TIMESTAMP finished_at, t.project_path,
+                       CURRENT_TIMESTAMP finished_at, t.project_path, t.provider,
                        t.command_json, ts.session_generation,
                        COALESCE(h.external_session_id, ts.external_session_id)
                            external_session_id,
                        h.job_id host_job_id,
-                       COALESCE(h.fencing_token, l.fencing_token) fencing_token
+                       COALESCE(h.fencing_token, l.fencing_token) fencing_token,
+                       h.result_json host_result_json
                 FROM task_runs r
                 JOIN tasks t ON t.id = r.task_id
                 LEFT JOIN task_sessions ts ON ts.task_id = t.id
@@ -862,6 +863,20 @@ class TaskRepository:
             if row is None:
                 raise DomainError(f"execution context missing for run: {run_id}")
             command = json.loads(row["command_json"])
+            host_result = (
+                json.loads(row["host_result_json"])
+                if row["host_result_json"] else {}
+            )
+            output_segments = [
+                {
+                    "ref": str(item.get("ref") or ""),
+                    "sha256": str(item.get("sha256") or ""),
+                    "bytes": int(item.get("bytes") or 0),
+                    "stream": str(item.get("stream") or ""),
+                }
+                for item in host_result.get("output_segments") or []
+                if item.get("ref") and item.get("sha256")
+            ]
             return {
                 "run_id": row["run_id"],
                 "argv": list(command.get("argv") or []),
@@ -872,6 +887,20 @@ class TaskRepository:
                 "external_session_id": row["external_session_id"],
                 "host_job_id": row["host_job_id"],
                 "fencing_token": row["fencing_token"],
+                "provider_execution": (
+                    {
+                        "kind": "provider_session",
+                        "provider": row["provider"],
+                        "host_job_id": row["host_job_id"],
+                        "run_id": row["run_id"],
+                        "external_session_id": row["external_session_id"],
+                        "session_generation": row["session_generation"],
+                        "fencing_token": row["fencing_token"],
+                        "output_ref": host_result.get("output_ref"),
+                        "output_segments": output_segments,
+                    }
+                    if row["host_job_id"] else None
+                ),
             }
         finally:
             connection.close()
@@ -1052,10 +1081,6 @@ class TaskRepository:
                 or evidence_manifest.get("call_id") != run_id
             ):
                 raise DomainError("EvidenceManifest call/run/spec/revision binding mismatch")
-            token_delta = int(execution.get("input_tokens", 0)) + int(
-                execution.get("output_tokens", 0)
-            )
-            actual_tokens = task.tokens_used + token_delta
             fingerprint = verification.get(
                 "failure_fingerprint", verification["evidence_hash"]
             )
@@ -1089,7 +1114,13 @@ class TaskRepository:
                 task=task,
                 provider=task.provider,
                 run_id=run_id,
+                add_to_task=True,
             )
+            token_row = connection.execute(
+                "SELECT tokens_used FROM tasks WHERE id = ?",
+                (task.id,),
+            ).fetchone()
+            actual_tokens = int(token_row["tokens_used"]) if token_row else 0
             connection.execute(
                 """
                 UPDATE tasks SET status = ?, revision = ?, tokens_used = ?,
@@ -1537,6 +1568,121 @@ class TaskRepository:
                         "failure_class": failure_class,
                     })),
                 )
+            return self._get_with_connection(connection, task.id)
+
+    def finalize_pre_dispatch_fault(
+        self,
+        task_id: str,
+        *,
+        attempt_id: str,
+        run_id: str,
+        failure_class: str,
+        reason: str,
+        idempotency_key: str,
+    ) -> TaskRecord:
+        """Fail closed after claim but before any physical Provider process."""
+        with self.database.transaction(immediate=True) as connection:
+            duplicate = connection.execute(
+                "SELECT task_id FROM task_events WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if duplicate:
+                return self._get_with_connection(connection, duplicate["task_id"])
+            task = self._get_with_connection(connection, task_id)
+            if task.status is not TaskStatus.RUNNING:
+                raise InvalidTransitionError(
+                    f"task has no pre-dispatch fault to finalize: {task.status}"
+                )
+            run = connection.execute(
+                """
+                SELECT id FROM task_runs
+                WHERE id = ? AND task_id = ? AND attempt_id = ?
+                  AND status = 'running'
+                """,
+                (run_id, task.id, attempt_id),
+            ).fetchone()
+            if run is None:
+                raise InvalidTransitionError("pre-dispatch run is no longer active")
+            revision = task.revision + 1
+            connection.execute(
+                """
+                UPDATE tasks
+                SET status = 'needs_human', revision = ?, worker_id = NULL,
+                    last_error = ?, next_eligible_at = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (revision, reason[:1000], task.id),
+            )
+            if task.worker_id:
+                connection.execute(
+                    """
+                    UPDATE workers
+                    SET status = 'idle', active_task_id = NULL, last_error = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND active_task_id = ?
+                    """,
+                    (reason[:1000], task.worker_id, task.id),
+                )
+            self._release_worker_and_lock(connection, task.id, task.worker_id)
+            connection.execute(
+                """
+                UPDATE task_attempts
+                SET status = 'suspended', finished_at = NULL
+                WHERE id = ? AND task_id = ?
+                """,
+                (attempt_id, task.id),
+            )
+            connection.execute(
+                """
+                UPDATE task_runs
+                SET status = 'needs_human', result_json = ?,
+                    finished_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    _dump({
+                        "fault": {
+                            "action": "needs_human",
+                            "failure_class": failure_class,
+                            "reason": reason[:1000],
+                            "physical_process_started": False,
+                        }
+                    }),
+                    run_id,
+                ),
+            )
+            self._event(
+                connection,
+                task_id=task.id,
+                event_type="task.needs_human",
+                payload={
+                    "attempt_id": attempt_id,
+                    "run_id": run_id,
+                    "failure_class": failure_class,
+                    "reason": reason[:1000],
+                    "physical_process_started": False,
+                    "required_action": "restart_with_new_task_spec_revision",
+                },
+                revision=revision,
+                idempotency_key=idempotency_key,
+            )
+            connection.execute(
+                """
+                INSERT INTO outbox_events(
+                    topic, aggregate_id, event_type, payload_json
+                ) VALUES ('task', ?, 'task.needs_human', ?)
+                """,
+                (
+                    task.id,
+                    _dump({
+                        "task_id": task.id,
+                        "reason": reason[:1000],
+                        "failure_class": failure_class,
+                        "required_action": "restart_with_new_task_spec_revision",
+                    }),
+                ),
+            )
             return self._get_with_connection(connection, task.id)
 
     def control(
@@ -2363,7 +2509,7 @@ def _validate_evidence_manifest(
     required_gate_fields = {
         "acceptance_id", "argv", "cwd", "started_at", "finished_at",
         "exit_code", "host_job_id", "run_id", "session", "summary",
-        "artifact_evidence", "check",
+        "artifact_evidence", "execution_identity", "check",
     }
     for item in commands:
         spec = item.get("spec") if isinstance(item.get("spec"), dict) else {}
@@ -2381,12 +2527,45 @@ def _validate_evidence_manifest(
             if command_gate
             else int(execution.get("returncode", -1))
         )
+        provider_identity = (
+            item.get("execution_identity")
+            if not exact_argv and task.provider != "generic-command"
+            else None
+        )
+        session = item.get("session") if isinstance(item.get("session"), dict) else {}
+        provider_identity_valid = bool(
+            isinstance(provider_identity, dict)
+            and provider_identity.get("kind") == "provider_session"
+            and provider_identity.get("provider") == task.provider
+            and provider_identity.get("host_job_id") == item.get("host_job_id")
+            and provider_identity.get("run_id") == evidence_manifest.get("run_id")
+            and provider_identity.get("external_session_id")
+            == session.get("external_session_id")
+            and provider_identity.get("session_generation")
+            == session.get("session_generation")
+            and provider_identity.get("fencing_token")
+            == session.get("fencing_token")
+            and isinstance(provider_identity.get("output_segments"), list)
+            and bool(provider_identity.get("output_segments"))
+            and all(
+                segment.get("ref")
+                and segment.get("sha256")
+                and int(segment.get("bytes") or 0) > 0
+                for segment in provider_identity.get("output_segments") or []
+            )
+        )
         if not required_gate_fields.issubset(item):
             raise DomainError("EvidenceManifest command evidence is incomplete")
         if (
             not item.get("acceptance_id")
-            or not exact_argv
-            or item.get("argv") != exact_argv
+            or (
+                bool(exact_argv)
+                and item.get("argv") != exact_argv
+            )
+            or (
+                not exact_argv
+                and not provider_identity_valid
+            )
             or str(item.get("cwd") or "") != exact_cwd
             or not item.get("started_at")
             or not item.get("finished_at")
@@ -2444,16 +2623,27 @@ def _validate_evidence_manifest(
     reason_codes = evidence_manifest.get("reason_codes")
     failed_acceptance_ids = evidence_manifest.get("failed_acceptance_ids")
     required_acceptance_ids = evidence_manifest.get("required_acceptance_ids")
+    acceptance_evidence = evidence_manifest.get("acceptance_evidence")
     if (
         verdict not in {"PASS", "CHANGES_REQUIRED"}
         or not isinstance(reason_codes, list)
         or not isinstance(failed_acceptance_ids, list)
         or not isinstance(required_acceptance_ids, list)
+        or not isinstance(acceptance_evidence, list)
         or any(not isinstance(item, str) or not item for item in required_acceptance_ids)
         or any(not isinstance(item, str) or not item for item in failed_acceptance_ids)
+        or any(
+            not isinstance(item, dict)
+            or not item.get("acceptance_id")
+            or not item.get("evidence_ref")
+            or item.get("stage") not in {"candidate", "verified"}
+            for item in acceptance_evidence
+        )
     ):
         raise DomainError("EvidenceManifest canonical verdict fields are invalid")
-    gate_acceptance_ids = {item["acceptance_id"] for item in commands}
+    gate_acceptance_ids = {
+        str(item["acceptance_id"]) for item in acceptance_evidence
+    }
     if not set(required_acceptance_ids).issubset(gate_acceptance_ids):
         if verdict == "PASS":
             raise DomainError("EvidenceManifest required acceptance id is missing")

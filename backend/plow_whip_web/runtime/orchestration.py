@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 from plow_whip_web.domain.model import DomainError
-from plow_whip_web.runtime.butler import route_goal
+from plow_whip_web.runtime.butler import requires_declared_artifact, route_goal
 from plow_whip_web.runtime.execution_policy import ExecutionRoute
 from plow_whip_web.runtime.sizing import TaskSizingInputs, estimate_task_sizing
 
@@ -55,9 +55,22 @@ def plan_goal_work_items(
     structured_items: list[dict[str, Any]] | None = None,
     execution_policy: dict[str, Any] | None = None,
     role_providers: dict[str, str] | None = None,
+    goal_artifacts: list[str] | None = None,
+    goal_acceptance: list[str] | None = None,
     model_invoked: bool = False,
 ) -> GoalPlan:
     """Build a bounded semantic role DAG; completion still uses task-local Gates."""
+    if (
+        goal_artifacts is not None
+        and requires_declared_artifact({
+            "objective": objective,
+            "acceptance": goal_acceptance or [],
+        })
+        and not goal_artifacts
+    ):
+        raise DomainError(
+            "Goal acceptance requires a file deliverable but declares no artifact"
+        )
     gate_inputs = replace(sizing_inputs, independent_review_required=False)
     preview = estimate_task_sizing(gate_inputs)
     if preview["status"] == "needs_planning":
@@ -111,6 +124,18 @@ def plan_goal_work_items(
         title=title,
         provider=(role_providers or {}).get("verification"),
     )
+    if structured_items is None and goal_artifacts:
+        implementation_ordinals = [
+            item.ordinal for item in items if item.kind == "implementation"
+        ]
+        if not implementation_ordinals:
+            raise DomainError("Goal artifacts require an implementation producer")
+        producer = max(implementation_ordinals)
+        items = [
+            replace(item, artifacts=tuple(goal_artifacts))
+            if item.ordinal == producer else item
+            for item in items
+        ]
     validated = validate_goal_plan(
         items,
         available_roles={
@@ -118,6 +143,7 @@ def plan_goal_work_items(
             "devops_sre", "verification", "web3",
         },
         sizing_preview=preview,
+        goal_artifacts=goal_artifacts,
     )
     return GoalPlan(
         status="planned",
@@ -134,6 +160,7 @@ def validate_goal_plan(
     *,
     available_roles: set[str],
     sizing_preview: dict[str, Any],
+    goal_artifacts: list[str] | None = None,
 ) -> dict[str, Any]:
     """Schema, capability, dependency, and verification checks. 0 Token."""
     if not items:
@@ -147,6 +174,10 @@ def validate_goal_plan(
         raise DomainError("goal plan ordinals must be contiguous from 1")
 
     seen: set[int] = set()
+    artifact_owners = (
+        {path: [] for path in goal_artifacts}
+        if goal_artifacts is not None else None
+    )
     for item in items:
         if item.role not in available_roles:
             raise DomainError(f"unknown or unavailable role capability: {item.role}")
@@ -156,12 +187,28 @@ def validate_goal_plan(
             raise DomainError("verification role and work item kind must match")
         if not item.title.strip() or not item.objective.strip():
             raise DomainError("work item title/objective required")
+        if item.kind == "verification" and item.artifacts:
+            raise DomainError("verification work item cannot produce artifacts")
+        for path in item.artifacts:
+            if artifact_owners is None:
+                continue
+            if path not in artifact_owners:
+                raise DomainError(
+                    f"work item declares undeclared Goal artifact: {path}"
+                )
+            artifact_owners[path].append(item.ordinal)
         for dep in item.depends_on_ordinals:
             if dep not in seen:
                 raise DomainError(f"work item {item.ordinal} depends on unseen ordinal {dep}")
             if dep >= item.ordinal:
                 raise DomainError("dependencies must refer to earlier ordinals")
         seen.add(item.ordinal)
+    if artifact_owners is not None:
+        for path, owners in artifact_owners.items():
+            if len(owners) != 1:
+                raise DomainError(
+                    f"Goal artifact must have exactly one implementation producer: {path}"
+                )
 
     return {
         "items": items,

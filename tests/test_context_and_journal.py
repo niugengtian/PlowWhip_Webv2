@@ -26,7 +26,7 @@ def test_context_compiler_layers_global_project_and_task_rules() -> None:
             idempotency_key="context-create",
         )
         app.state.conventions.put(
-            scope="global", scope_id="global", content="GLOBAL", expected_revision=0
+            scope="global", scope_id="global", content="GLOBAL", expected_revision=1
         )
         app.state.conventions.put(
             scope="project", scope_id=project_record["id"], content="PROJECT",

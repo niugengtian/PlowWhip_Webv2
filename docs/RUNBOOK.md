@@ -1,5 +1,26 @@
 # Docker runbook
 
+## Mandatory pre-change ledger
+
+Before changing lifecycle, state-machine, Butler/Provider/session, retry/recovery,
+evidence/completion, Token accounting, migration, deployment, security, or a
+cross-layer primary UI flow:
+
+```bash
+.venv/bin/python scripts/engineering_ledger.py check
+.venv/bin/python scripts/engineering_ledger.py context --domains lifecycle,evidence
+```
+
+Read the generated compact
+[`ENGINEERING_MODEL_LEDGER.md`](ENGINEERING_MODEL_LEDGER.md), then only the selected
+records under [`engineering-ledger/`](engineering-ledger/). The structured directory
+is the only source of truth; the compact model view and
+[`ENGINEERING_REQUIREMENTS_AND_INCIDENT_LEDGER.md`](ENGINEERING_REQUIREMENTS_AND_INCIDENT_LEDGER.md)
+are generated and must not be edited directly. After a change, update the relevant
+source record, bump its entry revision plus `manifest.toml` ledger revision, run
+`render`, then `check`. A code edit or passing unit test alone does not close an
+incident.
+
 ## First start
 
 ```bash

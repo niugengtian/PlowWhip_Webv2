@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from pathlib import Path
 from typing import Any
 
 from plow_whip_web.domain.model import DomainError, RevisionConflictError
@@ -12,11 +13,48 @@ from plow_whip_web.store.database import Database
 
 CONVENTION_SCOPES = ("global", "project", "task", "task_role")
 _DEV_CONFIG_SOURCE = "rule_versions:development"
+DEFAULT_GLOBAL_CONVENTION_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "defaults"
+    / "global_convention.md"
+)
+
+
+def default_global_convention() -> str:
+    content = DEFAULT_GLOBAL_CONVENTION_PATH.read_text(encoding="utf-8").strip()
+    if not content:
+        raise RuntimeError("bundled global Convention is empty")
+    return content
 
 
 class ConventionRepository:
     def __init__(self, database: Database) -> None:
         self.database = database
+
+    def seed_global_if_absent(self) -> dict[str, Any]:
+        """Bootstrap a fresh install without overwriting an existing Convention."""
+        with self.database.transaction(immediate=True) as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM conventions
+                WHERE scope = 'global' AND scope_id = 'global'
+                """
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    """
+                    INSERT INTO conventions(id, scope, scope_id, content, revision)
+                    VALUES (?, 'global', 'global', ?, 1)
+                    """,
+                    (
+                        str(uuid.uuid5(
+                            uuid.NAMESPACE_URL,
+                            "plow-whip-web:global-convention",
+                        )),
+                        default_global_convention(),
+                    ),
+                )
+        return self.get(scope="global", scope_id="global")
 
     def put(self, *, scope: str, scope_id: str, content: str, expected_revision: int) -> dict[str, Any]:
         self._validate_scope(scope, scope_id)

@@ -5,11 +5,17 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from fastapi.testclient import TestClient
+import pytest
 
 from plow_whip_web.api.app import create_app
 from plow_whip_web.config import Settings
+from plow_whip_web.domain.model import DomainError
 from plow_whip_web.providers.generic_command import ExecutionResult
-from plow_whip_web.runtime.butler import _parse_model_proposal, explicit_provider
+from plow_whip_web.runtime.butler import (
+    _parse_model_proposal,
+    explicit_provider,
+    validate_planner_proposal,
+)
 
 
 class PlannerBridge:
@@ -102,6 +108,126 @@ def test_planner_extracts_goal_spec_from_real_codex_jsonl_shape() -> None:
         json.dumps({"type": "turn.completed", "usage": {"input_tokens": 10}}),
     ])
     assert _parse_model_proposal(output) == proposal
+
+
+def test_butler_auto_declares_one_report_artifact_and_keeps_verification_read_only() -> None:
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        app = create_app(Settings(data_dir=root / "runtime"))
+        templates = app.state.role_instance_repository.list_templates()
+        rules = app.state.role_instance_repository.list_rules()
+        template_refs = {
+            item["capability"]: f"{item['template_id']}@{item['revision']}"
+            for item in templates
+        }
+        sizing = {
+            "layers_touched": 1,
+            "components_touched": 2,
+            "estimated_files_changed": 1,
+            "has_migration": False,
+            "has_deploy": False,
+            "verification_commands_count": 2,
+            "estimated_verification_seconds": 60,
+            "external_dependencies_count": 0,
+            "risk_level": "low",
+            "independent_review_required": True,
+            "gate_artifact": True,
+            "gate_boundary": True,
+            "gate_verification": True,
+            "gate_dependency": True,
+        }
+        proposal = {
+            "goal_spec": {
+                "title": "只读审查",
+                "objective": "审查当前项目并出具结构化审核报告",
+                "boundaries": ["不修改源代码"],
+                "acceptance": ["交付一份有代码证据的审核报告"],
+                "sizing_inputs": sizing,
+                "provider": "codex",
+                "role_providers": {
+                    "backend": "codex",
+                    "verification": "codex",
+                },
+                "role_templates": {
+                    role: template_refs[role]
+                    for role in ("backend", "verification")
+                },
+                "role_rules": {"backend": [], "verification": []},
+                "plan_items": [
+                    {
+                        "ordinal": 1,
+                        "role": "backend",
+                        "kind": "implementation",
+                        "title": "形成报告",
+                        "objective": "只读审查并写入声明的报告产物",
+                        "depends_on_ordinals": [],
+                        "acceptance": [],
+                        "artifacts": [],
+                        "provider": "codex",
+                    },
+                    {
+                        "ordinal": 2,
+                        "role": "verification",
+                        "kind": "verification",
+                        "title": "独立核验",
+                        "objective": "只读核验上游报告",
+                        "depends_on_ordinals": [1],
+                        "acceptance": [],
+                        "artifacts": [],
+                        "provider": "codex",
+                    },
+                ],
+            }
+        }
+        app.state.provider_pool.require_ready = lambda _provider: {}
+
+        validated = validate_planner_proposal(
+            proposal,
+            provider_pool=app.state.provider_pool,
+            templates=templates,
+            rules=rules,
+            required_worker_provider="codex",
+        )
+        generated_path = validated["artifacts"][0]
+        assert generated_path.startswith("reports/engineering-audit-")
+        assert generated_path.endswith(".md")
+        assert validated["plan_items"][0]["artifacts"] == [generated_path]
+        assert validated["plan_items"][1]["artifacts"] == []
+        repeated = validate_planner_proposal(
+            proposal,
+            provider_pool=app.state.provider_pool,
+            templates=templates,
+            rules=rules,
+            required_worker_provider="codex",
+        )
+        assert repeated["artifacts"] == [generated_path]
+
+        goal_spec = proposal["goal_spec"]
+        goal_spec["artifacts"] = ["reports/engineering-audit.md"]
+        goal_spec["plan_items"][0]["artifacts"] = [
+            "reports/engineering-audit.md"
+        ]
+        validated = validate_planner_proposal(
+            proposal,
+            provider_pool=app.state.provider_pool,
+            templates=templates,
+            rules=rules,
+            required_worker_provider="codex",
+        )
+        assert validated["artifacts"] == ["reports/engineering-audit.md"]
+
+        goal_spec["plan_items"][0]["artifacts"] = []
+        goal_spec["plan_items"][1]["artifacts"] = [
+            "reports/engineering-audit.md"
+        ]
+        with pytest.raises(DomainError, match="read-only"):
+            validate_planner_proposal(
+                proposal,
+                provider_pool=app.state.provider_pool,
+                templates=templates,
+                rules=rules,
+                required_worker_provider="codex",
+            )
 
 
 def test_natural_language_planner_creates_reviewable_three_task_codex_dag() -> None:

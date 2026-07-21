@@ -132,23 +132,53 @@ def _parse_evidence(raw: Any) -> dict[str, Any]:
 
 def _progress_evidence(snapshot: dict[str, Any]) -> dict[str, Any]:
     supplied = snapshot.get("progress_evidence")
+    structured: dict[str, Any] = {}
     if isinstance(supplied, dict) and supplied.get("available") is not False:
-        fingerprint = supplied.get("fingerprint")
-        if fingerprint:
-            return {**supplied, "fingerprint": str(fingerprint)}
+        supplied_without_fingerprint = {
+            key: value
+            for key, value in supplied.items()
+            if key != "fingerprint"
+        }
+        if (
+            supplied.get("kind") != "workspace"
+            or int(supplied.get("changed_files") or 0) > 0
+        ):
+            structured["supplied"] = supplied_without_fingerprint
+    output_segments = []
+    for segment in snapshot.get("output_segments") or []:
+        if not isinstance(segment, dict):
+            continue
+        ref = str(segment.get("ref") or "")
+        sha256 = str(segment.get("sha256") or "")
+        byte_count = int(segment.get("bytes") or 0)
+        if not ref or not sha256 or byte_count <= 0:
+            continue
+        output_segments.append({
+            "stream": str(segment.get("stream") or ""),
+            "ref": ref,
+            "sha256": sha256,
+            "bytes": byte_count,
+        })
+    if output_segments:
+        structured["provider_output_segments"] = sorted(
+            output_segments,
+            key=lambda item: (item["stream"], item["ref"]),
+        )
     payload = {
         "workspace_revision": snapshot.get("workspace_revision"),
         "artifact_hashes": snapshot.get("artifact_hashes"),
         "verified_acceptance_ids": snapshot.get("verified_acceptance_ids"),
         "checkpoint_ref": snapshot.get("checkpoint_ref"),
     }
-    if not any(value for value in payload.values()):
+    if any(value for value in payload.values()):
+        structured["explicit"] = payload
+    if not structured:
         return {}
     canonical = json.dumps(
-        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        structured, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     )
     return {
         "kind": "structured",
         "fingerprint": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
-        **payload,
+        **structured,
     }

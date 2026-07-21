@@ -72,6 +72,9 @@ py scripts\release_local.py deploy --expected-sha $sha
 
 浏览器打开 `http://127.0.0.1:8742`。
 
+- 仓库和镜像**不携带任何预生成 SQLite 数据库或用户数据**。空数据卷首次启动时会从 Git 跟踪的 `backend/plow_whip_web/store/migrations/*.sql` 自动创建 schema，再幂等写入默认 Provider、全局/项目管家身份、规则库、角色模板和 `backend/plow_whip_web/defaults/global_convention.md`。已有数据库和用户修改的 Convention 不会被默认模板覆盖。
+- 迁移 SQL、默认规则/角色模板源码和默认全局 Convention 都属于发布物；Python wheel 通过 `pyproject.toml` 的 package data 携带 SQL 与 Markdown。密钥、项目、任务、对话、Token 账本和运行证据只保存在本机数据卷，不进入 GitHub。
+- 可移植性由 `tests/test_fresh_install_bootstrap.py` 验证：全新临时目录必须自动得到完整迁移链、Provider catalog、全局管家、规则/模板和 global Convention，重启后必须保留用户修改。
 - `.env.local` 是本机私密配置，已被 Git 忽略；仓库只提交不含密钥的 `.env.local.example`。不要在聊天、SQLite、Compose 文件或日志中粘贴真实 Key。
 - `plow-whip-web-v2-data`：SQLite、WAL、日志、上下文归档和备份。
 - `plow-whip-web-v2-projects`：受管项目工作区，对应容器内 `/projects`。

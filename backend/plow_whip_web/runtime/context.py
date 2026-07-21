@@ -74,6 +74,23 @@ class ContextCompiler:
                 False,
             ),
         ]
+        if task.work_item_kind == "verification":
+            verdict_contract = (
+                "## Mandatory verification verdict\n"
+                "Perform independent read-only verification of every acceptance item. "
+                "Your final non-empty output line MUST be exactly one JSON object: "
+                '{"verdict":"PASS"} or '
+                '{"verdict":"CHANGES_REQUIRED","reason_codes":["..."],'
+                '"failed_acceptance_ids":["..."]}. '
+                "Never report PASS when any acceptance item lacks evidence."
+            )
+            sections.append((
+                verdict_contract,
+                7,
+                len(verdict_contract.encode("utf-8")),
+                "verification_verdict_contract",
+                True,
+            ))
         injected: list[dict[str, Any]] = [
             {
                 "kind": "task_spec",
@@ -88,6 +105,13 @@ class ContextCompiler:
                 "mandatory": False,
             },
         ]
+        if task.work_item_kind == "verification":
+            injected.append({
+                "kind": "verification_verdict_contract",
+                "source": "task.work_item_kind",
+                "protected": True,
+                "mandatory": True,
+            })
         # Prefer the RoleInstance snapshot ruleset when present; do not scan the
         # whole RuleLibrary. Fall back to bundled baseline only without an instance.
         snapshot_rules = list((role_instance or {}).get("ruleset") or [])
@@ -337,6 +361,18 @@ class ContextCompiler:
                 f"Task id: {task.id}\n"
                 f"Worker id: {task.worker_id or 'pending'}\n"
                 f"TaskSpec revision: {task.spec_revision}"
+            ),
+            (
+                "## Worker orchestration boundary\n"
+                "Execute only this TaskSpec in the assigned role. Do not create, "
+                "spawn, delegate to, or wait for other agents or roles. Upstream and "
+                "downstream Task dependencies, including independent verification, "
+                "are owned by the PlowWhip control plane. Finish your local objective "
+                "and return its evidence; do not attempt to complete another Task. "
+                "The compiled TaskSpec, RoleInstance rules, checkpoint, and handoff "
+                "are the complete execution context. Do not load personal memory, "
+                "old chats, external skills, or unrelated conventions unless this "
+                "TaskSpec or its RoleInstance explicitly names them."
             ),
             "## Completion rule\nOnly verification evidence can move this task to completed.",
         ]

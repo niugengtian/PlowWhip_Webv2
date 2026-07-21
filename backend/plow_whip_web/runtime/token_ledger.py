@@ -85,13 +85,17 @@ class TokenLedger:
                 execution.get("rotation_reason"),
             ),
         )
-        if add_to_task and task is not None and inserted.rowcount:
+        if add_to_task and task is not None:
             connection.execute(
                 """
-                UPDATE tasks SET tokens_used = tokens_used + ?,
+                UPDATE tasks SET tokens_used = (
+                    SELECT COALESCE(SUM(input_tokens + output_tokens), 0)
+                    FROM token_usage
+                    WHERE task_id = ?
+                ),
                     updated_at = CURRENT_TIMESTAMP WHERE id = ?
                 """,
-                (input_tokens + output_tokens, task.id),
+                (task.id, task.id),
             )
         return bool(inserted.rowcount)
 

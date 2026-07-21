@@ -21,6 +21,7 @@ class FaultPolicy:
         r"^\s*(?:error:\s*)?tls handshake(?:\b.*)?$",
         r"^\s*(?:error:\s*)?websocket eof(?:\b.*)?$",
         r"^\s*(?:error:\s*)?bridge temporary unavailable(?:\b.*)?$",
+        r"^\s*retriableerror:\s*connection stalled\s*$",
     )
 
     _NO_PROGRESS_MARKERS = (

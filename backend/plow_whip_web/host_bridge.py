@@ -842,8 +842,8 @@ def verify(payload: dict[str, Any], roots: tuple[Path, ...]) -> dict[str, object
         raise ValueError("verification must contain 1-32 checks")
     execution = ExecutionResult(
         returncode=int(execution_payload.get("returncode", 1)),
-        stdout="",
-        stderr="",
+        stdout=str(execution_payload.get("stdout") or ""),
+        stderr=str(execution_payload.get("stderr") or ""),
         duration_ms=int(execution_payload.get("duration_ms", 0)),
         failure_class=execution_payload.get("failure_class"),
         input_tokens=int(execution_payload.get("input_tokens", 0)),
@@ -851,7 +851,20 @@ def verify(payload: dict[str, Any], roots: tuple[Path, ...]) -> dict[str, object
         output_tokens=int(execution_payload.get("output_tokens", 0)),
         external_session_id=execution_payload.get("external_session_id"),
     )
-    result = VerificationEngine().verify(project_path, execution, specs)
+    acceptance = payload.get("acceptance", [])
+    if not isinstance(acceptance, list) or any(
+        not isinstance(item, str) for item in acceptance
+    ):
+        raise ValueError("acceptance must be a string list")
+    result = VerificationEngine().verify(
+        project_path,
+        execution,
+        specs,
+        acceptance=acceptance,
+        require_structured_verdict=bool(
+            payload.get("require_structured_verdict", False)
+        ),
+    )
     return {
         "passed": result.passed,
         "verdict": result.verdict,
@@ -1031,9 +1044,13 @@ def _execution_argv(
 ) -> list[str]:
     if adapter == "codex":
         if session_id:
-            return [executable, "exec", "resume", "--json", session_id, "-"]
+            return [
+                executable, "exec", "resume", "--json",
+                "--disable", "multi_agent", session_id, "-",
+            ]
         return [
             executable, "exec", "--json", "--sandbox", "workspace-write",
+            "--disable", "multi_agent",
             "-c", 'approval_policy="never"', "-C", str(project), "-",
         ]
     if adapter == "cursor":
@@ -1071,10 +1088,19 @@ def _parse_stream(output: str) -> dict[str, object]:
         except json.JSONDecodeError:
             continue
         session_id = session_id or _find_string(event, {"thread_id", "threadId", "session_id", "sessionId", "chat_id", "chatId"})
-        input_tokens = max(input_tokens, _find_int(event, {"input_tokens", "inputTokens"}))
+        event_input_tokens = _find_int(event, {"input_tokens", "inputTokens"})
+        cursor_cache_read_tokens = _find_int(event, {"cacheReadTokens"})
+        input_tokens = max(
+            input_tokens,
+            event_input_tokens + cursor_cache_read_tokens,
+        )
         cached_input_tokens = max(
             cached_input_tokens,
-            _find_int(event, {"cached_input_tokens", "cachedInputTokens", "cached_tokens"}),
+            cursor_cache_read_tokens,
+            _find_int(
+                event,
+                {"cached_input_tokens", "cachedInputTokens", "cached_tokens"},
+            ),
         )
         output_tokens = max(output_tokens, _find_int(event, {"output_tokens", "outputTokens"}))
     return {

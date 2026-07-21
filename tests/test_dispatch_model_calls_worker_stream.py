@@ -80,9 +80,15 @@ class BridgeFixture:
     def verify(
         self, *, project_path: str, execution: ExecutionResult,
         verification: list[dict[str, object]],
+        acceptance: list[str] | None = None,
+        require_structured_verdict: bool = False,
     ):
         return VerificationEngine().verify(
-            Path(project_path), execution, verification
+            Path(project_path),
+            execution,
+            verification,
+            acceptance=acceptance,
+            require_structured_verdict=require_structured_verdict,
         )
 
     result = staticmethod(HostBridgeClient.result)

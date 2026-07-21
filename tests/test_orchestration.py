@@ -12,7 +12,7 @@ import pytest
 
 from plow_whip_web.api.app import create_app
 from plow_whip_web.config import Settings
-from plow_whip_web.domain.model import ProviderUnavailableError
+from plow_whip_web.domain.model import DomainError, ProviderUnavailableError
 from plow_whip_web.runtime.orchestration import plan_goal_work_items
 from plow_whip_web.runtime.sizing import TaskSizingInputs
 from plow_whip_web.store.database import Database
@@ -73,6 +73,17 @@ def test_butler_routing_is_deterministic_and_bounded() -> None:
     assert first.items[2].depends_on_ordinals == ()
     assert first.items[3].depends_on_ordinals == (2,)
     assert first.items[4].depends_on_ordinals == (1, 2, 3, 4)
+
+
+def test_goal_route_rejects_report_acceptance_without_artifact() -> None:
+    with pytest.raises(DomainError, match="declares no artifact"):
+        plan_goal_work_items(
+            title="全面审查",
+            objective="只读审查并出具结构化审核报告",
+            sizing_inputs=_sizing(),
+            goal_artifacts=[],
+            goal_acceptance=["交付一份有代码证据的审核报告"],
+        )
 
 
 def test_fresh_and_idempotent_migration_adds_goals() -> None:
@@ -177,7 +188,7 @@ def test_goal_to_auto_advance_e2e_with_real_http() -> None:
             assert all(item["execution_policy"] is not None for item in children)
             assert children[0]["sizing"]["status"] == "estimated"
             assert children[0]["spec"]["acceptance"] == [
-                "manifest_bound_completion"
+                "完成当前工作项，并提供可由后续独立验证任务复核的候选证据"
             ]
             assert children[0]["spec"]["artifacts"] == [
                 "release-evidence.json"

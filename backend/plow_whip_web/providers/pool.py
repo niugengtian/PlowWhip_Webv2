@@ -316,6 +316,10 @@ class ProviderPool:
             project_path=worker["host_path"],
             execution=execution,
             verification=task.verification,
+            acceptance=list(task.spec.get("acceptance") or []),
+            require_structured_verdict=(
+                task.work_item_kind == "verification"
+            ),
         )
 
     def inspect_artifacts(

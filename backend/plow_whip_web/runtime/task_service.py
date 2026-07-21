@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from plow_whip_web.domain.model import (
+    DomainError,
     EvidenceBaselineMissingError,
     HostBridgeRejectedError,
     InvalidTransitionError,
@@ -28,7 +29,10 @@ from plow_whip_web.runtime.fault_policy import FaultPolicy
 from plow_whip_web.runtime.journal import SessionJournal
 from plow_whip_web.runtime.verification import VerificationEngine, VerificationResult
 from plow_whip_web.security import CommandPolicy
-from plow_whip_web.store.host_job_repository import HostJobRepository
+from plow_whip_web.store.host_job_repository import (
+    HostJobRepository,
+    TaskHardDeadlineExceeded,
+)
 from plow_whip_web.store.project_repository import ProjectRepository
 from plow_whip_web.store.task_repository import TaskRepository
 from plow_whip_web.store.settings_repository import SettingsRepository
@@ -141,12 +145,28 @@ class TaskService:
                 )
                 if self.settings else {"values": {}, "sources": {}}
             )
-            job = self.host_jobs.prepare(
-                task_id=task_id, attempt_id=claim.attempt_id,
-                run_id=claim.run_id, provider=claim.task.provider,
-                effective_limits=effective["values"],
-                limit_sources=effective["sources"],
-            )
+            try:
+                job = self.host_jobs.prepare(
+                    task_id=task_id, attempt_id=claim.attempt_id,
+                    run_id=claim.run_id, provider=claim.task.provider,
+                    effective_limits=effective["values"],
+                    limit_sources=effective["sources"],
+                )
+            except TaskHardDeadlineExceeded as error:
+                if call:
+                    self.model_calls.settle(
+                        call["call_id"],
+                        failed=True,
+                        error_class="task_hard_deadline_exhausted",
+                    )
+                return self.repository.finalize_pre_dispatch_fault(
+                    task_id,
+                    attempt_id=claim.attempt_id,
+                    run_id=claim.run_id,
+                    failure_class="task_hard_deadline_exhausted",
+                    reason=str(error),
+                    idempotency_key=f"{idempotency_key}:hard-deadline",
+                )
             try:
                 snapshot = self.provider_pool.start_task_job(
                     claim.task, job_id=job["job_id"], prompt=prompt
@@ -409,6 +429,25 @@ class TaskService:
                                 action="resume",
                                 failure_class="evidence_baseline_missing",
                                 reason="evidence_baseline_missing_requires_fresh_run",
+                                episode=checkpoint,
+                            )
+                        except DomainError as error:
+                            checkpoint = self.host_jobs.terminate_episode(
+                                job_id,
+                                reason="evidence_contract_invalid",
+                                snapshot={
+                                    **snapshot,
+                                    "failure_class": "evidence_contract_invalid",
+                                    "error_summary": str(error),
+                                },
+                            )
+                            result = self._finalize_host_fault(
+                                task,
+                                job,
+                                snapshot,
+                                action="needs_human",
+                                failure_class="evidence_contract_invalid",
+                                reason=str(error),
                                 episode=checkpoint,
                             )
                     else:
@@ -924,6 +963,16 @@ class TaskService:
         execution: ExecutionResult, *, idempotency_prefix: str,
         verification: VerificationResult | None = None,
     ) -> TaskRecord:
+        execution_payload = execution.as_dict()
+        if self.token_ledger:
+            self.token_ledger.record(
+                execution_payload,
+                call_id=run_id,
+                task=task,
+                provider=task.provider,
+                run_id=run_id,
+                add_to_task=True,
+            )
         project_path = Path(task.project_path).resolve()
         verifying = self.repository.mark_verifying(
             task.id, expected_revision=task.revision,
@@ -991,7 +1040,6 @@ class TaskService:
             idempotency_key=f"{idempotency_prefix}:finish",
             max_same_failure=limits.get("max_same_failure", 3),
         )
-        execution_payload = execution.as_dict()
         if self.journal:
             self.journal.append(completed.worker_id, {
                 "event": "task.finished", "task_id": task.id,

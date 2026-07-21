@@ -176,8 +176,15 @@ class VerificationEngine:
             reason_codes.append("GATE_FAILED")
 
         structured_verdict = _structured_verdict(execution.stdout)
+        authoritative_text = authoritative_assistant_text(execution.stdout)
         text_requires_changes = bool(
-            re.search(r"\bCHANGES_REQUIRED\b", execution.stdout, re.IGNORECASE)
+            require_structured_verdict
+            and structured_verdict != "PASS"
+            and re.search(
+                r"\bCHANGES_REQUIRED\b",
+                authoritative_text,
+                re.IGNORECASE,
+            )
         )
         if text_requires_changes:
             reason_codes.append("MODEL_TEXT_CHANGES_REQUIRED")
@@ -230,30 +237,113 @@ def _acceptance_ids(acceptance: list[str]) -> list[str]:
 
 
 def _structured_verdict(output: str) -> str | None:
-    """Read an explicit verdict only; prose never upgrades a result to PASS."""
-    candidates = [output.strip(), *(line.strip() for line in reversed(output.splitlines()))]
-    for candidate in candidates:
-        if not candidate:
+    """Read only the terminal JSON verdict from the last assistant message."""
+    value = _terminal_json_value(authoritative_assistant_text(output))
+    for _ in range(6):
+        if isinstance(value, str):
+            value = _terminal_json_value(value)
             continue
-        text = candidate.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        start, end = text.find("{"), text.rfind("}")
-        if start >= 0 and end >= start:
-            text = text[start:end + 1]
+        if not isinstance(value, dict):
+            break
+        verdict = value.get("verdict")
+        if verdict is not None:
+            normalized = str(verdict).strip().upper()
+            return (
+                normalized
+                if normalized in {"PASS", "CHANGES_REQUIRED"}
+                else "INVALID"
+            )
+        value = next(
+            (
+                value[key]
+                for key in (
+                    "result",
+                    "verification",
+                    "output",
+                    "content",
+                    "message",
+                )
+                if key in value
+            ),
+            None,
+        )
+    return None
+
+
+def authoritative_assistant_text(output: str) -> str:
+    assistant_messages: list[str] = []
+    result_messages: list[str] = []
+    for line in output.splitlines():
         try:
-            value: Any = json.loads(text)
+            event = json.loads(line.strip())
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        event_type = str(event.get("type") or "")
+        message: Any = None
+        if event_type == "assistant":
+            message = event.get("message")
+        elif event_type == "agent_message":
+            message = event
+        elif event_type == "item.completed":
+            item = event.get("item")
+            if isinstance(item, dict) and item.get("type") == "agent_message":
+                message = item
+        if message is not None:
+            text = _message_text(message)
+            if text:
+                assistant_messages.append(text)
+        elif event_type == "result":
+            text = _message_text(event.get("result"))
+            if text:
+                result_messages.append(text)
+    if assistant_messages:
+        return assistant_messages[-1]
+    if result_messages:
+        return result_messages[-1]
+    return output.strip()
+
+
+def _message_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        return "\n".join(
+            text for item in value if (text := _message_text(item))
+        ).strip()
+    if not isinstance(value, dict):
+        return ""
+    for key in ("text", "output_text"):
+        text = value.get(key)
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+    for key in ("content", "message"):
+        text = _message_text(value.get(key))
+        if text:
+            return text
+    return ""
+
+
+def _terminal_json_value(text: str) -> Any:
+    candidate = (
+        text.strip()
+        .removeprefix("```json")
+        .removeprefix("```")
+        .removesuffix("```")
+        .strip()
+    )
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        pass
+    for start in reversed([
+        index for index, character in enumerate(candidate) if character == "{"
+    ]):
+        try:
+            return json.loads(candidate[start:])
         except json.JSONDecodeError:
             continue
-        for _ in range(4):
-            if not isinstance(value, dict):
-                break
-            verdict = value.get("verdict")
-            if verdict is not None:
-                normalized = str(verdict).strip().upper()
-                return normalized if normalized in {"PASS", "CHANGES_REQUIRED"} else "INVALID"
-            value = next(
-                (value[key] for key in ("result", "verification", "output") if key in value),
-                None,
-            )
     return None
 
 

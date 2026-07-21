@@ -149,6 +149,18 @@ export function ProjectButlerDialog({
       await operation()
     } catch (reason) {
       setError(messageOf(reason))
+      if (!globalScope && projectId) {
+        try {
+          const latest = await api.projectButlerConversations(projectId)
+          setConversations(latest)
+          if (latest[0]) {
+            newConversationMode.current = false
+            setConversation(latest[0])
+          }
+        } catch {
+          // Preserve the original request error when state refresh also fails.
+        }
+      }
     } finally {
       operationInFlight.current = false
       setBusy(false)
@@ -194,6 +206,9 @@ export function ProjectButlerDialog({
         }}><Plus size={15} />新对话</button>
       </div>
       {error && <div className="butler-error">{error}</div>}
+      {busy && <div className="butler-planning-status" role="status">
+        项目管家正在分析并生成可确认方案。结果会持久化，请勿重复发送。
+      </div>}
       <div className="butler-layout">
         <nav className="butler-history" aria-label={`${globalScope ? '全局' : '项目'}管家历史会话`}>
           <span className="kicker">历史会话</span>
@@ -316,6 +331,10 @@ function ProposalCard({
       <ProposalFact label="目标" value={String(conversation.spec.objective ?? '')} />
       <ProposalFact label="边界" value={listValue(conversation.spec.boundaries)} />
       <ProposalFact label="验收标准" value={listValue(conversation.spec.acceptance)} />
+      <ProposalFact
+        label="交付产物（管家自动规划）"
+        value={listValue(conversation.spec.artifacts)}
+      />
     </dl>
     <p>置信度基于仍未解决、会改变方案的语义缺口，不是字段非空或固定三问。请核对内容；确认后才会拆分和唤醒 Worker。</p>
     <div className="butler-proposal-actions">

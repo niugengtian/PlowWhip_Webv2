@@ -14,6 +14,7 @@ from plow_whip_web.api.app import create_app
 from plow_whip_web.config import Settings
 from plow_whip_web.runtime.connectivity import ConnectivityResult, classify_connectivity, network_available
 from plow_whip_web.runtime.fault_policy import FaultPolicy
+from plow_whip_web.runtime.recovery import RecoveryService
 
 
 class FixedProbe:
@@ -175,6 +176,43 @@ def test_stale_running_task_and_worker_are_reconciled_once() -> None:
         assert second["recovered_tasks"] == []
         assert app.state.task_repository.get(task.id).status.value == "ready"
         assert app.state.project_repository.get(project["id"])["workers"][0]["status"] == "idle"
+
+
+def test_restart_marks_old_inflight_model_calls_unknown_once() -> None:
+    with TemporaryDirectory() as directory:
+        app = create_app(Settings(data_dir=Path(directory) / "runtime"))
+        call = app.state.model_calls.prepare(
+            idempotency_key="planner-before-restart",
+            call_kind="butler_planner",
+            provider="codex",
+        )
+        app.state.model_calls.dispatched(call["call_id"])
+        with app.state.database.transaction(immediate=True) as connection:
+            connection.execute(
+                """
+                UPDATE model_calls
+                SET updated_at = '2000-01-01 00:00:00'
+                WHERE call_id = ?
+                """,
+                (call["call_id"],),
+            )
+
+        restarted = RecoveryService(app.state.database)
+        first = restarted.reconcile()
+        second = restarted.reconcile()
+        with app.state.database.transaction() as connection:
+            recovered = connection.execute(
+                "SELECT status, error_class, raw_status FROM model_calls WHERE call_id = ?",
+                (call["call_id"],),
+            ).fetchone()
+
+        assert first["interrupted_model_calls"] == [call["call_id"]]
+        assert second["interrupted_model_calls"] == []
+        assert dict(recovered) == {
+            "status": "unknown",
+            "error_class": "control_plane_restarted",
+            "raw_status": "interrupted_by_control_plane_restart",
+        }
 
 
 def test_database_lock_becomes_safe_skip_not_recursive_retry() -> None:
