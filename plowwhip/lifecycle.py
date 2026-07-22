@@ -1,0 +1,151 @@
+from __future__ import annotations
+
+import sqlite3
+import time
+from uuid import uuid4
+
+from .execution import execute_task
+from .intake import canonical_json, normalize_instruction
+from .store import Store
+from .verification import verify_task
+
+
+class LeaseLost(RuntimeError):
+    pass
+
+
+def advance_project(store: Store, project_id: str, lease_token: str, fence: int) -> str:
+    """Perform exactly one lifecycle action. Cronner is the only caller with a lease."""
+    with store.transaction() as connection:
+        lease = connection.execute(
+            """
+            SELECT 1 FROM projects
+            WHERE id = ? AND lease_token = ? AND lease_fence = ? AND lease_until >= ?
+            """,
+            (project_id, lease_token, fence, time.time()),
+        ).fetchone()
+        if not lease:
+            raise LeaseLost(project_id)
+
+        task = connection.execute(
+            """
+            SELECT * FROM tasks
+            WHERE project_id = ? AND public_status IN ('pending', 'in_progress')
+              AND next_action_at <= ?
+            ORDER BY created_at LIMIT 1
+            """,
+            (project_id, time.time()),
+        ).fetchone()
+        if task:
+            if task["phase"] == "execute":
+                return execute_task(store, connection, task)
+            if task["phase"] == "verify":
+                return verify_task(store, connection, task)
+            return _stop_unknown_phase(connection, task)
+
+        blocking = connection.execute(
+            """
+            SELECT 1 FROM tasks
+            WHERE project_id = ? AND public_status = 'needs_decision' LIMIT 1
+            """,
+            (project_id,),
+        ).fetchone()
+        if blocking:
+            return "blocked"
+
+        message = connection.execute(
+            """
+            SELECT * FROM messages
+            WHERE project_id = ? AND processed_at IS NULL
+            ORDER BY created_at LIMIT 1
+            """,
+            (project_id,),
+        ).fetchone()
+        if not message:
+            return "idle"
+        return _create_task(connection, message)
+
+
+def _create_task(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
+    now = time.time()
+    goal_id = uuid4().hex
+    task_id = uuid4().hex
+    spec, acceptance = normalize_instruction(message["content"])
+    supported = spec["kind"] == "write_text"
+    public_status = "pending" if supported else "needs_decision"
+    phase = "execute" if supported else "intake"
+    reason = None if supported else "supported instruction is: write <relative-path>: <content>"
+    fault = None if supported else "scope"
+    outcome = None if supported else "needs_decision"
+
+    connection.execute(
+        """
+        INSERT INTO goals(
+            id, project_id, source_message_id, objective,
+            boundary_json, acceptance_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            goal_id,
+            message["project_id"],
+            message["id"],
+            message["content"],
+            canonical_json({"writes": "task artifact directory only"}),
+            canonical_json(acceptance),
+            now,
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO tasks(
+            id, project_id, goal_id, spec_json, acceptance_json, public_status,
+            phase, wait_reason, fault_code, next_action_at, outcome, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            task_id,
+            message["project_id"],
+            goal_id,
+            canonical_json(spec),
+            canonical_json(acceptance),
+            public_status,
+            phase,
+            reason,
+            fault,
+            now if supported else None,
+            outcome,
+            now,
+            now,
+        ),
+    )
+    connection.execute(
+        "UPDATE messages SET action_json = ?, processed_at = ? WHERE id = ?",
+        (canonical_json(spec), now, message["id"]),
+    )
+    connection.execute(
+        """
+        INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            message["project_id"],
+            task_id,
+            "task_created" if supported else "needs_decision",
+            canonical_json({"source_message_id": message["id"], "spec_revision": 1}),
+            now,
+        ),
+    )
+    return "intake"
+
+
+def _stop_unknown_phase(connection: sqlite3.Connection, task: sqlite3.Row) -> str:
+    now = time.time()
+    connection.execute(
+        """
+        UPDATE tasks SET public_status = 'needs_decision', wait_reason = ?,
+            fault_code = 'unsafe_unknown', next_action_at = NULL,
+            outcome = 'needs_decision', updated_at = ? WHERE id = ?
+        """,
+        (f"unknown lifecycle phase: {task['phase']}", now, task["id"]),
+    )
+    return "needs_decision"
