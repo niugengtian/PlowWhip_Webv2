@@ -1727,24 +1727,50 @@ class VerticalSliceTest(unittest.TestCase):
         spec, _ = normalize_instruction("探测 Provider codex_cli: minimal")
         self.assertEqual(spec["kind"], "authorization_required")
         requests = []
+        store = self.store
 
         class Bridge(BaseHTTPRequestHandler):
             def do_POST(self):
                 length = int(self.headers["Content-Length"])
                 payload = json.loads(self.rfile.read(length))
                 requests.append((self.path, self.headers["Authorization"], payload))
+                with store.transaction() as connection:
+                    updated = connection.execute(
+                        """
+                        UPDATE projects SET created_at = created_at + 0
+                        WHERE id = 'monitor-probe-codex_cli'
+                        """
+                    )
+                    if updated.rowcount != 1:
+                        raise RuntimeError("probe project was not durable before call")
                 if self.path == "/v1/probe":
                     body = {"available": True, "detail": "codex-cli test"}
-                else:
+                elif self.path == "/v1/jobs/start":
                     body = {
+                        "job_id": payload["job_id"],
+                        "status": "completed",
                         "returncode": 0,
-                        "stdout": "PLOWWHIP_PROBE_OK\n",
-                        "stderr": "",
                         "input_tokens": 30,
                         "cached_input_tokens": 10,
                         "output_tokens": 2,
                         "model": "codex-test",
+                        "session_id": "probe-session",
                     }
+                elif self.path == "/v1/jobs/output":
+                    body = {
+                        "job_id": payload["job_id"],
+                        "status": "completed",
+                        "chunks": [
+                            {
+                                "stream": "stdout",
+                                "text": "PLOWWHIP_PROBE_OK\n",
+                            }
+                        ],
+                    }
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
                 data = json.dumps(body).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -1825,7 +1851,10 @@ class VerticalSliceTest(unittest.TestCase):
             bridge.shutdown()
             bridge.server_close()
             thread.join()
-        self.assertEqual([item[0] for item in requests], ["/v1/probe", "/v1/execute"])
+        self.assertEqual(
+            [item[0] for item in requests],
+            ["/v1/probe", "/v1/jobs/start", "/v1/jobs/output"],
+        )
         self.assertTrue(all(item[1] == "Bearer test-token" for item in requests))
 
     def test_general_code_task_uses_registered_workspace_and_independent_checker(self):
@@ -2600,6 +2629,10 @@ class WebApiTest(unittest.TestCase):
             self.assertIn("任务泳道", html)
             self.assertEqual(html.count("data-task-lane="), 4)
             self.assertIn("HostJob / Session", html)
+            self.assertIn("本地会话分段", html)
+            self.assertIn('id="monitor-session-count"', html)
+            self.assertIn('id="monitor-job-count"', html)
+            self.assertIn('id="monitor-artifact-count"', html)
             self.assertIn("今日 Token", html)
             self.assertIn("项目 Goal", html)
             self.assertNotIn("event.target.value?openProject", html)

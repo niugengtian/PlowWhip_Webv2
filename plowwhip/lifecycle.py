@@ -8,10 +8,12 @@ from uuid import uuid4
 
 from .butler import sync_conversation_files
 from .execution import (
+    ProbeStep,
     ProviderStep,
     _context_policy,
     _fallback_provider_generation,
     _provider_output_streams,
+    apply_probe_step,
     apply_provider_step,
     archive_task_sessions,
     create_task_session,
@@ -20,7 +22,9 @@ from .execution import (
     effective_settings,
     ensure_task_sessions,
     execute_task,
+    pending_probe_step,
     pending_provider_step,
+    perform_probe_step,
     perform_provider_step,
     rotate_task_sessions,
 )
@@ -50,7 +54,7 @@ class LeaseLost(RuntimeError):
 
 def advance_project(store: Store, project_id: str, lease_token: str, fence: int) -> str:
     result = _advance_project_transaction(store, project_id, lease_token, fence)
-    if isinstance(result, (ProviderStep, CheckerStep, PlannerStep)):
+    if isinstance(result, (ProviderStep, ProbeStep, CheckerStep, PlannerStep)):
         with store.transaction() as connection:
             _assert_lease(connection, project_id, lease_token, fence)
             connection.execute(
@@ -62,7 +66,7 @@ def advance_project(store: Store, project_id: str, lease_token: str, fence: int)
                     time.time()
                     + (
                         result.timeout_seconds + 30
-                        if isinstance(result, (CheckerStep, PlannerStep))
+                        if isinstance(result, (CheckerStep, PlannerStep, ProbeStep))
                         else 90
                     ),
                     project_id,
@@ -70,7 +74,9 @@ def advance_project(store: Store, project_id: str, lease_token: str, fence: int)
                     fence,
                 ),
             )
-        if isinstance(result, CheckerStep):
+        if isinstance(result, ProbeStep):
+            facts = perform_probe_step(result)
+        elif isinstance(result, CheckerStep):
             facts = perform_checker_step(result)
         elif isinstance(result, PlannerStep):
             facts = perform_planner_step(result)
@@ -78,7 +84,9 @@ def advance_project(store: Store, project_id: str, lease_token: str, fence: int)
             facts = perform_provider_step(result)
         with store.transaction() as connection:
             _assert_lease(connection, project_id, lease_token, fence)
-            if isinstance(result, CheckerStep):
+            if isinstance(result, ProbeStep):
+                outcome = apply_probe_step(store, connection, result, facts)
+            elif isinstance(result, CheckerStep):
                 outcome = apply_checker_step(store, connection, result, facts)
             elif isinstance(result, PlannerStep):
                 outcome = _apply_planner_step(store, connection, result, facts)
@@ -109,7 +117,7 @@ def _assert_lease(
 
 def _advance_project_transaction(
     store: Store, project_id: str, lease_token: str, fence: int
-) -> str | ProviderStep | CheckerStep | PlannerStep:
+) -> str | ProviderStep | ProbeStep | CheckerStep | PlannerStep:
     """Perform exactly one lifecycle action. Cronner is the only caller with a lease."""
     with store.transaction() as connection:
         _assert_lease(connection, project_id, lease_token, fence)
@@ -168,9 +176,21 @@ def _advance_project_transaction(
                 "execute_snapshot",
                 "execute_dispatch",
                 "execute_wait",
-                "stopping",
             }:
                 return pending_provider_step(connection, task)
+            if task["phase"] in {
+                "probe_call",
+                "probe_dispatch",
+                "probe_wait",
+            }:
+                return pending_probe_step(connection, task)
+            if task["phase"] == "stopping":
+                spec = json.loads(task["spec_json"])
+                return (
+                    pending_probe_step(connection, task)
+                    if spec["kind"] == "provider_probe"
+                    else pending_provider_step(connection, task)
+                )
             if task["phase"] in {"check_call", "check_wait"}:
                 return pending_checker_step(store, connection, task)
             if task["phase"] in {"plan_call", "plan_wait"}:

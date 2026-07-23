@@ -71,6 +71,28 @@ polls the existing job instead of blindly replaying it. Explicitly read-only
 analysis Tasks use a read-only Host Bridge job and may finish from independent
 Evidence without a workspace delta.
 
+The repository includes the restricted host-side Bridge used by those calls.
+It binds only to `127.0.0.1`, accepts a fixed adapter set instead of arbitrary
+commands, restricts workspaces to explicit roots, persists job identity before
+starting a process, and returns bounded redacted output:
+
+```bash
+install -m 600 /dev/null /absolute/private/plowwhip-bridge.env
+# Edit that private file and add:
+# PLOW_WHIP_BRIDGE_TOKEN=replace-with-a-random-value-at-least-24-characters
+python3 -m plowwhip.host_bridge \
+  --port 8765 \
+  --env-file /absolute/private/plowwhip-bridge.env \
+  --state-dir /absolute/private/plowwhip-host-jobs \
+  --project-root /absolute/allowed-workspace
+```
+
+Use that exact command as a macOS `launchd` or Linux `systemd` service when a
+persistent host installation is approved. Service startup and `/v1/probe` do
+not invoke a model. Keep the environment file outside the repository; it may
+contain only the Bridge token and supported Provider variables and must remain
+mode `0600`. Job state never stores prompts, argv, or credentials.
+
 The global Butler accepts an optional Project ID or an `@project-id` prefix. An
 exact search such as `找 result.txt 任务` routes to a unique Project without
 creating a Task. Project conversation files are bounded projections; global
@@ -96,7 +118,10 @@ selection, one Butler question, scoped authorization and serial DAG
 materialization. Durable HostJob tests also prove that Executor, Planner and
 Checker waits release SQLite, different projects advance concurrently, all three
 model roles recover across restart and fall back by generation, and terminal
-jobs migrate to schema v5 without loss. The suite also covers deadline stopping,
+jobs migrate to schema v5 without loss. A real loopback HTTP test also runs the
+restricted Host Bridge against a local fake executable to prove authentication,
+root/executable guards, durable idempotent start, bounded output, cancellation,
+restart reconciliation, and zero-secret state. The suite also covers deadline stopping,
 compact/rotation, global routing, Project rules/templates, consistent SQLite
 backup, candidate isolation and the single-Cronner lock. The code-Task
 regressions use a fake Host Bridge and therefore spend no external Provider

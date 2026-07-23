@@ -16,7 +16,7 @@
 | 基线章节 | 状态 | 当前证据 | 明确缺口 |
 |---|---|---|---|
 | §1 使命 | 已实现 | 自然语言形成 Goal/Task；简单/中型直达执行，大型任务自动形成最小 Plan；模型任务可验证、修复、递补或一次提问 | — |
-| §2 部署边界 | 部分实现 | 单镜像内含 Web/API/UI/Cronner/Monitor；SQLite 持久卷；Host Bridge HTTP 适配；共享 data root 使用进程锁保证单一 Cronner | 未在本阶段安装 macOS/Linux 常驻 Host Bridge，也未做生产跨平台验收 |
+| §2 部署边界 | 部分实现 | 单镜像内含 Web/API/UI/Cronner/Monitor；SQLite 持久卷；当前仓库含标准库 Host Bridge，固定回环、Token、Project root、Adapter、持久 HostJob、真实退出码、有界输出/取消/重启恢复；共享 data root 使用进程锁保证单一 Cronner | 未在本阶段安装 macOS/Linux 常驻服务，也未做生产跨平台验收 |
 | §3 最终生命周期 | 已实现 | `Intake → Plan → Execute → Verify → Done/NeedsDecision`；执行、Planner、Checker 都使用可恢复 HostJob；compact 事件与 generation 轮转接入 | — |
 | §4 状态模型 | 已实现 | 四个公开状态、正交 phase/fault/outcome、取消归档与 rerun generation | — |
 | §5 唯一生命周期所有者 | 已实现 | Goal/Task 以及可见 Project 创建/恢复/绑定/归档和项目设置均先进入 messages；只有 `advance_project` 改变运行态；外部调用不占 SQLite 写事务；Monitor 只读 | — |
@@ -28,7 +28,7 @@
 | §11 验证与自动收敛 | 已实现 | 确定性哈希验证；Planner 可冻结 1–20 个细粒度 acceptance；独立 Checker 严格 JSON、逐项 Evidence、有界修复包；只读分析可凭 Evidence 在零 workspace delta 下完成 | — |
 | §12 故障/进展/恢复/超时 | 已实现 | fault 正交字段、有限 retry、稳定 job_id 对账、Provider 递补、deadline/stop_grace 优雅停止、Tick 后 handoff；不明结果不盲重放 | — |
 | §13 Cronner | 已实现 | 应用内唯一循环、项目租约、`next_action_at/kind`、deadline、每项目一步、跨项目有界并行、上下文 checkpoint/轮转；共享 data root 单 Cronner 进程锁 | — |
-| §14 Monitor | 已实现 | 只读连接、当前结构化状态、最后 20 行、数据库/Cronner/探针看板 | — |
+| §14 Monitor | 已实现 | 只读连接、当前结构化状态、最后 20 行、数据库/Cronner/探针看板；页面显示 TaskSession、HostJob、Artifact 计数 | — |
 | §15 三层记忆与 Token | 已实现 | Hot Capsule byte cap、Warm handoff 原子归档、Cold Session manifests 只追加；Codex 原生 compact 策略/事件和非原生 Provider Token 阈值 generation 轮转；Token 归一化看板 | — |
 | §16 SQLite 与队列 | 已实现 | WAL、十五类权威记录、messages/tasks 队列、授权/配置复用 messages，无第二队列 | — |
 | §17 文件目录 | 已实现 | project/task/role/generation、Cold segment、Artifact/Evidence/handoff/library，以及 global/project conversation 投影均在 data root；SQLite 仍是唯一状态真源 | — |
@@ -52,13 +52,13 @@
 | H-20260723-04 | 2026-07-23 | 主人 | 项目页支持新增、删除及必要基本操作 | 已被修订 | 见 H-20260723-06 |
 | H-20260723-05 | 2026-07-23 | 主人 | 持续同步台账，随时记录发现的问题和人的需求 | 已采纳 | 本文件；基线 Revision 5 §26 |
 | H-20260723-06 | 2026-07-23 | 主人 | 项目不叫删除，改为归档；归档后不在页面直观显示 | 已完成 | `projects.archived_at`；归档/恢复 API 与 UI；归档测试 |
-| H-20260723-07 | 2026-07-23 | 主人 | 复用旧系统已证明的 Provider 0 Token 探针和极小 Token 探针，并归入 Monitor 模块 | 已完成 | 8750 Task `50a80b36468644cca0da6c6d0911e9e6`：Codex CLI available、`model_invoked=false`、全部 Token 为 0、Evidence SHA `7c16ff4f93616b80c2c34ca85188fb1148010edbbd8ffebcd276538963f5084f`；极小 Token 路径仅用假 Bridge 自动测试，未产生付费调用 |
+| H-20260723-07 | 2026-07-23 | 主人 | 复用旧系统已证明的 Provider 0 Token 探针和极小 Token 探针，并归入 Monitor 模块 | 已完成 | 8750 Task `50a80b36468644cca0da6c6d0911e9e6`：Codex CLI available、`model_invoked=false`、全部 Token 为 0、Evidence SHA `7c16ff4f93616b80c2c34ca85188fb1148010edbbd8ffebcd276538963f5084f`；极小 Token 走先持久化 HostJob、释放 SQLite 后派发/对账的假 Bridge 测试，未产生付费调用 |
 | H-20260723-08 | 2026-07-23 | 主人 | Task 页参考原任务页补齐驱动与监视能力，并以真实任务验证能否无人值守完成 | 部分完成 | UI 与 0 Token Probe Task 已真实自动收敛；通用代码路径已用假 Bridge 覆盖持久 HostJob、对账、取消、fallback 和结构化 Checker，但尚未运行真实付费 Provider 任务 |
 | H-20260723-09 | 2026-07-23 | 主人 | 明确说明 `NeedsDecision` 在哪里、如何处理 | 已完成 | 项目页提供“处理待决定”入口；Task 页只在 `NeedsDecision` 启用主人决定/计划并显示 Fault、等待原因、示例与“取消 Task”；8750 实测 Task `be3b33ff8e224bd4899792a40edbb971` 输入和提交按钮可用 |
 | H-20260723-10 | 2026-07-23 | 主人 | Task 页参考原任务页时必须保留任务泳道 | 已完成 | 基线 Revision 4；8750 实测四条公开状态泳道：待决定项目 `0/0/1/0`、探针项目 `0/0/0/3`；卡片点击与详情联动 |
 | H-20260723-11 | 2026-07-23 | 主人 | Task 页必须参考原任务页整体重建，不接受只局部增加泳道的毛坯实现 | 已完成 | 8750：顶部指标、Goal 导航、四态泳道、统一 Goal/Task 详情、驱动/决定与运行证据同屏；`design-qa.md` passed |
 | H-20260723-12 | 2026-07-23 | 主人 | 所有页面适当沿用原版本 UI；项目范围选择项目后不得自动跳项目页 | 已完成 | 8750 逐页实测七个入口选择范围后 `beforeView == afterView`；显式“进入项目”按钮；基线 Revision 5 |
-| H-20260723-13 | 2026-07-23 | 主人 | 不得把阶段完成或少量 Task Done 冒充 V1 完成；继续自动推进全部冻结基线剩余项 | 进行中 | 本轮把覆盖矩阵从 7 已实现/15 部分/1 未实现推进到 20 已实现/3 部分/0 未实现；33 项自动化测试通过；生产切流、旧数据迁移和付费 Provider 真实任务仍按主人禁令未执行 |
+| H-20260723-13 | 2026-07-23 | 主人 | 不得把阶段完成或少量 Task Done 冒充 V1 完成；继续自动推进全部冻结基线剩余项 | 进行中 | 本轮把覆盖矩阵从 7 已实现/15 部分/1 未实现推进到 20 已实现/3 部分/0 未实现；35 项自动化测试通过；生产切流、旧数据迁移、常驻 Host Bridge 安装和付费 Provider 真实任务仍按主人禁令/授权边界未执行 |
 
 ## 发现的问题
 
@@ -94,3 +94,6 @@
 | I-20260723-28 | 2026-07-23 | 全局窗口要求手填项目且全局文件复制完整消息正文 | 不能按搜索结果路由；全局历史和项目历史重复内容 | 支持 `@project`、唯一项目和唯一搜索命中路由；搜索只写 `global_route` 引用不创建 Task；全局文件只含 message_id/project/time | 已解决 | `test_global_butler_routes_search_without_creating_a_task` |
 | I-20260723-29 | 2026-07-23 | 初版自动沉淀模板正文含 Task ID/Evidence 路径 | 临时 Task 身份会污染长期 Worker 模板 | 模板正文只保留稳定角色约束，revision 文件不可变；Task/Evidence 只留在审计事件，不进入模板 | 已解决 | `test_message_to_verified_done`；模板文件正文检查 |
 | I-20260723-30 | 2026-07-23 | 多镜像共享数据库时只有 Project 租约，没有实例级调度所有权 | 两个镜像可分别领取不同 Project，不满足任一时刻单一生产 Cronner | 同一 data root 使用标准库 `flock` 获得实例级调度锁；候选服务可显式 `--cronner-disabled` | 已解决 | `test_backup_candidate_isolation_and_single_scheduler_gate` |
+| I-20260723-31 | 2026-07-23 | 当前仓库原来只有 Host Bridge 客户端合同，没有可运行的宿主服务 | V1 不能独立创建、恢复、观察或取消真实 HostJob，只能依赖旧环境偶然存在的服务 | 只参考旧实现的最小已证明约束，使用标准库重写受限 Host Bridge；不复制旧服务、状态机或 UI | 已解决 | `test_restricted_durable_job_and_restart_recovery`、`test_scope_executable_loopback_and_cancel_guards` 运行真实 HTTP 和本地假进程，验证固定回环/Token/root/Adapter、先落盘、幂等、退出码、有界输出、取消和重启恢复 |
+| I-20260723-32 | 2026-07-23 | 极小 Token 探针原来在 `advance_project` 的 SQLite 写事务里同步调用一次性 `/v1/execute` | 探针期间阻塞所有写入，且进程结果没有持久 HostJob 所有权，重启可能重复付费调用 | 0 Token 和极小 Token 都先写 HostJob；外部调用在事务外执行；极小探针复用 jobs start/status/output/cancel 对账，只有明确终态才记录结果 | 已解决 | `test_provider_probe_tasks_record_zero_and_minimal_token_evidence` 在每次 Bridge 请求内另开 SQLite 写事务并成功；失去退出码按失败处理 |
+| I-20260723-33 | 2026-07-23 | Monitor API 已有 TaskSession/HostJob/Artifact，页面没有显示；Task API 已有本地 Session 文件，详情没有入口 | 主人只能看到汇总或数据库事实，不能在对应看板观察这些闭环证据 | 直接复用现有只读返回值增加四个小视图，无新 API、状态或服务 | 已解决 | Web 回归断言 Monitor 三项计数和 Task `task-session-files`；35 项回归通过 |

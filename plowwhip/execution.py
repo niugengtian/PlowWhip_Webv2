@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -12,6 +13,8 @@ from .intake import canonical_json
 from .provider import (
     ACTIVE_HOST_JOB_STATUSES,
     PROVIDERS,
+    PROBE_MARKER,
+    PROBE_TOKEN_CAP,
     cancel_provider_job,
     parse_context_events,
     provider_job_output,
@@ -36,6 +39,21 @@ class ProviderStep:
     session_id: str | None
     timeout_seconds: int
     access: str
+    context_policy: dict[str, object]
+
+
+@dataclass(frozen=True)
+class ProbeStep:
+    kind: str
+    project_id: str
+    task_id: str
+    job_id: str
+    provider_key: str
+    mode: str
+    project_path: str
+    prompt: str
+    session_id: str | None
+    timeout_seconds: int
     context_policy: dict[str, object]
 
 
@@ -304,13 +322,13 @@ def execute_task(
     connection: sqlite3.Connection,
     task: sqlite3.Row,
     purpose: str = "execute",
-) -> str | ProviderStep:
+) -> str | ProviderStep | ProbeStep:
     if purpose not in {"execute", "repair"}:
         raise ValueError("execution purpose must be execute or repair")
     started_at = time.time()
     spec = json.loads(task["spec_json"])
     if spec["kind"] == "provider_probe":
-        return _execute_provider_probe(store, connection, task, spec, purpose)
+        return _prepare_provider_probe(connection, task, spec, purpose)
     if spec["kind"] == "provider_task":
         return _prepare_provider_task(store, connection, task, spec, purpose)
     sequence = connection.execute(
@@ -1320,13 +1338,12 @@ def _context_policy(settings: dict) -> dict[str, object]:
     }
 
 
-def _execute_provider_probe(
-    store: Store,
+def _prepare_provider_probe(
     connection: sqlite3.Connection,
     task: sqlite3.Row,
     spec: dict,
     purpose: str,
-) -> str:
+) -> ProbeStep:
     started_at = time.time()
     sequence = connection.execute(
         "SELECT COALESCE(MAX(sequence), 0) + 1 AS value FROM host_jobs WHERE task_id = ?",
@@ -1335,12 +1352,381 @@ def _execute_provider_probe(
     task_session_id, session_generation = current_session(
         connection, task["id"], task["role_key"] or "provider_probe"
     )
+    generation = connection.execute(
+        """
+        SELECT provider_key, external_session_id FROM session_generations
+        WHERE task_session_id = ? AND generation = ?
+        """,
+        (task_session_id, session_generation),
+    ).fetchone()
+    session = connection.execute(
+        "SELECT settings_json FROM task_sessions WHERE id = ?",
+        (task_session_id,),
+    ).fetchone()
+    settings = json.loads(session["settings_json"])["values"]
+    job_id = uuid4().hex
+    project_path = (
+        os.environ.get("PLOW_WHIP_PROBE_PROJECT_PATH", "")
+        if spec["mode"] == "minimal"
+        else ""
+    )
+    prompt = (
+        f"Reply with exactly {PROBE_MARKER}. "
+        "Do not inspect or modify files. Do not call tools."
+        if spec["mode"] == "minimal"
+        else ""
+    )
+    dispatch = {
+        "mode": spec["mode"],
+        "project_path": project_path,
+        "prompt": prompt,
+        "access": "read",
+        "reconcile_failures": 0,
+    }
+    connection.execute(
+        """
+        INSERT INTO host_jobs(
+            id, task_id, task_session_id, session_generation,
+            spec_revision, sequence, purpose, status, started_at, dispatch_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'dispatching', ?, ?)
+        """,
+        (
+            job_id,
+            task["id"],
+            task_session_id,
+            session_generation,
+            task["spec_revision"],
+            sequence,
+            purpose,
+            started_at,
+            canonical_json(dispatch),
+        ),
+    )
+    phase = "probe_call" if spec["mode"] == "zero" else "probe_dispatch"
+    connection.execute(
+        """
+        UPDATE tasks SET public_status = 'in_progress', phase = ?,
+            wait_reason = NULL, fault_code = NULL, next_action_at = ?,
+            next_action_kind = ?, updated_at = ? WHERE id = ?
+        """,
+        (
+            phase,
+            started_at,
+            "probe" if spec["mode"] == "zero" else "probe_start",
+            started_at,
+            task["id"],
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
+        VALUES (?, ?, 'host_job_prepared', ?, ?)
+        """,
+        (
+            task["project_id"],
+            task["id"],
+            canonical_json(
+                {
+                    "host_job_id": job_id,
+                    "sequence": sequence,
+                    "purpose": purpose,
+                    "probe_mode": spec["mode"],
+                }
+            ),
+            started_at,
+        ),
+    )
+    return ProbeStep(
+        "zero" if spec["mode"] == "zero" else "start",
+        task["project_id"],
+        task["id"],
+        job_id,
+        generation["provider_key"],
+        spec["mode"],
+        project_path,
+        prompt,
+        generation["external_session_id"],
+        min(int(settings.get("max_runtime_seconds", 600)), 60),
+        _context_policy(settings)
+        | {"max_turns": 1, "tool_no_progress_limit": 1},
+    )
+
+
+def pending_probe_step(
+    connection: sqlite3.Connection, task: sqlite3.Row
+) -> ProbeStep:
+    job = connection.execute(
+        """
+        SELECT * FROM host_jobs
+        WHERE task_id = ? AND status IN ('dispatching', 'running', 'cancelling')
+        ORDER BY sequence DESC LIMIT 1
+        """,
+        (task["id"],),
+    ).fetchone()
+    if not job:
+        raise RuntimeError(f"Probe Task {task['id']} has no active HostJob")
+    generation = connection.execute(
+        """
+        SELECT provider_key, external_session_id FROM session_generations
+        WHERE task_session_id = ? AND generation = ?
+        """,
+        (job["task_session_id"], job["session_generation"]),
+    ).fetchone()
+    session = connection.execute(
+        "SELECT settings_json FROM task_sessions WHERE id = ?",
+        (job["task_session_id"],),
+    ).fetchone()
+    settings = json.loads(session["settings_json"])["values"]
+    dispatch = json.loads(job["dispatch_json"])
+    kind = {
+        "probe_call": "zero",
+        "probe_dispatch": "start",
+        "probe_wait": "poll",
+    }.get(task["phase"])
+    if task["phase"] == "stopping":
+        kind = "poll" if job["status"] == "cancelling" else "cancel"
+    if not kind:
+        raise RuntimeError(f"Probe Task {task['id']} has no pending action")
+    spec = json.loads(task["spec_json"])
+    return ProbeStep(
+        kind,
+        task["project_id"],
+        task["id"],
+        job["id"],
+        generation["provider_key"],
+        spec["mode"],
+        str(dispatch.get("project_path") or ""),
+        str(dispatch.get("prompt") or ""),
+        generation["external_session_id"],
+        min(int(settings.get("max_runtime_seconds", 600)), 60),
+        _context_policy(settings)
+        | {"max_turns": 1, "tool_no_progress_limit": 1},
+    )
+
+
+def perform_probe_step(step: ProbeStep) -> dict[str, object]:
+    try:
+        if step.kind == "zero":
+            return {
+                "ok": True,
+                "result": run_provider_probe(step.provider_key, "zero"),
+            }
+        if not step.project_path:
+            raise ValueError("PLOW_WHIP_PROBE_PROJECT_PATH is not configured")
+        if step.kind == "start":
+            state = start_provider_job(
+                step.job_id,
+                step.provider_key,
+                step.project_path,
+                step.prompt,
+                session_id=step.session_id,
+                timeout_seconds=step.timeout_seconds,
+                context_policy=step.context_policy,
+                access="read",
+            )
+        elif step.kind == "poll":
+            state = provider_job_status(step.job_id)
+        elif step.kind == "cancel":
+            state = cancel_provider_job(step.job_id)
+        else:
+            raise ValueError("unknown Probe step")
+        return {
+            "ok": True,
+            "state": state,
+            "output": provider_job_output(step.job_id),
+        }
+    except (OSError, RuntimeError, ValueError) as error:
+        return {"ok": False, "error": type(error).__name__}
+
+
+def apply_probe_step(
+    store: Store,
+    connection: sqlite3.Connection,
+    step: ProbeStep,
+    facts: dict[str, object],
+) -> str:
+    task = connection.execute(
+        "SELECT * FROM tasks WHERE id = ? AND project_id = ?",
+        (step.task_id, step.project_id),
+    ).fetchone()
+    job = connection.execute(
+        "SELECT * FROM host_jobs WHERE id = ? AND task_id = ?",
+        (step.job_id, step.task_id),
+    ).fetchone()
+    if not task or not job or task["outcome"] is not None:
+        return "stale_probe_fact"
+    now = time.time()
+    if not facts.get("ok"):
+        return _defer_probe_reconcile(connection, task, job, step, now)
+    if step.kind == "zero":
+        return _persist_probe_result(
+            store, connection, task, job, facts["result"], now
+        )
+
+    state = facts["state"]
+    status = str(state.get("status"))
+    if state.get("session_id"):
+        connection.execute(
+            """
+            UPDATE session_generations SET external_session_id = ?
+            WHERE task_session_id = ? AND generation = ?
+            """,
+            (state["session_id"], job["task_session_id"], job["session_generation"]),
+        )
+    if status in ACTIVE_HOST_JOB_STATUSES:
+        stopping = task["phase"] == "stopping" or step.kind == "cancel"
+        connection.execute(
+            "UPDATE host_jobs SET status = ? WHERE id = ?",
+            (
+                "cancelling"
+                if stopping
+                else ("running" if status != "dispatching" else "dispatching"),
+                job["id"],
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE tasks SET phase = ?, next_action_at = ?,
+                next_action_kind = ?, updated_at = ? WHERE id = ?
+            """,
+            (
+                "stopping" if stopping else "probe_wait",
+                now + 1,
+                "probe_poll",
+                now,
+                task["id"],
+            ),
+        )
+        return "probe_wait"
+    if status == "cancelled":
+        connection.execute(
+            """
+            UPDATE host_jobs SET status = 'cancelled', ended_at = ?,
+                returncode = 130, failure_code = 'process' WHERE id = ?
+            """,
+            (now, job["id"]),
+        )
+        connection.execute(
+            """
+            UPDATE tasks SET public_status = 'done', phase = 'done',
+                outcome = 'cancelled', next_action_at = NULL,
+                next_action_kind = NULL, updated_at = ? WHERE id = ?
+            """,
+            (now, task["id"]),
+        )
+        archive_task_sessions(connection, task["id"], now)
+        return "cancel"
+
+    stdout, stderr = _provider_output_streams(facts.get("output"))
+    input_tokens = max(0, int(state.get("input_tokens") or 0))
+    cached_tokens = min(
+        input_tokens, max(0, int(state.get("cached_input_tokens") or 0))
+    )
+    output_tokens = max(0, int(state.get("output_tokens") or 0))
+    total_tokens = input_tokens + output_tokens
+    raw_returncode = state.get("returncode")
+    returncode = int(raw_returncode) if isinstance(raw_returncode, int) else 1
+    marker_found = PROBE_MARKER in stdout
+    within_cap = 0 < total_tokens <= PROBE_TOKEN_CAP
+    result = {
+        "provider_key": step.provider_key,
+        "display_name": PROVIDERS[step.provider_key]["display_name"],
+        "mode": "minimal",
+        "configured": True,
+        "available": (
+            status == "completed"
+            and returncode == 0
+            and marker_found
+            and within_cap
+        ),
+        "detail": (
+            "minimal terminal probe returned the expected marker"
+            if marker_found and within_cap
+            else (
+                "minimal terminal probe exceeded the Token cap"
+                if total_tokens > PROBE_TOKEN_CAP
+                else "minimal terminal probe did not return valid bounded evidence"
+            )
+        ),
+        "model_invoked": True,
+        "returncode": returncode,
+        "marker_found": marker_found,
+        "input_tokens": input_tokens,
+        "cached_input_tokens": cached_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "token_cap": PROBE_TOKEN_CAP,
+        "model": str(state.get("model") or step.provider_key),
+        "checked_at": now,
+        "stderr_present": bool(stderr),
+    }
+    return _persist_probe_result(store, connection, task, job, result, now)
+
+
+def _defer_probe_reconcile(
+    connection: sqlite3.Connection,
+    task: sqlite3.Row,
+    job: sqlite3.Row,
+    step: ProbeStep,
+    now: float,
+) -> str:
+    dispatch = json.loads(job["dispatch_json"])
+    failures = int(dispatch.get("reconcile_failures") or 0) + 1
+    dispatch["reconcile_failures"] = failures
+    settings = connection.execute(
+        "SELECT settings_json FROM task_sessions WHERE id = ?",
+        (job["task_session_id"],),
+    ).fetchone()
+    values = json.loads(settings["settings_json"])["values"]
+    exhausted = failures > int(values.get("retry_count", 0))
+    connection.execute(
+        "UPDATE host_jobs SET dispatch_json = ? WHERE id = ?",
+        (canonical_json(dispatch), job["id"]),
+    )
+    connection.execute(
+        """
+        UPDATE tasks SET public_status = ?, wait_reason = ?, fault_code = ?,
+            next_action_at = ?, next_action_kind = ?, updated_at = ? WHERE id = ?
+        """,
+        (
+            "needs_decision" if exhausted else "in_progress",
+            (
+                "Provider probe could not produce bounded diagnostic facts"
+                if exhausted
+                else "Host Bridge probe reconcile scheduled"
+            ),
+            (
+                "unsafe_unknown"
+                if exhausted and step.mode == "minimal"
+                else ("provider" if exhausted else "transport")
+            ),
+            (
+                None
+                if exhausted
+                else now + max(1, int(values.get("retry_backoff_seconds", 0)))
+            ),
+            None if exhausted else task["next_action_kind"],
+            now,
+            task["id"],
+        ),
+    )
+    return "needs_decision" if exhausted else f"probe_{step.kind}_retry"
+
+
+def _persist_probe_result(
+    store: Store,
+    connection: sqlite3.Connection,
+    task: sqlite3.Row,
+    job: sqlite3.Row,
+    result: dict[str, object],
+    now: float,
+) -> str:
     base = store.data_root / "projects" / task["project_id"] / "tasks" / task["id"]
     output_path = (
         base
         / "artifacts"
         / f"revision-{task['spec_revision']:06d}"
-        / f"execution-{sequence:06d}"
+        / f"execution-{job['sequence']:06d}"
         / "output"
         / "provider-probe.json"
     )
@@ -1348,139 +1734,100 @@ def _execute_provider_probe(
         base
         / "sessions"
         / (task["role_key"] or "provider_probe")
-        / f"generation-{session_generation:06d}"
-        / f"sequence-{sequence:06d}.log"
+        / f"generation-{job['session_generation']:06d}"
+        / f"sequence-{job['sequence']:06d}.log"
     )
-    try:
-        result = run_provider_probe(spec["provider_key"], spec["mode"])
-        body = canonical_json(result).encode()
-        log_body = (
-            f"provider={spec['provider_key']} mode={spec['mode']} "
-            f"available={result['available']} detail={result['detail']}\n"
-        ).encode()
-        _write_atomic(output_path, body)
-        _write_atomic(log_path, log_body)
-        ended_at = time.time()
-        if result["model_invoked"]:
-            record_model_call(
-                connection,
-                task["id"],
-                task_session_id,
-                session_generation,
-                spec["provider_key"],
-                "single",
-                int(result["input_tokens"]),
-                int(result["cached_input_tokens"]),
-                int(result["output_tokens"]),
-                str(result["model"] or spec["provider_key"]),
-            )
+    body = canonical_json(result).encode()
+    log_body = (
+        f"provider={result['provider_key']} mode={result['mode']} "
+        f"available={result['available']} detail={result['detail']}\n"
+    ).encode()
+    _write_atomic(output_path, body)
+    _write_atomic(log_path, log_body)
+    if result["model_invoked"]:
+        record_model_call(
+            connection,
+            task["id"],
+            job["task_session_id"],
+            job["session_generation"],
+            str(result["provider_key"]),
+            "single",
+            int(result["input_tokens"]),
+            int(result["cached_input_tokens"]),
+            int(result["output_tokens"]),
+            str(result["model"] or result["provider_key"]),
+        )
+    returncode = result.get("returncode")
+    returncode = int(returncode) if isinstance(returncode, int) else 0
+    connection.execute(
+        """
+        UPDATE host_jobs SET status = ?, ended_at = ?, returncode = ?,
+            output_ref = ?, failure_code = ? WHERE id = ?
+        """,
+        (
+            "succeeded" if returncode == 0 else "failed",
+            now,
+            returncode,
+            store.relative_data_path(log_path),
+            None if returncode == 0 else "provider",
+            job["id"],
+        ),
+    )
+    for kind, path, data in (
+        ("output", output_path, body),
+        ("log", log_path, log_body),
+    ):
         connection.execute(
             """
-            INSERT INTO host_jobs(
-                id, task_id, task_session_id, session_generation,
-                spec_revision, sequence, purpose, status,
-                started_at, ended_at, returncode, output_ref
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'succeeded', ?, ?, 0, ?)
+            INSERT INTO artifacts(
+                id, project_id, task_id, kind, path, sha256, bytes,
+                acceptance_id, revision, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 uuid4().hex,
-                task["id"],
-                task_session_id,
-                session_generation,
-                task["spec_revision"],
-                sequence,
-                purpose,
-                started_at,
-                ended_at,
-                store.relative_data_path(log_path),
-            ),
-        )
-        for kind, path, data in (("output", output_path, body), ("log", log_path, log_body)):
-            connection.execute(
-                """
-                INSERT INTO artifacts(
-                    id, project_id, task_id, kind, path, sha256, bytes,
-                    acceptance_id, revision, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    uuid4().hex,
-                    task["project_id"],
-                    task["id"],
-                    kind,
-                    store.relative_data_path(path),
-                    hashlib.sha256(data).hexdigest(),
-                    len(data),
-                    (
-                        f"provider_{spec['mode']}_probe"
-                        if kind == "output"
-                        else None
-                    ),
-                    task["spec_revision"],
-                    ended_at,
-                ),
-            )
-        connection.execute(
-            """
-            UPDATE tasks
-            SET public_status = 'in_progress', phase = 'verify', next_action_at = ?,
-                next_action_kind = 'check', updated_at = ?
-            WHERE id = ?
-            """,
-            (ended_at, ended_at, task["id"]),
-        )
-        connection.execute(
-            """
-            INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
-            VALUES (?, ?, 'provider_probed', ?, ?)
-            """,
-            (
                 task["project_id"],
                 task["id"],
-                canonical_json(
-                    {
-                        "provider_key": spec["provider_key"],
-                        "mode": spec["mode"],
-                        "available": result["available"],
-                        "model_invoked": result["model_invoked"],
-                        "total_tokens": result["total_tokens"],
-                    }
+                kind,
+                store.relative_data_path(path),
+                hashlib.sha256(data).hexdigest(),
+                len(data),
+                (
+                    f"provider_{result['mode']}_probe"
+                    if kind == "output"
+                    else None
                 ),
-                ended_at,
-            ),
-        )
-        return purpose
-    except (OSError, RuntimeError, ValueError) as error:
-        ended_at = time.time()
-        log_body = f"provider probe failed: {type(error).__name__}\n".encode()
-        _write_atomic(log_path, log_body)
-        connection.execute(
-            """
-            INSERT INTO host_jobs(
-                id, task_id, task_session_id, session_generation,
-                spec_revision, sequence, purpose, status,
-                started_at, ended_at, returncode, output_ref, failure_code
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'failed', ?, ?, 1, ?, 'provider')
-            """,
-            (
-                uuid4().hex,
-                task["id"],
-                task_session_id,
-                session_generation,
                 task["spec_revision"],
-                sequence,
-                purpose,
-                started_at,
-                ended_at,
-                store.relative_data_path(log_path),
+                now,
             ),
         )
-        connection.execute(
-            """
-            UPDATE tasks SET public_status = 'needs_decision', phase = 'execute',
-                wait_reason = ?, fault_code = 'provider', next_action_at = NULL,
-                outcome = NULL, updated_at = ? WHERE id = ?
-            """,
-            ("Provider probe could not produce bounded diagnostic facts", ended_at, task["id"]),
-        )
-        return purpose
+    connection.execute(
+        """
+        UPDATE tasks SET public_status = 'in_progress', phase = 'verify',
+            next_action_at = ?, next_action_kind = 'check', updated_at = ?
+        WHERE id = ?
+        """,
+        (now, now, task["id"]),
+    )
+    connection.execute(
+        """
+        INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
+        VALUES (?, ?, 'provider_probed', ?, ?)
+        """,
+        (
+            task["project_id"],
+            task["id"],
+            canonical_json(
+                {
+                    "provider_key": result["provider_key"],
+                    "mode": result["mode"],
+                    "available": result["available"],
+                    "model_invoked": result["model_invoked"],
+                    "total_tokens": result["total_tokens"],
+                    "host_job_id": job["id"],
+                }
+            ),
+            now,
+        ),
+    )
+    return job["purpose"]

@@ -113,6 +113,8 @@ def run_provider_probe(provider_key: str, mode: str) -> dict[str, object]:
         raise ValueError("probe mode must be zero or minimal")
     if mode == "minimal" and not provider["minimal_probe"]:
         raise ValueError("minimal Token probe requires the read-only Codex adapter")
+    if mode == "minimal":
+        raise ValueError("minimal Token probes must use a durable HostJob")
 
     checked_at = time.time()
     base_url = os.environ.get(
@@ -129,57 +131,12 @@ def run_provider_probe(provider_key: str, mode: str) -> dict[str, object]:
             detail="Host Bridge token is not configured",
         )
 
-    if mode == "zero":
-        payload = {
-            "adapter": provider["adapter"],
-            "executable": provider["executable"],
-        }
-        try:
-            response = _bridge_post(base_url, token, "/v1/probe", payload, 20)
-        except RuntimeError as error:
-            return _probe_result(
-                provider_key,
-                mode,
-                checked_at,
-                configured=True,
-                available=False,
-                detail=str(error),
-            )
-        return _probe_result(
-            provider_key,
-            mode,
-            checked_at,
-            configured=True,
-            available=bool(response.get("available")),
-            detail=str(response.get("detail") or "no probe detail")[:500],
-        )
-
-    project_path = os.environ.get("PLOW_WHIP_PROBE_PROJECT_PATH")
-    if not project_path:
-        return _probe_result(
-            provider_key,
-            mode,
-            checked_at,
-            configured=False,
-            available=False,
-            detail="PLOW_WHIP_PROBE_PROJECT_PATH is not configured",
-            model_invoked=False,
-        )
     payload = {
         "adapter": provider["adapter"],
         "executable": provider["executable"],
-        "project_path": project_path,
-        "prompt": (
-            f"Reply with exactly {PROBE_MARKER}. "
-            "Do not inspect or modify files. Do not call tools."
-        ),
-        "session_id": None,
-        "timeout_seconds": 60,
-        "access": "read",
-        "context_policy": {"max_turns": 1, "tool_no_progress_limit": 1},
     }
     try:
-        response = _bridge_post(base_url, token, "/v1/execute", payload, 80)
+        response = _bridge_post(base_url, token, "/v1/probe", payload, 20)
     except RuntimeError as error:
         return _probe_result(
             provider_key,
@@ -188,34 +145,14 @@ def run_provider_probe(provider_key: str, mode: str) -> dict[str, object]:
             configured=True,
             available=False,
             detail=str(error),
-            model_invoked=False,
         )
-    input_tokens = max(0, int(response.get("input_tokens") or 0))
-    cached_tokens = max(0, int(response.get("cached_input_tokens") or 0))
-    output_tokens = max(0, int(response.get("output_tokens") or 0))
-    if cached_tokens > input_tokens:
-        cached_tokens = input_tokens
     return _probe_result(
         provider_key,
         mode,
         checked_at,
         configured=True,
-        available=(
-            int(response.get("returncode") or 0) == 0
-            and PROBE_MARKER in str(response.get("stdout") or "")
-        ),
-        detail=(
-            "minimal terminal probe returned the expected marker"
-            if PROBE_MARKER in str(response.get("stdout") or "")
-            else "minimal terminal probe did not return the expected marker"
-        ),
-        model_invoked=True,
-        returncode=int(response.get("returncode") or 0),
-        marker_found=PROBE_MARKER in str(response.get("stdout") or ""),
-        input_tokens=input_tokens,
-        cached_input_tokens=cached_tokens,
-        output_tokens=output_tokens,
-        model=str(response.get("model") or provider_key),
+        available=bool(response.get("available")),
+        detail=str(response.get("detail") or "no probe detail")[:500],
     )
 
 
