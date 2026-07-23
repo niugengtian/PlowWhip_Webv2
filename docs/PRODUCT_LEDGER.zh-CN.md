@@ -11,34 +11,34 @@
 - `部分实现` 不计为完成；Task 数、页面存在、容器健康和测试总数都不能替代逐项验收。
 - §23、§25、§26 是环境对比或治理要求，不计入功能完成率。
 
-当前结论：**7 个功能章节已实现，15 个部分实现，1 个未实现，3 个为对比/治理章节。V1 未完成。**
+当前结论：**20 个功能章节已实现，3 个部分实现，0 个未实现，3 个为对比/治理章节。V1 代码与本地候选仍未等同于生产切换完成。**
 
 | 基线章节 | 状态 | 当前证据 | 明确缺口 |
 |---|---|---|---|
-| §1 使命 | 部分实现 | 自然语言形成 Goal/Task；简单/中型直达执行，大型任务自动生成最小 Plan；低置信度由项目管家一次问一个问题 | 全局管家语义转接和所有模型任务的完整修复收敛仍不完整 |
-| §2 部署边界 | 部分实现 | 单镜像内含 Web/API/UI/Cronner/Monitor；SQLite 持久卷；Host Bridge HTTP 适配 | 没有生产调度租约门禁、Host Bridge 常驻安装与跨平台验收 |
-| §3 最终生命周期 | 部分实现 | `Intake → Plan → Execute → Verify → Done/NeedsDecision`、Provider fallback、结构化 Checker 可运行 | Provider 原生 compact、同步 Planner/Checker 的进程恢复仍不完整 |
+| §1 使命 | 已实现 | 自然语言形成 Goal/Task；简单/中型直达执行，大型任务自动形成最小 Plan；模型任务可验证、修复、递补或一次提问 | — |
+| §2 部署边界 | 部分实现 | 单镜像内含 Web/API/UI/Cronner/Monitor；SQLite 持久卷；Host Bridge HTTP 适配；共享 data root 使用进程锁保证单一 Cronner | 未在本阶段安装 macOS/Linux 常驻 Host Bridge，也未做生产跨平台验收 |
+| §3 最终生命周期 | 已实现 | `Intake → Plan → Execute → Verify → Done/NeedsDecision`；执行、Planner、Checker 都使用可恢复 HostJob；compact 事件与 generation 轮转接入 | — |
 | §4 状态模型 | 已实现 | 四个公开状态、正交 phase/fault/outcome、取消归档与 rerun generation | — |
 | §5 唯一生命周期所有者 | 已实现 | Goal/Task 以及可见 Project 创建/恢复/绑定/归档和项目设置均先进入 messages；只有 `advance_project` 改变运行态；外部调用不占 SQLite 写事务；Monitor 只读 | — |
-| §6 业务层级 | 部分实现 | Project/Goal/Plan/Task、Sprint、自动 Plan、DAG、同项目单活动 Task | 主人显式插队和复杂多 Goal 优先级仍未形成产品行为 |
+| §6 业务层级 | 已实现 | Project/Goal/版本化 Plan/Sprint/Task、串行 DAG、同项目单活动 Task；活动期间新主人消息在当前 Task 后、旧 DAG 队列前形成下一紧急 Task | — |
 | §7 指令分类与 Planner | 已实现 | 可解释简单/中型/大型判定；大型任务要求两套完整比较方案；置信度 ≥95% 且无授权风险才自动选择并物化 DAG | — |
-| §8 管家与统一窗口 | 部分实现 | 全局搜索、项目历史、两个入口和 NeedsDecision 单问题已存在 | 没有全局管家的自然语言代理转接和跨项目语义归纳 |
-| §9 Worker/Session/HostJob | 部分实现 | 所有权表与 Task+role 唯一约束；HostJob 可持久表示 dispatching/running/cancelling/终态；执行器可对账和停止 | 旧 Bridge 的只读 Checker 仍是同步调用；中断后只会安全停下，不能恢复原 Checker 进程 |
-| §10 Provider Pool | 部分实现 | TaskSession 冻结有序候选；Fullstack 从 Cursor 起步，明确终态失败后归档 generation 并递补 Codex；Task/预算不重置 | Checker 仅 Codex 支持只读；无完整可用性选择、compact/resume 和中断 generation 恢复 |
-| §11 验证与自动收敛 | 部分实现 | 确定性哈希验证；独立 Checker 使用严格 JSON 合同；两个冻结 acceptance 分别落 Evidence；CHANGES_REQUIRED 生成有界修复包 | Planner 尚不能把主人自然语言拆成全部细粒度 acceptance；NEEDS_DECISION 语义仍较基础 |
-| §12 故障/进展/恢复/超时 | 部分实现 | fault 字段、有限 retry、工作区 delta/Evidence；执行 HostJob 按稳定 job_id 对账、取消、终态 Provider 递补并保留有界输出 | Checker 进程恢复、deadline/stop_grace 后完整 handoff 和不可逆结果保护仍不完整 |
-| §13 Cronner | 部分实现 | 应用内唯一循环、租约、到期动作、每次每项目一个推进动作；不同项目使用标准库有界线程并行 | 缺少完整声明式观察/会话阈值执行；长 Checker 仍依赖延长项目租约 |
+| §8 管家与统一窗口 | 已实现 | 全局管家可用 `@project`、唯一项目或跨项目精确搜索路由；搜索只转接不创建 Task；全局文件只保存转接引用；项目管家长期历史和一次一个问题 | — |
+| §9 Worker/Session/HostJob | 已实现 | Task+role 唯一 TaskSession、generation 和 HostJob 所有权清晰；执行、Planner、Checker 均可按稳定 job_id 跨重启对账、轮询和取消 | — |
+| §10 Provider Pool | 部分实现 | 有序候选冻结并可由 Project/Task 覆盖；Executor、Planner、Checker 明确终态失败均归档 generation 并自动递补；上下文能力与 resume 事实可见 | 未运行付费 DeepSeek/Kimi/Cursor/Codex 真实任务；其宿主 Adapter 可用性只允许通过显式 Probe/真实 Task 证明 |
+| §11 验证与自动收敛 | 已实现 | 确定性哈希验证；Planner 可冻结 1–20 个细粒度 acceptance；独立 Checker 严格 JSON、逐项 Evidence、有界修复包；只读分析可凭 Evidence 在零 workspace delta 下完成 | — |
+| §12 故障/进展/恢复/超时 | 已实现 | fault 正交字段、有限 retry、稳定 job_id 对账、Provider 递补、deadline/stop_grace 优雅停止、Tick 后 handoff；不明结果不盲重放 | — |
+| §13 Cronner | 已实现 | 应用内唯一循环、项目租约、`next_action_at/kind`、deadline、每项目一步、跨项目有界并行、上下文 checkpoint/轮转；共享 data root 单 Cronner 进程锁 | — |
 | §14 Monitor | 已实现 | 只读连接、当前结构化状态、最后 20 行、数据库/Cronner/探针看板 | — |
-| §15 三层记忆与 Token | 部分实现 | Hot Context Capsule 临时生成且强制 byte cap；Warm handoff 原子替换并归档；Cold HostJob Session manifests 只追加；Token 归一化看板 | Provider 原生 compact 与 Token 阈值触发的 generation 轮转仍未接入 |
+| §15 三层记忆与 Token | 已实现 | Hot Capsule byte cap、Warm handoff 原子归档、Cold Session manifests 只追加；Codex 原生 compact 策略/事件和非原生 Provider Token 阈值 generation 轮转；Token 归一化看板 | — |
 | §16 SQLite 与队列 | 已实现 | WAL、十五类权威记录、messages/tasks 队列、授权/配置复用 messages，无第二队列 | — |
-| §17 文件目录 | 部分实现 | project/task/role/generation、Cold segment、Artifact/Evidence/handoff 和 library 均在 data root | global/project conversation 文件尚未落盘；SQLite messages 仍是其唯一事实 |
-| §18 角色/规则/模板/脚本 | 部分实现 | 默认文件库、SHA/revision 索引、TaskSession 快照 | Project 规则合并、成功后模板/脚本沉淀与跨项目确认未实现 |
-| §19 配置 | 部分实现 | Global/Project/Task+role 合并并冻结来源；项目数值阈值经 action 入队并由 `advance_project` 应用；Context/segment/handoff 等上限有真实消费者 | Provider 顺序写入口与原生 compact/轮转阈值执行尚未完成 |
+| §17 文件目录 | 已实现 | project/task/role/generation、Cold segment、Artifact/Evidence/handoff/library，以及 global/project conversation 投影均在 data root；SQLite 仍是唯一状态真源 | — |
+| §18 角色/规则/模板/脚本 | 已实现 | 文件正文 + SQLite revision/SHA 索引；Global/Project/Role/Task 合并；TaskSession 冻结；首次 Checker PASS 自动沉淀不含 Task ID/Secret 的项目模板，“以后都这样”才升 revision；无真实脚本需求时保持确定性命令 | — |
+| §19 配置 | 已实现 | Global/Project/Task+role 合并并冻结值与来源；数值阈值、Provider 顺序和项目规则均先入 messages，由 `advance_project` 应用；compact/轮转/观察/超时均有消费者 | — |
 | §20 页面和 API | 已实现 | 七导航、完整 Task 工作台、messages/actions 两类写路由；Project/设置动作只提交意图；本地 Session 分段可查看 | — |
-| §21 权限与不可逆操作 | 部分实现 | 高风险 Planner 方案不能由普通文本绕过；明确授权事实绑定 project/task/spec_revision/action_kind/target_scope/15 分钟有效期并写入 messages | 尚未为所有永久删除、外部发送、付款、权限变更等动作提供通用执行前授权检查；当前这些动作仍一律禁止 |
+| §21 权限与不可逆操作 | 已实现 | 三档权限冻结到角色快照；高风险方案授权绑定 project/task/revision/action/scope/expiry；普通文本不能绕过；当前没有实现的永久删除、生产切流、外部发送/付款/权限变更和新付费 Provider 一律拒绝，范围内删除默认改名 `.rm.时间戳` | — |
 | §22 模块边界 | 已实现 | 十个职责模块存在；API→intake→lifecycle→store 与只读 monitor 边界清晰 | — |
 | §23 环境对比 | 对比基线 | 旧仓库保持只读；未整体迁入旧状态机 | 不是功能完成项 |
-| §24 迁移与蓝绿门禁 | 未实现 | 当前仅保留本地 Docker 回滚容器 | 一致性备份、候选隔离、调度租约切换、回滚和旧数据 reconcile 均未实现 |
+| §24 迁移与蓝绿门禁 | 部分实现 | SQLite Backup API + quick_check；候选 code/data/db/Compose/port/Bridge namespace 隔离校验；候选 Cronner 必须关闭；共享 data root 单调度锁；门禁结果固定 `cutover_approved=false` | 按主人约束未迁移旧数据、未触碰生产、未执行最终切流或回滚演练；这些动作仍需单独批准 |
 | §25 冻结规则 | 治理已落实 | Revision 5 冻结文件保持唯一基线 | 后续不得再用局部 Task 完成冒充 V1 完成 |
 | §26 台账 | 治理已落实 | 本文件记录人的需求、问题、决定和证据 | 必须随每一阶段继续更新 |
 
@@ -58,6 +58,7 @@
 | H-20260723-10 | 2026-07-23 | 主人 | Task 页参考原任务页时必须保留任务泳道 | 已完成 | 基线 Revision 4；8750 实测四条公开状态泳道：待决定项目 `0/0/1/0`、探针项目 `0/0/0/3`；卡片点击与详情联动 |
 | H-20260723-11 | 2026-07-23 | 主人 | Task 页必须参考原任务页整体重建，不接受只局部增加泳道的毛坯实现 | 已完成 | 8750：顶部指标、Goal 导航、四态泳道、统一 Goal/Task 详情、驱动/决定与运行证据同屏；`design-qa.md` passed |
 | H-20260723-12 | 2026-07-23 | 主人 | 所有页面适当沿用原版本 UI；项目范围选择项目后不得自动跳项目页 | 已完成 | 8750 逐页实测七个入口选择范围后 `beforeView == afterView`；显式“进入项目”按钮；基线 Revision 5 |
+| H-20260723-13 | 2026-07-23 | 主人 | 不得把阶段完成或少量 Task Done 冒充 V1 完成；继续自动推进全部冻结基线剩余项 | 进行中 | 本轮把覆盖矩阵从 7 已实现/15 部分/1 未实现推进到 20 已实现/3 部分/0 未实现；33 项自动化测试通过；生产切流、旧数据迁移和付费 Provider 真实任务仍按主人禁令未执行 |
 
 ## 发现的问题
 
@@ -78,14 +79,18 @@
 | I-20260723-13 | 2026-07-23 | 项目范围选择器直接调用 `openProject` | 用户在 Task、Token、Monitor 等页选择范围时被强制切走，筛选与导航语义混淆 | 选择器只更新 `currentProject` 并刷新当前页；另设显式“进入项目”按钮 | 已解决 | 8750 逐页实测全局管家、项目管家、项目、Task、Token、Monitor、设置页均原位刷新 |
 | I-20260723-14 | 2026-07-23 | Monitor 枚举 Session 文件后再 `stat` 时，执行器可能已原子替换并移除临时文件 | 只读 Task 快照偶发 `FileNotFoundError`，HTTP 请求被断开 | 有界枚举时跳过已经消失的临时文件；不重试、不写状态、不扩大日志读取 | 已解决 | 并发 Web 回归复现后修复；15 项回归连续通过 |
 | I-20260723-15 | 2026-07-23 | CSS 只声明了 `section[hidden]`，Goal 历史和详情切换使用的普通 `div[hidden]` 仍被组件 `display` 覆盖 | 右侧 Task 详情与空状态同时显示，已完成 Goal 区也会泄漏隐藏内容 | 全局统一 `[hidden]{display:none!important}`，保持原生 hidden 语义 | 已解决 | 1280×720 实机截图发现并修复；Web UI 回归固定 hidden 规则 |
-| I-20260723-16 | 2026-07-23 | Provider 执行和 Checker 原来在 `advance_project` 的 SQLite 写事务与 30 秒项目租约内同步运行 | 长任务会阻塞 Cronner/API 写入、租约过期；无法可靠取消、重启恢复或让不同项目并行 | 执行器改为持久 HostJob snapshot/dispatch/poll/cancel；外部调用全部移出 SQLite 写事务；Cronner 跨项目并行。旧 Bridge 不支持只读异步 Checker，因此 Checker 中断先 fail-closed，待 Bridge 最小契约补齐后再恢复 | 部分解决 | Schema v4；`test_running_host_job_releases_sqlite_and_can_reconcile_or_cancel`；`test_schema_v4_preserves_terminal_jobs_and_accepts_running_jobs`；18 项回归通过 |
-| I-20260723-17 | 2026-07-23 | Provider 候选顺序原来只被保存，实际通用代码任务默认并固定 `codex_cli` | 普通 Provider 故障直接 NeedsDecision，违反自动递补与 generation 连续性 | 已按冻结 TaskSession 设置选择 Fullstack 候选；明确终态故障安全归档旧 generation 并递补下一 Provider。Checker 非 Codex 只读适配与 compact/resume 尚待补齐 | 部分解决 | `test_terminal_provider_failure_falls_back_with_new_generation`：Cursor generation 1 失败后 Codex generation 2 完成；19 项回归通过 |
-| I-20260723-18 | 2026-07-23 | 通用代码任务原来只生成 `independent_checker_pass` 一个 acceptance，并以字符串 marker 判 PASS | 无法证明主人的每项验收要求；失败不能形成可执行的最小修复包 | 已冻结“主人指令/相关检查”两项通用合同；Checker 严格 JSON 返回，每项单独 Evidence；CHANGES_REQUIRED 含 acceptance_id、实际/预期、允许范围和重验命令。待 Planner 拆分自然语言细粒度验收 | 部分解决 | `test_checker_changes_required_is_a_bounded_repair_package`；代码任务集成测试；20 项回归通过 |
+| I-20260723-16 | 2026-07-23 | Provider 执行和 Checker 原来在 `advance_project` 的 SQLite 写事务与 30 秒项目租约内同步运行 | 长任务会阻塞 Cronner/API 写入、租约过期；无法可靠取消、重启恢复或让不同项目并行 | 执行、Planner、Checker 全部改为持久 HostJob start/status/output/cancel；外部调用移出事务；稳定 job_id 可跨 Store/进程重启继续轮询 | 已解决 | `test_running_host_job_releases_sqlite_and_can_reconcile_or_cancel` 同时验证 Executor/Checker 释放 SQLite 与 Checker 重启恢复；`test_running_planner_host_job_reconciles_after_store_restart` |
+| I-20260723-17 | 2026-07-23 | Provider 候选顺序原来只被保存，实际通用代码任务默认并固定 `codex_cli` | 普通 Provider 故障直接 NeedsDecision，违反自动递补与 generation 连续性 | Executor、Planner、Checker 都按冻结候选顺序运行；明确终态失败归档 generation、保留 Task/TaskSession/预算/handoff 并自动递补；Project Provider 顺序可入队配置 | 已解决 | Executor、Planner、Checker 三条 fallback 回归；`test_project_provider_order_and_rules_freeze_into_task_session` |
+| I-20260723-18 | 2026-07-23 | 通用代码任务原来只生成 `independent_checker_pass` 一个 acceptance，并以字符串 marker 判 PASS | 无法证明主人的每项验收要求；失败不能形成可执行的最小修复包 | 通用合同冻结主人指令/相关检查；Planner 可为每个 Task 给出 1–20 项稳定 acceptance；Checker 严格 JSON、逐项 Evidence、CHANGES_REQUIRED 有界修复包 | 已解决 | `test_checker_changes_required_is_a_bounded_repair_package`；Planner 细粒度 acceptance 测试；代码任务集成测试 |
 | I-20260723-19 | 2026-07-23 | 任意非写入/探针指令直接视为中型代码任务；大型 Plan 只能由主人手工提交 JSON | Butler/Planner 无法按真实复杂度自动形成最小方案和 DAG | 已实现可解释分类；大型任务由只读 Planner 生成至少两套方案，≥95% 且无授权风险自动选中，否则项目管家一次只问一个问题 | 已解决 | `test_large_instruction_uses_planner_and_auto_selects_confident_plan`、`test_high_risk_plan_asks_exactly_one_project_butler_question`；25 项回归通过 |
-| I-20260723-20 | 2026-07-23 | 原 retry 直接重跑，没有先对账 HostJob/Session/workspace/Evidence/handoff；超时只传给同步 Bridge | 中断或返回不明确时可能重复执行，尤其不能保护不可逆动作 | 执行器按稳定 job_id 有界对账；模糊派发只按冻结 retry/backoff 重试，耗尽后保持活动 HostJob 并以 unsafe_unknown 停止，禁止改 TaskSpec，只允许继续对账或取消。待补完整 deadline/stop_grace/handoff 与 Checker 恢复 | 部分解决 | `test_ambiguous_dispatch_stops_for_decision_without_blind_replay`；21 项回归通过 |
-| I-20260723-21 | 2026-07-23 | 只有 Warm `current.json` handoff 与归档 revision | 长期任务缺少 Hot Capsule、Cold 分段、轮转和 Provider compact 协调 | 已补 Hot 临时 Capsule、Warm 原子归档与 Cold append-only Session manifest；Context/segment/checkpoint 上限冻结并执行。待补 Provider compact/rotation 触发 | 部分解决 | `test_hot_warm_cold_continuity_is_bounded_and_append_only`；25 项回归通过 |
-| I-20260723-22 | 2026-07-23 | 不可逆权限仅靠固定 prompt 和少量确认，未保存绑定范围的授权事实 | Session 替换后不能安全继承授权，也不能证明授权已在终态失效 | Planner 方案授权复用 messages，绑定 project/task/revision/action/scope/expiry；普通决定不能绕过。其他外部影响动作继续默认禁止，待接通用检查 | 部分解决 | `test_high_risk_plan_asks_exactly_one_project_butler_question` 验证错误确认拒绝、绑定字段、授权入队和应用 |
-| I-20260723-23 | 2026-07-23 | 设置与资源库只有只读页；Project 规则、模板/脚本晋升和多项阈值没有执行路径 | TaskSession 快照看似完整但不能形成可维护的业务配置闭环 | 已开放白名单数值阈值 action；入队后由 `advance_project` 写 Project 配置，新 TaskSession 冻结值与 owner message 来源。Provider 顺序和模板晋升待补 | 部分解决 | `test_project_setting_is_queued_then_frozen_into_new_session`；设置 UI |
-| I-20260723-24 | 2026-07-23 | 没有一致性备份、候选隔离、生产调度租约切换和回滚工具 | 无法满足 §24 蓝绿切换门禁；当前 8750 只能算本地候选演示 | P2：真实任务闭环稳定后再实现，任何切流必须主人单独批准 | 待处理 | Docker 只有单镜像构建与手工回滚容器 |
+| I-20260723-20 | 2026-07-23 | 原 retry 直接重跑，没有先对账 HostJob/Session/workspace/Evidence/handoff；超时只传给同步 Bridge | 中断或返回不明确时可能重复执行，尤其不能保护不可逆动作 | 稳定 job_id 有界对账；模糊派发耗尽后保持未知 HostJob 并停到 unsafe_unknown；Planner/Checker 同样恢复；deadline 先 reconcile、按 stop_grace 取消，Tick 后保存 handoff | 已解决 | 模糊派发、跨重启 Planner/Checker、deadline graceful stop 三组回归 |
+| I-20260723-21 | 2026-07-23 | 只有 Warm `current.json` handoff 与归档 revision | 长期任务缺少 Hot Capsule、Cold 分段、轮转和 Provider compact 协调 | Hot 临时 Capsule、Warm 原子归档、Cold append-only Session manifest；Codex 原生 compact 阈值下传并记录事件；非原生 Provider 超阈值在安全边界生成新 generation | 已解决 | `test_hot_warm_cold_continuity_is_bounded_and_append_only`；`test_context_policy_compaction_event_and_non_native_rotation` |
+| I-20260723-22 | 2026-07-23 | 不可逆权限仅靠固定 prompt 和少量确认，未保存绑定范围的授权事实 | Session 替换后不能安全继承授权，也不能证明授权已在终态失效 | 三档权限进入角色快照；Planner 方案授权复用 messages 并绑定 project/task/revision/action/scope/expiry；普通决定不能绕过；未实现的外部影响动作继续硬拒绝 | 已解决 | `test_high_risk_plan_asks_exactly_one_project_butler_question`；read-only 分析 HostJob 验证 `access=read` |
+| I-20260723-23 | 2026-07-23 | 设置与资源库只有只读页；Project 规则、模板/脚本晋升和多项阈值没有执行路径 | TaskSession 快照看似完整但不能形成可维护的业务配置闭环 | 数值阈值、Provider 顺序、Project 规则均走 messages/advance；新 Session 冻结来源；首次 PASS 自动沉淀项目模板，“以后都这样”才升 revision | 已解决 | `test_project_provider_order_and_rules_freeze_into_task_session`；项目模板回归；设置 UI |
+| I-20260723-24 | 2026-07-23 | 没有一致性备份、候选隔离、生产调度租约切换和回滚工具 | 无法满足 §24 蓝绿切换门禁；当前 8750 只能算本地候选演示 | 实现 SQLite Backup API、候选六项隔离清单、候选 Cronner 默认无权、共享 data root 调度锁；门禁不授予切流，生产动作仍需主人单独批准 | 部分解决 | `test_backup_candidate_isolation_and_single_scheduler_gate`；本阶段未触碰旧数据或生产 |
 | I-20260723-25 | 2026-07-23 | 曾用“台账显式待处理为 0”和“7/7 Task Done”宣称 V1 完成 | 混淆局部运行结果与冻结基线覆盖，导致遗漏未被记录 | 永久使用本章逐项覆盖审计；部分实现不得计完成；每次报告同时列出未做项 | 已解决 | 本次 26 章覆盖矩阵和 I-20260723-16 至 24 |
 | I-20260723-26 | 2026-07-23 | Project 创建/绑定/归档和设置原由 API 直接写最终状态 | 绕过唯一生命周期所有者，重启时也无法从消息队列重放未处理意图 | 新 Project 先保存为隐藏队列宿主；创建/恢复/绑定/归档/设置全部写 messages action，只由 `advance_project` 应用可见状态 | 已解决 | Project 归档、Web API、设置与 Planner 项目测试；25 项回归通过 |
+| I-20260723-27 | 2026-07-23 | 通用 Checker 把“没有 workspace delta”一律判失败 | 只读查询、审查和分析即使有独立 Evidence 也无法 Done，违反真实进展规则 | Intake 冻结 `workspace_change_required`；只读分析的 Executor HostJob 使用 `access=read`，Checker 合同和 Evidence 可在零 delta 下通过 | 已解决 | `test_read_only_analysis_can_finish_from_evidence_without_workspace_delta` |
+| I-20260723-28 | 2026-07-23 | 全局窗口要求手填项目且全局文件复制完整消息正文 | 不能按搜索结果路由；全局历史和项目历史重复内容 | 支持 `@project`、唯一项目和唯一搜索命中路由；搜索只写 `global_route` 引用不创建 Task；全局文件只含 message_id/project/time | 已解决 | `test_global_butler_routes_search_without_creating_a_task` |
+| I-20260723-29 | 2026-07-23 | 初版自动沉淀模板正文含 Task ID/Evidence 路径 | 临时 Task 身份会污染长期 Worker 模板 | 模板正文只保留稳定角色约束，revision 文件不可变；Task/Evidence 只留在审计事件，不进入模板 | 已解决 | `test_message_to_verified_done`；模板文件正文检查 |
+| I-20260723-30 | 2026-07-23 | 多镜像共享数据库时只有 Project 租约，没有实例级调度所有权 | 两个镜像可分别领取不同 Project，不满足任一时刻单一生产 Cronner | 同一 data root 使用标准库 `flock` 获得实例级调度锁；候选服务可显式 `--cronner-disabled` | 已解决 | `test_backup_candidate_isolation_and_single_scheduler_gate` |

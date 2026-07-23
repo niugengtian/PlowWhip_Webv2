@@ -10,6 +10,7 @@ from .store import Store
 
 
 PROJECT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+LIBRARY_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 TASK_ID = re.compile(r"^[0-9a-f]{32}$")
 WRITE_INSTRUCTION = re.compile(
     r"^(?:write|写入)\s+([^:\s]+)\s*:\s*([\s\S]*)$", re.IGNORECASE
@@ -18,6 +19,10 @@ PROVIDER_PROBE_INSTRUCTION = re.compile(
     r"^(?:probe\s+provider|探测\s*Provider)\s+"
     r"(codex_cli|cursor_cli|deepseek|kimi)\s*:\s*"
     r"(0token|minimal)(?:\s+确认\s+([a-z0-9_]+))?$",
+    re.IGNORECASE,
+)
+READ_ONLY_INSTRUCTION = re.compile(
+    r"^\s*(?:分析|审查|检查|查询|只读|audit|review|inspect|analy[sz]e)",
     re.IGNORECASE,
 )
 PROJECT_SETTING_LIMITS = {
@@ -34,6 +39,16 @@ PROJECT_SETTING_LIMITS = {
     "retry_count": (0, 10),
     "retry_backoff_seconds": (0, 86_400),
 }
+PROJECT_PROVIDER_ROLES = {
+    "planner",
+    "fullstack",
+    "independent_checker",
+    "simple",
+    "provider_probe",
+    "deterministic",
+    "deterministic_checker",
+}
+PROJECT_PROVIDERS = {"local", "codex_cli", "cursor_cli", "deepseek", "kimi"}
 
 
 def submit_message(
@@ -241,7 +256,9 @@ def set_project_setting(
 ) -> str:
     _validate_project_action(project_id, idempotency_key)
     limits = PROJECT_SETTING_LIMITS.get(setting_key)
-    if (
+    if setting_key == "provider_order":
+        _validate_provider_order(value)
+    elif (
         not limits
         or isinstance(value, bool)
         or not isinstance(value, int)
@@ -283,6 +300,73 @@ def set_project_setting(
             (project_id, idempotency_key),
         ).fetchone()
     return str(row["id"])
+
+
+def set_project_rule(
+    store: Store,
+    project_id: str,
+    rule_key: str,
+    content: str,
+    idempotency_key: str,
+) -> str:
+    _validate_project_action(project_id, idempotency_key)
+    if not LIBRARY_KEY.fullmatch(rule_key):
+        raise ValueError("rule_key must be a safe 1-64 character identifier")
+    if not content.strip() or len(content.encode()) > 65_536:
+        raise ValueError("project rule must contain 1-65536 UTF-8 bytes")
+    now = time.time()
+    message_id = uuid4().hex
+    with store.transaction() as connection:
+        project = connection.execute(
+            "SELECT archived_at FROM projects WHERE id = ?", (project_id,)
+        ).fetchone()
+        if not project or project["archived_at"] is not None:
+            raise ValueError("active project not found")
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO messages(
+                id, project_id, role, content, action_json,
+                idempotency_key, created_at
+            ) VALUES (?, ?, 'owner', ?, ?, ?, ?)
+            """,
+            (
+                message_id,
+                project_id,
+                f"set project rule {rule_key}",
+                canonical_json(
+                    {
+                        "kind": "set_project_rule",
+                        "rule_key": rule_key,
+                        "content": content,
+                    }
+                ),
+                idempotency_key,
+                now,
+            ),
+        )
+        row = connection.execute(
+            "SELECT id FROM messages WHERE project_id = ? AND idempotency_key = ?",
+            (project_id, idempotency_key),
+        ).fetchone()
+    return str(row["id"])
+
+
+def _validate_provider_order(value: object) -> None:
+    if not isinstance(value, dict) or not value:
+        raise ValueError("provider_order must contain at least one role")
+    for role, providers in value.items():
+        if (
+            role not in PROJECT_PROVIDER_ROLES
+            or not isinstance(providers, list)
+            or not providers
+            or len(providers) != len(set(providers))
+            or any(provider not in PROJECT_PROVIDERS for provider in providers)
+        ):
+            raise ValueError("provider_order contains an invalid role or Provider list")
+        if role in {"deterministic", "deterministic_checker"} and providers != ["local"]:
+            raise ValueError("deterministic roles require provider_order ['local']")
+        if role not in {"deterministic", "deterministic_checker"} and "local" in providers:
+            raise ValueError("model roles cannot use the local deterministic Provider")
 
 
 def _validate_project_action(project_id: str, idempotency_key: str) -> None:
@@ -458,10 +542,14 @@ def normalize_instruction(content: str) -> tuple[dict[str, object], list[dict[st
 
     match = WRITE_INSTRUCTION.fullmatch(content.strip())
     if not match:
+        workspace_change_required = not bool(
+            READ_ONLY_INSTRUCTION.match(content)
+        )
         return (
             {
                 "kind": "provider_task",
                 "instruction": content,
+                "workspace_change_required": workspace_change_required,
             },
             [
                 {
@@ -472,7 +560,11 @@ def normalize_instruction(content: str) -> tuple[dict[str, object], list[dict[st
                 {
                     "id": "relevant_checks",
                     "kind": "checker_evidence",
-                    "expected": "smallest relevant deterministic checks pass",
+                    "expected": (
+                        "smallest relevant deterministic checks pass"
+                        if workspace_change_required
+                        else "read-only findings are independently supported by bounded evidence"
+                    ),
                 },
             ],
         )

@@ -49,7 +49,8 @@ POST /api/messages
 ```
 
 Large instructions use a read-only Planner that must return at least two
-comparable alternatives and a bounded Task DAG. Confidence of at least 95%
+comparable alternatives, per-Task acceptance contracts, scheduling declarations
+and a bounded Task DAG. Confidence of at least 95%
 selects the plan automatically only when no explicit authorization is needed;
 otherwise the project Butler asks one question. Plan authorization is stored as
 a message bound to the project, Task, spec revision, action, workspace scope and
@@ -57,10 +58,24 @@ a message bound to the project, Task, spec revision, action, workspace scope and
 
 Runtime continuity has three deliberately small layers: a transient bounded Hot
 Context Capsule, atomic Warm `current.json` handoffs with archives, and
-append-only Cold Session segment manifests. Project numeric settings are
-validated, queued as actions, applied only by `advance_project`, and frozen with
-their source into newly-created TaskSessions. Visible project creation, restore,
-workspace binding and archive also pass through the same action queue.
+append-only Cold Session segment manifests. Native compact policy/events and
+non-native generation rotation use the same frozen thresholds. Project numeric
+settings, Provider order and Project rules are validated, queued as actions,
+applied only by `advance_project`, and frozen with their source into newly-created
+TaskSessions. Visible project creation, restore, workspace binding and archive
+also pass through the same action queue.
+
+Executor, Planner and Checker calls use stable HostJob IDs with
+start/status/output reconciliation outside SQLite write transactions. A restart
+polls the existing job instead of blindly replaying it. Explicitly read-only
+analysis Tasks use a read-only Host Bridge job and may finish from independent
+Evidence without a workspace delta.
+
+The global Butler accepts an optional Project ID or an `@project-id` prefix. An
+exact search such as `找 result.txt 任务` routes to a unique Project without
+creating a Task. Project conversation files are bounded projections; global
+conversation files contain only transfer references, while SQLite remains the
+single canonical history.
 
 Only `POST /api/messages` and `POST /api/actions` mutate owner intent. Monitor
 and all GET routes are read-only.
@@ -78,11 +93,14 @@ normalization, Token dashboards, recoverable project archive, restart recovery,
 read-only Monitor, Provider Probe Tasks, queued project settings, UI/API safety,
 and fail-closed external Providers. Planner tests cover high-confidence
 selection, one Butler question, scoped authorization and serial DAG
-materialization. Durable HostJob tests also prove that Provider
-and Checker waits release SQLite, different projects advance concurrently,
-terminal failures fall back by generation, and v3 terminal jobs migrate to
-schema v4 without loss. The code-Task regressions use a fake Host Bridge and
-therefore spend no external Provider tokens.
+materialization. Durable HostJob tests also prove that Executor, Planner and
+Checker waits release SQLite, different projects advance concurrently, all three
+model roles recover across restart and fall back by generation, and terminal
+jobs migrate to schema v5 without loss. The suite also covers deadline stopping,
+compact/rotation, global routing, Project rules/templates, consistent SQLite
+backup, candidate isolation and the single-Cronner lock. The code-Task
+regressions use a fake Host Bridge and therefore spend no external Provider
+tokens.
 
 ## Deliberate V1 boundary
 
@@ -91,6 +109,29 @@ probe is deterministic; the bounded Codex minimal-Token probe requires an exact
 human confirmation and records its ModelCallLedger usage. The application does
 not control Docker, touch production, migrate old data, or copy the old
 repository.
+
+## Candidate gate
+
+Create a consistent database copy without copying a live `.db` away from its
+WAL:
+
+```bash
+python3 -m plowwhip --db data/plowwhip.db --data-root data \
+  backup /absolute/candidate-data/plowwhip.db
+```
+
+`candidate-preflight` accepts production and candidate JSON manifests containing
+exactly `code_root`, `data_root`, `db_path`, `compose_project`, `port`,
+`host_bridge_namespace`, and `cronner_enabled`. It rejects shared isolation
+fields, requires the candidate database to live in its own data root, and
+requires the candidate Cronner to be disabled:
+
+```bash
+python3 -m plowwhip candidate-preflight production.json candidate.json
+```
+
+The result never authorizes cutover. Production switching, old-data reconcile
+and rollback remain separate owner-approval actions.
 
 ## Local Docker check
 

@@ -7,19 +7,28 @@ import time
 from dataclasses import dataclass
 from uuid import uuid4
 
-from .execution import _write_atomic, archive_task_sessions, current_session
+from .execution import (
+    _context_policy,
+    _fallback_provider_generation,
+    archive_task_sessions,
+    current_session,
+)
 from .intake import canonical_json
 from .provider import (
     CHECKER_RESULT_PREFIX,
+    ACTIVE_HOST_JOB_STATUSES,
     PROBE_TOKEN_CAP,
+    provider_job_output,
+    provider_job_status,
     record_model_call,
-    run_provider_task,
+    start_provider_job,
 )
-from .store import Store
+from .store import Store, write_atomic as _write_atomic
 
 
 @dataclass(frozen=True)
 class CheckerStep:
+    kind: str
     project_id: str
     task_id: str
     job_id: str
@@ -29,6 +38,7 @@ class CheckerStep:
     session_id: str | None
     timeout_seconds: int
     execution: dict
+    context_policy: dict[str, object]
 
 
 def verify_task(
@@ -195,10 +205,14 @@ def verify_task(
         ),
     )
     if passed:
+        _promote_verified_worker_template(
+            store, connection, task, evidence_path, now
+        )
         connection.execute(
             """
             UPDATE tasks SET public_status = 'done', phase = 'done', wait_reason = NULL,
-                fault_code = NULL, next_action_at = NULL, outcome = 'done', updated_at = ?
+                fault_code = NULL, next_action_at = NULL, next_action_kind = NULL,
+                outcome = 'done', updated_at = ?
             WHERE id = ?
             """,
             (now, task["id"]),
@@ -210,7 +224,8 @@ def verify_task(
             UPDATE tasks SET public_status = 'in_progress', phase = 'repair',
                 wait_reason = ?,
                 fault_code = 'verification', retry_count = retry_count + 1,
-                next_action_at = ?, updated_at = ? WHERE id = ?
+                next_action_at = ?, next_action_kind = 'repair',
+                updated_at = ? WHERE id = ?
             """,
             (
                 (
@@ -229,7 +244,7 @@ def verify_task(
             UPDATE tasks SET public_status = 'needs_decision', phase = 'verify',
                 wait_reason = ?,
                 fault_code = 'verification', next_action_at = NULL,
-                outcome = NULL, updated_at = ? WHERE id = ?
+                next_action_kind = NULL, outcome = NULL, updated_at = ? WHERE id = ?
             """,
             (
                 (
@@ -249,6 +264,84 @@ def verify_task(
         (task["project_id"], task["id"], canonical_json(evidence), now),
     )
     return "verify"
+
+
+def _promote_verified_worker_template(
+    store: Store,
+    connection: sqlite3.Connection,
+    task: sqlite3.Row,
+    evidence_path,
+    now: float,
+) -> None:
+    role_key = task["role_key"] or "fullstack"
+    item_key = "code_change" if role_key == "fullstack" else str(role_key)
+    existing = connection.execute(
+        """
+        SELECT MAX(revision) AS revision FROM library_items
+        WHERE scope = 'project' AND project_id = ?
+          AND kind = 'worker_template' AND item_key = ?
+        """,
+        (task["project_id"], item_key),
+    ).fetchone()
+    revision = int(existing["revision"] or 0) + 1
+    goal = connection.execute(
+        "SELECT objective FROM goals WHERE id = ?", (task["goal_id"],)
+    ).fetchone()
+    reuse_requested = bool(
+        goal and "以后都这样" in str(goal["objective"])
+    )
+    if revision > 1 and not reuse_requested:
+        return
+    body = (
+        "# Project-verified Worker template\n\n"
+        f"Role: {role_key}\n"
+        "Use the frozen TaskSpec, stay inside the registered workspace, make only "
+        "recoverable changes, run bounded checks, and leave independent Evidence.\n"
+    ).encode()
+    path = (
+        store.data_root
+        / "projects"
+        / task["project_id"]
+        / "library"
+        / "worker-templates"
+        / f"{item_key}.revision-{revision:06d}.md"
+    )
+    _write_atomic(path, body)
+    connection.execute(
+        """
+        INSERT INTO library_items(
+            id, scope, project_id, kind, item_key, revision,
+            path, sha256, created_at
+        ) VALUES (?, 'project', ?, 'worker_template', ?, ?, ?, ?, ?)
+        """,
+        (
+            uuid4().hex,
+            task["project_id"],
+            item_key,
+            revision,
+            store.relative_data_path(path),
+            hashlib.sha256(body).hexdigest(),
+            now,
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
+        VALUES (?, ?, 'worker_template_promoted', ?, ?)
+        """,
+        (
+            task["project_id"],
+            task["id"],
+            canonical_json(
+                {
+                    "item_key": item_key,
+                    "revision": revision,
+                    "evidence_ref": store.relative_data_path(evidence_path),
+                }
+            ),
+            now,
+        ),
+    )
 
 
 def _prepare_checker_step(
@@ -290,12 +383,13 @@ def _prepare_checker_step(
         (task["id"],),
     ).fetchone()["value"]
     job_id = str(uuid4())
+    prompt = _checker_prompt(task, spec, execution)
     connection.execute(
         """
         INSERT INTO host_jobs(
             id, task_id, task_session_id, session_generation,
-            spec_revision, sequence, purpose, status, started_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 'check', 'dispatching', ?)
+            spec_revision, sequence, purpose, status, started_at, dispatch_json
+        ) VALUES (?, ?, ?, ?, ?, ?, 'check', 'dispatching', ?, ?)
         """,
         (
             job_id,
@@ -305,12 +399,14 @@ def _prepare_checker_step(
             task["spec_revision"],
             sequence,
             started_at,
+            canonical_json({"prompt": prompt, "access": "read"}),
         ),
     )
     connection.execute(
         """
         UPDATE tasks SET public_status = 'in_progress', phase = 'check_call',
-            wait_reason = NULL, fault_code = NULL, next_action_at = ?, updated_at = ?
+            wait_reason = NULL, fault_code = NULL, next_action_at = ?,
+            next_action_kind = 'check', updated_at = ?
         WHERE id = ?
         """,
         (started_at, started_at, task["id"]),
@@ -328,30 +424,87 @@ def _prepare_checker_step(
         ),
     )
     return CheckerStep(
+        "start",
         task["project_id"],
         task["id"],
         job_id,
         generation["provider_key"],
         str(spec["project_path"]),
-        _checker_prompt(task, spec, execution),
+        prompt,
         generation["external_session_id"],
         int(settings.get("max_runtime_seconds", 600)),
         execution,
+        _context_policy(settings),
+    )
+
+
+def pending_checker_step(
+    store: Store, connection: sqlite3.Connection, task: sqlite3.Row
+) -> CheckerStep:
+    job = connection.execute(
+        """
+        SELECT * FROM host_jobs
+        WHERE task_id = ? AND purpose = 'check'
+          AND status IN ('dispatching', 'running')
+        ORDER BY sequence DESC LIMIT 1
+        """,
+        (task["id"],),
+    ).fetchone()
+    if not job:
+        raise RuntimeError(f"Task {task['id']} has no active Checker HostJob")
+    generation = connection.execute(
+        """
+        SELECT provider_key, external_session_id FROM session_generations
+        WHERE task_session_id = ? AND generation = ?
+        """,
+        (job["task_session_id"], job["session_generation"]),
+    ).fetchone()
+    session = connection.execute(
+        "SELECT settings_json FROM task_sessions WHERE id = ?",
+        (job["task_session_id"],),
+    ).fetchone()
+    settings = json.loads(session["settings_json"])["values"]
+    spec = json.loads(task["spec_json"])
+    execution = _execution_manifest(store, connection, task)
+    prompt = str(
+        json.loads(job["dispatch_json"]).get("prompt")
+        or _checker_prompt(task, spec, execution)
+    )
+    return CheckerStep(
+        "start" if job["status"] == "dispatching" else "poll",
+        task["project_id"],
+        task["id"],
+        job["id"],
+        generation["provider_key"],
+        str(spec["project_path"]),
+        prompt,
+        generation["external_session_id"],
+        int(settings.get("max_runtime_seconds", 600)),
+        execution,
+        _context_policy(settings),
     )
 
 
 def perform_checker_step(step: CheckerStep) -> dict[str, object]:
     try:
-        return {
-            "ok": True,
-            "checker": run_provider_task(
+        state = (
+            start_provider_job(
+                step.job_id,
                 step.provider_key,
                 step.project_path,
                 step.prompt,
                 session_id=step.session_id,
-                access="read",
                 timeout_seconds=step.timeout_seconds,
-            ),
+                context_policy=step.context_policy,
+                access="read",
+            )
+            if step.kind == "start"
+            else provider_job_status(step.job_id)
+        )
+        return {
+            "ok": True,
+            "state": state,
+            "output": provider_job_output(step.job_id),
         }
     except (OSError, RuntimeError, ValueError) as error:
         return {"ok": False, "error": type(error).__name__}
@@ -373,20 +526,93 @@ def apply_checker_step(
     ).fetchone()
     if not task or not job or task["outcome"] is not None:
         return "stale_checker_fact"
+    if not facts.get("ok"):
+        now = time.time()
+        dispatch = json.loads(job["dispatch_json"])
+        failures = int(dispatch.get("reconcile_failures") or 0) + 1
+        dispatch["reconcile_failures"] = failures
+        session = connection.execute(
+            "SELECT settings_json FROM task_sessions WHERE id = ?",
+            (job["task_session_id"],),
+        ).fetchone()
+        values = json.loads(session["settings_json"]).get("values", {})
+        exhausted = failures > int(values.get("retry_count", 0))
+        connection.execute(
+            "UPDATE host_jobs SET dispatch_json = ? WHERE id = ?",
+            (canonical_json(dispatch), job["id"]),
+        )
+        connection.execute(
+            """
+            UPDATE tasks SET public_status = ?, phase = ?,
+                wait_reason = ?, fault_code = ?, next_action_at = ?,
+                next_action_kind = ?, updated_at = ? WHERE id = ?
+            """,
+            (
+                "needs_decision" if exhausted else "in_progress",
+                "provider_recovery" if exhausted else task["phase"],
+                (
+                    "independent Checker outcome is unknown; reconcile or cancel the HostJob"
+                    if exhausted
+                    else "Checker HostJob unavailable; idempotent reconcile scheduled"
+                ),
+                "unsafe_unknown" if exhausted else "transport",
+                None if exhausted else now + max(
+                    1, int(values.get("retry_backoff_seconds", 0))
+                ),
+                None if exhausted else (
+                    "check" if job["status"] == "dispatching" else "check_poll"
+                ),
+                now,
+                task["id"],
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
+            VALUES (?, ?, 'host_job_reconcile_deferred', ?, ?)
+            """,
+            (
+                task["project_id"],
+                task["id"],
+                canonical_json(
+                    {
+                        "host_job_id": job["id"],
+                        "purpose": "check",
+                        "failures": failures,
+                    }
+                ),
+                now,
+            ),
+        )
+        return "needs_decision" if exhausted else "check_reconcile"
+    if facts.get("ok") and str(facts["state"].get("status")) in ACTIVE_HOST_JOB_STATUSES:
+        state = facts["state"]
+        now = time.time()
+        connection.execute(
+            "UPDATE host_jobs SET status = 'running' WHERE id = ?",
+            (job["id"],),
+        )
+        if state.get("session_id"):
+            connection.execute(
+                """
+                UPDATE session_generations SET external_session_id = ?
+                WHERE task_session_id = ? AND generation = ?
+                """,
+                (state["session_id"], job["task_session_id"], job["session_generation"]),
+            )
+        connection.execute(
+            """
+            UPDATE tasks SET phase = 'check_wait', next_action_at = ?,
+                next_action_kind = 'check_poll', updated_at = ? WHERE id = ?
+            """,
+            (now + 1, now, task["id"]),
+        )
+        return "check_wait"
     spec = json.loads(task["spec_json"])
     checker = (
-        facts["checker"]
+        _checker_result(step, facts["state"], facts.get("output"))
         if facts.get("ok")
-        else {
-            "returncode": 1,
-            "stdout": "",
-            "stderr": f"checker unavailable: {facts.get('error', 'unknown')}",
-            "session_id": step.session_id,
-            "input_tokens": 0,
-            "cached_input_tokens": 0,
-            "output_tokens": 0,
-            "model": step.provider_key,
-        }
+        else {}
     )
     if facts.get("ok"):
         if checker["session_id"]:
@@ -409,13 +635,71 @@ def apply_checker_step(
             int(checker["output_tokens"]),
             str(checker["model"]),
         )
+    checker_completed = bool(
+        str(facts["state"].get("status")) == "completed"
+        and checker["returncode"] == 0
+    )
+    if not checker_completed:
+        now = time.time()
+        fallback = _fallback_provider_generation(
+            connection, task, job, step.provider_key, now
+        )
+        connection.execute(
+            """
+            UPDATE host_jobs SET status = 'failed', ended_at = ?, returncode = ?,
+                failure_code = 'provider' WHERE id = ?
+            """,
+            (now, checker["returncode"], job["id"]),
+        )
+        connection.execute(
+            """
+            UPDATE tasks SET public_status = ?, phase = ?, wait_reason = ?,
+                fault_code = 'provider', next_action_at = ?,
+                next_action_kind = ?, updated_at = ? WHERE id = ?
+            """,
+            (
+                "in_progress" if fallback else "needs_decision",
+                "verify" if fallback else "provider_recovery",
+                (
+                    f"Checker Provider failed; falling back to {fallback}"
+                    if fallback
+                    else "independent Checker exhausted all frozen Provider candidates"
+                ),
+                now if fallback else None,
+                "check" if fallback else None,
+                now,
+                task["id"],
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
+            VALUES (?, ?, 'checker_provider_failed', ?, ?)
+            """,
+            (
+                task["project_id"],
+                task["id"],
+                canonical_json(
+                    {
+                        "host_job_id": job["id"],
+                        "provider_key": step.provider_key,
+                        "fallback": fallback,
+                    }
+                ),
+                now,
+            ),
+        )
+        return "checker_fallback" if fallback else "needs_decision"
     checker_stdout = str(checker["stdout"])
     workspace_changed = bool(step.execution.get("workspace_changed"))
+    workspace_change_required = bool(
+        spec.get("workspace_change_required", True)
+    )
     expected_acceptance = json.loads(task["acceptance_json"])
     verdict = _parse_checker_verdict(
         checker_stdout, expected_acceptance, spec["project_path"]
     )
-    if not workspace_changed:
+    if workspace_change_required and not workspace_changed:
         for item in verdict["acceptances"]:
             if item["acceptance_id"] == "relevant_checks":
                 item.update(
@@ -433,7 +717,7 @@ def apply_checker_step(
     passed = bool(
         step.execution
         and step.execution.get("returncode") == 0
-        and workspace_changed
+        and (workspace_changed or not workspace_change_required)
         and checker["returncode"] == 0
         and verdict["passed"]
     )
@@ -458,6 +742,7 @@ def apply_checker_step(
         "provider_key": step.provider_key,
         "executor_returncode": step.execution.get("returncode"),
         "workspace_changed": workspace_changed,
+        "workspace_change_required": workspace_change_required,
         "before": step.execution.get("before"),
         "after": step.execution.get("after"),
         "checker_returncode": checker["returncode"],
@@ -509,7 +794,11 @@ def apply_checker_step(
             acceptance["acceptance_id"],
             now,
         )
-    checker_succeeded = bool(facts.get("ok") and checker["returncode"] == 0)
+    checker_succeeded = bool(
+        facts.get("ok")
+        and str(facts["state"].get("status")) == "completed"
+        and checker["returncode"] == 0
+    )
     connection.execute(
         """
         UPDATE host_jobs SET status = ?, ended_at = ?, returncode = ?,
@@ -525,10 +814,14 @@ def apply_checker_step(
         ),
     )
     if passed:
+        _promote_verified_worker_template(
+            store, connection, task, evidence_path, now
+        )
         connection.execute(
             """
             UPDATE tasks SET public_status = 'done', phase = 'done', wait_reason = NULL,
-                fault_code = NULL, next_action_at = NULL, outcome = 'done', updated_at = ?
+                fault_code = NULL, next_action_at = NULL, next_action_kind = NULL,
+                outcome = 'done', updated_at = ?
             WHERE id = ?
             """,
             (now, task["id"]),
@@ -539,13 +832,14 @@ def apply_checker_step(
             """
             UPDATE tasks SET public_status = 'in_progress', phase = 'repair',
                 wait_reason = ?, fault_code = 'verification',
-                retry_count = retry_count + 1, next_action_at = ?, updated_at = ?
+                retry_count = retry_count + 1, next_action_at = ?,
+                next_action_kind = 'repair', updated_at = ?
             WHERE id = ?
             """,
             (
                 (
-                    "No workspace delta was proven"
-                    if not workspace_changed
+                    "No required workspace delta was proven"
+                    if workspace_change_required and not workspace_changed
                     else (
                         "Independent checker requested changes: "
                         + canonical_json(verdict["repair_package"])[:4000]
@@ -556,27 +850,17 @@ def apply_checker_step(
                 task["id"],
             ),
         )
-    elif not facts.get("ok"):
-        connection.execute(
-            """
-            UPDATE tasks SET public_status = 'needs_decision', phase = 'provider_recovery',
-                wait_reason = 'independent Checker result is unknown; automatic replay is unsafe',
-                fault_code = 'unsafe_unknown', next_action_at = NULL,
-                outcome = NULL, updated_at = ? WHERE id = ?
-            """,
-            (now, task["id"]),
-        )
     else:
         connection.execute(
             """
             UPDATE tasks SET public_status = 'needs_decision', phase = 'verify',
                 wait_reason = ?, fault_code = 'verification', next_action_at = NULL,
-                outcome = NULL, updated_at = ? WHERE id = ?
+                next_action_kind = NULL, outcome = NULL, updated_at = ? WHERE id = ?
             """,
             (
                 (
-                    "code task produced no workspace delta"
-                    if not workspace_changed
+                    "code task produced no required workspace delta"
+                    if workspace_change_required and not workspace_changed
                     else (
                         verdict["decision_reason"]
                         or "independent checker contract did not prove every acceptance"
@@ -594,6 +878,55 @@ def apply_checker_step(
         (task["project_id"], task["id"], canonical_json(evidence), now),
     )
     return "verify"
+
+
+def _execution_manifest(
+    store: Store, connection: sqlite3.Connection, task: sqlite3.Row
+) -> dict:
+    artifact = connection.execute(
+        """
+        SELECT path FROM artifacts
+        WHERE task_id = ? AND kind = 'output' AND revision = ?
+        ORDER BY created_at DESC, rowid DESC LIMIT 1
+        """,
+        (task["id"], task["spec_revision"]),
+    ).fetchone()
+    if not artifact:
+        return {}
+    try:
+        value = json.loads(store.resolve_data_path(artifact["path"]).read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _checker_result(
+    step: CheckerStep, state: object, output: object
+) -> dict[str, object]:
+    state = state if isinstance(state, dict) else {}
+    streams: dict[str, list[str]] = {"stdout": [], "stderr": []}
+    if isinstance(output, dict):
+        for chunk in output.get("chunks", []):
+            if isinstance(chunk, dict) and chunk.get("stream") in streams:
+                streams[str(chunk["stream"])].append(str(chunk.get("text") or ""))
+    input_tokens = max(0, int(state.get("input_tokens") or 0))
+    cached_tokens = min(
+        input_tokens, max(0, int(state.get("cached_input_tokens") or 0))
+    )
+    return {
+        "returncode": (
+            int(state["returncode"])
+            if isinstance(state.get("returncode"), int)
+            else 1
+        ),
+        "stdout": "".join(streams["stdout"]),
+        "stderr": "".join(streams["stderr"]),
+        "session_id": str(state.get("session_id") or "") or step.session_id,
+        "input_tokens": input_tokens,
+        "cached_input_tokens": cached_tokens,
+        "output_tokens": max(0, int(state.get("output_tokens") or 0)),
+        "model": str(state.get("model") or step.provider_key),
+    }
 
 
 def _checker_prompt(task: sqlite3.Row, spec: dict, execution: dict) -> str:

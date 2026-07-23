@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -102,6 +103,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     retry_count INTEGER NOT NULL DEFAULT 0,
     next_retry_at REAL,
     next_action_at REAL,
+    next_action_kind TEXT,
+    deadline_at REAL,
     outcome TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
@@ -289,6 +292,90 @@ DEFAULT_LIBRARY = {
 }
 
 
+def write_atomic(path: Path, body: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        temporary.write_bytes(body)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def candidate_preflight(
+    production: dict[str, object], candidate: dict[str, object]
+) -> dict[str, object]:
+    required = {
+        "code_root",
+        "data_root",
+        "db_path",
+        "compose_project",
+        "port",
+        "host_bridge_namespace",
+        "cronner_enabled",
+    }
+    if set(production) != required or set(candidate) != required:
+        raise ValueError(
+            "production and candidate must declare the exact isolation fields"
+        )
+    if candidate["cronner_enabled"] is not False:
+        raise ValueError("candidate Cronner must be disabled before cutover approval")
+    if production["cronner_enabled"] is not True:
+        raise ValueError("production manifest must identify the active Cronner")
+    path_fields = ("code_root", "data_root", "db_path")
+    normalized: dict[str, dict[str, object]] = {"production": {}, "candidate": {}}
+    for name, source in (("production", production), ("candidate", candidate)):
+        for field in path_fields:
+            value = source[field]
+            if not isinstance(value, str) or not Path(value).is_absolute():
+                raise ValueError(f"{name}.{field} must be an absolute path")
+            normalized[name][field] = str(Path(value).resolve())
+        for field in ("compose_project", "host_bridge_namespace"):
+            value = source[field]
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name}.{field} must be a non-empty string")
+            normalized[name][field] = value.strip()
+        port = source["port"]
+        if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65_535:
+            raise ValueError(f"{name}.port must be a valid TCP port")
+        normalized[name]["port"] = port
+        normalized[name]["cronner_enabled"] = source["cronner_enabled"]
+    isolated_fields = (
+        "code_root",
+        "data_root",
+        "db_path",
+        "compose_project",
+        "port",
+        "host_bridge_namespace",
+    )
+    collisions = [
+        field
+        for field in isolated_fields
+        if normalized["production"][field] == normalized["candidate"][field]
+    ]
+    if collisions:
+        raise ValueError(
+            "candidate isolation collision: " + ", ".join(collisions)
+        )
+    candidate_data = str(normalized["candidate"]["data_root"])
+    candidate_db = str(normalized["candidate"]["db_path"])
+    try:
+        inside_data_root = os.path.commonpath([candidate_data, candidate_db]) == candidate_data
+    except ValueError:
+        inside_data_root = False
+    if not inside_data_root:
+        raise ValueError("candidate db_path must be inside candidate data_root")
+    return {
+        "isolated": True,
+        "backup_required": "sqlite_backup_api",
+        "candidate_cronner_enabled": False,
+        "cutover_approved": False,
+        "next_gate": "owner_explicit_cutover_approval",
+        "production": normalized["production"],
+        "candidate": normalized["candidate"],
+    }
+
+
 class Store:
     def __init__(self, db_path: str | Path, data_root: str | Path):
         self.db_path = Path(db_path).resolve()
@@ -331,10 +418,43 @@ class Store:
                     (value_json, now, key, value_json),
                 )
             self._sync_default_library(connection, now)
-            connection.execute("PRAGMA user_version = 4")
+            connection.execute("PRAGMA user_version = 5")
             connection.commit()
         finally:
             connection.close()
+
+    def backup_to(self, destination: str | Path) -> dict[str, object]:
+        target_path = Path(destination).resolve()
+        if target_path == self.db_path:
+            raise ValueError("backup destination must differ from the source database")
+        if target_path.exists():
+            raise ValueError("backup destination already exists")
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        source = self.connect_readonly()
+        target = sqlite3.connect(target_path)
+        try:
+            source.backup(target)
+            quick_check = [
+                row[0] for row in target.execute("PRAGMA quick_check").fetchall()
+            ]
+            if quick_check != ["ok"]:
+                raise RuntimeError("backup quick_check failed")
+            target.commit()
+        except Exception:
+            target.close()
+            target_path.unlink(missing_ok=True)
+            raise
+        else:
+            target.close()
+        finally:
+            source.close()
+        return {
+            "method": "sqlite_backup_api",
+            "source": str(self.db_path),
+            "destination": str(target_path),
+            "bytes": target_path.stat().st_size,
+            "quick_check": quick_check,
+        }
 
     @staticmethod
     def _ensure_host_job_schema(connection: sqlite3.Connection) -> None:
@@ -388,6 +508,8 @@ class Store:
             "sprint": "INTEGER",
             "role_key": "TEXT",
             "checker_role_key": "TEXT",
+            "next_action_kind": "TEXT",
+            "deadline_at": "REAL",
         }
         for name, declaration in additions.items():
             if name not in columns:

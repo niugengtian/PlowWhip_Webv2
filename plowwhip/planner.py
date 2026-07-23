@@ -5,7 +5,12 @@ import re
 from dataclasses import dataclass
 
 from .intake import normalize_instruction
-from .provider import PROVIDERS, run_provider_task
+from .provider import (
+    PROVIDERS,
+    provider_job_output,
+    provider_job_status,
+    start_provider_job,
+)
 
 
 TASK_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -50,6 +55,7 @@ TASK_SETTING_LIMITS = {
 
 @dataclass(frozen=True)
 class PlannerStep:
+    kind: str
     project_id: str
     task_id: str
     job_id: str
@@ -59,6 +65,7 @@ class PlannerStep:
     session_id: str | None
     timeout_seconds: int
     classification: dict
+    context_policy: dict[str, object]
 
 
 def classify_instruction(content: str, kind: str) -> dict[str, object]:
@@ -93,7 +100,9 @@ def planner_prompt(instruction: str, project_id: str, classification: dict) -> s
         "Return at least two genuine alternatives comparing name, scope, cost, risk, "
         "reversible, and acceptance. Select one and emit a serializable Task DAG with "
         "2-50 bounded tasks. Each task needs key, instruction, depends_on, sprint, "
-        "role_key, and optional settings. Use role_key fullstack for code work or "
+        "role_key, a 1-20 item acceptance array with stable id and expected result, "
+        "optional earliest_start_delay_seconds, optional deadline_seconds, and optional "
+        "settings. Use role_key fullstack for code work or "
         "deterministic only for exact '写入 relative-path: content' instructions. "
         "Do not add deployment, deletion, payment, publishing, permission changes, "
         "or scope absent from the Goal. Finish with one line beginning "
@@ -105,15 +114,25 @@ def planner_prompt(instruction: str, project_id: str, classification: dict) -> s
 
 def perform_planner_step(step: PlannerStep) -> dict[str, object]:
     try:
-        result = run_provider_task(
-            step.provider_key,
-            step.project_path,
-            step.prompt,
-            session_id=step.session_id,
-            access="read",
-            timeout_seconds=step.timeout_seconds,
+        state = (
+            start_provider_job(
+                step.job_id,
+                step.provider_key,
+                step.project_path,
+                step.prompt,
+                session_id=step.session_id,
+                timeout_seconds=step.timeout_seconds,
+                context_policy=step.context_policy,
+                access="read",
+            )
+            if step.kind == "start"
+            else provider_job_status(step.job_id)
         )
-        return {"ok": True, "result": result}
+        return {
+            "ok": True,
+            "state": state,
+            "output": provider_job_output(step.job_id),
+        }
     except (OSError, RuntimeError, ValueError) as error:
         return {"ok": False, "error": type(error).__name__}
 
@@ -199,6 +218,15 @@ def normalize_plan(plan: object) -> dict:
         settings = _normalize_task_settings(
             key, role_key, checker_role, item.get("settings", {})
         )
+        acceptance = _normalize_task_acceptance(
+            key, item.get("acceptance"), acceptance
+        )
+        earliest_start_delay_seconds = _bounded_schedule_value(
+            key, "earliest_start_delay_seconds", item.get("earliest_start_delay_seconds"), 0
+        )
+        deadline_seconds = _bounded_schedule_value(
+            key, "deadline_seconds", item.get("deadline_seconds"), None
+        )
         normalized.append(
             {
                 "key": key,
@@ -209,6 +237,8 @@ def normalize_plan(plan: object) -> dict:
                 "role_key": role_key,
                 "checker_role": checker_role,
                 "settings": settings,
+                "earliest_start_delay_seconds": earliest_start_delay_seconds,
+                "deadline_seconds": deadline_seconds,
             }
         )
 
@@ -231,6 +261,53 @@ def normalize_plan(plan: object) -> dict:
         "summary": str(plan.get("summary", "")),
         "tasks": ordered,
     }
+
+
+def _normalize_task_acceptance(
+    task_key: str, raw: object, fallback: list[dict]
+) -> list[dict]:
+    if raw is None:
+        return fallback
+    if not isinstance(raw, list) or not 1 <= len(raw) <= 20:
+        raise ValueError(f"task {task_key} requires 1-20 acceptance items")
+    normalized = []
+    seen = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            raise ValueError(f"task {task_key} acceptance must contain objects")
+        acceptance_id = str(item.get("id") or "")
+        expected = str(item.get("expected") or "").strip()
+        if (
+            not TASK_KEY.fullmatch(acceptance_id)
+            or acceptance_id in seen
+            or not expected
+            or len(expected.encode()) > 4096
+        ):
+            raise ValueError(f"task {task_key} has invalid acceptance")
+        seen.add(acceptance_id)
+        normalized.append(
+            {
+                "id": acceptance_id,
+                "kind": "planner_acceptance",
+                "expected": expected,
+            }
+        )
+    return normalized
+
+
+def _bounded_schedule_value(
+    task_key: str, name: str, value: object, default: int | None
+) -> int | None:
+    if value is None:
+        return default
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value <= 31_536_000
+        or (name == "deadline_seconds" and value == 0)
+    ):
+        raise ValueError(f"task {task_key} has invalid {name}")
+    return value
 
 
 def _normalize_task_settings(

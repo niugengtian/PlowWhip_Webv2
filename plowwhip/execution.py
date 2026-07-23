@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -14,6 +13,7 @@ from .provider import (
     ACTIVE_HOST_JOB_STATUSES,
     PROVIDERS,
     cancel_provider_job,
+    parse_context_events,
     provider_job_output,
     provider_job_status,
     record_model_call,
@@ -21,7 +21,7 @@ from .provider import (
     start_provider_job,
     workspace_snapshot,
 )
-from .store import Store
+from .store import Store, write_atomic as _write_atomic
 
 
 @dataclass(frozen=True)
@@ -35,16 +35,8 @@ class ProviderStep:
     prompt: str
     session_id: str | None
     timeout_seconds: int
-
-
-def _write_atomic(path: Path, body: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
-    try:
-        temporary.write_bytes(body)
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    access: str
+    context_policy: dict[str, object]
 
 
 def create_task_sessions(
@@ -113,7 +105,11 @@ def create_task_session(
             task_id,
             worker_id,
             role_key,
-            canonical_json(_role_snapshot(connection, role_key, checker_independent)),
+            canonical_json(
+                _role_snapshot(
+                    connection, project_id, role_key, checker_independent
+                )
+            ),
             canonical_json(settings),
             now,
         ),
@@ -188,7 +184,10 @@ def effective_settings(
 
 
 def _role_snapshot(
-    connection: sqlite3.Connection, role_key: str, checker_independent: bool
+    connection: sqlite3.Connection,
+    project_id: str,
+    role_key: str,
+    checker_independent: bool,
 ) -> dict:
     template_key = {
         "provider_probe": "provider_probe",
@@ -200,8 +199,13 @@ def _role_snapshot(
     rows = connection.execute(
         """
         SELECT kind, item_key, revision, path, sha256 FROM library_items
-        WHERE scope = 'global' AND project_id IS NULL
-          AND item_key IN (?, ?, ?)
+        WHERE (
+            (scope = 'global' AND project_id IS NULL AND item_key IN (?, ?, ?))
+            OR (
+                scope = 'project' AND project_id = ?
+                AND (kind = 'rule' OR item_key IN (?, ?))
+            )
+          )
           AND revision = (
               SELECT MAX(latest.revision) FROM library_items latest
               WHERE latest.scope = library_items.scope
@@ -209,13 +213,23 @@ def _role_snapshot(
                 AND latest.kind = library_items.kind
                 AND latest.item_key = library_items.item_key
           )
-        ORDER BY kind, item_key
+        ORDER BY CASE scope WHEN 'global' THEN 0 ELSE 1 END, kind, item_key
         """,
-        keys,
+        (*keys, project_id, role_key, template_key),
     ).fetchall()
     return {
         "role_key": role_key,
-        "permission": "recoverable_workspace_change",
+        "permission": (
+            "read_only"
+            if role_key
+            in {
+                "planner",
+                "independent_checker",
+                "deterministic_checker",
+                "provider_probe",
+            }
+            else "recoverable_workspace_change"
+        ),
         "checker_independent": checker_independent,
         "library": [dict(row) for row in rows],
     }
@@ -378,7 +392,7 @@ def execute_task(
             """
             UPDATE tasks
             SET public_status = 'in_progress', phase = 'verify', next_action_at = ?,
-                updated_at = ?
+                next_action_kind = 'check', updated_at = ?
             WHERE id = ?
             """,
             (ended_at, ended_at, task["id"]),
@@ -479,6 +493,7 @@ def _prepare_provider_task(
             (str(error), started_at, task["id"]),
         )
         return "needs_decision"
+    access = "write" if spec.get("workspace_change_required", True) else "read"
     job_id = str(uuid4())
     connection.execute(
         """
@@ -500,6 +515,7 @@ def _prepare_provider_task(
                 {
                     "prompt": prompt,
                     "context_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+                    "access": access,
                 }
             ),
         ),
@@ -507,7 +523,8 @@ def _prepare_provider_task(
     connection.execute(
         """
         UPDATE tasks SET public_status = 'in_progress', phase = 'execute_snapshot',
-            wait_reason = NULL, fault_code = NULL, next_action_at = ?, updated_at = ?
+            wait_reason = NULL, fault_code = NULL, next_action_at = ?,
+            next_action_kind = 'snapshot', updated_at = ?
         WHERE id = ?
         """,
         (started_at, started_at, task["id"]),
@@ -534,6 +551,8 @@ def _prepare_provider_task(
         prompt,
         generation["external_session_id"],
         int(settings.get("max_runtime_seconds", 600)),
+        access,
+        _context_policy(settings),
     )
 
 
@@ -562,12 +581,19 @@ def pending_provider_step(
         (job["task_session_id"],),
     ).fetchone()
     spec = json.loads(task["spec_json"])
+    dispatch = json.loads(job["dispatch_json"])
     kind = {
         "execute_snapshot": "snapshot",
         "execute_dispatch": "start",
         "execute_wait": "poll",
         "stopping": "cancel",
     }.get(task["phase"])
+    settings = json.loads(session["settings_json"])["values"]
+    if task["phase"] == "stopping" and job["status"] == "cancelling":
+        dispatch = json.loads(job["dispatch_json"])
+        requested_at = float(dispatch.get("stop_requested_at") or time.time())
+        if time.time() >= requested_at + int(settings.get("stop_grace_seconds", 10)):
+            kind = "poll"
     if not kind:
         raise RuntimeError(f"Task {task['id']} is not waiting on a Provider")
     return ProviderStep(
@@ -578,11 +604,13 @@ def pending_provider_step(
         generation["provider_key"],
         str(spec["project_path"]),
         str(
-            json.loads(job["dispatch_json"]).get("prompt")
+            dispatch.get("prompt")
             or _provider_prompt(task, spec, job["purpose"])
         ),
         generation["external_session_id"],
-        int(json.loads(session["settings_json"])["values"].get("max_runtime_seconds", 600)),
+        int(settings.get("max_runtime_seconds", 600)),
+        str(dispatch.get("access") or "write"),
+        _context_policy(settings),
     )
 
 
@@ -598,6 +626,8 @@ def perform_provider_step(step: ProviderStep) -> dict[str, object]:
                 step.prompt,
                 session_id=step.session_id,
                 timeout_seconds=step.timeout_seconds,
+                context_policy=step.context_policy,
+                access=step.access,
             )
         elif step.kind == "poll":
             state = provider_job_status(step.job_id)
@@ -709,7 +739,8 @@ def apply_provider_step(
         connection.execute(
             """
             UPDATE tasks SET phase = 'execute_dispatch', wait_reason = NULL,
-                fault_code = NULL, next_action_at = ?, updated_at = ? WHERE id = ?
+                fault_code = NULL, next_action_at = ?,
+                next_action_kind = 'dispatch', updated_at = ? WHERE id = ?
             """,
             (now, now, task["id"]),
         )
@@ -721,15 +752,24 @@ def apply_provider_step(
     if log_body:
         _write_atomic(log_path, log_body)
     if bridge_status in ACTIVE_HOST_JOB_STATUSES:
-        database_status = "cancelling" if step.kind == "cancel" else "running"
+        stopping = bool(
+            task["phase"] == "stopping"
+            or job["status"] == "cancelling"
+            or step.kind == "cancel"
+        )
+        dispatch = json.loads(job["dispatch_json"])
+        if stopping:
+            dispatch.setdefault("stop_requested_at", now)
         connection.execute(
             """
-            UPDATE host_jobs SET status = ?, output_ref = COALESCE(?, output_ref)
+            UPDATE host_jobs SET status = ?, output_ref = COALESCE(?, output_ref),
+                dispatch_json = ?
             WHERE id = ?
             """,
             (
-                database_status,
+                "cancelling" if stopping else "running",
                 store.relative_data_path(log_path) if log_body else None,
+                canonical_json(dispatch),
                 job["id"],
             ),
         )
@@ -743,21 +783,23 @@ def apply_provider_step(
             )
         connection.execute(
             """
-            UPDATE tasks SET phase = ?, wait_reason = ?, fault_code = NULL,
-                next_action_at = ?, updated_at = ? WHERE id = ?
+            UPDATE tasks SET phase = ?, wait_reason = ?, fault_code = ?,
+                next_action_at = ?, next_action_kind = ?, updated_at = ? WHERE id = ?
             """,
             (
-                "stopping" if step.kind == "cancel" else "execute_wait",
-                "cancellation requested" if step.kind == "cancel" else None,
+                "stopping" if stopping else "execute_wait",
+                task["wait_reason"] if stopping else None,
+                task["fault_code"] if stopping else None,
                 now + 1,
+                "reconcile_stop" if stopping else "poll",
                 now,
                 task["id"],
             ),
         )
-        return "cancel" if step.kind == "cancel" else (
+        return "cancel" if stopping else (
             "dispatch" if step.kind == "start" else "wait"
         )
-    if step.kind == "cancel":
+    if task["phase"] == "stopping" or step.kind == "cancel":
         return _finalize_provider_cancel(store, connection, task, job, state, log_path, log_body)
     return _finalize_provider_job(
         store, connection, task, job, step, state, facts, log_path, log_body
@@ -814,6 +856,7 @@ def _finalize_provider_job(
     returncode = int(returncode) if isinstance(returncode, int) else 1
     succeeded = str(state.get("status")) == "completed" and returncode == 0
     stdout, stderr = _provider_output_streams(facts.get("output"))
+    context_events = parse_context_events(stdout)
     manifest = {
         "provider_key": step.provider_key,
         "project_path": step.project_path,
@@ -884,6 +927,26 @@ def _finalize_provider_job(
         output_tokens,
         str(state.get("model") or step.provider_key),
     )
+    for event in context_events:
+        connection.execute(
+            """
+            INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
+            VALUES (?, ?, 'provider_compacted', ?, ?)
+            """,
+            (
+                task["project_id"],
+                task["id"],
+                canonical_json(
+                    {
+                        "host_job_id": job["id"],
+                        "provider_key": step.provider_key,
+                        "generation": job["session_generation"],
+                        "event": event,
+                    }
+                ),
+                now,
+            ),
+        )
     for kind, path, data in (("output", output_path, body), ("log", log_path, log_body)):
         connection.execute(
             """
@@ -909,15 +972,19 @@ def _finalize_provider_job(
         if not succeeded
         else None
     )
+    if succeeded and step.provider_key != "codex_cli":
+        _rotate_context_generation(connection, task, job, step.provider_key, now)
     connection.execute(
         """
         UPDATE tasks SET public_status = ?, phase = ?, next_action_at = ?,
-            wait_reason = ?, fault_code = ?, updated_at = ? WHERE id = ?
+            next_action_kind = ?, wait_reason = ?, fault_code = ?,
+            updated_at = ? WHERE id = ?
         """,
         (
             "in_progress" if succeeded or fallback else "needs_decision",
             "verify" if succeeded else ("execute" if fallback else "provider_recovery"),
             now if succeeded or fallback else None,
+            "check" if succeeded else ("execute" if fallback else None),
             (
                 None
                 if succeeded
@@ -955,6 +1022,85 @@ def _finalize_provider_job(
         ),
     )
     return "provider_fallback" if fallback else job["purpose"]
+
+
+def _rotate_context_generation(
+    connection: sqlite3.Connection,
+    task: sqlite3.Row,
+    job: sqlite3.Row,
+    provider_key: str,
+    now: float,
+) -> bool:
+    session = connection.execute(
+        "SELECT settings_json FROM task_sessions WHERE id = ?",
+        (job["task_session_id"],),
+    ).fetchone()
+    threshold = int(
+        json.loads(session["settings_json"])["values"].get(
+            "rotation_input_tokens", 180_000
+        )
+    )
+    used = connection.execute(
+        """
+        SELECT COALESCE(SUM(normalized_total), 0) AS value FROM model_calls
+        WHERE task_session_id = ? AND session_generation = ?
+        """,
+        (job["task_session_id"], job["session_generation"]),
+    ).fetchone()["value"]
+    generation = connection.execute(
+        """
+        SELECT handoff_ref FROM session_generations
+        WHERE task_session_id = ? AND generation = ? AND status = 'active'
+        """,
+        (job["task_session_id"], job["session_generation"]),
+    ).fetchone()
+    if used < threshold or not generation or not generation["handoff_ref"]:
+        return False
+    connection.execute(
+        """
+        UPDATE session_generations SET status = 'archived', ended_at = ?
+        WHERE task_session_id = ? AND generation = ?
+        """,
+        (now, job["task_session_id"], job["session_generation"]),
+    )
+    connection.execute(
+        """
+        INSERT INTO session_generations(
+            id, task_session_id, generation, provider_key, status,
+            handoff_ref, created_at
+        ) VALUES (?, ?, ?, ?, 'active', ?, ?)
+        """,
+        (
+            uuid4().hex,
+            job["task_session_id"],
+            job["session_generation"] + 1,
+            provider_key,
+            generation["handoff_ref"],
+            now,
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
+        VALUES (?, ?, 'context_generation_rotated', ?, ?)
+        """,
+        (
+            task["project_id"],
+            task["id"],
+            canonical_json(
+                {
+                    "from_generation": job["session_generation"],
+                    "to_generation": job["session_generation"] + 1,
+                    "provider_key": provider_key,
+                    "normalized_total": used,
+                    "threshold": threshold,
+                    "handoff_ref": generation["handoff_ref"],
+                }
+            ),
+            now,
+        ),
+    )
+    return True
 
 
 def _fallback_provider_generation(
@@ -1068,28 +1214,44 @@ def _finalize_provider_cancel(
             job["id"],
         ),
     )
+    deadline_stop = str(task["wait_reason"] or "").startswith("[deadline]")
     connection.execute(
         """
-        UPDATE tasks SET public_status = 'done', outcome = 'cancelled', phase = 'done',
-            next_action_at = NULL, wait_reason = NULL, fault_code = NULL, updated_at = ?
+        UPDATE tasks SET public_status = ?, outcome = ?, phase = ?,
+            next_action_at = NULL, next_action_kind = NULL,
+            wait_reason = ?, fault_code = ?, updated_at = ?
         WHERE id = ?
         """,
-        (now, task["id"]),
+        (
+            "needs_decision" if deadline_stop else "done",
+            None if deadline_stop else "cancelled",
+            "provider_recovery" if deadline_stop else "done",
+            (
+                "[deadline] HostJob stopped after reconcile; decide whether to resume, revise, or cancel"
+                if deadline_stop
+                else None
+            ),
+            "process" if deadline_stop else None,
+            now,
+            task["id"],
+        ),
     )
-    archive_task_sessions(connection, task["id"], now)
+    if not deadline_stop:
+        archive_task_sessions(connection, task["id"], now)
     connection.execute(
         """
         INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
-        VALUES (?, ?, 'cancelled', ?, ?)
+        VALUES (?, ?, ?, ?, ?)
         """,
         (
             task["project_id"],
             task["id"],
+            "deadline_stopped" if deadline_stop else "cancelled",
             canonical_json({"host_job_id": job["id"]}),
             now,
         ),
     )
-    return "cancel"
+    return "needs_decision" if deadline_stop else "cancel"
 
 
 def _provider_output_streams(output: object) -> tuple[str, str]:
@@ -1109,14 +1271,23 @@ def _provider_prompt(
         if purpose == "repair" and task["wait_reason"]
         else ""
     )
+    access = (
+        "This is a read-only analysis Task: inspect and report bounded findings; "
+        "do not modify any workspace file.\n"
+        if not spec.get("workspace_change_required", True)
+        else ""
+    )
     return (
         f"Complete this bounded code Task in the current workspace:\n{spec['instruction']}\n"
         f"Task ID: {task['id']} · spec revision {task['spec_revision']}.{repair}\n"
         + (f"Bounded context capsule:\n{hot_context}\n" if hot_context else "")
+        + access
         +
         "Stay inside the workspace. Make only recoverable changes. Do not commit, deploy, "
         "delete permanently, expose secrets, send external messages, make purchases, or "
-        "change permissions. Run the smallest relevant checks and leave the workspace ready "
+        "change permissions. A scoped deletion must move the target to "
+        "original-name.rm.YYYYMMDDHHMMSS instead of unlinking it. Run the smallest relevant "
+        "checks and leave the workspace ready "
         "for an independent read-only checker."
     )
 
@@ -1124,6 +1295,29 @@ def _provider_prompt(
 def _bounded_tail(value: str, byte_cap: int = 16_384) -> str:
     body = value.encode()
     return body[-byte_cap:].decode(errors="replace")
+
+
+def _context_policy(settings: dict) -> dict[str, object]:
+    return {
+        "hot_max_bytes": int(settings.get("context_max_bytes", 16_384)),
+        "warm_max_bytes": int(settings.get("handoff_max_bytes", 8_192)),
+        "rotation_max_bytes": int(
+            settings.get("session_segment_max_bytes", 65_536)
+        ),
+        "provider_compaction_token_limit": int(
+            settings.get("native_compact_input_tokens", 120_000)
+        ),
+        "provider_compaction_scope": "body_after_prefix",
+        "sources": {
+            key: "task_session"
+            for key in (
+                "hot_max_bytes",
+                "warm_max_bytes",
+                "rotation_max_bytes",
+                "provider_compaction_token_limit",
+            )
+        },
+    }
 
 
 def _execute_provider_probe(
@@ -1230,7 +1424,7 @@ def _execute_provider_probe(
             """
             UPDATE tasks
             SET public_status = 'in_progress', phase = 'verify', next_action_at = ?,
-                updated_at = ?
+                next_action_kind = 'check', updated_at = ?
             WHERE id = ?
             """,
             (ended_at, ended_at, task["id"]),

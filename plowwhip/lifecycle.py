@@ -6,9 +6,12 @@ import sqlite3
 import time
 from uuid import uuid4
 
+from .butler import sync_conversation_files
 from .execution import (
     ProviderStep,
-    _write_atomic,
+    _context_policy,
+    _fallback_provider_generation,
+    _provider_output_streams,
     apply_provider_step,
     archive_task_sessions,
     create_task_session,
@@ -30,9 +33,15 @@ from .planner import (
     perform_planner_step,
     planner_prompt,
 )
-from .provider import record_model_call
-from .store import Store
-from .verification import CheckerStep, apply_checker_step, perform_checker_step, verify_task
+from .provider import ACTIVE_HOST_JOB_STATUSES, record_model_call
+from .store import Store, write_atomic as _write_atomic
+from .verification import (
+    CheckerStep,
+    apply_checker_step,
+    pending_checker_step,
+    perform_checker_step,
+    verify_task,
+)
 
 
 class LeaseLost(RuntimeError):
@@ -80,6 +89,7 @@ def advance_project(store: Store, project_id: str, lease_token: str, fence: int)
     with store.transaction() as connection:
         _assert_lease(connection, project_id, lease_token, fence)
         _ensure_project_question(connection, project_id)
+    sync_conversation_files(store, project_id)
     return outcome
 
 
@@ -120,8 +130,10 @@ def _advance_project_transaction(
                 "bind_project_workspace",
                 "archive_project",
                 "set_project_setting",
+                "set_project_rule",
+                "global_route",
             }:
-                return _apply_project_action(connection, action)
+                return _apply_project_action(store, connection, action)
             return _apply_action(connection, action)
 
         task = connection.execute(
@@ -129,12 +141,21 @@ def _advance_project_transaction(
             SELECT * FROM tasks
             WHERE project_id = ? AND outcome IS NULL
               AND public_status IN ('pending', 'in_progress')
-              AND next_action_at <= ?
+              AND (
+                next_action_at <= ?
+                OR (deadline_at IS NOT NULL AND deadline_at <= ?)
+              )
             ORDER BY created_at, rowid LIMIT 1
             """,
-            (project_id, time.time()),
+            (project_id, time.time(), time.time()),
         ).fetchone()
         if task:
+            if (
+                task["deadline_at"] is not None
+                and task["deadline_at"] <= time.time()
+                and task["phase"] != "stopping"
+            ):
+                return _handle_task_deadline(connection, task)
             if task["phase"] == "plan":
                 return _prepare_planner_step(connection, task)
             if task["phase"] == "execute":
@@ -150,10 +171,10 @@ def _advance_project_transaction(
                 "stopping",
             }:
                 return pending_provider_step(connection, task)
-            if task["phase"] == "check_call":
-                return _stop_interrupted_checker(connection, task)
-            if task["phase"] == "plan_call":
-                return _stop_interrupted_planner(connection, task)
+            if task["phase"] in {"check_call", "check_wait"}:
+                return pending_checker_step(store, connection, task)
+            if task["phase"] in {"plan_call", "plan_wait"}:
+                return _pending_planner_step(connection, task)
             return _stop_unknown_phase(connection, task)
 
         blocking = connection.execute(
@@ -166,6 +187,17 @@ def _advance_project_transaction(
         ).fetchone()
         if blocking:
             return "blocked"
+
+        message = connection.execute(
+            """
+            SELECT * FROM messages
+            WHERE project_id = ? AND processed_at IS NULL AND action_json IS NULL
+            ORDER BY created_at, rowid LIMIT 1
+            """,
+            (project_id,),
+        ).fetchone()
+        if message:
+            return _create_task(connection, message)
 
         broken = connection.execute(
             """
@@ -218,7 +250,13 @@ def _advance_project_transaction(
         if ready:
             now = time.time()
             connection.execute(
-                "UPDATE tasks SET phase = 'execute', next_action_at = ?, updated_at = ? WHERE id = ?",
+                """
+                UPDATE tasks SET phase = 'execute',
+                    next_action_at = ? + COALESCE(
+                        json_extract(spec_json, '$.earliest_start_delay_seconds'), 0
+                    ),
+                    next_action_kind = 'execute', updated_at = ? WHERE id = ?
+                """,
                 (now, now, ready["id"]),
             )
             connection.execute(
@@ -230,17 +268,7 @@ def _advance_project_transaction(
             )
             return "ready"
 
-        message = connection.execute(
-            """
-            SELECT * FROM messages
-            WHERE project_id = ? AND processed_at IS NULL AND action_json IS NULL
-            ORDER BY created_at, rowid LIMIT 1
-            """,
-            (project_id,),
-        ).fetchone()
-        if not message:
-            return "idle"
-        return _create_task(connection, message)
+        return "idle"
 
 
 def _create_task(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
@@ -348,9 +376,9 @@ def _create_task(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
         INSERT INTO tasks(
             id, project_id, goal_id, spec_json, acceptance_json, public_status,
             phase, wait_reason, fault_code, next_action_at, outcome, created_at, updated_at,
-            plan_id, sprint, role_key, checker_role_key
+            plan_id, sprint, role_key, checker_role_key, next_action_kind
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1,
-                  ?, ?)
+                  ?, ?, ?)
         """,
         (
             task_id,
@@ -369,6 +397,7 @@ def _create_task(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
             plan_id,
             role_key,
             checker_role,
+            phase if supported else None,
         ),
     )
     if supported:
@@ -465,7 +494,8 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
             connection.execute(
                 """
                 UPDATE tasks SET public_status = 'in_progress', phase = 'stopping',
-                    next_action_at = ?, wait_reason = 'cancellation requested',
+                    next_action_at = ?, next_action_kind = 'cancel',
+                    wait_reason = 'cancellation requested',
                     fault_code = NULL, updated_at = ? WHERE id = ?
                 """,
                 (now, now, task["id"]),
@@ -487,7 +517,8 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
             connection.execute(
                 """
                 UPDATE tasks SET public_status = 'done', outcome = 'cancelled', phase = 'done',
-                    next_action_at = NULL, wait_reason = NULL, fault_code = NULL,
+                    next_action_at = NULL, next_action_kind = NULL,
+                    wait_reason = NULL, fault_code = NULL,
                     updated_at = ? WHERE id = ?
                 """,
                 (now, task["id"]),
@@ -521,12 +552,14 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
             """
             UPDATE tasks SET public_status = ?, phase = ?, outcome = NULL,
                 retry_count = 0, next_retry_at = NULL,
-                next_action_at = ?, updated_at = ? WHERE id = ?
+                next_action_at = ?, next_action_kind = ?,
+                updated_at = ? WHERE id = ?
             """,
             (
                 "pending" if supported else "needs_decision",
                 "execute" if supported else "intake",
                 now if supported else None,
+                "execute" if supported else None,
                 now,
                 task["id"],
             ),
@@ -615,7 +648,8 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
                 UPDATE tasks SET spec_revision = ?, spec_json = ?, acceptance_json = ?,
                     public_status = 'pending', phase = 'execute', wait_reason = NULL,
                     fault_code = NULL, retry_count = 0, next_retry_at = NULL,
-                    next_action_at = ?, outcome = NULL, role_key = ?, updated_at = ?
+                    next_action_at = ?, next_action_kind = 'execute',
+                    outcome = NULL, role_key = ?, updated_at = ?
                     , checker_role_key = ?
                 WHERE id = ?
                 """,
@@ -652,7 +686,10 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
         and task["public_status"] in {"pending", "in_progress"}
     ):
         connection.execute(
-            "UPDATE tasks SET next_action_at = ?, updated_at = ? WHERE id = ?",
+            """
+            UPDATE tasks SET next_action_at = ?, next_action_kind = 'wake',
+                updated_at = ? WHERE id = ?
+            """,
             (now, now, task["id"]),
         )
         event, detail = "wake_requested", {"message_id": message["id"]}
@@ -748,7 +785,7 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
 
 
 def _apply_project_action(
-    connection: sqlite3.Connection, message: sqlite3.Row
+    store: Store, connection: sqlite3.Connection, message: sqlite3.Row
 ) -> str:
     now = time.time()
     action = json.loads(message["action_json"])
@@ -774,6 +811,24 @@ def _apply_project_action(
             (now, message["project_id"]),
         )
     elif kind == "set_project_setting":
+        value = action["value"]
+        if action["setting_key"] == "provider_order":
+            current = connection.execute(
+                """
+                SELECT value_json FROM settings
+                WHERE setting_key = 'provider_order'
+                  AND (
+                    (scope = 'project' AND project_id = ?)
+                    OR (scope = 'global' AND project_id IS NULL)
+                  )
+                ORDER BY CASE scope WHEN 'project' THEN 0 ELSE 1 END LIMIT 1
+                """,
+                (message["project_id"],),
+            ).fetchone()
+            value = {
+                **(json.loads(current["value_json"]) if current else {}),
+                **value,
+            }
         connection.execute(
             """
             INSERT INTO settings(
@@ -788,11 +843,49 @@ def _apply_project_action(
                 f"project:{message['project_id']}:{action['setting_key']}",
                 message["project_id"],
                 action["setting_key"],
-                canonical_json(action["value"]),
+                canonical_json(value),
                 f"owner_message:{message['id']}",
                 now,
             ),
         )
+    elif kind == "set_project_rule":
+        revision = connection.execute(
+            """
+            SELECT COALESCE(MAX(revision), 0) + 1 AS value FROM library_items
+            WHERE scope = 'project' AND project_id = ?
+              AND kind = 'rule' AND item_key = ?
+            """,
+            (message["project_id"], action["rule_key"]),
+        ).fetchone()["value"]
+        body = str(action["content"]).encode()
+        path = (
+            store.data_root
+            / "projects"
+            / message["project_id"]
+            / "library"
+            / "rules"
+            / f"{action['rule_key']}.revision-{revision:06d}.md"
+        )
+        _write_atomic(path, body)
+        connection.execute(
+            """
+            INSERT INTO library_items(
+                id, scope, project_id, kind, item_key, revision,
+                path, sha256, created_at
+            ) VALUES (?, 'project', ?, 'rule', ?, ?, ?, ?, ?)
+            """,
+            (
+                uuid4().hex,
+                message["project_id"],
+                action["rule_key"],
+                revision,
+                store.relative_data_path(path),
+                hashlib.sha256(body).hexdigest(),
+                now,
+            ),
+        )
+    elif kind == "global_route":
+        pass
     connection.execute(
         "UPDATE messages SET processed_at = ? WHERE id = ?", (now, message["id"])
     )
@@ -830,8 +923,8 @@ def _prepare_planner_step(
         """
         INSERT INTO host_jobs(
             id, task_id, task_session_id, session_generation,
-            spec_revision, sequence, purpose, status, started_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 'command', 'dispatching', ?)
+            spec_revision, sequence, purpose, status, started_at, dispatch_json
+        ) VALUES (?, ?, ?, ?, ?, ?, 'command', 'dispatching', ?, ?)
         """,
         (
             job_id,
@@ -841,12 +934,27 @@ def _prepare_planner_step(
             task["spec_revision"],
             sequence,
             started_at,
+            canonical_json(
+                {
+                    "prompt": planner_prompt(
+                        str(
+                            goal["objective"]
+                            if goal
+                            else spec.get("instruction") or ""
+                        ),
+                        task["project_id"],
+                        dict(spec.get("classification") or {}),
+                    ),
+                    "access": "read",
+                }
+            ),
         ),
     )
     connection.execute(
         """
         UPDATE tasks SET public_status = 'in_progress', phase = 'plan_call',
-            wait_reason = NULL, fault_code = NULL, next_action_at = ?, updated_at = ?
+            wait_reason = NULL, fault_code = NULL, next_action_at = ?,
+            next_action_kind = 'plan', updated_at = ?
         WHERE id = ?
         """,
         (started_at, started_at, task["id"]),
@@ -864,20 +972,67 @@ def _prepare_planner_step(
         ),
     )
     classification = dict(spec.get("classification") or {})
+    prompt = planner_prompt(
+        str(goal["objective"] if goal else spec.get("instruction") or ""),
+        task["project_id"],
+        classification,
+    )
     return PlannerStep(
+        "start",
         task["project_id"],
         task["id"],
         job_id,
         generation["provider_key"],
         str(spec["project_path"]),
-        planner_prompt(
-            str(goal["objective"] if goal else spec.get("instruction") or ""),
-            task["project_id"],
-            classification,
-        ),
+        prompt,
         generation["external_session_id"],
         int(settings.get("max_runtime_seconds", 600)),
         classification,
+        _context_policy(settings),
+    )
+
+
+def _pending_planner_step(
+    connection: sqlite3.Connection, task: sqlite3.Row
+) -> PlannerStep:
+    job = connection.execute(
+        """
+        SELECT * FROM host_jobs
+        WHERE task_id = ? AND purpose = 'command'
+          AND status IN ('dispatching', 'running')
+        ORDER BY sequence DESC LIMIT 1
+        """,
+        (task["id"],),
+    ).fetchone()
+    if not job:
+        raise RuntimeError(f"Task {task['id']} has no active Planner HostJob")
+    generation = connection.execute(
+        """
+        SELECT provider_key, external_session_id FROM session_generations
+        WHERE task_session_id = ? AND generation = ?
+        """,
+        (job["task_session_id"], job["session_generation"]),
+    ).fetchone()
+    session = connection.execute(
+        "SELECT settings_json FROM task_sessions WHERE id = ?",
+        (job["task_session_id"],),
+    ).fetchone()
+    settings = json.loads(session["settings_json"]).get("values", {})
+    spec = json.loads(task["spec_json"])
+    dispatch = json.loads(job["dispatch_json"])
+    classification = dict(spec.get("classification") or {})
+    return PlannerStep(
+        "start" if job["status"] == "dispatching" else "poll",
+        task["project_id"],
+        task["id"],
+        job["id"],
+        generation["provider_key"],
+        str(spec["project_path"]),
+        str(dispatch["prompt"]),
+        generation["external_session_id"],
+        int(settings.get("max_runtime_seconds", 600)),
+        classification,
+        _context_policy(settings),
     )
 
 
@@ -898,7 +1053,102 @@ def _apply_planner_step(
     if not task or not job or task["outcome"] is not None:
         return "stale_planner_fact"
     now = time.time()
-    result = facts.get("result") if facts.get("ok") else None
+    if not facts.get("ok"):
+        dispatch = json.loads(job["dispatch_json"])
+        failures = int(dispatch.get("reconcile_failures") or 0) + 1
+        dispatch["reconcile_failures"] = failures
+        session = connection.execute(
+            "SELECT settings_json FROM task_sessions WHERE id = ?",
+            (job["task_session_id"],),
+        ).fetchone()
+        values = json.loads(session["settings_json"]).get("values", {})
+        exhausted = failures > int(values.get("retry_count", 0))
+        connection.execute(
+            "UPDATE host_jobs SET dispatch_json = ? WHERE id = ?",
+            (canonical_json(dispatch), job["id"]),
+        )
+        connection.execute(
+            """
+            UPDATE tasks SET public_status = ?, phase = ?,
+                wait_reason = ?, fault_code = ?, next_action_at = ?,
+                next_action_kind = ?, updated_at = ? WHERE id = ?
+            """,
+            (
+                "needs_decision" if exhausted else "in_progress",
+                "provider_recovery" if exhausted else task["phase"],
+                (
+                    "Planner outcome is unknown; reconcile or cancel the HostJob"
+                    if exhausted
+                    else "Planner HostJob unavailable; idempotent reconcile scheduled"
+                ),
+                "unsafe_unknown" if exhausted else "transport",
+                None if exhausted else now + max(
+                    1, int(values.get("retry_backoff_seconds", 0))
+                ),
+                None if exhausted else (
+                    "plan" if job["status"] == "dispatching" else "plan_poll"
+                ),
+                now,
+                task["id"],
+            ),
+        )
+        _record_event(
+            connection,
+            task,
+            "host_job_reconcile_deferred",
+            {
+                "host_job_id": job["id"],
+                "purpose": "command",
+                "failures": failures,
+            },
+            now,
+        )
+        return "needs_decision" if exhausted else "plan_reconcile"
+    state = facts.get("state")
+    state = state if isinstance(state, dict) else {}
+    if str(state.get("status")) in ACTIVE_HOST_JOB_STATUSES:
+        connection.execute(
+            "UPDATE host_jobs SET status = 'running' WHERE id = ?",
+            (job["id"],),
+        )
+        if state.get("session_id"):
+            connection.execute(
+                """
+                UPDATE session_generations SET external_session_id = ?
+                WHERE task_session_id = ? AND generation = ?
+                """,
+                (
+                    state["session_id"],
+                    job["task_session_id"],
+                    job["session_generation"],
+                ),
+            )
+        connection.execute(
+            """
+            UPDATE tasks SET phase = 'plan_wait', next_action_at = ?,
+                next_action_kind = 'plan_poll', updated_at = ? WHERE id = ?
+            """,
+            (now + 1, now, task["id"]),
+        )
+        return "plan_wait"
+    stdout, stderr = _provider_output_streams(facts.get("output"))
+    input_tokens = max(0, int(state.get("input_tokens") or 0))
+    result = {
+        "returncode": (
+            int(state["returncode"])
+            if isinstance(state.get("returncode"), int)
+            else 1
+        ),
+        "stdout": stdout,
+        "stderr": stderr,
+        "session_id": state.get("session_id"),
+        "input_tokens": input_tokens,
+        "cached_input_tokens": min(
+            input_tokens, max(0, int(state.get("cached_input_tokens") or 0))
+        ),
+        "output_tokens": max(0, int(state.get("output_tokens") or 0)),
+        "model": state.get("model") or step.provider_key,
+    }
     if isinstance(result, dict):
         if result.get("session_id"):
             connection.execute(
@@ -930,7 +1180,10 @@ def _apply_planner_step(
         )
     returncode = int(result.get("returncode") or 0) if isinstance(result, dict) else 1
     stdout = str(result.get("stdout") or "") if isinstance(result, dict) else ""
-    if not facts.get("ok") or returncode != 0:
+    if str(state.get("status")) != "completed" or returncode != 0:
+        fallback = _fallback_provider_generation(
+            connection, task, job, step.provider_key, now
+        )
         connection.execute(
             """
             UPDATE host_jobs SET status = 'failed', ended_at = ?, returncode = ?,
@@ -939,33 +1192,41 @@ def _apply_planner_step(
             (
                 now,
                 returncode,
-                "provider" if facts.get("ok") else "transport",
+                "provider",
                 job["id"],
             ),
         )
         connection.execute(
             """
-            UPDATE tasks SET public_status = 'needs_decision',
-                phase = 'provider_recovery', wait_reason = ?,
-                fault_code = ?, next_action_at = NULL, updated_at = ?
+            UPDATE tasks SET public_status = ?, phase = ?, wait_reason = ?,
+                fault_code = 'provider', next_action_at = ?,
+                next_action_kind = ?, updated_at = ?
             WHERE id = ?
             """,
             (
-                "Planner did not return a usable result; inspect Provider availability before retrying",
-                "provider" if facts.get("ok") else "transport",
+                "in_progress" if fallback else "needs_decision",
+                "plan" if fallback else "provider_recovery",
+                (
+                    f"Planner Provider failed; falling back to {fallback}"
+                    if fallback
+                    else "Planner did not return a usable result; all frozen candidates are exhausted"
+                ),
+                now if fallback else None,
+                "plan" if fallback else None,
                 now,
                 task["id"],
             ),
         )
-        _archive_role_generation(connection, task["id"], "planner", now)
+        if not fallback:
+            _archive_role_generation(connection, task["id"], "planner", now)
         _record_event(
             connection,
             task,
             "planner_failed",
-            {"host_job_id": job["id"], "error": facts.get("error")},
+            {"host_job_id": job["id"], "error": state.get("failure_class")},
             now,
         )
-        return "needs_decision"
+        return "provider_fallback" if fallback else "needs_decision"
 
     try:
         proposal = parse_planner_result(stdout)
@@ -984,7 +1245,8 @@ def _apply_planner_step(
             """
             UPDATE tasks SET public_status = 'needs_decision', phase = 'plan',
                 wait_reason = ?, fault_code = 'verification',
-                next_action_at = NULL, updated_at = ? WHERE id = ?
+                next_action_at = NULL, next_action_kind = NULL,
+                updated_at = ? WHERE id = ?
             """,
             (f"Planner output is invalid: {error}", now, task["id"]),
         )
@@ -1084,6 +1346,7 @@ def _apply_planner_step(
         """
         UPDATE tasks SET public_status = 'needs_decision', phase = 'plan',
             wait_reason = ?, fault_code = 'scope', next_action_at = NULL,
+            next_action_kind = NULL,
             updated_at = ? WHERE id = ?
         """,
         (question, now, task["id"]),
@@ -1124,7 +1387,12 @@ def _materialize_plan(
         tasks.append(
             {
                 **item,
-                "spec": spec,
+                "spec": {
+                    **spec,
+                    "earliest_start_delay_seconds": item[
+                        "earliest_start_delay_seconds"
+                    ],
+                },
                 "role_key": role_key,
                 "checker_role": checker_role,
                 "executor_provider": (
@@ -1208,6 +1476,7 @@ def _install_plan(
             spec_json = ?, acceptance_json = ?, public_status = 'pending',
             phase = 'execute', wait_reason = NULL, fault_code = NULL,
             retry_count = 0, next_retry_at = NULL, next_action_at = ?,
+            next_action_kind = 'execute', deadline_at = ?,
             outcome = NULL, sprint = ?, role_key = ?,
             checker_role_key = ?, updated_at = ?
         WHERE id = ?
@@ -1216,7 +1485,12 @@ def _install_plan(
             plan_id,
             canonical_json(first["spec"]),
             canonical_json(first["acceptance"]),
-            now,
+            now + first["earliest_start_delay_seconds"],
+            (
+                now + first["deadline_seconds"]
+                if first["deadline_seconds"] is not None
+                else None
+            ),
             first["sprint"],
             first["role_key"],
             first["checker_role"],
@@ -1253,10 +1527,11 @@ def _install_plan(
             """
             INSERT INTO tasks(
                 id, project_id, goal_id, spec_json, acceptance_json, public_status,
-                phase, next_action_at, created_at, updated_at, plan_id, sprint,
+                phase, next_action_at, next_action_kind, deadline_at,
+                created_at, updated_at, plan_id, sprint,
                 role_key, checker_role_key
-            ) VALUES (?, ?, ?, ?, ?, 'pending', 'queued', NULL, ?, ?, ?, ?, ?,
-                      ?)
+            ) VALUES (?, ?, ?, ?, ?, 'pending', 'queued', NULL, 'dependency',
+                      ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -1264,6 +1539,11 @@ def _install_plan(
                 placeholder["goal_id"],
                 canonical_json(item["spec"]),
                 canonical_json(item["acceptance"]),
+                (
+                    now + item["deadline_seconds"]
+                    if item["deadline_seconds"] is not None
+                    else None
+                ),
                 now,
                 now,
                 plan_id,
@@ -1303,6 +1583,59 @@ def _install_plan(
             )
 
 
+def _handle_task_deadline(
+    connection: sqlite3.Connection, task: sqlite3.Row
+) -> str:
+    now = time.time()
+    active = connection.execute(
+        """
+        SELECT * FROM host_jobs
+        WHERE task_id = ? AND status IN ('dispatching', 'running', 'cancelling')
+        ORDER BY sequence DESC LIMIT 1
+        """,
+        (task["id"],),
+    ).fetchone()
+    if active:
+        dispatch = json.loads(active["dispatch_json"])
+        dispatch.setdefault("stop_requested_at", now)
+        dispatch["stop_reason"] = "deadline"
+        connection.execute(
+            """
+            UPDATE host_jobs SET status = 'cancelling', dispatch_json = ?
+            WHERE id = ?
+            """,
+            (canonical_json(dispatch), active["id"]),
+        )
+        connection.execute(
+            """
+            UPDATE tasks SET public_status = 'in_progress', phase = 'stopping',
+                wait_reason = '[deadline] graceful stop requested after reconcile',
+                fault_code = 'process', next_action_at = ?,
+                next_action_kind = 'cancel', updated_at = ? WHERE id = ?
+            """,
+            (now, now, task["id"]),
+        )
+        event = "deadline_stop_requested"
+        detail = {"host_job_id": active["id"], "deadline_at": task["deadline_at"]}
+        result = "deadline_stop"
+    else:
+        connection.execute(
+            """
+            UPDATE tasks SET public_status = 'needs_decision',
+                phase = 'provider_recovery',
+                wait_reason = '[deadline] reached with no active HostJob to reconcile',
+                fault_code = 'process', next_action_at = NULL,
+                next_action_kind = NULL, updated_at = ? WHERE id = ?
+            """,
+            (now, task["id"]),
+        )
+        event = "deadline_reached"
+        detail = {"deadline_at": task["deadline_at"]}
+        result = "needs_decision"
+    _record_event(connection, task, event, detail, now)
+    return result
+
+
 def _stop_unknown_phase(connection: sqlite3.Connection, task: sqlite3.Row) -> str:
     now = time.time()
     connection.execute(
@@ -1313,64 +1646,6 @@ def _stop_unknown_phase(connection: sqlite3.Connection, task: sqlite3.Row) -> st
         """,
         (f"unknown lifecycle phase: {task['phase']}", now, task["id"]),
     )
-    return "needs_decision"
-
-
-def _stop_interrupted_checker(
-    connection: sqlite3.Connection, task: sqlite3.Row
-) -> str:
-    now = time.time()
-    connection.execute(
-        """
-        UPDATE host_jobs SET status = 'interrupted', ended_at = ?,
-            returncode = 1, failure_code = 'unsafe_unknown'
-        WHERE task_id = ? AND purpose = 'check' AND status = 'dispatching'
-        """,
-        (now, task["id"]),
-    )
-    connection.execute(
-        """
-        UPDATE tasks SET public_status = 'needs_decision', phase = 'provider_recovery',
-            wait_reason = 'Checker call was interrupted; automatic paid replay is unsafe',
-            fault_code = 'unsafe_unknown', next_action_at = NULL, updated_at = ?
-        WHERE id = ?
-        """,
-        (now, task["id"]),
-    )
-    connection.execute(
-        """
-        INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
-        VALUES (?, ?, 'checker_interrupted', '{}', ?)
-        """,
-        (task["project_id"], task["id"], now),
-    )
-    return "needs_decision"
-
-
-def _stop_interrupted_planner(
-    connection: sqlite3.Connection, task: sqlite3.Row
-) -> str:
-    now = time.time()
-    connection.execute(
-        """
-        UPDATE host_jobs SET status = 'interrupted', ended_at = ?,
-            returncode = 1, failure_code = 'unsafe_unknown'
-        WHERE task_id = ? AND purpose = 'command' AND status = 'dispatching'
-        """,
-        (now, task["id"]),
-    )
-    connection.execute(
-        """
-        UPDATE tasks SET public_status = 'needs_decision',
-            phase = 'provider_recovery',
-            wait_reason = 'Planner call was interrupted; automatic paid replay is unsafe',
-            fault_code = 'unsafe_unknown', next_action_at = NULL, updated_at = ?
-        WHERE id = ?
-        """,
-        (now, task["id"]),
-    )
-    _archive_role_generation(connection, task["id"], "planner", now)
-    _record_event(connection, task, "planner_interrupted", {}, now)
     return "needs_decision"
 
 

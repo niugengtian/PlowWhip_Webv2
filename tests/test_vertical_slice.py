@@ -12,13 +12,19 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from plowwhip.app import make_server
-from plowwhip.butler import conversation
+from plowwhip.butler import conversation, route_global_message
 from plowwhip.continuity import checkpoint_project, compile_hot_context
-from plowwhip.cronner import run as run_cronner, run_until_idle, tick
+from plowwhip.cronner import (
+    acquire_scheduler_lock,
+    run as run_cronner,
+    run_until_idle,
+    tick,
+)
 from plowwhip.intake import (
     archive_project,
     create_project,
     normalize_instruction,
+    set_project_rule,
     set_project_setting,
     submit_action,
     submit_message,
@@ -39,11 +45,12 @@ from plowwhip.planner import (
 )
 from plowwhip.provider import (
     CHECKER_RESULT_PREFIX,
+    parse_context_events,
     provider_adapter,
     provider_facts,
     record_model_call,
 )
-from plowwhip.store import Store
+from plowwhip.store import Store, candidate_preflight
 from plowwhip.verification import _parse_checker_verdict
 
 
@@ -127,6 +134,38 @@ class VerticalSliceTest(unittest.TestCase):
         self.assertEqual(
             view["last_output"],
             [json.dumps(evidence, ensure_ascii=False, sort_keys=True)],
+        )
+        promoted = [
+            item
+            for item in settings_library_snapshot(self.db, self.data)["library"]
+            if item["scope"] == "project"
+            and item["project_id"] == "project-a"
+            and item["kind"] == "worker_template"
+        ]
+        self.assertEqual(
+            [(item["item_key"], item["revision"]) for item in promoted],
+            [("deterministic", 1)],
+        )
+        self.assertNotIn(
+            view["task"]["id"],
+            self.store.resolve_data_path(promoted[0]["path"]).read_text(),
+        )
+        self.assertEqual(
+            len(
+                list(
+                    (
+                        self.data
+                        / "projects"
+                        / "project-a"
+                        / "conversations"
+                    ).glob("*.json")
+                )
+            ),
+            1,
+        )
+        self.assertEqual(
+            len(list((self.data / "global" / "conversations").glob("*.json"))),
+            1,
         )
 
         connection = self.store.connect()
@@ -259,7 +298,74 @@ class VerticalSliceTest(unittest.TestCase):
             )
         )
 
-    def test_schema_v4_preserves_terminal_jobs_and_accepts_running_jobs(self):
+    def test_project_provider_order_and_rules_freeze_into_task_session(self):
+        self._create_project("policy", "policy-create", "/workspace/policy")
+        with self.assertRaisesRegex(ValueError, "deterministic roles"):
+            set_project_setting(
+                self.store,
+                "policy",
+                "provider_order",
+                {"deterministic": ["codex_cli"]},
+                "policy-invalid-order",
+            )
+        set_project_setting(
+            self.store,
+            "policy",
+            "provider_order",
+            {"fullstack": ["codex_cli", "cursor_cli"]},
+            "policy-order",
+        )
+        self.assertEqual(tick(self.store)[0]["action"], "set_project_setting")
+        set_project_rule(
+            self.store,
+            "policy",
+            "coding_convention",
+            "# Project convention\n\nUse the smallest relevant test.\n",
+            "policy-rule",
+        )
+        self.assertEqual(tick(self.store)[0]["action"], "set_project_rule")
+        submit_message(
+            self.store,
+            "policy",
+            "实现一个项目内刷新按钮",
+            "policy-task",
+        )
+        self.assertEqual(tick(self.store)[0]["action"], "intake")
+        connection = self.store.connect()
+        try:
+            session = connection.execute(
+                """
+                SELECT settings_json, role_snapshot_json FROM task_sessions
+                WHERE task_id = (
+                    SELECT id FROM tasks WHERE project_id = 'policy'
+                ) AND role_key = 'fullstack'
+                """
+            ).fetchone()
+            setting = connection.execute(
+                """
+                SELECT value_json FROM settings
+                WHERE scope = 'project' AND project_id = 'policy'
+                  AND setting_key = 'provider_order'
+                """
+            ).fetchone()
+        finally:
+            connection.close()
+        frozen = json.loads(session["settings_json"])
+        self.assertEqual(
+            frozen["values"]["provider_order"]["fullstack"],
+            ["codex_cli", "cursor_cli"],
+        )
+        self.assertIn("planner", json.loads(setting["value_json"]))
+        role_snapshot = json.loads(session["role_snapshot_json"])
+        self.assertEqual(
+            role_snapshot["permission"], "recoverable_workspace_change"
+        )
+        self.assertIn(
+            "coding_convention",
+            {item["item_key"] for item in role_snapshot["library"]},
+        )
+
+    def test_schema_v5_preserves_terminal_jobs_and_adds_task_schedule(self):
         submit_message(self.store, "migration", "写入 migrated.txt: ok", "migration")
         run_until_idle(self.store)
         connection = self.store.connect()
@@ -307,7 +413,11 @@ class VerticalSliceTest(unittest.TestCase):
         self.store.initialize()
         connection = self.store.connect()
         try:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 4)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 5)
+            task_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(tasks)")
+            }
+            self.assertTrue({"deadline_at", "next_action_kind"} <= task_columns)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM host_jobs").fetchone()[0], 2)
             previous = connection.execute(
                 "SELECT * FROM host_jobs ORDER BY sequence LIMIT 1"
@@ -336,6 +446,56 @@ class VerticalSliceTest(unittest.TestCase):
             self.assertIsNone(active["returncode"])
         finally:
             connection.close()
+
+    def test_backup_candidate_isolation_and_single_scheduler_gate(self):
+        submit_message(
+            self.store, "backup-source", "写入 backup.txt: ok", "backup-source"
+        )
+        run_until_idle(self.store)
+        backup_path = self.root / "candidate" / "plowwhip.db"
+        result = self.store.backup_to(backup_path)
+        self.assertEqual(result["method"], "sqlite_backup_api")
+        self.assertEqual(result["quick_check"], ["ok"])
+        backup = sqlite3.connect(backup_path)
+        try:
+            self.assertEqual(
+                backup.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 1
+            )
+        finally:
+            backup.close()
+        production = {
+            "code_root": "/srv/plowwhip-blue",
+            "data_root": "/srv/plowwhip-data-blue",
+            "db_path": "/srv/plowwhip-data-blue/plowwhip.db",
+            "compose_project": "plowwhip_blue",
+            "port": 8742,
+            "host_bridge_namespace": "production",
+            "cronner_enabled": True,
+        }
+        candidate = {
+            "code_root": "/srv/plowwhip-green",
+            "data_root": "/srv/plowwhip-data-green",
+            "db_path": "/srv/plowwhip-data-green/plowwhip.db",
+            "compose_project": "plowwhip_green",
+            "port": 8750,
+            "host_bridge_namespace": "candidate",
+            "cronner_enabled": False,
+        }
+        gate = candidate_preflight(production, candidate)
+        self.assertTrue(gate["isolated"])
+        self.assertFalse(gate["cutover_approved"])
+        with self.assertRaisesRegex(ValueError, "collision"):
+            candidate_preflight(
+                production, {**candidate, "compose_project": "plowwhip_blue"}
+            )
+        scheduler = acquire_scheduler_lock(self.data)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "already owns"):
+                acquire_scheduler_lock(self.data)
+        finally:
+            scheduler.close()
+        replacement = acquire_scheduler_lock(self.data)
+        replacement.close()
 
     def test_owner_wake_is_queued_but_cronner_remains_the_only_driver(self):
         submit_message(self.store, "wake", "写入 wake.txt: done", "wake-message")
@@ -472,7 +632,14 @@ class VerticalSliceTest(unittest.TestCase):
         self.assertEqual(done["task"]["retry_count"], 1)
         self.assertEqual(
             [event["kind"] for event in reversed(done["events"])],
-            ["task_created", "executed", "verified", "repaired", "verified"],
+            [
+                "task_created",
+                "executed",
+                "verified",
+                "repaired",
+                "worker_template_promoted",
+                "verified",
+            ],
         )
 
     def test_unrecognized_instruction_requires_decision_without_execution(self):
@@ -635,9 +802,19 @@ class VerticalSliceTest(unittest.TestCase):
             "plan-2",
             plan,
         )
+        self.assertEqual(tick(self.store)[0]["action"], "provide_plan")
+        submit_message(
+            self.store,
+            "plan",
+            "写入 urgent.txt: urgent",
+            "plan-urgent",
+        )
+        self.assertEqual(tick(self.store)[0]["action"], "execute")
+        self.assertEqual(tick(self.store)[0]["action"], "verify")
+        self.assertEqual(tick(self.store)[0]["action"], "intake")
         self.assertEqual(
             [item["action"] for item in run_until_idle(self.store)],
-            ["provide_plan", "execute", "verify", "ready", "execute", "verify"],
+            ["execute", "verify", "ready", "execute", "verify"],
         )
         connection = self.store.connect()
         try:
@@ -645,7 +822,8 @@ class VerticalSliceTest(unittest.TestCase):
                 "SELECT id, outcome, sprint FROM tasks WHERE project_id = 'plan' ORDER BY rowid"
             ).fetchall()
             selected = connection.execute(
-                "SELECT revision FROM plans WHERE selected = 1"
+                "SELECT revision FROM plans WHERE selected = 1 AND goal_id = ?",
+                (placeholder["goal_id"],),
             ).fetchone()["revision"]
             dependencies = connection.execute(
                 "SELECT COUNT(*) AS count FROM task_dependencies"
@@ -666,9 +844,12 @@ class VerticalSliceTest(unittest.TestCase):
         finally:
             connection.close()
         self.assertEqual(tasks[0]["id"], placeholder["id"])
-        self.assertEqual([(row["outcome"], row["sprint"]) for row in tasks], [("done", 1), ("done", 2)])
+        self.assertEqual(
+            [(row["outcome"], row["sprint"]) for row in tasks],
+            [("done", 1), ("done", 2), ("done", 1)],
+        )
         self.assertEqual((selected, dependencies), (2, 1))
-        self.assertEqual(session_count, 4)
+        self.assertEqual(session_count, 6)
         self.assertEqual(second_settings[0]["values"]["max_runtime_seconds"], 30)
         self.assertEqual(second_settings[0]["sources"]["max_runtime_seconds"], "task_role")
         self.assertEqual(second_settings[1]["values"]["monitor_tail_lines"], 10)
@@ -749,6 +930,12 @@ class VerticalSliceTest(unittest.TestCase):
                         "depends_on": [],
                         "sprint": 1,
                         "role_key": "fullstack",
+                        "acceptance": [
+                            {
+                                "id": "backend_refresh",
+                                "expected": "refresh endpoint passes its bounded check",
+                            }
+                        ],
                     },
                     {
                         "key": "frontend",
@@ -760,18 +947,30 @@ class VerticalSliceTest(unittest.TestCase):
                 ],
             },
         }
-        with patch(
-            "plowwhip.planner.run_provider_task",
-            return_value={
-                "returncode": 0,
-                "stdout": PLANNER_RESULT_PREFIX + json.dumps(planned),
-                "stderr": "",
-                "session_id": "planner-session",
-                "input_tokens": 120,
-                "cached_input_tokens": 80,
-                "output_tokens": 60,
-                "model": "test-planner",
-            },
+        with (
+            patch(
+                "plowwhip.planner.start_provider_job",
+                return_value={
+                    "status": "completed",
+                    "returncode": 0,
+                    "session_id": "planner-session",
+                    "input_tokens": 120,
+                    "cached_input_tokens": 80,
+                    "output_tokens": 60,
+                    "model": "test-planner",
+                },
+            ),
+            patch(
+                "plowwhip.planner.provider_job_output",
+                return_value={
+                    "chunks": [
+                        {
+                            "stream": "stdout",
+                            "text": PLANNER_RESULT_PREFIX + json.dumps(planned),
+                        }
+                    ]
+                },
+            ),
         ):
             result = tick(self.store)[0]
         self.assertEqual(result["action"], "plan_applied")
@@ -779,7 +978,7 @@ class VerticalSliceTest(unittest.TestCase):
         try:
             tasks = connection.execute(
                 """
-                SELECT id, phase, role_key, checker_role_key
+                SELECT id, phase, role_key, checker_role_key, acceptance_json
                 FROM tasks WHERE project_id = 'auto-plan' ORDER BY rowid
                 """
             ).fetchall()
@@ -813,6 +1012,10 @@ class VerticalSliceTest(unittest.TestCase):
         )
         self.assertEqual([tuple(row) for row in plans], [(1, 0), (2, 1)])
         self.assertEqual(
+            json.loads(tasks[0]["acceptance_json"])[0]["id"],
+            "backend_refresh",
+        )
+        self.assertEqual(
             [row["role_key"] for row in roles],
             ["fullstack", "independent_checker", "planner"],
         )
@@ -822,6 +1025,163 @@ class VerticalSliceTest(unittest.TestCase):
             "large",
         )
         self.assertEqual(parse_planner_result(PLANNER_RESULT_PREFIX + json.dumps(planned))["confidence"], 0.97)
+
+    def test_running_planner_host_job_reconciles_after_store_restart(self):
+        self._create_project(
+            "planner-restart", "planner-restart-create", "/workspace/planner"
+        )
+        submit_message(
+            self.store,
+            "planner-restart",
+            "前端和后端分两步写入验收文件",
+            "planner-restart-message",
+        )
+        self.assertEqual(tick(self.store)[0]["action"], "intake")
+        with (
+            patch(
+                "plowwhip.planner.start_provider_job",
+                return_value={
+                    "status": "running",
+                    "session_id": "planner-restart-session",
+                },
+            ),
+            patch(
+                "plowwhip.planner.provider_job_output",
+                return_value={"chunks": []},
+            ),
+        ):
+            self.assertEqual(tick(self.store)[0]["action"], "plan_wait")
+        running = snapshot(self.db, self.data, "planner-restart")
+        self.assertEqual(running["task"]["phase"], "plan_wait")
+        self.assertEqual(running["host_jobs"][0]["status"], "running")
+        planned = {
+            "confidence": 0.98,
+            "plan": {
+                "summary": "two deterministic steps",
+                "alternatives": [
+                    {
+                        "name": "serial",
+                        "scope": "two files",
+                        "cost": "low",
+                        "risk": "low",
+                        "reversible": True,
+                        "acceptance": "both hashes pass",
+                    },
+                    {
+                        "name": "combined",
+                        "scope": "one broader write",
+                        "cost": "medium",
+                        "risk": "medium",
+                        "reversible": True,
+                        "acceptance": "manual combined review",
+                    },
+                ],
+                "selected": 0,
+                "tasks": [
+                    {
+                        "key": "one",
+                        "instruction": "写入 one.txt: one",
+                    },
+                    {
+                        "key": "two",
+                        "instruction": "写入 two.txt: two",
+                        "depends_on": ["one"],
+                    },
+                ],
+            },
+        }
+        restarted = Store(self.db, self.data)
+        restarted.initialize()
+        with (
+            patch(
+                "plowwhip.planner.provider_job_status",
+                return_value={
+                    "status": "completed",
+                    "returncode": 0,
+                    "session_id": "planner-restart-session",
+                    "input_tokens": 9,
+                    "cached_input_tokens": 4,
+                    "output_tokens": 3,
+                    "model": "planner-test",
+                },
+            ),
+            patch(
+                "plowwhip.planner.provider_job_output",
+                return_value={
+                    "chunks": [
+                        {
+                            "stream": "stdout",
+                            "text": PLANNER_RESULT_PREFIX + json.dumps(planned),
+                        }
+                    ]
+                },
+            ),
+        ):
+            with restarted.transaction() as connection:
+                connection.execute(
+                    """
+                    UPDATE tasks SET next_action_at = ?
+                    WHERE project_id = 'planner-restart'
+                    """,
+                    (time.time(),),
+                )
+            self.assertEqual(tick(restarted)[0]["action"], "plan_applied")
+        finished = snapshot(self.db, self.data, "planner-restart")
+        planner_jobs = [
+            job for job in finished["host_jobs"] if job["purpose"] == "command"
+        ]
+        self.assertEqual(len(planner_jobs), 1)
+        self.assertEqual(planner_jobs[0]["status"], "succeeded")
+
+    def test_planner_terminal_failure_falls_back_without_resetting_task(self):
+        self._create_project(
+            "planner-fallback", "planner-fallback-create", "/workspace/planner"
+        )
+        submit_message(
+            self.store,
+            "planner-fallback",
+            "前端和后端比较方案后分别实现",
+            "planner-fallback-message",
+        )
+        self.assertEqual(tick(self.store)[0]["action"], "intake")
+        with (
+            patch(
+                "plowwhip.planner.start_provider_job",
+                return_value={
+                    "status": "completed",
+                    "returncode": 1,
+                    "failure_class": "provider_unavailable",
+                    "input_tokens": 2,
+                    "cached_input_tokens": 1,
+                    "output_tokens": 1,
+                    "model": "codex-test",
+                },
+            ),
+            patch(
+                "plowwhip.planner.provider_job_output",
+                return_value={
+                    "chunks": [
+                        {"stream": "stderr", "text": "provider unavailable"}
+                    ]
+                },
+            ),
+        ):
+            self.assertEqual(tick(self.store)[0]["action"], "provider_fallback")
+        state = snapshot(self.db, self.data, "planner-fallback")
+        self.assertEqual(state["task"]["phase"], "plan")
+        self.assertEqual(state["task"]["spec_revision"], 1)
+        planner = [
+            (item["generation"], item["provider_key"], item["status"])
+            for item in state["sessions"]
+            if item["role_key"] == "planner"
+        ]
+        self.assertEqual(
+            planner,
+            [
+                (1, "codex_cli", "archived"),
+                (2, "cursor_cli", "active"),
+            ],
+        )
 
     def test_high_risk_plan_asks_exactly_one_project_butler_question(self):
         self._create_project("risk-plan", "project-1", "/workspace/risk-plan")
@@ -870,18 +1230,30 @@ class VerticalSliceTest(unittest.TestCase):
                 ],
             },
         }
-        with patch(
-            "plowwhip.planner.run_provider_task",
-            return_value={
-                "returncode": 0,
-                "stdout": PLANNER_RESULT_PREFIX + json.dumps(planned),
-                "stderr": "",
-                "session_id": "planner-session",
-                "input_tokens": 20,
-                "cached_input_tokens": 10,
-                "output_tokens": 20,
-                "model": "test-planner",
-            },
+        with (
+            patch(
+                "plowwhip.planner.start_provider_job",
+                return_value={
+                    "status": "completed",
+                    "returncode": 0,
+                    "session_id": "planner-session",
+                    "input_tokens": 20,
+                    "cached_input_tokens": 10,
+                    "output_tokens": 20,
+                    "model": "test-planner",
+                },
+            ),
+            patch(
+                "plowwhip.planner.provider_job_output",
+                return_value={
+                    "chunks": [
+                        {
+                            "stream": "stdout",
+                            "text": PLANNER_RESULT_PREFIX + json.dumps(planned),
+                        }
+                    ]
+                },
+            ),
         ):
             result = tick(self.store)[0]
         self.assertEqual(result["status"], "needs_decision")
@@ -1057,7 +1429,7 @@ class VerticalSliceTest(unittest.TestCase):
         self.assertTrue(state["read_only"])
         self.assertEqual(state["database"]["journal_mode"], "wal")
         self.assertEqual(state["database"]["quick_check"], ["ok"])
-        self.assertEqual(state["database"]["schema_version"], 4)
+        self.assertEqual(state["database"]["schema_version"], 5)
 
         archive_project(
             self.store, "archive-me", "archive-me", "archive-confirmed"
@@ -1087,6 +1459,43 @@ class VerticalSliceTest(unittest.TestCase):
             archive_project(
                 self.store, "archive-me", "archive-me", "archive-rejected"
             )
+
+    def test_global_butler_routes_search_without_creating_a_task(self):
+        self._create_project("alpha", "alpha-create")
+        submit_message(
+            self.store, "alpha", "写入 unique-alpha.txt: found", "alpha-task"
+        )
+        run_until_idle(self.store)
+        self._create_project("beta", "beta-create")
+        before = self._row_counts()[3]
+        routed = route_global_message(
+            self.store, "找 unique-alpha.txt 任务", "global-search"
+        )
+        self.assertEqual(routed["project_id"], "alpha")
+        self.assertTrue(routed["routed_only"])
+        self.assertTrue(routed["results"])
+        self.assertEqual(tick(self.store)[0]["action"], "global_route")
+        self.assertEqual(self._row_counts()[3], before)
+        transfer = json.loads(
+            (
+                self.data
+                / "global"
+                / "conversations"
+                / f"{routed['message_id']}.json"
+            ).read_text()
+        )
+        self.assertEqual(
+            set(transfer),
+            {"message_id", "routed_project_id", "created_at"},
+        )
+        instruction = route_global_message(
+            self.store,
+            "@beta 写入 routed.txt: routed",
+            "global-instruction",
+        )
+        self.assertEqual(instruction["project_id"], "beta")
+        self.assertFalse(instruction["routed_only"])
+        self.assertEqual(tick(self.store)[0]["action"], "intake")
 
     def test_settings_and_library_are_indexed_and_read_only(self):
         state = settings_library_snapshot(self.db, self.data)
@@ -1146,6 +1555,173 @@ class VerticalSliceTest(unittest.TestCase):
         before = [path for path in self.data.rglob("segment-*.json")]
         checkpoint_project(self.store, "continuity")
         self.assertEqual(before, [path for path in self.data.rglob("segment-*.json")])
+
+    def test_deadline_reconciles_and_gracefully_stops_active_host_job(self):
+        self._create_project(
+            "deadline", "deadline-project", "/workspace/deadline"
+        )
+        submit_message(
+            self.store,
+            "deadline",
+            "实现截止时间处理",
+            "deadline-message",
+        )
+        self.assertEqual(tick(self.store)[0]["action"], "intake")
+        with patch(
+            "plowwhip.execution.workspace_snapshot",
+            return_value={"git": {"head": "before"}},
+        ):
+            self.assertEqual(tick(self.store)[0]["action"], "snapshot")
+        running_state = {
+            "status": "running",
+            "session_id": "deadline-session",
+        }
+        with (
+            patch(
+                "plowwhip.execution.start_provider_job",
+                return_value=running_state,
+            ),
+            patch(
+                "plowwhip.execution.provider_job_output",
+                return_value={"chunks": []},
+            ),
+        ):
+            self.assertEqual(tick(self.store)[0]["action"], "dispatch")
+        with self.store.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE tasks SET deadline_at = ?, next_action_at = ?
+                WHERE project_id = 'deadline'
+                """,
+                (time.time() - 1, time.time() + 3_600),
+            )
+        result = tick(self.store)[0]
+        self.assertEqual(result["action"], "deadline_stop")
+        stopped = snapshot(self.db, self.data, "deadline")
+        self.assertEqual(stopped["task"]["phase"], "stopping")
+        self.assertEqual(stopped["task"]["next_action_kind"], "cancel")
+        self.assertEqual(stopped["host_jobs"][0]["status"], "cancelling")
+        with (
+            patch(
+                "plowwhip.execution.cancel_provider_job",
+                return_value={"status": "cancelled", "returncode": -15},
+            ),
+            patch(
+                "plowwhip.execution.provider_job_output",
+                return_value={"chunks": []},
+            ),
+            patch(
+                "plowwhip.execution.workspace_snapshot",
+                return_value={"git": {"head": "before"}},
+            ),
+        ):
+            result = tick(self.store)[0]
+        self.assertEqual(result["status"], "needs_decision")
+        final = snapshot(self.db, self.data, "deadline")
+        self.assertIsNone(final["task"]["outcome"])
+        self.assertEqual(final["task"]["phase"], "provider_recovery")
+        self.assertIn(
+            "deadline_stopped", {item["kind"] for item in final["events"]}
+        )
+
+    def test_context_policy_compaction_event_and_non_native_rotation(self):
+        self._create_project("context-run", "context-project", "/workspace/context")
+        set_project_setting(
+            self.store,
+            "context-run",
+            "rotation_input_tokens",
+            1_000,
+            "context-threshold",
+        )
+        self.assertEqual(tick(self.store)[0]["action"], "set_project_setting")
+        submit_message(
+            self.store,
+            "context-run",
+            "实现上下文轮转",
+            "context-task",
+        )
+        self.assertEqual(tick(self.store)[0]["action"], "intake")
+        with patch(
+            "plowwhip.execution.workspace_snapshot",
+            return_value={"git": {"head": "before"}},
+        ):
+            self.assertEqual(tick(self.store)[0]["action"], "snapshot")
+        completed = {
+            "status": "completed",
+            "returncode": 0,
+            "session_id": "cursor-context-session",
+            "input_tokens": 1_200,
+            "cached_input_tokens": 800,
+            "output_tokens": 100,
+            "model": "cursor-test",
+        }
+        compact_line = json.dumps(
+            {
+                "type": "session.compacted",
+                "rotation_id": "compact-1",
+                "before_bytes": 9_000,
+                "after_bytes": 2_000,
+            }
+        )
+        with (
+            patch(
+                "plowwhip.execution.start_provider_job",
+                return_value=completed,
+            ) as started,
+            patch(
+                "plowwhip.execution.provider_job_output",
+                return_value={
+                    "chunks": [{"stream": "stdout", "text": compact_line + "\n"}]
+                },
+            ),
+            patch(
+                "plowwhip.execution.workspace_snapshot",
+                return_value={"git": {"head": "after"}},
+            ),
+        ):
+            self.assertEqual(tick(self.store)[0]["action"], "execute")
+        policy = started.call_args.kwargs["context_policy"]
+        self.assertEqual(policy["provider_compaction_token_limit"], 120_000)
+        self.assertEqual(policy["rotation_max_bytes"], 65_536)
+        connection = self.store.connect()
+        try:
+            task_id = connection.execute(
+                "SELECT id FROM tasks WHERE project_id = 'context-run'"
+            ).fetchone()["id"]
+            generations = connection.execute(
+                """
+                SELECT generation.generation, generation.status
+                FROM session_generations generation
+                JOIN task_sessions session
+                  ON session.id = generation.task_session_id
+                WHERE session.task_id = ? AND session.role_key = 'fullstack'
+                ORDER BY generation.generation
+                """,
+                (task_id,),
+            ).fetchall()
+            event_kinds = {
+                row["kind"]
+                for row in connection.execute(
+                    "SELECT kind FROM task_events WHERE task_id = ?", (task_id,)
+                )
+            }
+        finally:
+            connection.close()
+        self.assertEqual([tuple(row) for row in generations], [(1, "archived"), (2, "active")])
+        self.assertIn("context_generation_rotated", event_kinds)
+        self.assertIn("provider_compacted", event_kinds)
+        self.assertEqual(
+            parse_context_events(compact_line),
+            [
+                {
+                    "type": "session.compacted",
+                    "rotation_id": "compact-1",
+                    "before_bytes": 9_000,
+                    "after_bytes": 2_000,
+                    "provider_event_type": "session.compacted",
+                }
+            ],
+        )
 
     def test_provider_probe_tasks_record_zero_and_minimal_token_evidence(self):
         spec, _ = normalize_instruction("探测 Provider codex_cli: minimal")
@@ -1255,6 +1831,7 @@ class VerticalSliceTest(unittest.TestCase):
     def test_general_code_task_uses_registered_workspace_and_independent_checker(self):
         requests = []
         snapshots = 0
+        jobs = {}
 
         class Bridge(BaseHTTPRequestHandler):
             def do_POST(self):
@@ -1274,16 +1851,37 @@ class VerticalSliceTest(unittest.TestCase):
                     }
                     snapshots += 1
                 elif self.path == "/v1/jobs/start":
+                    failed = (
+                        payload["access"] == "read"
+                        and payload["adapter"] == "codex"
+                    )
                     body = {
                         "job_id": payload["job_id"],
                         "status": "completed",
-                        "returncode": 0,
+                        "returncode": 1 if failed else 0,
                         "duration_ms": 12,
                         "input_tokens": 20,
                         "cached_input_tokens": 5,
                         "output_tokens": 3,
                         "model": "codex-test",
-                        "session_id": "executor-session",
+                        "session_id": (
+                            "checker-session"
+                            if payload["access"] == "read"
+                            else "executor-session"
+                        ),
+                    }
+                    if payload["access"] == "read":
+                        body.update(
+                            {
+                                "input_tokens": 10,
+                                "cached_input_tokens": 4,
+                                "output_tokens": 1,
+                            }
+                        )
+                    jobs[payload["job_id"]] = {
+                        **body,
+                        "access": payload["access"],
+                        "failed": failed,
                     }
                 elif self.path == "/v1/jobs/output":
                     body = {
@@ -1292,22 +1890,21 @@ class VerticalSliceTest(unittest.TestCase):
                         "chunks": [
                             {
                                 "stream": "stdout",
-                                "text": "implemented and tests passed",
+                                "text": (
+                                    (
+                                        "checker provider failed"
+                                        if jobs[payload["job_id"]]["failed"]
+                                        else checker_output()
+                                    )
+                                    if jobs[payload["job_id"]]["access"] == "read"
+                                    else "implemented and tests passed"
+                                ),
                             }
                         ],
                     }
                 else:
-                    body = {
-                        "returncode": 0,
-                        "stdout": checker_output(),
-                        "stderr": "",
-                        "duration_ms": 8,
-                        "input_tokens": 10,
-                        "cached_input_tokens": 4,
-                        "output_tokens": 1,
-                        "model": "codex-test",
-                        "session_id": "checker-session",
-                    }
+                    self.send_error(404)
+                    return
                 data = json.dumps(body).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -1342,7 +1939,13 @@ class VerticalSliceTest(unittest.TestCase):
                 )
                 self.assertEqual(
                     [item["action"] for item in run_until_idle(self.store)],
-                    ["intake", "snapshot", "execute", "verify"],
+                    [
+                        "intake",
+                        "snapshot",
+                        "execute",
+                        "checker_fallback",
+                        "verify",
+                    ],
                 )
         finally:
             bridge.shutdown()
@@ -1354,17 +1957,26 @@ class VerticalSliceTest(unittest.TestCase):
         self.assertEqual(view["task"]["outcome"], "done")
         self.assertEqual(view["host_path"], str(self.root))
         self.assertEqual(
-            [(item["role_key"], item["provider_key"], item["external_session_id"]) for item in view["sessions"]],
             [
-                ("fullstack", "cursor_cli", "executor-session"),
-                ("independent_checker", "codex_cli", "checker-session"),
+                (
+                    item["role_key"],
+                    item["generation"],
+                    item["provider_key"],
+                    item["external_session_id"],
+                )
+                for item in view["sessions"]
+            ],
+            [
+                ("fullstack", 1, "cursor_cli", "executor-session"),
+                ("independent_checker", 1, "codex_cli", "checker-session"),
+                ("independent_checker", 2, "cursor_cli", "checker-session"),
             ],
         )
         self.assertEqual(
             [item["purpose"] for item in reversed(view["host_jobs"])],
-            ["execute", "check"],
+            ["execute", "check", "check"],
         )
-        self.assertEqual(sum(item["normalized_total"] for item in view["model_usage"]), 34)
+        self.assertEqual(sum(item["normalized_total"] for item in view["model_usage"]), 45)
         evidence = json.loads(
             next(
                 Path(item["path"]).read_text()
@@ -1381,11 +1993,100 @@ class VerticalSliceTest(unittest.TestCase):
                 "/v1/jobs/start",
                 "/v1/jobs/output",
                 "/v1/evidence/snapshot",
-                "/v1/execute",
+                "/v1/jobs/start",
+                "/v1/jobs/output",
+                "/v1/jobs/start",
+                "/v1/jobs/output",
             ],
         )
         self.assertEqual(requests[1][1]["adapter"], "cursor")
         self.assertEqual(requests[4][1]["access"], "read")
+        self.assertEqual(requests[6][1]["adapter"], "cursor")
+
+    def test_read_only_analysis_can_finish_from_evidence_without_workspace_delta(self):
+        self._create_project(
+            "analysis", "analysis-create", "/workspace/analysis"
+        )
+        submit_message(
+            self.store,
+            "analysis",
+            "分析当前项目的刷新流程并给出有证据的结论",
+            "analysis-message",
+        )
+        self.assertEqual(tick(self.store)[0]["action"], "intake")
+        unchanged = {
+            "git": {
+                "available": True,
+                "head": "abc123",
+                "status": "",
+                "diff_stat": "",
+            }
+        }
+        with (
+            patch(
+                "plowwhip.execution.workspace_snapshot",
+                return_value=unchanged,
+            ),
+            patch(
+                "plowwhip.execution.start_provider_job",
+                return_value={
+                    "status": "completed",
+                    "returncode": 0,
+                    "input_tokens": 5,
+                    "cached_input_tokens": 2,
+                    "output_tokens": 2,
+                    "model": "cursor-test",
+                    "session_id": "analysis-session",
+                },
+            ) as executor_start,
+            patch(
+                "plowwhip.execution.provider_job_output",
+                return_value={
+                    "chunks": [
+                        {
+                            "stream": "stdout",
+                            "text": "bounded findings with file references",
+                        }
+                    ]
+                },
+            ),
+            patch(
+                "plowwhip.verification.start_provider_job",
+                return_value={
+                    "status": "completed",
+                    "returncode": 0,
+                    "input_tokens": 4,
+                    "cached_input_tokens": 1,
+                    "output_tokens": 1,
+                    "model": "codex-test",
+                    "session_id": "analysis-checker",
+                },
+            ),
+            patch(
+                "plowwhip.verification.provider_job_output",
+                return_value={
+                    "chunks": [
+                        {"stream": "stdout", "text": checker_output()}
+                    ]
+                },
+            ),
+        ):
+            self.assertEqual(
+                [item["action"] for item in run_until_idle(self.store)],
+                ["snapshot", "execute", "verify"],
+            )
+        self.assertEqual(executor_start.call_args.kwargs["access"], "read")
+        state = snapshot(self.db, self.data, "analysis")
+        self.assertEqual(state["task"]["outcome"], "done")
+        evidence = next(
+            json.loads(Path(item["path"]).read_text())
+            for item in state["artifacts"]
+            if item["kind"] == "evidence"
+            and item["acceptance_id"] is None
+        )
+        self.assertFalse(evidence["workspace_changed"])
+        self.assertFalse(evidence["workspace_change_required"])
+        self.assertTrue(evidence["passed"])
 
     def test_terminal_provider_failure_falls_back_with_new_generation(self):
         snapshots = 0
@@ -1412,7 +2113,8 @@ class VerticalSliceTest(unittest.TestCase):
                     snapshots += 1
                 elif self.path == "/v1/jobs/start":
                     adapters.append(payload["adapter"])
-                    failed = payload["adapter"] == "cursor"
+                    checking = payload["access"] == "read"
+                    failed = payload["adapter"] == "cursor" and not checking
                     body = {
                         "job_id": payload["job_id"],
                         "status": "completed",
@@ -1422,9 +2124,13 @@ class VerticalSliceTest(unittest.TestCase):
                         "cached_input_tokens": 1,
                         "output_tokens": 1,
                         "model": f"{payload['adapter']}-test",
-                        "session_id": f"{payload['adapter']}-session",
+                        "session_id": (
+                            "checker-session"
+                            if checking
+                            else f"{payload['adapter']}-session"
+                        ),
                     }
-                    jobs[payload["job_id"]] = body
+                    jobs[payload["job_id"]] = {**body, "access": payload["access"]}
                 elif self.path == "/v1/jobs/output":
                     body = {
                         "job_id": payload["job_id"],
@@ -1435,22 +2141,18 @@ class VerticalSliceTest(unittest.TestCase):
                                 "text": (
                                     "provider failed"
                                     if jobs[payload["job_id"]]["returncode"]
-                                    else "implemented"
+                                    else (
+                                        checker_output()
+                                        if jobs[payload["job_id"]]["access"] == "read"
+                                        else "implemented"
+                                    )
                                 ),
                             }
                         ],
                     }
                 else:
-                    body = {
-                        "returncode": 0,
-                        "stdout": checker_output(),
-                        "stderr": "",
-                        "input_tokens": 2,
-                        "cached_input_tokens": 1,
-                        "output_tokens": 1,
-                        "model": "codex-checker",
-                        "session_id": "checker-session",
-                    }
+                    self.send_error(404)
+                    return
                 data = json.dumps(body).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -1503,7 +2205,7 @@ class VerticalSliceTest(unittest.TestCase):
             fullstack,
             [(1, "cursor_cli", "archived"), (2, "codex_cli", "archived")],
         )
-        self.assertEqual(adapters, ["cursor", "codex"])
+        self.assertEqual(adapters, ["cursor", "codex", "codex"])
         self.assertIn("provider_fallback", {item["kind"] for item in view["events"]})
 
     def test_running_host_job_releases_sqlite_and_can_reconcile_or_cancel(self):
@@ -1530,16 +2232,26 @@ class VerticalSliceTest(unittest.TestCase):
                     }
                     snapshots += 1
                 elif self.path == "/v1/jobs/start":
-                    entered.set()
-                    release.wait(2)
-                    body = jobs.setdefault(
-                        payload["job_id"],
-                        {
+                    if payload["access"] == "read":
+                        checker_entered.set()
+                        checker_release.wait(2)
+                        body = {
+                            "job_id": payload["job_id"],
+                            "status": "running",
+                            "session_id": "durable-checker",
+                        }
+                    else:
+                        entered.set()
+                        release.wait(2)
+                        body = {
                             "job_id": payload["job_id"],
                             "status": "running",
                             "session_id": "durable-executor",
-                        },
-                    )
+                        }
+                    jobs[payload["job_id"]] = {
+                        **body,
+                        "access": payload["access"],
+                    }
                 elif self.path == "/v1/jobs/status":
                     body = {
                         **jobs[payload["job_id"]],
@@ -1555,7 +2267,16 @@ class VerticalSliceTest(unittest.TestCase):
                     body = {
                         "job_id": payload["job_id"],
                         "status": jobs[payload["job_id"]]["status"],
-                        "chunks": [{"stream": "stdout", "text": "bounded progress\n"}],
+                        "chunks": [
+                            {
+                                "stream": "stdout",
+                                "text": (
+                                    checker_output()
+                                    if jobs[payload["job_id"]]["access"] == "read"
+                                    else "bounded progress\n"
+                                ),
+                            }
+                        ],
                     }
                 elif self.path == "/v1/jobs/cancel":
                     body = {
@@ -1565,18 +2286,8 @@ class VerticalSliceTest(unittest.TestCase):
                     }
                     jobs[payload["job_id"]] = body
                 else:
-                    checker_entered.set()
-                    checker_release.wait(2)
-                    body = {
-                        "returncode": 0,
-                        "stdout": checker_output(),
-                        "stderr": "",
-                        "input_tokens": 4,
-                        "cached_input_tokens": 1,
-                        "output_tokens": 1,
-                        "model": "codex-test",
-                        "session_id": "durable-checker",
-                    }
+                    self.send_error(404)
+                    return
                 data = json.dumps(body).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -1662,8 +2373,21 @@ class VerticalSliceTest(unittest.TestCase):
                 self.assertFalse(verify_thread.is_alive())
                 self.assertEqual(
                     {(item["project_id"], item["action"]) for item in verified},
-                    {("durable-code", "verify"), ("checker-side", "intake")},
+                    {("durable-code", "check_wait"), ("checker-side", "intake")},
                 )
+                checker_wait = snapshot(self.db, self.data, "durable-code")
+                self.assertEqual(checker_wait["task"]["phase"], "check_wait")
+                restarted = Store(self.db, self.data)
+                restarted.initialize()
+                with restarted.transaction() as connection:
+                    connection.execute(
+                        """
+                        UPDATE tasks SET next_action_at = ?
+                        WHERE project_id = 'durable-code'
+                        """,
+                        (time.time(),),
+                    )
+                self.assertEqual(tick(restarted)[0]["action"], "verify")
                 self.assertEqual(
                     snapshot(self.db, self.data, "durable-code")["task"]["outcome"],
                     "done",
@@ -1933,7 +2657,13 @@ class WebApiTest(unittest.TestCase):
         self.assertEqual(done["task"]["spec_revision"], 2)
         self.assertEqual(
             [event["kind"] for event in reversed(done["events"])],
-            ["needs_decision", "decision_applied", "executed", "verified"],
+            [
+                "needs_decision",
+                "decision_applied",
+                "executed",
+                "worker_template_promoted",
+                "verified",
+            ],
         )
         self.assertEqual({item["revision"] for item in done["artifacts"]}, {2})
         with urlopen(self.base + "/api/search?q=web.txt", timeout=2) as response:

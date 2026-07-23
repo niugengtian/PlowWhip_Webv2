@@ -7,13 +7,14 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from .butler import conversation, search
-from .cronner import run as run_cronner
+from .butler import conversation, route_global_message, search
+from .cronner import acquire_scheduler_lock, run as run_cronner
 from .intake import (
     PROJECT_ID,
     TASK_ID,
     archive_project,
     create_project,
+    set_project_rule,
     set_project_setting,
     submit_action,
     submit_message,
@@ -48,7 +49,17 @@ class Handler(BaseHTTPRequestHandler):
                 connection.execute("SELECT 1").fetchone()
             finally:
                 connection.close()
-            self._send(200, {"status": "ok"})
+            self._send(
+                200,
+                {
+                    "status": "ok",
+                    "cronner": (
+                        "enabled"
+                        if getattr(self.server, "cronner_enabled", False)
+                        else "disabled"
+                    ),
+                },
+            )
             return
         if path == "/api/projects":
             store = self.server.store  # type: ignore[attr-defined]
@@ -124,12 +135,13 @@ class Handler(BaseHTTPRequestHandler):
             store = self.server.store  # type: ignore[attr-defined]
             path = urlsplit(self.path).path
             if path == "/api/messages":
-                identifier = submit_message(
+                routed = route_global_message(
                     store,
-                    body["project_id"],
                     body["content"],
                     body["idempotency_key"],
+                    body.get("project_id"),
                 )
+                identifier = routed["message_id"]
             elif path == "/api/actions":
                 if body.get("kind") == "create_project":
                     identifier = create_project(
@@ -153,6 +165,14 @@ class Handler(BaseHTTPRequestHandler):
                         body["value"],
                         body["idempotency_key"],
                     )
+                elif body.get("kind") == "set_project_rule":
+                    identifier = set_project_rule(
+                        store,
+                        body["project_id"],
+                        body["rule_key"],
+                        body["content"],
+                        body["idempotency_key"],
+                    )
                 else:
                     identifier = submit_action(
                         store,
@@ -172,7 +192,15 @@ class Handler(BaseHTTPRequestHandler):
         except sqlite3.Error:
             self._send(500, {"error": "store_error"})
             return
-        self._send(202, {"message_id": identifier})
+        response = {"message_id": identifier}
+        if path == "/api/messages":
+            response.update(
+                {
+                    "project_id": routed["project_id"],
+                    "routed_only": routed["routed_only"],
+                }
+            )
+        self._send(202, response)
 
     def _body(self) -> dict:
         if self.headers.get_content_type() != "application/json":
@@ -238,16 +266,28 @@ def serve(
     port: int,
     interval_seconds: float,
     allow_non_loopback: bool = False,
+    cronner_enabled: bool = True,
 ) -> None:
     if interval_seconds <= 0:
         raise ValueError("cronner interval must be positive")
     store.initialize()
     server = make_server(store, host, port, allow_non_loopback)
+    server.cronner_enabled = cronner_enabled  # type: ignore[attr-defined]
     stop = threading.Event()
-    cronner = threading.Thread(
-        target=run_cronner, args=(store, stop, interval_seconds), daemon=True
+    scheduler_lock = (
+        acquire_scheduler_lock(store.data_root) if cronner_enabled else None
     )
-    cronner.start()
+    cronner = (
+        threading.Thread(
+            target=run_cronner,
+            args=(store, stop, interval_seconds),
+            daemon=True,
+        )
+        if cronner_enabled
+        else None
+    )
+    if cronner:
+        cronner.start()
     try:
         try:
             server.serve_forever()
@@ -256,4 +296,7 @@ def serve(
     finally:
         stop.set()
         server.server_close()
-        cronner.join()
+        if cronner:
+            cronner.join()
+        if scheduler_lock:
+            scheduler_lock.close()

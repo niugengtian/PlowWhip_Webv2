@@ -6,9 +6,8 @@ import sqlite3
 import time
 from uuid import uuid4
 
-from .execution import _write_atomic
 from .intake import canonical_json
-from .store import Store
+from .store import Store, write_atomic as _write_atomic
 
 
 def checkpoint_project(store: Store, project_id: str) -> None:

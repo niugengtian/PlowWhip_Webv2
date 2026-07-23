@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import logging
 import threading
 import time
@@ -12,6 +13,20 @@ from .store import Store
 
 
 LEASE_SECONDS = 30
+
+
+def acquire_scheduler_lock(data_root) -> object:
+    path = data_root / ".cronner.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+b")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        raise RuntimeError(
+            "another image instance already owns the scheduler lock"
+        ) from None
+    return handle
 
 
 def tick(store: Store, limit: int = 100) -> list[dict[str, str]]:
@@ -29,7 +44,10 @@ def tick(store: Store, limit: int = 100) -> list[dict[str, str]]:
                     WHERE t.project_id = p.id
                       AND t.outcome IS NULL
                       AND t.public_status IN ('pending', 'in_progress')
-                      AND t.next_action_at <= ?
+                      AND (
+                        t.next_action_at <= ?
+                        OR (t.deadline_at IS NOT NULL AND t.deadline_at <= ?)
+                      )
                 )
                 OR EXISTS (
                     SELECT 1 FROM tasks queued
@@ -69,7 +87,7 @@ def tick(store: Store, limit: int = 100) -> list[dict[str, str]]:
               )
             ORDER BY p.created_at LIMIT ?
             """,
-            (now, now, limit),
+            (now, now, now, limit),
         ).fetchall()
     finally:
         connection.close()

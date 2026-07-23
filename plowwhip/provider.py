@@ -97,6 +97,8 @@ def provider_facts(role_key: str) -> list[dict[str, object]]:
             "minimal_token_probe": bool(
                 PROVIDERS.get(provider, {}).get("minimal_probe")
             ),
+            "supports_native_compact": provider == "codex_cli",
+            "supports_resume": provider in {"codex_cli", "cursor_cli"},
         }
         for provider in PROVIDER_ORDERS.get(role_key, ())
     ]
@@ -228,59 +230,6 @@ def workspace_snapshot(project_path: str) -> dict[str, object]:
     )
 
 
-def run_provider_task(
-    provider_key: str,
-    project_path: str,
-    prompt: str,
-    *,
-    session_id: str | None = None,
-    access: str = "write",
-    timeout_seconds: int = 600,
-) -> dict[str, object]:
-    provider = PROVIDERS.get(provider_key)
-    if not provider:
-        raise ValueError("unknown Provider")
-    if access not in {"read", "write"}:
-        raise ValueError("Provider access must be read or write")
-    if access == "read" and provider["adapter"] != "codex":
-        raise ValueError("read-only checking requires Codex CLI")
-    base_url, token = _bridge_configuration()
-    response = _bridge_post(
-        base_url,
-        token,
-        "/v1/execute",
-        {
-            "adapter": provider["adapter"],
-            "executable": provider["executable"],
-            "project_path": project_path,
-            "prompt": prompt,
-            "session_id": session_id,
-            "timeout_seconds": min(max(int(timeout_seconds), 10), 86_400),
-            "access": access,
-            "context_policy": {"max_turns": 24, "tool_no_progress_limit": 6},
-        },
-        min(max(int(timeout_seconds) + 20, 30), 86_420),
-        max_bytes=1_048_576,
-    )
-    input_tokens = max(0, int(response.get("input_tokens") or 0))
-    cached_tokens = min(input_tokens, max(0, int(response.get("cached_input_tokens") or 0)))
-    output_tokens = max(0, int(response.get("output_tokens") or 0))
-    return {
-        "provider_key": provider_key,
-        "model": str(response.get("model") or provider_key),
-        "returncode": int(response.get("returncode") or 0),
-        "failure_class": response.get("failure_class"),
-        "stdout": str(response.get("stdout") or ""),
-        "stderr": str(response.get("stderr") or ""),
-        "duration_ms": max(0, int(response.get("duration_ms") or 0)),
-        "input_tokens": input_tokens,
-        "cached_input_tokens": cached_tokens,
-        "output_tokens": output_tokens,
-        "total_tokens": input_tokens + output_tokens,
-        "session_id": str(response.get("session_id") or "") or session_id,
-    }
-
-
 def start_provider_job(
     job_id: str,
     provider_key: str,
@@ -289,10 +238,14 @@ def start_provider_job(
     *,
     session_id: str | None,
     timeout_seconds: int,
+    context_policy: dict[str, object] | None = None,
+    access: str = "write",
 ) -> dict[str, object]:
     provider = PROVIDERS.get(provider_key)
     if not provider:
         raise ValueError("unknown Provider")
+    if access not in {"read", "write"}:
+        raise ValueError("Provider access must be read or write")
     base_url, token = _bridge_configuration()
     return _bridge_post(
         base_url,
@@ -306,7 +259,12 @@ def start_provider_job(
             "prompt": prompt,
             "session_id": session_id,
             "timeout_seconds": min(max(int(timeout_seconds), 10), 86_400),
-            "context_policy": {"max_turns": 24, "tool_no_progress_limit": 6},
+            "access": access,
+            "context_policy": {
+                "max_turns": 24,
+                "tool_no_progress_limit": 6,
+                **(context_policy or {}),
+            },
         },
         20,
         max_bytes=1_048_576,
@@ -353,6 +311,56 @@ def cancel_provider_job(job_id: str) -> dict[str, object]:
         10,
         max_bytes=1_048_576,
     )
+
+
+def parse_context_events(output: str) -> list[dict[str, object]]:
+    """Keep only proven compact events from bounded Provider JSON output."""
+    events = []
+    for line in output.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        event_type = str(event.get("type") or "")
+        compacted = event_type in {
+            "session.compacted",
+            "context.compacted",
+            "context_compaction",
+        } or _contains_context_compaction(event)
+        if compacted:
+            events.append(
+                {
+                    key: event.get(key)
+                    for key in (
+                        "type",
+                        "session_id",
+                        "rotation_id",
+                        "before_bytes",
+                        "after_bytes",
+                        "warm_bytes",
+                        "archive",
+                    )
+                    if event.get(key) is not None
+                }
+                | {"provider_event_type": event_type}
+            )
+    return events
+
+
+def _contains_context_compaction(value: object) -> bool:
+    if isinstance(value, dict):
+        if str(value.get("type") or "") in {
+            "context_compaction",
+            "contextCompaction",
+            "context.compacted",
+        }:
+            return True
+        return any(_contains_context_compaction(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_context_compaction(item) for item in value)
+    return False
 
 
 def _bridge_configuration() -> tuple[str, str]:

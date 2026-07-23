@@ -5,7 +5,7 @@ import json
 
 from .app import serve
 from .monitor import snapshot
-from .store import Store
+from .store import Store, candidate_preflight
 
 
 def main() -> None:
@@ -23,13 +23,39 @@ def main() -> None:
         action="store_true",
         help="explicitly allow a container-facing bind",
     )
+    server.add_argument(
+        "--cronner-disabled",
+        action="store_true",
+        help="serve a candidate UI/API without scheduler authority",
+    )
 
     monitor = commands.add_parser("monitor", help="read current state and bounded output")
     monitor.add_argument("project_id")
+    backup = commands.add_parser(
+        "backup", help="create a consistent SQLite Backup API copy"
+    )
+    backup.add_argument("destination")
+    preflight = commands.add_parser(
+        "candidate-preflight", help="verify blue/green candidate isolation"
+    )
+    preflight.add_argument("production_manifest")
+    preflight.add_argument("candidate_manifest")
 
     args = parser.parse_args()
     if args.command == "monitor":
         result = snapshot(args.db, args.data_root, args.project_id)
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
+        return
+    if args.command == "backup":
+        result = Store(args.db, args.data_root).backup_to(args.destination)
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
+        return
+    if args.command == "candidate-preflight":
+        with open(args.production_manifest, encoding="utf-8") as handle:
+            production = json.load(handle)
+        with open(args.candidate_manifest, encoding="utf-8") as handle:
+            candidate = json.load(handle)
+        result = candidate_preflight(production, candidate)
         print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
         return
     serve(
@@ -38,6 +64,7 @@ def main() -> None:
         args.port,
         args.cronner_interval,
         args.allow_non_loopback,
+        not args.cronner_disabled,
     )
 
 

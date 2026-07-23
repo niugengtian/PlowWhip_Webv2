@@ -660,7 +660,9 @@ def _provider_monitor(connection, store: Store) -> list[dict]:
                         if zero_result and zero_result.get("available")
                         else "unavailable" if zero_result else "unknown"
                     ),
-                    "session_resume_ready": "unknown",
+                    "session_resume_ready": (
+                        "supported" if fact["supports_resume"] else "unsupported"
+                    ),
                     "recent_execution_health": execution_health,
                 },
                 "zero_probe": zero,
