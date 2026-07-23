@@ -93,7 +93,7 @@ class VerticalSliceTest(unittest.TestCase):
         )
         self.assertEqual(
             [item["action"] for item in run_until_idle(self.store)],
-            ["decision", "execute", "verify"],
+            ["provide_decision", "execute", "verify"],
         )
         revised = snapshot(self.db, self.data, "project-b")
         self.assertEqual(revised["task"]["public_status"], "done")
@@ -129,6 +129,60 @@ class VerticalSliceTest(unittest.TestCase):
         finally:
             connection.close()
         self.assertEqual([tuple(row) for row in rows], [("done", "done"), ("done", "done")])
+
+    def test_cancel_rerun_and_complete_schema(self):
+        submit_message(self.store, "cancel", "write result.txt: first", "cancel-1")
+        self.assertEqual(tick(self.store)[0]["action"], "intake")
+        self.assertEqual(tick(self.store)[0]["action"], "execute")
+        task = snapshot(self.db, self.data, "cancel")["task"]
+
+        submit_action(self.store, "cancel", task["id"], "cancel", "", "cancel-2")
+        result = tick(self.store)[0]
+        self.assertEqual((result["action"], result["status"]), ("cancel", "cancelled"))
+        cancelled = snapshot(self.db, self.data, "cancel")
+        self.assertEqual(cancelled["task"]["outcome"], "cancelled")
+        self.assertEqual(tick(self.store), [])
+
+        submit_action(self.store, "cancel", task["id"], "rerun", "", "cancel-3")
+        self.assertEqual(
+            [item["action"] for item in run_until_idle(self.store)],
+            ["rerun", "execute", "verify"],
+        )
+        rerun = snapshot(self.db, self.data, "cancel")
+        self.assertEqual(rerun["task"]["id"], task["id"])
+        self.assertEqual(rerun["task"]["outcome"], "done")
+        self.assertEqual(len({item["path"] for item in rerun["artifacts"]}), 3)
+
+        connection = self.store.connect()
+        try:
+            tables = {
+                row["name"]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+                )
+            }
+        finally:
+            connection.close()
+        self.assertEqual(
+            tables,
+            {
+                "projects",
+                "messages",
+                "goals",
+                "plans",
+                "tasks",
+                "task_dependencies",
+                "workers",
+                "task_sessions",
+                "session_generations",
+                "host_jobs",
+                "artifacts",
+                "task_events",
+                "model_calls",
+                "library_items",
+                "settings",
+            },
+        )
 
     def _row_counts(self):
         connection = sqlite3.connect(str(self.db))

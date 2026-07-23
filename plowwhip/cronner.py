@@ -25,6 +25,7 @@ def tick(store: Store, limit: int = 100) -> list[dict[str, str]]:
                 EXISTS (
                     SELECT 1 FROM tasks t
                     WHERE t.project_id = p.id
+                      AND t.outcome IS NULL
                       AND t.public_status IN ('pending', 'in_progress')
                       AND t.next_action_at <= ?
                 )
@@ -38,6 +39,7 @@ def tick(store: Store, limit: int = 100) -> list[dict[str, str]]:
                     NOT EXISTS (
                         SELECT 1 FROM tasks active
                         WHERE active.project_id = p.id
+                          AND active.outcome IS NULL
                           AND active.public_status IN ('pending', 'in_progress', 'needs_decision')
                     )
                     AND EXISTS (
@@ -96,10 +98,13 @@ def _latest_status(store: Store, project_id: str) -> str:
     connection = store.connect()
     try:
         row = connection.execute(
-            "SELECT public_status FROM tasks WHERE project_id = ? ORDER BY created_at DESC LIMIT 1",
+            """
+            SELECT public_status, outcome FROM tasks
+            WHERE project_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1
+            """,
             (project_id,),
         ).fetchone()
-        return row["public_status"] if row else "pending"
+        return row["outcome"] or row["public_status"] if row else "pending"
     finally:
         connection.close()
 

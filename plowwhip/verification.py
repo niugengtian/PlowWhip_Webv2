@@ -19,6 +19,7 @@ def verify_task(store: Store, connection: sqlite3.Connection, task: sqlite3.Row)
         """
         SELECT path FROM artifacts
         WHERE task_id = ? AND kind = 'output' AND revision = ?
+        ORDER BY created_at DESC, rowid DESC LIMIT 1
         """,
         (task["id"], task["spec_revision"]),
     ).fetchone()
@@ -27,6 +28,10 @@ def verify_task(store: Store, connection: sqlite3.Connection, task: sqlite3.Row)
     observed = hashlib.sha256(output_path.read_bytes()).hexdigest() if exists else None
     passed = exists and observed == expected
     now = time.time()
+    sequence = connection.execute(
+        "SELECT COALESCE(MAX(sequence), 0) + 1 AS value FROM host_jobs WHERE task_id = ?",
+        (task["id"],),
+    ).fetchone()["value"]
     evidence = {
         "acceptance_id": "artifact_content_sha256",
         "expected_sha256": expected,
@@ -45,6 +50,7 @@ def verify_task(store: Store, connection: sqlite3.Connection, task: sqlite3.Row)
         / task["id"]
         / "artifacts"
         / f"revision-{task['spec_revision']:06d}"
+        / f"check-{sequence:06d}"
         / "evidence"
         / "artifact_content_sha256.json"
     )
@@ -67,10 +73,6 @@ def verify_task(store: Store, connection: sqlite3.Connection, task: sqlite3.Row)
             now,
         ),
     )
-    sequence = connection.execute(
-        "SELECT COALESCE(MAX(sequence), 0) + 1 AS value FROM host_jobs WHERE task_id = ?",
-        (task["id"],),
-    ).fetchone()["value"]
     connection.execute(
         """
         INSERT INTO host_jobs(
@@ -103,7 +105,7 @@ def verify_task(store: Store, connection: sqlite3.Connection, task: sqlite3.Row)
             UPDATE tasks SET public_status = 'needs_decision', phase = 'verify',
                 wait_reason = 'output hash does not satisfy acceptance',
                 fault_code = 'verification', next_action_at = NULL,
-                outcome = 'needs_decision', updated_at = ? WHERE id = ?
+                outcome = NULL, updated_at = ? WHERE id = ?
             """,
             (now, task["id"]),
         )

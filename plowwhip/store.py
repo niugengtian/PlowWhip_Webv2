@@ -39,6 +39,16 @@ CREATE TABLE IF NOT EXISTS goals (
     created_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS plans (
+    id TEXT PRIMARY KEY,
+    goal_id TEXT NOT NULL REFERENCES goals(id),
+    revision INTEGER NOT NULL,
+    selected INTEGER NOT NULL DEFAULT 1 CHECK (selected IN (0, 1)),
+    summary_json TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    UNIQUE (goal_id, revision)
+);
+
 CREATE TABLE IF NOT EXISTS tasks (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL REFERENCES projects(id),
@@ -65,9 +75,52 @@ CREATE TABLE IF NOT EXISTS tasks (
     updated_at REAL NOT NULL
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS one_active_task_per_project
+DROP INDEX IF EXISTS one_active_task_per_project;
+CREATE UNIQUE INDEX one_active_task_per_project
 ON tasks(project_id)
-WHERE public_status IN ('pending', 'in_progress', 'needs_decision');
+WHERE outcome IS NULL
+  AND phase <> 'queued'
+  AND public_status IN ('pending', 'in_progress', 'needs_decision');
+
+CREATE TABLE IF NOT EXISTS task_dependencies (
+    task_id TEXT NOT NULL REFERENCES tasks(id),
+    depends_on_task_id TEXT NOT NULL REFERENCES tasks(id),
+    PRIMARY KEY (task_id, depends_on_task_id),
+    CHECK (task_id <> depends_on_task_id)
+);
+
+CREATE TABLE IF NOT EXISTS workers (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    role_key TEXT NOT NULL,
+    template_revision INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL,
+    UNIQUE (project_id, role_key)
+);
+
+CREATE TABLE IF NOT EXISTS task_sessions (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id),
+    worker_id TEXT NOT NULL REFERENCES workers(id),
+    role_key TEXT NOT NULL,
+    role_snapshot_json TEXT NOT NULL,
+    settings_json TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    UNIQUE (task_id, role_key)
+);
+
+CREATE TABLE IF NOT EXISTS session_generations (
+    id TEXT PRIMARY KEY,
+    task_session_id TEXT NOT NULL REFERENCES task_sessions(id),
+    generation INTEGER NOT NULL,
+    provider_key TEXT NOT NULL,
+    external_session_id TEXT,
+    status TEXT NOT NULL CHECK (status IN ('active', 'archived', 'broken')),
+    handoff_ref TEXT,
+    created_at REAL NOT NULL,
+    ended_at REAL,
+    UNIQUE (task_session_id, generation)
+);
 
 CREATE TABLE IF NOT EXISTS host_jobs (
     id TEXT PRIMARY KEY,
@@ -108,6 +161,44 @@ CREATE TABLE IF NOT EXISTS task_events (
     detail_json TEXT NOT NULL,
     created_at REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS model_calls (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id),
+    task_session_id TEXT NOT NULL REFERENCES task_sessions(id),
+    session_generation INTEGER NOT NULL,
+    provider_key TEXT NOT NULL,
+    usage_kind TEXT NOT NULL CHECK (usage_kind IN ('single', 'cumulative')),
+    input_tokens INTEGER NOT NULL,
+    cached_input_tokens INTEGER NOT NULL,
+    output_tokens INTEGER NOT NULL,
+    normalized_total INTEGER NOT NULL,
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS library_items (
+    id TEXT PRIMARY KEY,
+    scope TEXT NOT NULL CHECK (scope IN ('global', 'project')),
+    project_id TEXT REFERENCES projects(id),
+    kind TEXT NOT NULL CHECK (kind IN ('role', 'rule', 'worker_template', 'script')),
+    item_key TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    path TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    UNIQUE (scope, project_id, kind, item_key, revision)
+);
+
+CREATE TABLE IF NOT EXISTS settings (
+    id TEXT PRIMARY KEY,
+    scope TEXT NOT NULL CHECK (scope IN ('global', 'project')),
+    project_id TEXT REFERENCES projects(id),
+    setting_key TEXT NOT NULL,
+    value_json TEXT NOT NULL,
+    source TEXT NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE (scope, project_id, setting_key)
+);
 """
 
 
@@ -122,8 +213,30 @@ class Store:
         connection = self.connect()
         try:
             connection.executescript(SCHEMA)
+            self._ensure_task_columns(connection)
+            connection.execute(
+                """
+                UPDATE tasks SET outcome = NULL
+                WHERE public_status = 'needs_decision' AND outcome = 'needs_decision'
+                """
+            )
+            connection.execute("PRAGMA user_version = 1")
+            connection.commit()
         finally:
             connection.close()
+
+    @staticmethod
+    def _ensure_task_columns(connection: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(tasks)")}
+        additions = {
+            "plan_id": "TEXT REFERENCES plans(id)",
+            "sprint": "INTEGER",
+            "role_key": "TEXT",
+            "checker_role_key": "TEXT",
+        }
+        for name, declaration in additions.items():
+            if name not in columns:
+                connection.execute(f"ALTER TABLE tasks ADD COLUMN {name} {declaration}")
 
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path, timeout=5)

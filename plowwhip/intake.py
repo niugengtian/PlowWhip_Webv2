@@ -58,10 +58,12 @@ def submit_action(
 ) -> str:
     if not PROJECT_ID.fullmatch(project_id) or not TASK_ID.fullmatch(task_id):
         raise ValueError("invalid project_id or task_id")
-    if kind != "provide_decision":
-        raise ValueError("supported action is: provide_decision")
-    if not instruction or len(instruction.encode()) > 65_536:
-        raise ValueError("instruction must contain 1-65536 UTF-8 bytes")
+    if kind not in {"provide_decision", "cancel", "rerun"}:
+        raise ValueError("supported actions: provide_decision, cancel, rerun")
+    if kind == "provide_decision" and not instruction:
+        raise ValueError("provide_decision requires instruction")
+    if len(instruction.encode()) > 65_536:
+        raise ValueError("instruction must contain at most 65536 UTF-8 bytes")
     if not idempotency_key or len(idempotency_key) > 128:
         raise ValueError("idempotency_key must contain 1-128 characters")
 
@@ -76,14 +78,20 @@ def submit_action(
         if existing:
             return str(existing["id"])
         task = connection.execute(
-            """
-            SELECT 1 FROM tasks
-            WHERE id = ? AND project_id = ? AND public_status = 'needs_decision'
-            """,
+            "SELECT public_status, outcome FROM tasks WHERE id = ? AND project_id = ?",
             (task_id, project_id),
         ).fetchone()
         if not task:
-            raise ValueError("task is not waiting for a decision")
+            raise ValueError("task not found")
+        allowed = (
+            kind == "provide_decision"
+            and task["public_status"] == "needs_decision"
+            and task["outcome"] != "cancelled"
+        ) or (kind == "cancel" and task["outcome"] is None) or (
+            kind == "rerun" and task["outcome"] == "cancelled"
+        )
+        if not allowed:
+            raise ValueError(f"action {kind} is not allowed for current task")
         connection.execute(
             """
             INSERT INTO messages(
@@ -94,7 +102,7 @@ def submit_action(
             (
                 message_id,
                 project_id,
-                instruction,
+                instruction or kind,
                 canonical_json(action),
                 idempotency_key,
                 now,

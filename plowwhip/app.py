@@ -70,7 +70,7 @@ class Handler(BaseHTTPRequestHandler):
                     body["project_id"],
                     body["task_id"],
                     body["kind"],
-                    body["instruction"],
+                    body.get("instruction", ""),
                     body["idempotency_key"],
                 )
             else:
