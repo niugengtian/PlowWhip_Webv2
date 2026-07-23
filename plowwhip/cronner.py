@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import threading
 import time
 from uuid import uuid4
 
@@ -25,6 +27,12 @@ def tick(store: Store, limit: int = 100) -> list[dict[str, str]]:
                     WHERE t.project_id = p.id
                       AND t.public_status IN ('pending', 'in_progress')
                       AND t.next_action_at <= ?
+                )
+                OR EXISTS (
+                    SELECT 1 FROM messages action
+                    WHERE action.project_id = p.id
+                      AND action.processed_at IS NULL
+                      AND action.action_json IS NOT NULL
                 )
                 OR (
                     NOT EXISTS (
@@ -73,6 +81,17 @@ def run_until_idle(store: Store, max_actions: int = 100) -> list[dict[str, str]]
             return results
         results.extend(batch)
     raise RuntimeError("cronner max_actions reached before idle")
+
+
+def run(store: Store, stop: threading.Event, interval_seconds: float = 1.0) -> None:
+    while not stop.is_set():
+        try:
+            tick(store)
+        except Exception:
+            logging.exception("cronner tick failed")
+        stop.wait(interval_seconds)
+
+
 def _latest_status(store: Store, project_id: str) -> str:
     connection = store.connect()
     try:

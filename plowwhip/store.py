@@ -4,6 +4,7 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
+from urllib.parse import quote
 
 
 SCHEMA = """
@@ -130,6 +131,14 @@ class Store:
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("PRAGMA synchronous = FULL")
+        return connection
+
+    def connect_readonly(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(
+            f"file:{quote(str(self.db_path))}?mode=ro", uri=True, timeout=5
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only = ON")
         return connection
 
     @contextmanager

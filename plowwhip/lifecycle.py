@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from uuid import uuid4
@@ -43,6 +44,17 @@ def advance_project(store: Store, project_id: str, lease_token: str, fence: int)
                 return verify_task(store, connection, task)
             return _stop_unknown_phase(connection, task)
 
+        action = connection.execute(
+            """
+            SELECT * FROM messages
+            WHERE project_id = ? AND processed_at IS NULL AND action_json IS NOT NULL
+            ORDER BY created_at LIMIT 1
+            """,
+            (project_id,),
+        ).fetchone()
+        if action:
+            return _apply_decision(connection, action)
+
         blocking = connection.execute(
             """
             SELECT 1 FROM tasks
@@ -56,7 +68,7 @@ def advance_project(store: Store, project_id: str, lease_token: str, fence: int)
         message = connection.execute(
             """
             SELECT * FROM messages
-            WHERE project_id = ? AND processed_at IS NULL
+            WHERE project_id = ? AND processed_at IS NULL AND action_json IS NULL
             ORDER BY created_at LIMIT 1
             """,
             (project_id,),
@@ -136,6 +148,63 @@ def _create_task(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
         ),
     )
     return "intake"
+
+
+def _apply_decision(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
+    now = time.time()
+    action = json.loads(message["action_json"])
+    task = connection.execute(
+        """
+        SELECT * FROM tasks
+        WHERE id = ? AND project_id = ? AND public_status = 'needs_decision'
+        """,
+        (action["task_id"], message["project_id"]),
+    ).fetchone()
+    connection.execute(
+        "UPDATE messages SET processed_at = ? WHERE id = ?", (now, message["id"])
+    )
+    if not task:
+        return "decision_rejected"
+
+    spec, acceptance = normalize_instruction(action["instruction"])
+    if spec["kind"] != "write_text":
+        connection.execute(
+            """
+            UPDATE tasks SET wait_reason = ?, fault_code = 'scope', updated_at = ?
+            WHERE id = ?
+            """,
+            ("decision must use: write <relative-path>: <content>", now, task["id"]),
+        )
+        event = "decision_rejected"
+        detail = {"message_id": message["id"]}
+    else:
+        revision = task["spec_revision"] + 1
+        connection.execute(
+            """
+            UPDATE tasks SET spec_revision = ?, spec_json = ?, acceptance_json = ?,
+                public_status = 'pending', phase = 'execute', wait_reason = NULL,
+                fault_code = NULL, next_action_at = ?, outcome = NULL, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                revision,
+                canonical_json(spec),
+                canonical_json(acceptance),
+                now,
+                now,
+                task["id"],
+            ),
+        )
+        event = "decision_applied"
+        detail = {"message_id": message["id"], "spec_revision": revision}
+    connection.execute(
+        """
+        INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (message["project_id"], task["id"], event, canonical_json(detail), now),
+    )
+    return "decision"
 
 
 def _stop_unknown_phase(connection: sqlite3.Connection, task: sqlite3.Row) -> str:

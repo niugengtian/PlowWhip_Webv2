@@ -44,6 +44,7 @@ def verify_task(store: Store, connection: sqlite3.Connection, task: sqlite3.Row)
         / "tasks"
         / task["id"]
         / "artifacts"
+        / f"revision-{task['spec_revision']:06d}"
         / "evidence"
         / "artifact_content_sha256.json"
     )

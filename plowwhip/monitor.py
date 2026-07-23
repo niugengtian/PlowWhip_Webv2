@@ -1,17 +1,15 @@
 from __future__ import annotations
 
-import sqlite3
 from pathlib import Path
-from urllib.parse import quote
+
+from .store import Store
 
 
 def snapshot(db_path: str | Path, data_root: str | Path, project_id: str) -> dict:
     """Read canonical state and a bounded log tail without opening a write path."""
     db_path = Path(db_path).resolve()
     data_root = Path(data_root).resolve()
-    connection = sqlite3.connect(f"file:{quote(str(db_path))}?mode=ro", uri=True)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA query_only = ON")
+    connection = Store(db_path, data_root).connect_readonly()
     try:
         task = connection.execute(
             """
@@ -46,7 +44,7 @@ def snapshot(db_path: str | Path, data_root: str | Path, project_id: str) -> dic
             """
             SELECT kind, path, sha256, acceptance_id, revision FROM artifacts
             WHERE task_id = ? AND kind IN ('output', 'evidence')
-            ORDER BY CASE kind WHEN 'output' THEN 0 ELSE 1 END
+            ORDER BY revision, CASE kind WHEN 'output' THEN 0 ELSE 1 END
             """,
             (task["id"],),
         ).fetchall()

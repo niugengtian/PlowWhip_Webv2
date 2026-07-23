@@ -34,8 +34,9 @@ def execute_task(store: Store, connection: sqlite3.Connection, task: sqlite3.Row
 
     try:
         body = spec["content"].encode()
-        output_path = base / "artifacts" / "output" / spec["target"]
-        output_path.resolve().relative_to((base / "artifacts" / "output").resolve())
+        output_root = base / "artifacts" / f"revision-{task['spec_revision']:06d}" / "output"
+        output_path = output_root / spec["target"]
+        output_path.resolve().relative_to(output_root.resolve())
         _write_atomic(output_path, body)
         digest = hashlib.sha256(body).hexdigest()
         log_body = f"wrote {spec['target']} sha256={digest}\n".encode()
