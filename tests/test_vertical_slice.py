@@ -523,8 +523,10 @@ class WebApiTest(unittest.TestCase):
     def test_http_intake_decision_and_automatic_completion(self):
         with urlopen(self.base + "/", timeout=2) as response:
             html = response.read().decode()
-            self.assertIn("全局首页", html)
-            self.assertIn("Task 详情", html)
+            self.assertIn("Plow Whip · 无人值守控制台", html)
+            self.assertIn("SQLite WAL", html)
+            self.assertEqual(html.count("data-view="), 4)
+            self.assertIn("Evidence Trail", html)
             self.assertIn("设置与资源库", html)
             self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
         with urlopen(self.base + "/api/settings-library", timeout=2) as response:
