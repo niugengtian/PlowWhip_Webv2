@@ -1,13 +1,16 @@
 import json
+import os
 import subprocess
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from plowwhip.git_publish_worker import (
     PublishError,
     _safe_tracked_tree,
+    _ssh_command,
     _validated_spec,
     publish,
 )
@@ -96,6 +99,40 @@ class GitPublishWorkerTest(unittest.TestCase):
             check=True,
         ).stdout.strip()
         self.assertEqual(remote_head, self.head)
+
+    def test_identity_selection_is_scoped_to_a_private_ssh_file(self):
+        ssh_root = self.root / ".ssh"
+        ssh_root.mkdir()
+        identity = ssh_root / "id_ed25519"
+        identity.write_text("fixture", encoding="utf-8")
+        identity.chmod(0o600)
+        with patch.dict(
+            os.environ,
+            {
+                "HOME": str(self.root),
+                "PLOW_WHIP_GIT_SSH_IDENTITY_FILE": str(identity),
+            },
+            clear=True,
+        ):
+            command = _ssh_command()
+        self.assertIn("IdentitiesOnly=yes", command)
+        self.assertIn(str(identity), command)
+
+        outside = self.root / "outside-key"
+        outside.write_text("fixture", encoding="utf-8")
+        outside.chmod(0o600)
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "HOME": str(self.root),
+                    "PLOW_WHIP_GIT_SSH_IDENTITY_FILE": str(outside),
+                },
+                clear=True,
+            ),
+            self.assertRaisesRegex(PublishError, "inside ~/.ssh"),
+        ):
+            _ssh_command()
 
 
 if __name__ == "__main__":

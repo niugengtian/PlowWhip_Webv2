@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -34,7 +35,7 @@ def _git(
 ) -> subprocess.CompletedProcess[str]:
     environment = dict(os.environ)
     environment["GIT_TERMINAL_PROMPT"] = "0"
-    environment["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes"
+    environment["GIT_SSH_COMMAND"] = _ssh_command()
     completed = subprocess.run(
         ["git", *args],
         cwd=cwd,
@@ -46,8 +47,28 @@ def _git(
     )
     if check and completed.returncode != 0:
         detail = (completed.stderr or completed.stdout).strip().splitlines()
-        raise PublishError(detail[-1][:500] if detail else f"git {args[0]} failed")
+        raise PublishError(
+            "\n".join(detail[-3:])[:500]
+            if detail
+            else f"git {args[0]} failed"
+        )
     return completed
+
+
+def _ssh_command() -> str:
+    argv = ["ssh", "-o", "BatchMode=yes"]
+    configured = os.environ.get("PLOW_WHIP_GIT_SSH_IDENTITY_FILE")
+    if configured:
+        identity = Path(configured).expanduser().resolve()
+        ssh_root = (Path.home() / ".ssh").resolve()
+        try:
+            identity.relative_to(ssh_root)
+        except ValueError as error:
+            raise PublishError("Git SSH identity must be inside ~/.ssh") from error
+        if not identity.is_file() or identity.stat().st_mode & 0o077:
+            raise PublishError("Git SSH identity is missing or has unsafe permissions")
+        argv.extend(["-o", "IdentitiesOnly=yes", "-i", str(identity)])
+    return shlex.join(argv)
 
 
 def _validated_spec(raw: bytes) -> dict[str, object]:

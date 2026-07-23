@@ -840,6 +840,7 @@ def _safe_environment() -> dict[str, str]:
         "KIMI_BASE_URL",
         "PLOW_WHIP_SIMPLE_WORKER_STATE_DIR",
         "PLOW_WHIP_KIMI_WORKER_STATE_DIR",
+        "PLOW_WHIP_GIT_SSH_IDENTITY_FILE",
     }
     provider_key = re.compile(r"^(?:DEEPSEEK|KIMI)_API_KEY(?:_\d+)?$")
     return {
@@ -856,7 +857,7 @@ def _load_private_env(path: Path) -> None:
     if path.stat().st_mode & 0o077:
         raise SystemExit("private environment file must not be group/world accessible")
     allowed = re.compile(
-        r"^(?:PLOW_WHIP_BRIDGE_TOKEN|CURSOR_API_KEY|"
+        r"^(?:PLOW_WHIP_BRIDGE_TOKEN|PLOW_WHIP_GIT_SSH_IDENTITY_FILE|CURSOR_API_KEY|"
         r"(?:DEEPSEEK|KIMI)_(?:API_KEY(?:_\d+)?|MODEL|BASE_URL)|"
         r"PLOW_WHIP_(?:SIMPLE|KIMI)_WORKER_STATE_DIR)$"
     )

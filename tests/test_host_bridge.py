@@ -415,6 +415,9 @@ else:
                 "HOME": str(self.root),
                 "PATH": self.old_path,
                 "SSH_AUTH_SOCK": "/private/tmp/test-agent.sock",
+                "PLOW_WHIP_GIT_SSH_IDENTITY_FILE": (
+                    "/Users/test/.ssh/id_ed25519"
+                ),
                 "UNRELATED_SECRET": "must-not-pass",
             },
             clear=True,
@@ -422,6 +425,10 @@ else:
             environment = _safe_environment()
         self.assertEqual(
             environment["SSH_AUTH_SOCK"], "/private/tmp/test-agent.sock"
+        )
+        self.assertEqual(
+            environment["PLOW_WHIP_GIT_SSH_IDENTITY_FILE"],
+            "/Users/test/.ssh/id_ed25519",
         )
         self.assertNotIn("UNRELATED_SECRET", environment)
 
