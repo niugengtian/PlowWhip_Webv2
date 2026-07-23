@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 
 
-VERSION = "plowwhip-git-publish 1"
+VERSION = "plowwhip-git-publish 2"
 MAX_SPEC_BYTES = 65_536
 MAX_SCAN_BYTES = 64 * 1_048_576
 REMOTE = re.compile(

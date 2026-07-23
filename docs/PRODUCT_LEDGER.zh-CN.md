@@ -34,8 +34,8 @@
 | §17 文件目录 | 已实现 | project/task/role/generation、Cold segment、Artifact/Evidence/handoff/library，以及 global/project conversation 投影均在 data root；SQLite 仍是唯一状态真源 | — |
 | §18 角色/规则/模板/脚本 | 已实现 | 文件正文 + SQLite revision/SHA 索引；Global/Project/Role/Task 合并；TaskSession 冻结；首次 Checker PASS 自动沉淀不含 Task ID/Secret 的项目模板，“以后都这样”才升 revision；无真实脚本需求时保持确定性命令 | — |
 | §19 配置 | 已实现 | Global/Project/Task+role 合并并冻结值与来源；数值阈值、Provider 顺序和项目规则均先入 messages，由 `advance_project` 应用；compact/轮转/观察/超时均有消费者 | — |
-| §20 页面和 API | 部分实现 | 七导航、Task 工作台、messages/actions 两类写路由、本地 Session 分段和 `unsafe_unknown` 精确 HostJob 恢复按钮均可用 | 中文主人可见项目名称尚未与内部 ID 分离；同项目/路径重复创建动作尚未按语义去重 |
-| §21 权限与不可逆操作 | 已实现 | 三档权限、作用域授权快照和不可逆默认拒绝；Git 发布只接受主人消息中精确 GitHub SSH remote/branch，冻结 15 分钟授权并由确定性脚本执行秘密扫描、push 和远端 SHA 复核 | — |
+| §20 页面和 API | 部分实现 | 七导航、Task 工作台、messages/actions 两类写路由、本地 Session 分段、`unsafe_unknown` 精确 HostJob 恢复，以及 Git 冲突的新分支/force-with-lease 两个精确决定入口均可用 | 中文主人可见项目名称尚未与内部 ID 分离；同项目/路径重复创建动作尚未按语义去重 |
+| §21 权限与不可逆操作 | 已实现 | 三档权限、作用域授权快照和不可逆默认拒绝；Git 发布只接受精确 GitHub SSH remote/branch；普通发布、改发新分支和输入远端 SHA 的 force-with-lease 都绑定 project/task/spec revision/action/scope/15 分钟有效期，并由确定性脚本执行秘密扫描、lease 检查、push 和远端 SHA 复核 | — |
 | §22 模块边界 | 已实现 | 十个职责模块存在；API→intake→lifecycle→store 与只读 monitor 边界清晰 | — |
 | §23 环境对比 | 对比基线 | 旧仓库保持只读；未整体迁入旧状态机 | 不是功能完成项 |
 | §24 迁移与蓝绿门禁 | 已实现 | SQLite Backup API + quick_check；候选 code/data/db/Compose/port/Bridge namespace 隔离；候选 Cronner 关闭；共享 data root 单调度锁；切换门禁固定要求主人授权；回滚门禁验证候选调度锁已释放、无活动租约且数据库完整 | 当前是主人指定的全新 clean-room 项目，因此不迁移旧数据；生产切流/回滚执行仍需单独授权 |
@@ -112,3 +112,4 @@
 | I-20260724-41 | 2026-07-24 | 计划用于 clean-room Bridge 的 8766 已被另一个 2026-07-24 前启动的 Bridge 占用，且该实例不支持 `git-publish` | 若直接复用会再次把 8750 接到非本阶段代码和状态命名空间 | 不停止、不修改未知 8766；新 Bridge 改用 8767，并保持独立 launchd 标签、环境和状态目录 | 已解决 | 8765 PID 90968、8766 PID 99372 均保留；8767 由 `com.plowwhip.v1-8750.host-bridge` 独占；容器内 `git-publish` 0 Token probe=`available` |
 | I-20260724-42 | 2026-07-24 | 宿主默认 SSH 先选中 `id_rsa`，认证为 GitHub 账号 `Niu-Happy`；目标仓库属于 `niugengtian` | 确定性 Worker 即使有 SSH 访问能力，也会以错误账号被拒绝；笼统“权限不足”掩盖物理身份 | 私有 Bridge 配置显式选择已验证属于 `niugengtian` 的 `~/.ssh/id_ed25519`；代码只接受 `~/.ssh` 内 mode 0600 的 IdentityFile 路径，不读取或持久化密钥内容 | 已解决 | `ssh -T IdentitiesOnly id_ed25519` 返回 `Hi niugengtian`，`id_rsa` 返回 `Hi Niu-Happy`；commit `66a1c7f`；generation 3 已越过身份门禁进入 non-fast-forward 检查 |
 | I-20260724-43 | 2026-07-24 | 目标远端 `blue` 已有 SHA `0b06db7`，本地 clean-room HEAD `66a1c7f` 不包含该提交 | 普通 push 安全拒绝；合并会把目标分支历史迁入 clean-room，实现与冻结边界冲突；强制覆盖会改写远端历史 | 不自动 merge、不 force；保留远端不变并停在 `NeedsDecision`。主人只能精确选择“以当前远端 SHA 为 lease 强制覆盖 blue”或“改发新分支” | 待主人决定 | `git push --dry-run` 与 HostJob `c9f66c46-3a7f-48f8-896e-de573e2bfbf7` 都返回 non-fast-forward；未产生 ModelCall，远端 SHA 未变化 |
+| I-20260724-44 | 2026-07-24 | Git 发布进入 `NeedsDecision` 后只显示通用决定框；重新解析 Git 指令不会生成新授权，无法形成可执行恢复 | 页面看起来允许决定，实际无论输入什么都不能安全恢复当前 Task；再次重跑还会丢失远端冲突事实 | Worker 先读并结构化记录远端 SHA；冲突只提供“新分支普通发布”或“输入完整 SHA 后 force-with-lease”两个 action；两者都新建 Spec revision、作用域授权和 Session generation，远端移动时 lease 安全失败 | 已解决 | commit `aa3f218`；48 项回归通过；8750 r15 实机 Task `6baddc86e4d846438587bf2352c35ade` 只显示两个精确恢复表单，通用决定/计划禁用；未点击、未产生远端写入 |

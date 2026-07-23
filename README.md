@@ -42,9 +42,14 @@ An explicit GitHub SSH publish instruction is normalized into a deterministic
 requires a clean tree and an unexpired remote/branch authorization, rejects
 tracked secret-like files and credential patterns, pushes the frozen HEAD, then
 compares `git ls-remote` with the local commit. It records Evidence but no model
-Token. A Host Bridge rejection before job acceptance is terminal; a genuinely
-unknown accepted job remains `NeedsDecision`, where the Task page exposes the
-exact HostJob confirmation needed for safe recovery.
+Token. A non-fast-forward result records both local and observed remote SHA and
+stops at `NeedsDecision`. The Task page then offers exactly two scoped recovery
+actions: publish to a different branch without rewriting history, or enter the
+full observed remote SHA to authorize `force-with-lease`. Either choice creates
+a new TaskSpec revision, 15-minute authorization and Session generation; a moved
+remote safely fails the lease. A Host Bridge rejection before job acceptance is
+terminal; a genuinely unknown accepted job remains `NeedsDecision`, where the
+Task page exposes the exact HostJob confirmation needed for safe recovery.
 
 It follows this path:
 
@@ -143,7 +148,8 @@ compact/rotation, global routing, Project rules/templates, consistent SQLite
 backup, candidate isolation and the single-Cronner lock. The code-Task
 regressions use a fake Host Bridge and therefore spend no external Provider
 tokens. Git publishing is tested against a local bare repository, including
-authorization scope, tracked-secret rejection and exact remote SHA evidence.
+authorization scope, tracked-secret rejection, diverged history, stale leases,
+the two recovery actions and exact remote SHA evidence.
 
 ## Deliberate V1 boundary
 
