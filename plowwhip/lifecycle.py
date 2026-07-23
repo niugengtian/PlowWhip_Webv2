@@ -659,6 +659,111 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
         )
         event, detail = "rerun", {"message_id": message["id"]}
     elif (
+        kind in {"publish_new_branch", "force_publish_with_lease"}
+        and task["public_status"] == "needs_decision"
+        and task["outcome"] is None
+    ):
+        spec = json.loads(task["spec_json"])
+        authorization = action.get("authorization")
+        revised = {
+            **spec,
+            "branch": action.get("branch"),
+            "publish_mode": action.get("publish_mode"),
+            "authorization": authorization,
+        }
+        if action.get("expected_remote_head"):
+            revised["expected_remote_head"] = action["expected_remote_head"]
+        else:
+            revised.pop("expected_remote_head", None)
+        (
+            supported,
+            revised,
+            role_key,
+            provider_key,
+            checker_role,
+            checker_provider,
+            reason,
+        ) = _runtime_contract(connection, task["project_id"], revised)
+        revision = int(action.get("next_spec_revision") or 0)
+        valid = bool(
+            spec.get("kind") == "git_publish"
+            and action.get("previous_spec_revision") == task["spec_revision"]
+            and revision == task["spec_revision"] + 1
+            and isinstance(authorization, dict)
+            and authorization.get("spec_revision") == revision
+        )
+        if supported and valid:
+            ensure_task_sessions(
+                connection,
+                task["project_id"],
+                task["id"],
+                now,
+                executor_role=role_key,
+                checker_role=checker_role,
+                executor_provider=provider_key,
+                checker_provider=checker_provider,
+                settings_overrides={role_key: {"retry_count": 0}},
+            )
+            rotate_task_sessions(connection, task["id"], now)
+            connection.execute(
+                """
+                UPDATE tasks SET spec_revision = ?, spec_json = ?,
+                    public_status = 'pending', phase = 'execute',
+                    wait_reason = NULL, fault_code = NULL, retry_count = 0,
+                    next_retry_at = NULL, next_action_at = ?,
+                    next_action_kind = 'execute', role_key = ?,
+                    checker_role_key = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    revision,
+                    canonical_json(revised),
+                    now,
+                    role_key,
+                    checker_role,
+                    now,
+                    task["id"],
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO task_events(
+                    project_id, task_id, kind, detail_json, created_at
+                ) VALUES (?, ?, 'authorization_granted', ?, ?)
+                """,
+                (
+                    task["project_id"],
+                    task["id"],
+                    canonical_json(authorization),
+                    now,
+                ),
+            )
+            event = "git_publish_recovery_authorized"
+            detail = {
+                "message_id": message["id"],
+                "spec_revision": revision,
+                "publish_mode": action.get("publish_mode"),
+                "branch": action.get("branch"),
+                "expected_remote_head": action.get("expected_remote_head"),
+            }
+        else:
+            connection.execute(
+                """
+                UPDATE tasks SET wait_reason = ?, fault_code = 'scope',
+                    updated_at = ? WHERE id = ?
+                """,
+                (
+                    reason or "Git publish recovery authorization is stale",
+                    now,
+                    task["id"],
+                ),
+            )
+            event = "decision_rejected"
+            detail = {
+                "message_id": message["id"],
+                "reason": "stale_or_invalid_git_publish_recovery",
+            }
+    elif (
         kind == "provide_decision"
         and task["public_status"] == "needs_decision"
         and task["phase"] == "plan"
@@ -1854,14 +1959,30 @@ def _runtime_contract(
             or ""
         )
         authorization = spec.get("authorization")
+        publish_mode = str(spec.get("publish_mode") or "fast_forward")
         expected_scope = (
             f"{spec.get('remote_ssh')}#refs/heads/{spec.get('branch')}"
         )
+        expected_action = (
+            "git_publish_force_with_lease"
+            if publish_mode == "force_with_lease"
+            else "git_publish"
+        )
+        expected_remote_head = spec.get("expected_remote_head")
         authorized = bool(
             isinstance(authorization, dict)
             and authorization.get("project_id") == project_id
-            and authorization.get("action_kind") == "git_publish"
+            and authorization.get("action_kind") == expected_action
             and authorization.get("target_scope") == expected_scope
+            and (
+                publish_mode != "force_with_lease"
+                or (
+                    isinstance(expected_remote_head, str)
+                    and len(expected_remote_head) == 40
+                    and authorization.get("expected_remote_head")
+                    == expected_remote_head
+                )
+            )
             and float(authorization.get("expires_at") or 0) >= time.time()
         )
         if project_path and authorized:

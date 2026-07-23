@@ -2742,6 +2742,165 @@ class VerticalSliceTest(unittest.TestCase):
         self.assertEqual(dispatch["authorization"]["target_scope"], (
             "git@github.com:niugengtian/PlowWhip_Webv2.git#refs/heads/blue"
         ))
+        self.assertEqual(dispatch["authorization"]["expected_head"], head)
+        self.assertEqual(dispatch["publish_mode"], "fast_forward")
+
+    def test_git_publish_conflict_has_two_scoped_recovery_actions(self):
+        head = "c" * 40
+        remote_head = "d" * 40
+        failure = {
+            "kind": "git_publish",
+            "status": "failed",
+            "code": "remote_history_conflict",
+            "branch": "blue",
+            "local_head": head,
+            "remote_head": remote_head,
+            "error": "non-fast-forward",
+        }
+
+        class Bridge(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers["Content-Length"])
+                payload = json.loads(self.rfile.read(length))
+                if self.path == "/v1/evidence/snapshot":
+                    body = {
+                        "git": {
+                            "kind": "workspace",
+                            "available": True,
+                            "fingerprint": "fixture",
+                            "head": head,
+                            "status": "",
+                        }
+                    }
+                elif self.path == "/v1/jobs/start":
+                    body = {
+                        "job_id": payload["job_id"],
+                        "status": "completed",
+                        "returncode": 1,
+                        "duration_ms": 4,
+                    }
+                elif self.path == "/v1/jobs/output":
+                    body = {
+                        "job_id": payload["job_id"],
+                        "status": "completed",
+                        "chunks": [
+                            {
+                                "stream": "stderr",
+                                "text": json.dumps(failure),
+                            }
+                        ],
+                    }
+                else:
+                    self.send_error(404)
+                    return
+                data = json.dumps(body).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *_args):
+                return
+
+        bridge = ThreadingHTTPServer(("127.0.0.1", 0), Bridge)
+        thread = threading.Thread(target=bridge.serve_forever, daemon=True)
+        thread.start()
+        instruction = (
+            "用ssh上传到"
+            "https://github.com/niugengtian/PlowWhip_Webv2/tree/blue"
+        )
+        try:
+            with patch.dict(
+                os.environ,
+                {
+                    "PLOW_WHIP_BRIDGE_URL": (
+                        f"http://127.0.0.1:{bridge.server_port}"
+                    ),
+                    "PLOW_WHIP_BRIDGE_TOKEN": "test-token",
+                },
+            ):
+                for project_id in ("new-branch", "force-lease"):
+                    self._create_project(
+                        project_id, f"{project_id}-project", str(self.root)
+                    )
+                    submit_message(
+                        self.store,
+                        project_id,
+                        instruction,
+                        f"{project_id}-message",
+                    )
+                    self.assertEqual(
+                        [item["action"] for item in run_until_idle(self.store)],
+                        ["intake", "snapshot", "execute"],
+                    )
+        finally:
+            bridge.shutdown()
+            bridge.server_close()
+            thread.join()
+
+        new_view = snapshot(self.db, self.data, "new-branch")
+        self.assertEqual(new_view["task"]["fault_code"], "scope")
+        self.assertIn(remote_head, new_view["task"]["wait_reason"])
+        self.assertEqual(
+            json.loads(new_view["events"][0]["detail_json"])["remote_head"],
+            remote_head,
+        )
+        submit_action(
+            self.store,
+            "new-branch",
+            new_view["task"]["id"],
+            "publish_new_branch",
+            "blue-v1",
+            "publish-blue-v1",
+        )
+        self.assertEqual(tick(self.store)[0]["action"], "publish_new_branch")
+        recovered = snapshot(self.db, self.data, "new-branch")
+        recovered_spec = json.loads(recovered["task"]["spec_json"])
+        self.assertEqual(recovered["task"]["public_status"], "pending")
+        self.assertEqual(recovered["task"]["spec_revision"], 2)
+        self.assertEqual(recovered_spec["branch"], "blue-v1")
+        self.assertEqual(recovered_spec["publish_mode"], "fast_forward")
+        self.assertEqual(
+            recovered_spec["authorization"]["target_scope"],
+            "git@github.com:niugengtian/PlowWhip_Webv2.git#refs/heads/blue-v1",
+        )
+        with self.store.transaction() as connection:
+            connection.execute(
+                "UPDATE tasks SET next_action_at = NULL WHERE id = ?",
+                (recovered["task"]["id"],),
+            )
+
+        force_view = snapshot(self.db, self.data, "force-lease")
+        with self.assertRaisesRegex(ValueError, "exact 40-character remote SHA"):
+            submit_action(
+                self.store,
+                "force-lease",
+                force_view["task"]["id"],
+                "force_publish_with_lease",
+                "short",
+                "bad-lease",
+            )
+        submit_action(
+            self.store,
+            "force-lease",
+            force_view["task"]["id"],
+            "force_publish_with_lease",
+            remote_head,
+            "force-with-exact-lease",
+        )
+        self.assertEqual(
+            tick(self.store)[0]["action"], "force_publish_with_lease"
+        )
+        forced = snapshot(self.db, self.data, "force-lease")
+        forced_spec = json.loads(forced["task"]["spec_json"])
+        self.assertEqual(forced["task"]["public_status"], "pending")
+        self.assertEqual(forced_spec["publish_mode"], "force_with_lease")
+        self.assertEqual(forced_spec["expected_remote_head"], remote_head)
+        self.assertEqual(
+            forced_spec["authorization"]["action_kind"],
+            "git_publish_force_with_lease",
+        )
 
     def test_rejected_start_is_terminal_not_unknown(self):
         class Bridge(BaseHTTPRequestHandler):
@@ -2906,6 +3065,10 @@ class WebApiTest(unittest.TestCase):
             self.assertIn("Provider 探针", html)
             self.assertIn("立即唤醒", html)
             self.assertIn("处理待决定", html)
+            self.assertIn("授权发布到新分支", html)
+            self.assertIn("明确授权 force-with-lease", html)
+            self.assertIn("publish_new_branch", html)
+            self.assertIn("force_publish_with_lease", html)
             self.assertIn("探测 Provider codex_cli: 0token", html)
             self.assertIn("0 Token 版本探活", html)
             self.assertIn("未调用模型", html)

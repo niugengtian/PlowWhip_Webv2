@@ -12,6 +12,10 @@ from .store import Store
 PROJECT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 LIBRARY_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 TASK_ID = re.compile(r"^[0-9a-f]{32}$")
+GIT_BRANCH = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9._/-]{0,126}[A-Za-z0-9])?$"
+)
+GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 WRITE_INSTRUCTION = re.compile(
     r"^(?:write|写入)\s+([^:\s]+)\s*:\s*([\s\S]*)$", re.IGNORECASE
 )
@@ -413,12 +417,15 @@ def submit_action(
         "authorize",
         "cancel",
         "confirm_not_executed",
+        "publish_new_branch",
+        "force_publish_with_lease",
         "rerun",
         "wake",
     }:
         raise ValueError(
             "supported actions: provide_decision, provide_plan, authorize, cancel, "
-            "confirm_not_executed, rerun, wake"
+            "confirm_not_executed, publish_new_branch, "
+            "force_publish_with_lease, rerun, wake"
         )
     if kind == "provide_decision" and not instruction:
         raise ValueError("provide_decision requires instruction")
@@ -444,7 +451,7 @@ def submit_action(
         task = connection.execute(
             """
             SELECT task.public_status, task.phase, task.outcome, task.spec_revision,
-                   task.fault_code,
+                   task.fault_code, task.spec_json,
                    project.host_path
             FROM tasks task JOIN projects project ON project.id = task.project_id
             WHERE task.id = ? AND task.project_id = ?
@@ -496,6 +503,69 @@ def submit_action(
                 "plan_id": proposal["id"],
                 "plan_revision": proposal["revision"],
             }
+        if kind in {"publish_new_branch", "force_publish_with_lease"}:
+            spec = json.loads(task["spec_json"])
+            active_job = connection.execute(
+                """
+                SELECT 1 FROM host_jobs
+                WHERE task_id = ? AND status IN (
+                    'dispatching', 'running', 'cancelling'
+                ) LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+            if (
+                spec.get("kind") != "git_publish"
+                or task["public_status"] != "needs_decision"
+                or task["outcome"] is not None
+                or active_job
+            ):
+                raise ValueError("Git publish recovery is not allowed for current task")
+            branch = str(spec.get("branch") or "")
+            publish_mode = "fast_forward"
+            expected_remote_head = None
+            action_kind = "git_publish"
+            if kind == "publish_new_branch":
+                branch = instruction.strip()
+                if (
+                    not GIT_BRANCH.fullmatch(branch)
+                    or ".." in branch
+                    or branch.endswith((".lock", ".", "/"))
+                    or branch.startswith((".", "/"))
+                    or branch == spec.get("branch")
+                ):
+                    raise ValueError(
+                        "publish_new_branch requires a different safe branch"
+                    )
+            else:
+                expected_remote_head = instruction.strip()
+                if not GIT_SHA.fullmatch(expected_remote_head):
+                    raise ValueError(
+                        "force_publish_with_lease requires the exact "
+                        "40-character remote SHA"
+                    )
+                publish_mode = "force_with_lease"
+                action_kind = "git_publish_force_with_lease"
+            target_scope = f"{spec.get('remote_ssh')}#refs/heads/{branch}"
+            action = {
+                "kind": kind,
+                "task_id": task_id,
+                "previous_spec_revision": task["spec_revision"],
+                "next_spec_revision": task["spec_revision"] + 1,
+                "branch": branch,
+                "publish_mode": publish_mode,
+                "expected_remote_head": expected_remote_head,
+                "authorization": {
+                    "source_message_id": message_id,
+                    "project_id": project_id,
+                    "task_id": task_id,
+                    "spec_revision": task["spec_revision"] + 1,
+                    "action_kind": action_kind,
+                    "target_scope": target_scope,
+                    "expected_remote_head": expected_remote_head,
+                    "expires_at": now + 900,
+                },
+            }
         allowed = (
             kind == "provide_decision"
             and task["public_status"] == "needs_decision"
@@ -513,6 +583,10 @@ def submit_action(
             kind == "confirm_not_executed"
             and task["public_status"] == "needs_decision"
             and task["fault_code"] == "unsafe_unknown"
+            and task["outcome"] is None
+        ) or (
+            kind in {"publish_new_branch", "force_publish_with_lease"}
+            and task["public_status"] == "needs_decision"
             and task["outcome"] is None
         ) or (
             kind == "rerun" and task["outcome"] == "cancelled"

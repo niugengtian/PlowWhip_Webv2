@@ -778,12 +778,18 @@ def apply_provider_step(
         dispatch["before"] = before_git
         spec = json.loads(task["spec_json"])
         if spec["kind"] == "git_publish":
+            authorization = {
+                **spec["authorization"],
+                "expected_head": before_git.get("head"),
+            }
             dispatch["prompt"] = canonical_json(
                 {
                     "kind": "git_publish",
                     "remote_ssh": spec["remote_ssh"],
                     "branch": spec["branch"],
-                    "authorization": spec["authorization"],
+                    "publish_mode": spec.get("publish_mode", "fast_forward"),
+                    "expected_remote_head": spec.get("expected_remote_head"),
+                    "authorization": authorization,
                     "expected_head": before_git.get("head"),
                 }
             )
@@ -925,8 +931,10 @@ def _finalize_provider_job(
         "stdout_tail": _bounded_tail(stdout),
         "stderr_tail": _bounded_tail(stderr),
     }
+    script_result = None
     if step.provider_key == "git_publish":
-        manifest["script_result"] = _last_json_object(stdout)
+        script_result = _last_json_object(stdout) or _last_json_object(stderr)
+        manifest["script_result"] = script_result
     body = canonical_json(manifest).encode()
     output_path = (
         store.data_root
@@ -1032,6 +1040,24 @@ def _finalize_provider_job(
     )
     if succeeded and step.provider_key not in {"codex_cli", "git_publish"}:
         _rotate_context_generation(connection, task, job, step.provider_key, now)
+    conflict = bool(
+        isinstance(script_result, dict)
+        and script_result.get("code")
+        in {"remote_history_conflict", "lease_mismatch"}
+    )
+    wait_reason = None
+    if not succeeded:
+        if conflict:
+            remote_head = str(script_result.get("remote_head") or "不存在")
+            branch = str(script_result.get("branch") or "目标分支")
+            wait_reason = (
+                f"远端 {branch} 当前为 {remote_head}；"
+                "请选择发布到新分支，或用该 SHA 明确授权 force-with-lease"
+            )
+        elif fallback:
+            wait_reason = f"Provider {step.provider_key} failed; falling back to {fallback}"
+        else:
+            wait_reason = "Provider execution did not exit successfully"
     connection.execute(
         """
         UPDATE tasks SET public_status = ?, phase = ?, next_action_at = ?,
@@ -1043,16 +1069,8 @@ def _finalize_provider_job(
             "verify" if succeeded else ("execute" if fallback else "provider_recovery"),
             now if succeeded or fallback else None,
             "check" if succeeded else ("execute" if fallback else None),
-            (
-                None
-                if succeeded
-                else (
-                    f"Provider {step.provider_key} failed; falling back to {fallback}"
-                    if fallback
-                    else "Provider execution did not exit successfully"
-                )
-            ),
-            None if succeeded else "provider",
+            wait_reason,
+            None if succeeded else ("scope" if conflict else "provider"),
             now,
             task["id"],
         ),
@@ -1079,6 +1097,31 @@ def _finalize_provider_job(
             now,
         ),
     )
+    if conflict:
+        connection.execute(
+            """
+            INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
+            VALUES (?, ?, 'git_publish_needs_decision', ?, ?)
+            """,
+            (
+                task["project_id"],
+                task["id"],
+                canonical_json(
+                    {
+                        "host_job_id": job["id"],
+                        "branch": script_result.get("branch"),
+                        "local_head": script_result.get("local_head"),
+                        "remote_head": script_result.get("remote_head"),
+                        "reason": script_result.get("code"),
+                        "allowed_decisions": [
+                            "publish_new_branch",
+                            "force_publish_with_lease",
+                        ],
+                    }
+                ),
+                now,
+            ),
+        )
     return "provider_fallback" if fallback else job["purpose"]
 
 
@@ -1330,6 +1373,8 @@ def _provider_prompt(
                 "kind": "git_publish",
                 "remote_ssh": spec["remote_ssh"],
                 "branch": spec["branch"],
+                "publish_mode": spec.get("publish_mode", "fast_forward"),
+                "expected_remote_head": spec.get("expected_remote_head"),
                 "authorization": spec["authorization"],
                 "expected_head": "",
             }

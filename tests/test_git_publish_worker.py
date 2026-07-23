@@ -52,6 +52,7 @@ class GitPublishWorkerTest(unittest.TestCase):
             "authorization": {
                 "action_kind": "git_publish",
                 "target_scope": f"{remote}#refs/heads/blue",
+                "expected_head": self.head,
                 "expires_at": time.time() + 60,
             },
         }
@@ -64,6 +65,22 @@ class GitPublishWorkerTest(unittest.TestCase):
             _validated_spec(json.dumps(spec).encode())
         spec["authorization"]["expires_at"] = "not-a-time"
         with self.assertRaisesRegex(PublishError, "expiry is invalid"):
+            _validated_spec(json.dumps(spec).encode())
+        spec["authorization"] = {
+            "action_kind": "git_publish_force_with_lease",
+            "target_scope": f"{remote}#refs/heads/blue",
+            "expected_head": self.head,
+            "expected_remote_head": "b" * 40,
+            "expires_at": time.time() + 60,
+        }
+        spec["publish_mode"] = "force_with_lease"
+        spec["expected_remote_head"] = "b" * 40
+        self.assertEqual(
+            _validated_spec(json.dumps(spec).encode())["publish_mode"],
+            "force_with_lease",
+        )
+        spec["authorization"]["expected_remote_head"] = "c" * 40
+        with self.assertRaisesRegex(PublishError, "remote SHA"):
             _validated_spec(json.dumps(spec).encode())
 
         (self.project / ".env").write_text("SECRET=value\n", encoding="utf-8")
@@ -99,6 +116,115 @@ class GitPublishWorkerTest(unittest.TestCase):
             check=True,
         ).stdout.strip()
         self.assertEqual(remote_head, self.head)
+
+    def test_diverged_remote_requires_an_exact_force_with_lease(self):
+        bare = self.root / "remote.git"
+        subprocess.run(
+            ["git", "init", "--bare", str(bare)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        publish(
+            self.project,
+            {
+                "remote_ssh": str(bare),
+                "branch": "blue",
+                "expected_head": self.head,
+            },
+        )
+        other = self.root / "other"
+        subprocess.run(
+            ["git", "clone", "--branch", "blue", str(bare), str(other)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "other@example.invalid"],
+            cwd=other,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Other"],
+            cwd=other,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        (other / "REMOTE.md").write_text("remote\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "REMOTE.md"],
+            cwd=other,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "remote change"],
+            cwd=other,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "push", "origin", "blue"],
+            cwd=other,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        remote_head = subprocess.run(
+            ["git", "--git-dir", str(bare), "rev-parse", "refs/heads/blue"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+        (self.project / "LOCAL.md").write_text("local\n", encoding="utf-8")
+        self._git("add", "LOCAL.md")
+        self._git("commit", "-m", "local change")
+        local_head = self._git("rev-parse", "HEAD").stdout.strip()
+        with self.assertRaises(PublishError) as raised:
+            publish(
+                self.project,
+                {
+                    "remote_ssh": str(bare),
+                    "branch": "blue",
+                    "expected_head": local_head,
+                },
+            )
+        self.assertEqual(raised.exception.code, "remote_history_conflict")
+        self.assertEqual(raised.exception.details["remote_head"], remote_head)
+
+        with self.assertRaises(PublishError) as stale:
+            publish(
+                self.project,
+                {
+                    "remote_ssh": str(bare),
+                    "branch": "blue",
+                    "expected_head": local_head,
+                    "publish_mode": "force_with_lease",
+                    "expected_remote_head": "f" * 40,
+                },
+            )
+        self.assertEqual(stale.exception.code, "lease_mismatch")
+
+        result = publish(
+            self.project,
+            {
+                "remote_ssh": str(bare),
+                "branch": "blue",
+                "expected_head": local_head,
+                "publish_mode": "force_with_lease",
+                "expected_remote_head": remote_head,
+            },
+        )
+        self.assertEqual(result["publish_mode"], "force_with_lease")
+        self.assertEqual(result["previous_remote_head"], remote_head)
+        self.assertEqual(result["remote_head"], local_head)
 
     def test_identity_selection_is_scoped_to_a_private_ssh_file(self):
         ssh_root = self.root / ".ssh"

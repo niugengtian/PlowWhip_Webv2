@@ -27,7 +27,15 @@ SECRET = re.compile(
 
 
 class PublishError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        code: str = "publish_failed",
+        **details: object,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details = details
 
 
 def _git(
@@ -36,6 +44,8 @@ def _git(
     environment = dict(os.environ)
     environment["GIT_TERMINAL_PROMPT"] = "0"
     environment["GIT_SSH_COMMAND"] = _ssh_command()
+    environment["LC_ALL"] = "C"
+    environment["LANG"] = "C"
     completed = subprocess.run(
         ["git", *args],
         cwd=cwd,
@@ -83,6 +93,8 @@ def _validated_spec(raw: bytes) -> dict[str, object]:
     remote = str(value.get("remote_ssh") or "")
     branch = str(value.get("branch") or "")
     expected_head = str(value.get("expected_head") or "")
+    publish_mode = str(value.get("publish_mode") or "fast_forward")
+    expected_remote_head = str(value.get("expected_remote_head") or "")
     authorization = value.get("authorization")
     if not REMOTE.fullmatch(remote):
         raise PublishError("only an exact GitHub SSH remote is allowed")
@@ -95,6 +107,8 @@ def _validated_spec(raw: bytes) -> dict[str, object]:
         raise PublishError("branch is invalid")
     if not re.fullmatch(r"[0-9a-f]{40}", expected_head):
         raise PublishError("expected_head must be a full Git commit SHA")
+    if publish_mode not in {"fast_forward", "force_with_lease"}:
+        raise PublishError("publish_mode is invalid")
     scope = f"{remote}#refs/heads/{branch}"
     try:
         expires_at = float(
@@ -102,12 +116,24 @@ def _validated_spec(raw: bytes) -> dict[str, object]:
         )
     except (TypeError, ValueError) as error:
         raise PublishError("publish authorization expiry is invalid") from error
+    action_kind = (
+        "git_publish_force_with_lease"
+        if publish_mode == "force_with_lease"
+        else "git_publish"
+    )
     if not isinstance(authorization, dict) or not (
-        authorization.get("action_kind") == "git_publish"
+        authorization.get("action_kind") == action_kind
         and authorization.get("target_scope") == scope
+        and authorization.get("expected_head") == expected_head
         and expires_at >= time.time()
     ):
         raise PublishError("publish authorization is missing, expired, or out of scope")
+    if publish_mode == "force_with_lease" and not (
+        re.fullmatch(r"[0-9a-f]{40}", expected_remote_head)
+        and authorization.get("expected_remote_head") == expected_remote_head
+    ):
+        raise PublishError("force-with-lease authorization is missing the remote SHA")
+    value["publish_mode"] = publish_mode
     return value
 
 
@@ -162,8 +188,50 @@ def publish(cwd: Path, spec: dict[str, object]) -> dict[str, object]:
     scan = _safe_tracked_tree(cwd)
     remote = str(spec["remote_ssh"])
     branch = str(spec["branch"])
-    push = _git(cwd, "push", "--porcelain", remote, f"HEAD:refs/heads/{branch}")
-    remote_lines = _git(cwd, "ls-remote", remote, f"refs/heads/{branch}").stdout.splitlines()
+    publish_mode = str(spec.get("publish_mode") or "fast_forward")
+    remote_lines = _git(
+        cwd, "ls-remote", remote, f"refs/heads/{branch}"
+    ).stdout.splitlines()
+    previous_remote_head = remote_lines[0].split()[0] if remote_lines else ""
+    push_args = ["push", "--porcelain"]
+    if publish_mode == "force_with_lease":
+        expected_remote_head = str(spec.get("expected_remote_head") or "")
+        if previous_remote_head != expected_remote_head:
+            raise PublishError(
+                "remote branch moved after the owner decision",
+                "lease_mismatch",
+                branch=branch,
+                expected_remote_head=expected_remote_head,
+                remote_head=previous_remote_head,
+            )
+        push_args.append(
+            f"--force-with-lease=refs/heads/{branch}:{expected_remote_head}"
+        )
+    push_args.extend([remote, f"HEAD:refs/heads/{branch}"])
+    push = _git(cwd, *push_args, check=False)
+    if push.returncode:
+        push_output = "\n".join(
+            part for part in (push.stdout, push.stderr) if part
+        )
+        detail = push_output.strip().splitlines()
+        conflict = previous_remote_head and any(
+            marker in push_output.lower()
+            for marker in (
+                "non-fast-forward",
+                "fetch first",
+                "remote contains work that you do not have locally",
+            )
+        )
+        raise PublishError(
+            "\n".join(detail[-3:])[:500] if detail else "git push failed",
+            "remote_history_conflict" if conflict else "push_rejected",
+            branch=branch,
+            local_head=local_head,
+            remote_head=previous_remote_head,
+        )
+    remote_lines = _git(
+        cwd, "ls-remote", remote, f"refs/heads/{branch}"
+    ).stdout.splitlines()
     remote_head = remote_lines[0].split()[0] if remote_lines else ""
     if remote_head != local_head:
         raise PublishError("remote branch SHA does not match local HEAD")
@@ -173,6 +241,8 @@ def publish(cwd: Path, spec: dict[str, object]) -> dict[str, object]:
         "branch": branch,
         "local_head": local_head,
         "remote_head": remote_head,
+        "previous_remote_head": previous_remote_head,
+        "publish_mode": publish_mode,
         "pushed": True,
         "push_summary": (push.stdout or push.stderr).strip()[-1_000:],
         **scan,
@@ -187,16 +257,15 @@ def main() -> int:
         spec = _validated_spec(sys.stdin.buffer.read(MAX_SPEC_BYTES + 1))
         result = publish(Path.cwd(), spec)
     except (OSError, PublishError, subprocess.TimeoutExpired) as error:
+        failure = {
+            "kind": "git_publish",
+            "status": "failed",
+            "error": str(error)[:500],
+        }
+        if isinstance(error, PublishError):
+            failure.update({"code": error.code, **error.details})
         print(
-            json.dumps(
-                {
-                    "kind": "git_publish",
-                    "status": "failed",
-                    "error": str(error)[:500],
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-            ),
+            json.dumps(failure, ensure_ascii=False, sort_keys=True),
             file=sys.stderr,
         )
         return 1
