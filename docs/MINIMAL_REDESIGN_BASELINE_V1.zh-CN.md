@@ -1,9 +1,9 @@
-# PlowWhip 极简重设计基线 V1 · Revision 4
+# PlowWhip 极简重设计基线 V1 · Revision 5
 
 - 状态：**已冻结（FROZEN）**
 - 冻结日期：2026-07-23
 - 决策人：主人
-- 当前 revision：**4**
+- 当前 revision：**5**
 - 适用范围：PlowWhip Web 控制面、Cronner、Monitor、Host Bridge、Provider、Worker、记忆与验证闭环
 - 变更门禁：未经主人明确说“开始改”，不得据此修改代码、SQLite、Docker、任务、Provider 或蓝绿环境
 
@@ -28,6 +28,13 @@ Revision 4 主人决定：
 - Task 页恢复原任务页最直观的泳道结构，但只使用 V1 四个公开状态：待执行、进行中、待决定、已完成。
 - 内部 phase、取消 outcome、角色、revision、重试和等待原因只显示在卡片中，不新增泳道、不恢复旧 12 态状态机；取消 Task 进入已完成泳道并保留“已取消”标签。
 - 泳道替代重复的同项目扁平 Task 列表；点击卡片复用同一个 Task 详情、HostJob、TaskSession、Artifact 和 Evidence 观察面。
+
+Revision 5 主人决定：
+
+- UI 继续使用原版本已经成熟的信息架构、暗色视觉语言和内容密度，并根据当前 V1 基线删改；不得把“极简”误解为毛坯页面，也不得整体迁入旧前端或旧状态机。
+- 顶部“项目范围”是当前页面的上下文筛选器，选择项目后必须停留在当前导航页并原位刷新；只有主人明确点击“进入项目”时才跳到项目页。
+- Task 不再是“泳道 + 页面下方若干面板”的局部拼接，而是完整任务工作台：顶部项目指标、左侧 Goal 导航、中间四态泳道、右侧 Goal/Task 详情、驱动/决定、Evidence、HostJob 和 Session。
+- 其他六个导航页沿用统一的页面标题、指标、面板层级、内容密度和响应式规则；只展示当前基线确有数据与操作的能力，不为视觉完整度新增状态、服务或写入口。
 
 ## 1. 使命
 
@@ -749,7 +756,10 @@ TaskSession 创建时计算有效值、显示来源并冻结。
 
 Task 详情显示：
 
-- 同项目 Task 的四态泳道；内部 phase 只作为卡片诊断字段。
+- 顶部显示当前项目今日 Token、进行中 Goal、活动 Task 和已终态 Task。
+- 左侧按进行中/已完成导航 Goal；Goal 状态只由所属 Task 推导。
+- 中间显示同项目 Task 的四态泳道；内部 phase 只作为诊断字段。
+- 右侧复用一个选择详情面板，在 Goal 概览和 Task 详情之间切换。
 - 四态和内部 phase。
 - Worker 角色、Provider、模型和 generation。
 - 当前 HostJob 最后 20 行。
@@ -757,6 +767,8 @@ Task 详情显示：
 - Checker 结论、acceptance、Artifact、Evidence 和 handoff。
 - 取消、重新执行等明确操作。
 - 同项目 Task 泳道、等待决定的准确原因和立即唤醒；立即唤醒只提交 action，由 Cronner 在后续 Tick 推进。
+
+顶部项目范围只改变当前上下文，不触发页面导航。进入项目必须使用明确的“进入项目”按钮或项目列表项。
 
 Worker、Provider、Attempt、Episode、Candidate 不再各占产品页面，只作为 Task 诊断信息按需展开。
 

@@ -19,6 +19,7 @@ def snapshot(db_path: str | Path, data_root: str | Path, project_id: str) -> dic
     connection = store.connect_readonly()
     try:
         tasks = _task_summaries(connection, project_id)
+        goals = _goal_summaries(connection, project_id)
         task = connection.execute(
             """
             SELECT * FROM tasks WHERE project_id = ?
@@ -40,9 +41,11 @@ def snapshot(db_path: str | Path, data_root: str | Path, project_id: str) -> dic
                 "artifacts": [],
                 "last_output": [],
                 "tasks": tasks,
+                "goals": goals,
             }
         view = _task_view(connection, store, task)
         view["tasks"] = tasks
+        view["goals"] = goals
         return view
     finally:
         connection.close()
@@ -87,6 +90,7 @@ def task_snapshot(db_path: str | Path, data_root: str | Path, task_id: str) -> d
             return {"task": None, "events": [], "artifacts": [], "last_output": []}
         view = _task_view(connection, store, task)
         view["tasks"] = _task_summaries(connection, task["project_id"])
+        view["goals"] = _goal_summaries(connection, task["project_id"])
         return view
     finally:
         connection.close()
@@ -191,6 +195,7 @@ def token_snapshot(db_path: str | Path, data_root: str | Path) -> dict:
         "today": {"date": today.isoformat(), **_usage_totals(today_calls)},
         "trend": trend,
         "projects": _group_calls(calls, ("project_id",)),
+        "today_projects": _group_calls(today_calls, ("project_id",)),
         "tasks": _group_calls(calls, ("task_id", "project_id")),
         "models": _group_calls(calls, ("model", "provider_key")),
         "sessions": _group_calls(
@@ -508,15 +513,79 @@ def _task_summaries(connection, project_id: str) -> list[dict]:
         dict(row)
         for row in connection.execute(
             """
-            SELECT id, goal_id, spec_revision, public_status, phase,
-                   wait_reason, fault_code, retry_count, outcome,
-                   role_key, checker_role_key, created_at, updated_at
-            FROM tasks WHERE project_id = ?
-            ORDER BY created_at DESC, rowid DESC LIMIT 100
+            SELECT task.id, task.goal_id, task.spec_revision,
+                   task.public_status, task.phase, task.wait_reason,
+                   task.fault_code, task.retry_count, task.outcome,
+                   task.role_key, task.checker_role_key, task.sprint,
+                   task.created_at, task.updated_at,
+                   goal.objective,
+                   COALESCE((
+                       SELECT generation.provider_key
+                       FROM task_sessions session
+                       JOIN session_generations generation
+                         ON generation.task_session_id = session.id
+                       WHERE session.task_id = task.id
+                         AND session.role_key = COALESCE(
+                             task.role_key, 'deterministic'
+                         )
+                       ORDER BY generation.generation DESC
+                       LIMIT 1
+                   ), 'local') AS provider_key,
+                   COALESCE((
+                       SELECT SUM(call.normalized_total)
+                       FROM model_calls call
+                       WHERE call.task_id = task.id
+                   ), 0) AS normalized_total
+            FROM tasks task
+            JOIN goals goal ON goal.id = task.goal_id
+            WHERE task.project_id = ?
+            ORDER BY task.created_at DESC, task.rowid DESC LIMIT 100
             """,
             (project_id,),
         )
     ]
+
+
+def _goal_summaries(connection, project_id: str) -> list[dict]:
+    rows = connection.execute(
+        """
+        SELECT goal.id, goal.objective, goal.boundary_json,
+               goal.acceptance_json, goal.spec_revision, goal.created_at,
+               COUNT(task.id) AS task_count,
+               SUM(CASE WHEN task.public_status = 'pending'
+                         AND task.outcome IS NULL THEN 1 ELSE 0 END) AS pending,
+               SUM(CASE WHEN task.public_status = 'in_progress'
+                         AND task.outcome IS NULL THEN 1 ELSE 0 END) AS in_progress,
+               SUM(CASE WHEN task.public_status = 'needs_decision'
+                         AND task.outcome IS NULL THEN 1 ELSE 0 END) AS needs_decision,
+               SUM(CASE WHEN task.outcome IS NOT NULL THEN 1 ELSE 0 END) AS terminal,
+               COALESCE((
+                   SELECT MAX(plan.revision) FROM plans plan
+                   WHERE plan.goal_id = goal.id AND plan.selected = 1
+               ), 0) AS plan_revision
+        FROM goals goal
+        LEFT JOIN tasks task ON task.goal_id = goal.id
+        WHERE goal.project_id = ?
+        GROUP BY goal.id
+        ORDER BY goal.created_at DESC, goal.rowid DESC
+        """,
+        (project_id,),
+    ).fetchall()
+    goals = []
+    for row in rows:
+        item = dict(row)
+        if item["needs_decision"]:
+            item["public_status"] = "needs_decision"
+        elif item["in_progress"]:
+            item["public_status"] = "in_progress"
+        elif item["pending"] or not item["task_count"]:
+            item["public_status"] = "pending"
+        else:
+            item["public_status"] = "done"
+        item["boundary"] = json.loads(item.pop("boundary_json"))
+        item["acceptance"] = json.loads(item.pop("acceptance_json"))
+        goals.append(item)
+    return goals
 
 
 def _provider_monitor(connection, store: Store) -> list[dict]:
@@ -609,13 +678,14 @@ def _session_files(store: Store, task) -> list[dict]:
     if not root.is_dir():
         return []
     files = sorted((path for path in root.rglob("*") if path.is_file()), reverse=True)[:100]
-    return [
-        {
-            "path": str(path),
-            "bytes": path.stat().st_size,
-        }
-        for path in files
-    ]
+    result = []
+    for path in files:
+        try:
+            size = path.stat().st_size
+        except FileNotFoundError:
+            continue
+        result.append({"path": str(path), "bytes": size})
+    return result
 
 
 def _tail(data_root: Path, relative: str, lines: int = 20, byte_cap: int = 8192) -> list[str]:

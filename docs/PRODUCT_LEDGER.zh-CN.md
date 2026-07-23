@@ -10,12 +10,14 @@
 | H-20260723-02 | 2026-07-23 | 主人 | Monitor 加入导航和独立只读看板 | 已完成 | `/api/monitor`；Monitor UI；`test_project_archive_preserves_history_and_monitor_is_read_only` |
 | H-20260723-03 | 2026-07-23 | 主人 | 保留全局管家和项目管家 | 已完成 | 七入口 UI；`/api/butler`；Web API 测试 |
 | H-20260723-04 | 2026-07-23 | 主人 | 项目页支持新增、删除及必要基本操作 | 已被修订 | 见 H-20260723-06 |
-| H-20260723-05 | 2026-07-23 | 主人 | 持续同步台账，随时记录发现的问题和人的需求 | 已采纳 | 本文件；基线 Revision 4 §26 |
+| H-20260723-05 | 2026-07-23 | 主人 | 持续同步台账，随时记录发现的问题和人的需求 | 已采纳 | 本文件；基线 Revision 5 §26 |
 | H-20260723-06 | 2026-07-23 | 主人 | 项目不叫删除，改为归档；归档后不在页面直观显示 | 已完成 | `projects.archived_at`；归档/恢复 API 与 UI；归档测试 |
 | H-20260723-07 | 2026-07-23 | 主人 | 复用旧系统已证明的 Provider 0 Token 探针和极小 Token 探针，并归入 Monitor 模块 | 已完成 | 8750 Task `50a80b36468644cca0da6c6d0911e9e6`：Codex CLI available、`model_invoked=false`、全部 Token 为 0、Evidence SHA `7c16ff4f93616b80c2c34ca85188fb1148010edbbd8ffebcd276538963f5084f`；极小 Token 路径仅用假 Bridge 自动测试，未产生付费调用 |
 | H-20260723-08 | 2026-07-23 | 主人 | Task 页参考原任务页补齐驱动与监视能力，并以真实任务验证能否无人值守完成 | 已完成 | 8750 显示四态泳道、两个成功 HostJob、TaskSession/Worker、Artifact/Evidence、等待原因与操作；Task `50a80b36468644cca0da6c6d0911e9e6` 自动收敛 Done；15 项回归通过 |
 | H-20260723-09 | 2026-07-23 | 主人 | 明确说明 `NeedsDecision` 在哪里、如何处理 | 已完成 | 项目页提供“处理待决定”入口；Task 页只在 `NeedsDecision` 启用主人决定/计划并显示 Fault、等待原因、示例与“取消 Task”；8750 实测 Task `be3b33ff8e224bd4899792a40edbb971` 输入和提交按钮可用 |
 | H-20260723-10 | 2026-07-23 | 主人 | Task 页参考原任务页时必须保留任务泳道 | 已完成 | 基线 Revision 4；8750 实测四条公开状态泳道：待决定项目 `0/0/1/0`、探针项目 `0/0/0/3`；卡片点击与详情联动 |
+| H-20260723-11 | 2026-07-23 | 主人 | Task 页必须参考原任务页整体重建，不接受只局部增加泳道的毛坯实现 | 已完成 | 8750：顶部指标、Goal 导航、四态泳道、统一 Goal/Task 详情、驱动/决定与运行证据同屏；`design-qa.md` passed |
+| H-20260723-12 | 2026-07-23 | 主人 | 所有页面适当沿用原版本 UI；项目范围选择项目后不得自动跳项目页 | 已完成 | 8750 逐页实测七个入口选择范围后 `beforeView == afterView`；显式“进入项目”按钮；基线 Revision 5 |
 
 ## 发现的问题
 
@@ -32,3 +34,7 @@
 | I-20260723-09 | 2026-07-23 | 首次容器化 0 Token 探针报告 Host Bridge unreachable | 容器没有 `host.docker.internal` 到宿主机的映射，Provider 探针只能得到不可达结果 | 容器启动固定加入 `--add-host host.docker.internal:host-gateway`，保留失败 Task 作为历史，不篡改结果 | 已解决 | 失败 Task `9dd5d4147ecc4a68a9667348c86ce415`；修复后 Task `e168cbf8ab284b25ba621b24bd6c0223` 与最终 Task `50a80b36468644cca0da6c6d0911e9e6` 均 `available=true` |
 | I-20260723-10 | 2026-07-23 | 已有数据库中来源为 `v1_default` 的 `provider_order` 不会自动补入新 `provider_probe` 角色 | 新 TaskSession 的有效设置快照缺少探针角色默认顺序 | 初始化时只同步 `source=v1_default` 的默认值，保留主人或项目策略 | 已解决 | 最终 Task 两个 Session 的设置快照都含 `provider_probe=[codex_cli,cursor_cli,deepseek,kimi]`；`test_default_settings_upgrade_without_overwriting_project_policy` |
 | I-20260723-11 | 2026-07-23 | Task 页只实现了扁平 Task 列表，遗漏原任务页的泳道 | 主人不能一眼看到项目 Task 的四态分布，且“参考原任务页”验收不完整 | 用四态泳道替换重复列表；phase/outcome 等仅作为卡片字段，点击复用原详情 | 已解决 | 8750 浏览器验收：两项目归类与计数正确、选中态和详情同步、无控制台错误、无内容越界 |
+| I-20260723-12 | 2026-07-23 | 任务页把泳道放在旧详情面板上方，只修了局部结构 | 页面缺少原版的 Goal 上下文、核心指标和同屏详情，信息密度低且操作路径割裂 | 整页替换为指标 + Goal 导航 + 四泳道 + 右侧详情的单一工作台；保留 V1 四态和现有写入口 | 已解决 | 1280×720 同尺寸比较、Goal/Task 联动和四泳道无溢出通过；`design-qa.md` |
+| I-20260723-13 | 2026-07-23 | 项目范围选择器直接调用 `openProject` | 用户在 Task、Token、Monitor 等页选择范围时被强制切走，筛选与导航语义混淆 | 选择器只更新 `currentProject` 并刷新当前页；另设显式“进入项目”按钮 | 已解决 | 8750 逐页实测全局管家、项目管家、项目、Task、Token、Monitor、设置页均原位刷新 |
+| I-20260723-14 | 2026-07-23 | Monitor 枚举 Session 文件后再 `stat` 时，执行器可能已原子替换并移除临时文件 | 只读 Task 快照偶发 `FileNotFoundError`，HTTP 请求被断开 | 有界枚举时跳过已经消失的临时文件；不重试、不写状态、不扩大日志读取 | 已解决 | 并发 Web 回归复现后修复；15 项回归连续通过 |
+| I-20260723-15 | 2026-07-23 | CSS 只声明了 `section[hidden]`，Goal 历史和详情切换使用的普通 `div[hidden]` 仍被组件 `display` 覆盖 | 右侧 Task 详情与空状态同时显示，已完成 Goal 区也会泄漏隐藏内容 | 全局统一 `[hidden]{display:none!important}`，保持原生 hidden 语义 | 已解决 | 1280×720 实机截图发现并修复；Web UI 回归固定 hidden 规则 |
