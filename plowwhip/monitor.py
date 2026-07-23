@@ -118,7 +118,14 @@ def settings_library_snapshot(db_path: str | Path, data_root: str | Path) -> dic
             )
         return {
             "settings": [
-                {**dict(row), "value": json.loads(row["value_json"])}
+                {
+                    "scope": row["scope"],
+                    "project_id": row["project_id"],
+                    "setting_key": row["setting_key"],
+                    "value": json.loads(row["value_json"]),
+                    "source": row["source"],
+                    "updated_at": row["updated_at"],
+                }
                 for row in settings
             ],
             "library": library,
@@ -211,7 +218,12 @@ def _task_view(connection, store: Store, task) -> dict:
         ],
         "sessions": [
             {
-                **dict(session),
+                "task_session_id": session["task_session_id"],
+                "role_key": session["role_key"],
+                "generation": session["generation"],
+                "provider_key": session["provider_key"],
+                "status": session["status"],
+                "handoff_ref": session["handoff_ref"],
                 "model": "deterministic" if session["provider_key"] == "local" else None,
                 "role_snapshot": json.loads(session["role_snapshot_json"]),
                 "settings": json.loads(session["settings_json"]),
