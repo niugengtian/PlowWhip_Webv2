@@ -20,6 +20,20 @@ PROVIDER_PROBE_INSTRUCTION = re.compile(
     r"(0token|minimal)(?:\s+确认\s+([a-z0-9_]+))?$",
     re.IGNORECASE,
 )
+PROJECT_SETTING_LIMITS = {
+    "max_runtime_seconds": (1, 86_400),
+    "stop_grace_seconds": (0, 300),
+    "handoff_max_bytes": (512, 1_048_576),
+    "checkpoint_max_bytes": (512, 1_048_576),
+    "context_max_bytes": (1_024, 1_048_576),
+    "session_segment_max_bytes": (1_024, 1_048_576),
+    "native_compact_input_tokens": (1_000, 100_000_000),
+    "rotation_input_tokens": (1_000, 100_000_000),
+    "monitor_tail_lines": (1, 1_000),
+    "monitor_tail_bytes": (256, 1_048_576),
+    "retry_count": (0, 10),
+    "retry_backoff_seconds": (0, 86_400),
+}
 
 
 def submit_message(
@@ -35,15 +49,34 @@ def submit_message(
     now = time.time()
     message_id = uuid4().hex
     with store.transaction() as connection:
-        connection.execute(
-            "INSERT OR IGNORE INTO projects(id, created_at) VALUES (?, ?)",
-            (project_id, now),
-        )
+        duplicate = connection.execute(
+            "SELECT id FROM messages WHERE project_id = ? AND idempotency_key = ?",
+            (project_id, idempotency_key),
+        ).fetchone()
+        if duplicate:
+            return str(duplicate["id"])
         project = connection.execute(
             "SELECT archived_at FROM projects WHERE id = ?", (project_id,)
         ).fetchone()
-        if project["archived_at"] is not None:
-            raise ValueError("project is archived; restore it before sending messages")
+        if not project:
+            connection.execute(
+                """
+                INSERT INTO projects(id, archived_at, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (project_id, now, now),
+            )
+        elif project["archived_at"] is not None:
+            pending_intake = connection.execute(
+                """
+                SELECT 1 FROM messages
+                WHERE project_id = ? AND processed_at IS NULL
+                  AND action_json IS NULL LIMIT 1
+                """,
+                (project_id,),
+            ).fetchone()
+            if not pending_intake:
+                raise ValueError("project is archived; restore it before sending messages")
         connection.execute(
             """
             INSERT OR IGNORE INTO messages(
@@ -79,63 +112,59 @@ def create_project(
         existing = connection.execute(
             "SELECT id, host_path, archived_at FROM projects WHERE id = ?", (project_id,)
         ).fetchone()
-        if existing and existing["archived_at"] is None:
-            if workspace and workspace != existing["host_path"]:
-                if connection.execute(
-                    "SELECT 1 FROM tasks WHERE project_id = ? AND outcome IS NULL LIMIT 1",
-                    (project_id,),
-                ).fetchone():
-                    raise ValueError("active project workspace cannot be changed")
-                connection.execute(
-                    "UPDATE projects SET host_path = ? WHERE id = ?",
-                    (workspace, project_id),
-                )
-                connection.execute(
-                    """
-                    INSERT OR IGNORE INTO messages(
-                        id, project_id, role, content, action_json,
-                        idempotency_key, created_at, processed_at
-                    ) VALUES (?, ?, 'owner', 'bind_project_workspace', ?, ?, ?, ?)
-                    """,
-                    (
-                        action_id,
-                        project_id,
-                        canonical_json({"kind": "bind_project_workspace"}),
-                        idempotency_key,
-                        now,
-                        now,
-                    ),
-                )
-            return project_id
-        kind = "restore_project" if existing else "create_project"
-        if existing:
+        pending = (
             connection.execute(
                 """
-                UPDATE projects
-                SET archived_at = NULL, host_path = COALESCE(?, host_path)
-                WHERE id = ?
+                SELECT id FROM messages
+                WHERE project_id = ? AND processed_at IS NULL
+                  AND json_extract(action_json, '$.kind') IN (
+                      'create_project', 'restore_project',
+                      'bind_project_workspace', 'archive_project'
+                  )
+                ORDER BY created_at LIMIT 1
                 """,
-                (workspace, project_id),
+                (project_id,),
+            ).fetchone()
+            if existing
+            else None
+        )
+        if pending:
+            return str(pending["id"])
+        if existing and existing["archived_at"] is None:
+            kind = (
+                "bind_project_workspace"
+                if workspace and workspace != existing["host_path"]
+                else "create_project"
             )
+            if kind == "bind_project_workspace" and connection.execute(
+                "SELECT 1 FROM tasks WHERE project_id = ? AND outcome IS NULL LIMIT 1",
+                (project_id,),
+            ).fetchone():
+                raise ValueError("active project workspace cannot be changed")
+        elif existing:
+            kind = "restore_project"
         else:
             connection.execute(
-                "INSERT INTO projects(id, host_path, created_at) VALUES (?, ?, ?)",
-                (project_id, workspace, now),
+                """
+                INSERT INTO projects(id, host_path, archived_at, created_at)
+                VALUES (?, NULL, ?, ?)
+                """,
+                (project_id, now, now),
             )
+            kind = "create_project"
         connection.execute(
             """
             INSERT INTO messages(
                 id, project_id, role, content, action_json,
-                idempotency_key, created_at, processed_at
-            ) VALUES (?, ?, 'owner', ?, ?, ?, ?, ?)
+                idempotency_key, created_at
+            ) VALUES (?, ?, 'owner', ?, ?, ?, ?)
             """,
             (
                 action_id,
                 project_id,
                 kind,
-                canonical_json({"kind": kind}),
+                canonical_json({"kind": kind, "host_path": workspace}),
                 idempotency_key,
-                now,
                 now,
             ),
         )
@@ -151,13 +180,30 @@ def archive_project(
     now = time.time()
     action_id = uuid4().hex
     with store.transaction() as connection:
+        duplicate = connection.execute(
+            "SELECT id FROM messages WHERE project_id = ? AND idempotency_key = ?",
+            (project_id, idempotency_key),
+        ).fetchone()
+        if duplicate:
+            return str(duplicate["id"])
         project = connection.execute(
             "SELECT archived_at FROM projects WHERE id = ?", (project_id,)
         ).fetchone()
         if not project:
             raise ValueError("project not found")
         if project["archived_at"] is not None:
-            return project_id
+            pending_create = connection.execute(
+                """
+                SELECT 1 FROM messages
+                WHERE project_id = ? AND processed_at IS NULL
+                  AND json_extract(action_json, '$.kind') IN (
+                      'create_project', 'restore_project'
+                  ) LIMIT 1
+                """,
+                (project_id,),
+            ).fetchone()
+            if not pending_create:
+                return project_id
         if connection.execute(
             "SELECT 1 FROM tasks WHERE project_id = ? AND outcome IS NULL LIMIT 1",
             (project_id,),
@@ -167,22 +213,76 @@ def archive_project(
             """
             INSERT INTO messages(
                 id, project_id, role, content, action_json,
-                idempotency_key, created_at, processed_at
-            ) VALUES (?, ?, 'owner', 'archive_project', ?, ?, ?, ?)
+                idempotency_key, created_at
+            ) VALUES (?, ?, 'owner', 'archive_project', ?, ?, ?)
             """,
             (
                 action_id,
                 project_id,
-                canonical_json({"kind": "archive_project"}),
+                canonical_json(
+                    {
+                        "kind": "archive_project",
+                        "confirmation": confirmation,
+                    }
+                ),
                 idempotency_key,
-                now,
                 now,
             ),
         )
-        connection.execute(
-            "UPDATE projects SET archived_at = ? WHERE id = ?", (now, project_id)
-        )
     return action_id
+
+
+def set_project_setting(
+    store: Store,
+    project_id: str,
+    setting_key: str,
+    value: object,
+    idempotency_key: str,
+) -> str:
+    _validate_project_action(project_id, idempotency_key)
+    limits = PROJECT_SETTING_LIMITS.get(setting_key)
+    if (
+        not limits
+        or isinstance(value, bool)
+        or not isinstance(value, int)
+        or not limits[0] <= value <= limits[1]
+    ):
+        raise ValueError("setting is not an allowed bounded project value")
+    now = time.time()
+    message_id = uuid4().hex
+    with store.transaction() as connection:
+        project = connection.execute(
+            "SELECT archived_at FROM projects WHERE id = ?", (project_id,)
+        ).fetchone()
+        if not project or project["archived_at"] is not None:
+            raise ValueError("active project not found")
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO messages(
+                id, project_id, role, content, action_json,
+                idempotency_key, created_at
+            ) VALUES (?, ?, 'owner', ?, ?, ?, ?)
+            """,
+            (
+                message_id,
+                project_id,
+                f"set {setting_key}={value}",
+                canonical_json(
+                    {
+                        "kind": "set_project_setting",
+                        "setting_key": setting_key,
+                        "value": value,
+                    }
+                ),
+                idempotency_key,
+                now,
+            ),
+        )
+        row = connection.execute(
+            "SELECT id FROM messages WHERE project_id = ? AND idempotency_key = ?",
+            (project_id, idempotency_key),
+        ).fetchone()
+    return str(row["id"])
 
 
 def _validate_project_action(project_id: str, idempotency_key: str) -> None:
@@ -217,9 +317,16 @@ def submit_action(
 ) -> str:
     if not PROJECT_ID.fullmatch(project_id) or not TASK_ID.fullmatch(task_id):
         raise ValueError("invalid project_id or task_id")
-    if kind not in {"provide_decision", "provide_plan", "cancel", "rerun", "wake"}:
+    if kind not in {
+        "provide_decision",
+        "provide_plan",
+        "authorize",
+        "cancel",
+        "rerun",
+        "wake",
+    }:
         raise ValueError(
-            "supported actions: provide_decision, provide_plan, cancel, rerun, wake"
+            "supported actions: provide_decision, provide_plan, authorize, cancel, rerun, wake"
         )
     if kind == "provide_decision" and not instruction:
         raise ValueError("provide_decision requires instruction")
@@ -243,11 +350,41 @@ def submit_action(
         if existing:
             return str(existing["id"])
         task = connection.execute(
-            "SELECT public_status, outcome FROM tasks WHERE id = ? AND project_id = ?",
+            """
+            SELECT task.public_status, task.phase, task.outcome, task.spec_revision,
+                   project.host_path
+            FROM tasks task JOIN projects project ON project.id = task.project_id
+            WHERE task.id = ? AND task.project_id = ?
+            """,
             (task_id, project_id),
         ).fetchone()
         if not task:
             raise ValueError("task not found")
+        if kind == "authorize":
+            if instruction != task_id:
+                raise ValueError("authorize requires exact Task ID confirmation")
+            proposal = connection.execute(
+                """
+                SELECT id, revision FROM plans
+                WHERE goal_id = (
+                    SELECT goal_id FROM tasks WHERE id = ?
+                ) AND selected = 0 AND revision > 1
+                ORDER BY revision DESC LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+            if not proposal:
+                raise ValueError("no Planner proposal is awaiting authorization")
+            action = {
+                "kind": "authorize",
+                "task_id": task_id,
+                "spec_revision": task["spec_revision"],
+                "action_kind": "select_plan",
+                "target_scope": task["host_path"] or f"project:{project_id}",
+                "expires_at": now + 900,
+                "plan_id": proposal["id"],
+                "plan_revision": proposal["revision"],
+            }
         allowed = (
             kind == "provide_decision"
             and task["public_status"] == "needs_decision"
@@ -255,6 +392,11 @@ def submit_action(
         ) or (
             kind == "provide_plan"
             and task["public_status"] == "needs_decision"
+            and task["outcome"] is None
+        ) or (
+            kind == "authorize"
+            and task["public_status"] == "needs_decision"
+            and task["phase"] == "plan"
             and task["outcome"] is None
         ) or (kind == "cancel" and task["outcome"] is None) or (
             kind == "rerun" and task["outcome"] == "cancelled"

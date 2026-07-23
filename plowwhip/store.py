@@ -234,6 +234,10 @@ DEFAULT_SETTINGS = {
     "stop_grace_seconds": 10,
     "handoff_max_bytes": 8192,
     "checkpoint_max_bytes": 8192,
+    "context_max_bytes": 16_384,
+    "session_segment_max_bytes": 65_536,
+    "native_compact_input_tokens": 120_000,
+    "rotation_input_tokens": 180_000,
     "monitor_tail_lines": 20,
     "monitor_tail_bytes": 8192,
     "retry_count": 1,
@@ -257,6 +261,10 @@ DEFAULT_LIBRARY = {
     ("role", "fullstack"): (
         "roles/fullstack.md",
         "# Fullstack Worker\n\nOwn one bounded code Task inside its registered workspace and leave verifiable changes.\n",
+    ),
+    ("role", "planner"): (
+        "roles/planner.md",
+        "# Planner\n\nRead the frozen Goal and produce the smallest bounded alternatives and Task DAG without modifying the workspace.\n",
     ),
     ("role", "independent_checker"): (
         "roles/independent-checker.md",

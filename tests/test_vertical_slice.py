@@ -13,11 +13,13 @@ from urllib.request import Request, urlopen
 
 from plowwhip.app import make_server
 from plowwhip.butler import conversation
+from plowwhip.continuity import checkpoint_project, compile_hot_context
 from plowwhip.cronner import run as run_cronner, run_until_idle, tick
 from plowwhip.intake import (
     archive_project,
     create_project,
     normalize_instruction,
+    set_project_setting,
     submit_action,
     submit_message,
 )
@@ -29,7 +31,12 @@ from plowwhip.monitor import (
     snapshot,
     token_snapshot,
 )
-from plowwhip.planner import normalize_plan
+from plowwhip.planner import (
+    PLANNER_RESULT_PREFIX,
+    classify_instruction,
+    normalize_plan,
+    parse_planner_result,
+)
 from plowwhip.provider import (
     CHECKER_RESULT_PREFIX,
     provider_adapter,
@@ -81,6 +88,12 @@ class VerticalSliceTest(unittest.TestCase):
 
     def tearDown(self):
         self.temporary.cleanup()
+
+    def _create_project(
+        self, project_id: str, idempotency_key: str, host_path: str | None = None
+    ) -> None:
+        create_project(self.store, project_id, idempotency_key, host_path)
+        self.assertEqual(tick(self.store)[0]["action"], "create_project")
 
     def test_message_to_verified_done(self):
         first = submit_message(
@@ -189,6 +202,62 @@ class VerticalSliceTest(unittest.TestCase):
         self.assertEqual(rows["provider_order"]["source"], "v1_default")
         self.assertEqual(json.loads(rows["retry_count"]["value_json"]), 7)
         self.assertEqual(rows["retry_count"]["source"], "owner")
+
+    def test_project_setting_is_queued_then_frozen_into_new_session(self):
+        self._create_project("configured", "configured-create")
+        with self.assertRaisesRegex(ValueError, "allowed bounded"):
+            set_project_setting(
+                self.store,
+                "configured",
+                "max_runtime_seconds",
+                0,
+                "configured-invalid",
+            )
+        set_project_setting(
+            self.store,
+            "configured",
+            "max_runtime_seconds",
+            45,
+            "configured-setting",
+        )
+        connection = self.store.connect()
+        try:
+            self.assertIsNone(
+                connection.execute(
+                    """
+                    SELECT 1 FROM settings
+                    WHERE scope = 'project' AND project_id = 'configured'
+                    """
+                ).fetchone()
+            )
+        finally:
+            connection.close()
+        self.assertEqual(tick(self.store)[0]["action"], "set_project_setting")
+        submit_message(
+            self.store,
+            "configured",
+            "写入 configured.txt: configured",
+            "configured-task",
+        )
+        self.assertEqual(tick(self.store)[0]["action"], "intake")
+        connection = self.store.connect()
+        try:
+            frozen = json.loads(
+                connection.execute(
+                    """
+                    SELECT settings_json FROM task_sessions
+                    WHERE role_key = 'deterministic'
+                    """
+                ).fetchone()["settings_json"]
+            )
+        finally:
+            connection.close()
+        self.assertEqual(frozen["values"]["max_runtime_seconds"], 45)
+        self.assertTrue(
+            frozen["sources"]["max_runtime_seconds"].startswith(
+                "project:configured:owner_message:"
+            )
+        )
 
     def test_schema_v4_preserves_terminal_jobs_and_accepts_running_jobs(self):
         submit_message(self.store, "migration", "写入 migrated.txt: ok", "migration")
@@ -638,8 +707,245 @@ class VerticalSliceTest(unittest.TestCase):
             {"key": "a", "instruction": "write a.txt: a", "settings": {"deterministic": {"provider_order": ["codex_cli"]}}},
             {"key": "b", "instruction": "write b.txt: b", "depends_on": ["a"]},
         ]}
-        with self.assertRaisesRegex(ValueError, "external Provider"):
+        with self.assertRaisesRegex(ValueError, "requires local"):
             normalize_plan(external)
+
+    def test_large_instruction_uses_planner_and_auto_selects_confident_plan(self):
+        self._create_project("auto-plan", "project-1", "/workspace/auto-plan")
+        submit_message(
+            self.store,
+            "auto-plan",
+            "前端和后端增加刷新能力",
+            "message-1",
+        )
+        self.assertEqual(tick(self.store)[0]["action"], "intake")
+        planned = {
+            "confidence": 0.97,
+            "plan": {
+                "summary": "two bounded code tasks",
+                "alternatives": [
+                    {
+                        "name": "serial",
+                        "scope": "backend then frontend",
+                        "cost": "low",
+                        "risk": "low",
+                        "reversible": True,
+                        "acceptance": "refresh flow passes checks",
+                    },
+                    {
+                        "name": "single change",
+                        "scope": "one broad worker task",
+                        "cost": "medium",
+                        "risk": "medium",
+                        "reversible": True,
+                        "acceptance": "manual integrated review",
+                    },
+                ],
+                "selected": 0,
+                "tasks": [
+                    {
+                        "key": "backend",
+                        "instruction": "实现后端刷新接口",
+                        "depends_on": [],
+                        "sprint": 1,
+                        "role_key": "fullstack",
+                    },
+                    {
+                        "key": "frontend",
+                        "instruction": "实现前端刷新按钮",
+                        "depends_on": ["backend"],
+                        "sprint": 1,
+                        "role_key": "fullstack",
+                    },
+                ],
+            },
+        }
+        with patch(
+            "plowwhip.planner.run_provider_task",
+            return_value={
+                "returncode": 0,
+                "stdout": PLANNER_RESULT_PREFIX + json.dumps(planned),
+                "stderr": "",
+                "session_id": "planner-session",
+                "input_tokens": 120,
+                "cached_input_tokens": 80,
+                "output_tokens": 60,
+                "model": "test-planner",
+            },
+        ):
+            result = tick(self.store)[0]
+        self.assertEqual(result["action"], "plan_applied")
+        connection = self.store.connect()
+        try:
+            tasks = connection.execute(
+                """
+                SELECT id, phase, role_key, checker_role_key
+                FROM tasks WHERE project_id = 'auto-plan' ORDER BY rowid
+                """
+            ).fetchall()
+            plans = connection.execute(
+                "SELECT revision, selected FROM plans ORDER BY revision"
+            ).fetchall()
+            roles = connection.execute(
+                """
+                SELECT role_key FROM task_sessions
+                WHERE task_id = ? ORDER BY role_key
+                """,
+                (tasks[0]["id"],),
+            ).fetchall()
+            planner_generation = connection.execute(
+                """
+                SELECT generation.status FROM session_generations generation
+                JOIN task_sessions session ON session.id = generation.task_session_id
+                WHERE session.task_id = ? AND session.role_key = 'planner'
+                """,
+                (tasks[0]["id"],),
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(len(tasks), 2)
+        self.assertEqual(
+            [(row["phase"], row["role_key"], row["checker_role_key"]) for row in tasks],
+            [
+                ("execute", "fullstack", "independent_checker"),
+                ("queued", "fullstack", "independent_checker"),
+            ],
+        )
+        self.assertEqual([tuple(row) for row in plans], [(1, 0), (2, 1)])
+        self.assertEqual(
+            [row["role_key"] for row in roles],
+            ["fullstack", "independent_checker", "planner"],
+        )
+        self.assertEqual(planner_generation["status"], "archived")
+        self.assertEqual(
+            classify_instruction("前端和后端增加刷新能力", "provider_task")["size"],
+            "large",
+        )
+        self.assertEqual(parse_planner_result(PLANNER_RESULT_PREFIX + json.dumps(planned))["confidence"], 0.97)
+
+    def test_high_risk_plan_asks_exactly_one_project_butler_question(self):
+        self._create_project("risk-plan", "project-1", "/workspace/risk-plan")
+        submit_message(
+            self.store,
+            "risk-plan",
+            "部署前端和后端到生产",
+            "message-1",
+        )
+        self.assertEqual(tick(self.store)[0]["action"], "intake")
+        planned = {
+            "confidence": 0.99,
+            "plan": {
+                "summary": "prepare only",
+                "alternatives": [
+                    {
+                        "name": "staged",
+                        "scope": "prepare deployment changes",
+                        "cost": "medium",
+                        "risk": "medium",
+                        "reversible": True,
+                        "acceptance": "owner approves before external effect",
+                    },
+                    {
+                        "name": "manual",
+                        "scope": "leave deployment to owner",
+                        "cost": "high",
+                        "risk": "low",
+                        "reversible": True,
+                        "acceptance": "owner performs deployment",
+                    },
+                ],
+                "selected": 0,
+                "tasks": [
+                    {
+                        "key": "backend",
+                        "instruction": "准备后端部署清单但不执行部署",
+                        "role_key": "fullstack",
+                    },
+                    {
+                        "key": "frontend",
+                        "instruction": "准备前端部署清单但不执行部署",
+                        "depends_on": ["backend"],
+                        "role_key": "fullstack",
+                    },
+                ],
+            },
+        }
+        with patch(
+            "plowwhip.planner.run_provider_task",
+            return_value={
+                "returncode": 0,
+                "stdout": PLANNER_RESULT_PREFIX + json.dumps(planned),
+                "stderr": "",
+                "session_id": "planner-session",
+                "input_tokens": 20,
+                "cached_input_tokens": 10,
+                "output_tokens": 20,
+                "model": "test-planner",
+            },
+        ):
+            result = tick(self.store)[0]
+        self.assertEqual(result["status"], "needs_decision")
+        messages = conversation(self.db, self.data, "risk-plan")["messages"]
+        questions = [item for item in messages if item["role"] == "butler"]
+        self.assertEqual(len(questions), 1)
+        self.assertIn("只需要你决定一件事", questions[0]["content"])
+        self.assertIn("是否批准", questions[0]["content"])
+        self.assertEqual(tick(self.store), [])
+        task = snapshot(self.db, self.data, "risk-plan")["task"]
+        with self.assertRaisesRegex(ValueError, "exact Task ID"):
+            submit_action(
+                self.store,
+                "risk-plan",
+                task["id"],
+                "authorize",
+                "yes",
+                "authorize-wrong",
+            )
+        submit_action(
+            self.store,
+            "risk-plan",
+            task["id"],
+            "authorize",
+            task["id"],
+            "authorize-plan",
+        )
+        connection = self.store.connect()
+        try:
+            authorization = json.loads(
+                connection.execute(
+                    """
+                    SELECT action_json FROM messages
+                    WHERE project_id = 'risk-plan' AND idempotency_key = 'authorize-plan'
+                    """
+                ).fetchone()["action_json"]
+            )
+        finally:
+            connection.close()
+        self.assertEqual(
+            {
+                key: authorization[key]
+                for key in (
+                    "task_id",
+                    "spec_revision",
+                    "action_kind",
+                    "target_scope",
+                )
+            },
+            {
+                "task_id": task["id"],
+                "spec_revision": 1,
+                "action_kind": "select_plan",
+                "target_scope": "/workspace/risk-plan",
+            },
+        )
+        self.assertGreater(authorization["expires_at"], time.time())
+        self.assertEqual(tick(self.store)[0]["action"], "authorize")
+        after = snapshot(self.db, self.data, "risk-plan")
+        self.assertEqual(len(after["tasks"]), 2)
+        self.assertEqual(after["task"]["phase"], "execute")
+        self.assertIn(
+            "authorization_granted", {item["kind"] for item in after["events"]}
+        )
 
     def test_provider_facts_and_token_normalization_are_fail_closed(self):
         submit_message(self.store, "usage", "write result.txt: usage", "usage-1")
@@ -739,7 +1045,7 @@ class VerticalSliceTest(unittest.TestCase):
             provider_adapter("codex_cli")
 
     def test_project_archive_preserves_history_and_monitor_is_read_only(self):
-        create_project(self.store, "archive-me", "archive-create")
+        self._create_project("archive-me", "archive-create")
         history = conversation(self.db, self.data, "archive-me")
         self.assertEqual(history["project"]["id"], "archive-me")
         self.assertEqual(history["messages"][0]["content"], "create_project")
@@ -756,6 +1062,7 @@ class VerticalSliceTest(unittest.TestCase):
         archive_project(
             self.store, "archive-me", "archive-me", "archive-confirmed"
         )
+        self.assertEqual(tick(self.store)[0]["action"], "archive_project")
         self.assertEqual(projects_snapshot(self.db, self.data)["projects"], [])
         archived_history = conversation(self.db, self.data, "archive-me")
         self.assertEqual(
@@ -767,6 +1074,7 @@ class VerticalSliceTest(unittest.TestCase):
         self.assertEqual(state["summary"]["archived_projects"], 1)
 
         create_project(self.store, "archive-me", "archive-restore")
+        self.assertEqual(tick(self.store)[0]["action"], "restore_project")
         self.assertEqual(
             projects_snapshot(self.db, self.data)["projects"][0]["project_id"],
             "archive-me",
@@ -782,8 +1090,8 @@ class VerticalSliceTest(unittest.TestCase):
 
     def test_settings_and_library_are_indexed_and_read_only(self):
         state = settings_library_snapshot(self.db, self.data)
-        self.assertEqual(len(state["settings"]), 9)
-        self.assertEqual(len(state["library"]), 9)
+        self.assertEqual(len(state["settings"]), 13)
+        self.assertEqual(len(state["library"]), 10)
         self.assertEqual(
             {item["kind"] for item in state["library"]},
             {"role", "rule", "worker_template"},
@@ -795,6 +1103,49 @@ class VerticalSliceTest(unittest.TestCase):
         role = next(item for item in updated["library"] if item["item_key"] == "deterministic")
         self.assertEqual(role["revision"], 2)
         self.assertTrue(all(item["sha256_matches"] for item in updated["library"]))
+
+    def test_hot_warm_cold_continuity_is_bounded_and_append_only(self):
+        submit_message(
+            self.store,
+            "continuity",
+            "写入 result.txt: continuity",
+            "continuity-1",
+        )
+        run_until_idle(self.store)
+        connection = self.store.connect()
+        try:
+            task = connection.execute(
+                "SELECT * FROM tasks WHERE project_id = 'continuity'"
+            ).fetchone()
+            capsule = compile_hot_context(
+                self.store, connection, task, "deterministic"
+            )
+            segment_rows = connection.execute(
+                """
+                SELECT path, acceptance_id FROM artifacts
+                WHERE task_id = ? AND kind = 'log'
+                  AND acceptance_id LIKE 'session_segment:%'
+                ORDER BY path
+                """,
+                (task["id"],),
+            ).fetchall()
+        finally:
+            connection.close()
+        self.assertLessEqual(len(capsule.encode()), 16_384)
+        self.assertEqual(len(segment_rows), 2)
+        manifests = [
+            json.loads(self.store.resolve_data_path(row["path"]).read_text())
+            for row in segment_rows
+        ]
+        self.assertEqual(
+            {manifest["role_key"] for manifest in manifests},
+            {"deterministic", "deterministic_checker"},
+        )
+        self.assertTrue(all(manifest["host_jobs"] for manifest in manifests))
+        self.assertFalse(any(self.data.rglob("current.md")))
+        before = [path for path in self.data.rglob("segment-*.json")]
+        checkpoint_project(self.store, "continuity")
+        self.assertEqual(before, [path for path in self.data.rglob("segment-*.json")])
 
     def test_provider_probe_tasks_record_zero_and_minimal_token_evidence(self):
         spec, _ = normalize_instruction("探测 Provider codex_cli: minimal")
@@ -971,8 +1322,7 @@ class VerticalSliceTest(unittest.TestCase):
         thread = threading.Thread(target=bridge.serve_forever, daemon=True)
         thread.start()
         try:
-            create_project(
-                self.store,
+            self._create_project(
                 "code-task",
                 "code-project",
                 str(self.root),
@@ -1122,7 +1472,7 @@ class VerticalSliceTest(unittest.TestCase):
                     "PLOW_WHIP_BRIDGE_TOKEN": "test-token",
                 },
             ):
-                create_project(self.store, "fallback", "fallback-project", str(self.root))
+                self._create_project("fallback", "fallback-project", str(self.root))
                 submit_message(
                     self.store, "fallback", "先失败再自动递补完成", "fallback-message"
                 )
@@ -1246,7 +1596,7 @@ class VerticalSliceTest(unittest.TestCase):
         }
         try:
             with patch.dict(os.environ, environment):
-                create_project(self.store, "durable-code", "durable-project", str(self.root))
+                self._create_project("durable-code", "durable-project", str(self.root))
                 submit_message(
                     self.store, "durable-code", "实现持久 HostJob", "durable-message"
                 )
@@ -1330,7 +1680,7 @@ class VerticalSliceTest(unittest.TestCase):
 
                 entered.clear()
                 release.set()
-                create_project(self.store, "cancel-code", "cancel-project", str(self.root))
+                self._create_project("cancel-code", "cancel-project", str(self.root))
                 submit_message(self.store, "cancel-code", "实现后取消", "cancel-message")
                 self.assertEqual(tick(self.store)[0]["action"], "intake")
                 self.assertEqual(tick(self.store)[0]["action"], "snapshot")
@@ -1412,7 +1762,7 @@ class VerticalSliceTest(unittest.TestCase):
                     "PLOW_WHIP_BRIDGE_TOKEN": "test-token",
                 },
             ):
-                create_project(self.store, "ambiguous", "ambiguous-project", str(self.root))
+                self._create_project("ambiguous", "ambiguous-project", str(self.root))
                 submit_message(
                     self.store, "ambiguous", "不要盲目重复执行", "ambiguous-message"
                 )
@@ -1535,7 +1885,7 @@ class WebApiTest(unittest.TestCase):
             self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
         with urlopen(self.base + "/api/settings-library", timeout=2) as response:
             settings_library = json.load(response)
-        self.assertEqual(len(settings_library["library"]), 9)
+        self.assertEqual(len(settings_library["library"]), 10)
 
         status, _ = self._post(
             "/api/actions",

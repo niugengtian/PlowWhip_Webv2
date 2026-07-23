@@ -32,7 +32,210 @@ def checkpoint_project(store: Store, project_id: str) -> None:
             (project_id,),
         ).fetchall()
         for session in sessions:
+            _segment_session(store, connection, project_id, session)
             _checkpoint_session(store, connection, project_id, session)
+
+
+def compile_hot_context(
+    store: Store,
+    connection: sqlite3.Connection,
+    task: sqlite3.Row,
+    role_key: str,
+) -> str:
+    """Build one transient bounded Context Capsule; never persist a Hot copy."""
+    session = connection.execute(
+        """
+        SELECT settings_json FROM task_sessions
+        WHERE task_id = ? AND role_key = ?
+        """,
+        (task["id"], role_key),
+    ).fetchone()
+    if not session:
+        raise ValueError(f"missing TaskSession settings for {role_key}")
+    cap = int(json.loads(session["settings_json"])["values"]["context_max_bytes"])
+    goal = connection.execute(
+        "SELECT objective, boundary_json FROM goals WHERE id = ?", (task["goal_id"],)
+    ).fetchone()
+    artifacts = connection.execute(
+        """
+        SELECT kind, path, sha256, acceptance_id, revision FROM artifacts
+        WHERE task_id = ? AND kind IN ('output', 'evidence')
+        ORDER BY created_at DESC, rowid DESC LIMIT 8
+        """,
+        (task["id"],),
+    ).fetchall()
+    handoff = connection.execute(
+        """
+        SELECT path, sha256 FROM artifacts
+        WHERE task_id = ? AND kind = 'handoff'
+          AND acceptance_id = ?
+        ORDER BY revision DESC LIMIT 1
+        """,
+        (task["id"], f"handoff:{role_key}"),
+    ).fetchone()
+    warm = None
+    if handoff:
+        try:
+            warm = json.loads(store.resolve_data_path(handoff["path"]).read_text())
+        except (OSError, json.JSONDecodeError, ValueError):
+            warm = {"path": handoff["path"], "sha256": handoff["sha256"]}
+    capsule = {
+        "version": 1,
+        "project_id": task["project_id"],
+        "task_id": task["id"],
+        "role_key": role_key,
+        "task_spec_revision": task["spec_revision"],
+        "goal": {
+            "objective": goal["objective"] if goal else None,
+            "boundary": json.loads(goal["boundary_json"]) if goal else None,
+        },
+        "task_spec": json.loads(task["spec_json"]),
+        "acceptance": json.loads(task["acceptance_json"]),
+        "state": {
+            "phase": task["phase"],
+            "fault_code": task["fault_code"],
+            "blocker": task["wait_reason"],
+        },
+        "warm_handoff": warm,
+        "recent_evidence_and_artifacts": [dict(row) for row in reversed(artifacts)],
+    }
+    body = canonical_json(capsule)
+    if len(body.encode()) > cap:
+        capsule["warm_handoff"] = (
+            {
+                "path": handoff["path"],
+                "sha256": handoff["sha256"],
+            }
+            if handoff
+            else None
+        )
+        capsule["recent_evidence_and_artifacts"] = [
+            {
+                "kind": row["kind"],
+                "path": row["path"],
+                "sha256": row["sha256"],
+                "acceptance_id": row["acceptance_id"],
+            }
+            for row in artifacts[:2]
+        ]
+        body = canonical_json(capsule)
+    if len(body.encode()) > cap:
+        raise ValueError(
+            f"mandatory Context Capsule exceeds configured {cap}-byte cap; "
+            "increase context_max_bytes or narrow the Task"
+        )
+    return body
+
+
+def _segment_session(
+    store: Store,
+    connection: sqlite3.Connection,
+    project_id: str,
+    session: sqlite3.Row,
+) -> None:
+    """Append bounded Cold manifests for new HostJobs; logs remain separate files."""
+    acceptance_id = (
+        f"session_segment:{session['role_key']}:generation-{session['generation']:06d}"
+    )
+    previous = connection.execute(
+        """
+        SELECT path, revision FROM artifacts
+        WHERE task_id = ? AND kind = 'log' AND acceptance_id = ?
+        ORDER BY revision DESC LIMIT 1
+        """,
+        (session["task_id"], acceptance_id),
+    ).fetchone()
+    last_sequence = 0
+    revision = 1
+    if previous:
+        revision = int(previous["revision"]) + 1
+        try:
+            last_sequence = int(
+                json.loads(store.resolve_data_path(previous["path"]).read_text())[
+                    "to_sequence"
+                ]
+            )
+        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+            last_sequence = 0
+    jobs = connection.execute(
+        """
+        SELECT id, spec_revision, sequence, purpose, status, started_at, ended_at,
+               returncode, output_ref, failure_code
+        FROM host_jobs
+        WHERE task_session_id = ? AND session_generation = ? AND sequence > ?
+        ORDER BY sequence
+        """,
+        (session["id"], session["generation"], last_sequence),
+    ).fetchall()
+    if not jobs:
+        return
+    cap = int(
+        json.loads(session["settings_json"])["values"]["session_segment_max_bytes"]
+    )
+    remaining = [dict(row) for row in jobs]
+    while remaining:
+        chunk = []
+        while remaining:
+            candidate = chunk + [remaining[0]]
+            manifest = _segment_manifest(project_id, session, candidate)
+            if len((canonical_json(manifest) + "\n").encode()) > cap:
+                break
+            chunk.append(remaining.pop(0))
+        if not chunk:
+            raise ValueError(
+                f"one Cold session record exceeds configured {cap}-byte segment cap"
+            )
+        manifest = _segment_manifest(project_id, session, chunk)
+        body = (canonical_json(manifest) + "\n").encode()
+        path = (
+            store.data_root
+            / "projects"
+            / project_id
+            / "tasks"
+            / session["task_id"]
+            / "sessions"
+            / session["role_key"]
+            / f"generation-{session['generation']:06d}"
+            / "segments"
+            / f"segment-{revision:06d}.json"
+        )
+        _write_atomic(path, body)
+        connection.execute(
+            """
+            INSERT INTO artifacts(
+                id, project_id, task_id, kind, path, sha256, bytes,
+                acceptance_id, revision, created_at
+            ) VALUES (?, ?, ?, 'log', ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                uuid4().hex,
+                project_id,
+                session["task_id"],
+                store.relative_data_path(path),
+                hashlib.sha256(body).hexdigest(),
+                len(body),
+                acceptance_id,
+                revision,
+                time.time(),
+            ),
+        )
+        revision += 1
+
+
+def _segment_manifest(
+    project_id: str, session: sqlite3.Row, jobs: list[dict]
+) -> dict:
+    return {
+        "version": 1,
+        "project_id": project_id,
+        "task_id": session["task_id"],
+        "task_session_id": session["id"],
+        "role_key": session["role_key"],
+        "session_generation": session["generation"],
+        "from_sequence": jobs[0]["sequence"],
+        "to_sequence": jobs[-1]["sequence"],
+        "host_jobs": jobs,
+    }
 
 
 def _checkpoint_session(

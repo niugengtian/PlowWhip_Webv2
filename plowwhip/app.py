@@ -14,6 +14,7 @@ from .intake import (
     TASK_ID,
     archive_project,
     create_project,
+    set_project_setting,
     submit_action,
     submit_message,
 )
@@ -142,6 +143,14 @@ class Handler(BaseHTTPRequestHandler):
                         store,
                         body["project_id"],
                         body.get("confirmation", ""),
+                        body["idempotency_key"],
+                    )
+                elif body.get("kind") == "set_project_setting":
+                    identifier = set_project_setting(
+                        store,
+                        body["project_id"],
+                        body["setting_key"],
+                        body["value"],
                         body["idempotency_key"],
                     )
                 else:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import time
@@ -7,9 +8,12 @@ from uuid import uuid4
 
 from .execution import (
     ProviderStep,
+    _write_atomic,
     apply_provider_step,
     archive_task_sessions,
+    create_task_session,
     create_task_sessions,
+    current_session,
     effective_settings,
     ensure_task_sessions,
     execute_task,
@@ -18,7 +22,15 @@ from .execution import (
     rotate_task_sessions,
 )
 from .intake import canonical_json, normalize_instruction
-from .planner import normalize_plan
+from .planner import (
+    PlannerStep,
+    classify_instruction,
+    normalize_plan,
+    parse_planner_result,
+    perform_planner_step,
+    planner_prompt,
+)
+from .provider import record_model_call
 from .store import Store
 from .verification import CheckerStep, apply_checker_step, perform_checker_step, verify_task
 
@@ -29,39 +41,46 @@ class LeaseLost(RuntimeError):
 
 def advance_project(store: Store, project_id: str, lease_token: str, fence: int) -> str:
     result = _advance_project_transaction(store, project_id, lease_token, fence)
-    if not isinstance(result, (ProviderStep, CheckerStep)):
-        return result
-    with store.transaction() as connection:
-        _assert_lease(connection, project_id, lease_token, fence)
-        connection.execute(
-            """
-            UPDATE projects SET lease_until = ?
-            WHERE id = ? AND lease_token = ? AND lease_fence = ?
-            """,
-            (
-                time.time()
-                + (
-                    result.timeout_seconds + 30
-                    if isinstance(result, CheckerStep)
-                    else 90
+    if isinstance(result, (ProviderStep, CheckerStep, PlannerStep)):
+        with store.transaction() as connection:
+            _assert_lease(connection, project_id, lease_token, fence)
+            connection.execute(
+                """
+                UPDATE projects SET lease_until = ?
+                WHERE id = ? AND lease_token = ? AND lease_fence = ?
+                """,
+                (
+                    time.time()
+                    + (
+                        result.timeout_seconds + 30
+                        if isinstance(result, (CheckerStep, PlannerStep))
+                        else 90
+                    ),
+                    project_id,
+                    lease_token,
+                    fence,
                 ),
-                project_id,
-                lease_token,
-                fence,
-            ),
-        )
-    facts = (
-        perform_checker_step(result)
-        if isinstance(result, CheckerStep)
-        else perform_provider_step(result)
-    )
+            )
+        if isinstance(result, CheckerStep):
+            facts = perform_checker_step(result)
+        elif isinstance(result, PlannerStep):
+            facts = perform_planner_step(result)
+        else:
+            facts = perform_provider_step(result)
+        with store.transaction() as connection:
+            _assert_lease(connection, project_id, lease_token, fence)
+            if isinstance(result, CheckerStep):
+                outcome = apply_checker_step(store, connection, result, facts)
+            elif isinstance(result, PlannerStep):
+                outcome = _apply_planner_step(store, connection, result, facts)
+            else:
+                outcome = apply_provider_step(store, connection, result, facts)
+    else:
+        outcome = result
     with store.transaction() as connection:
         _assert_lease(connection, project_id, lease_token, fence)
-        return (
-            apply_checker_step(store, connection, result, facts)
-            if isinstance(result, CheckerStep)
-            else apply_provider_step(store, connection, result, facts)
-        )
+        _ensure_project_question(connection, project_id)
+    return outcome
 
 
 def _assert_lease(
@@ -80,7 +99,7 @@ def _assert_lease(
 
 def _advance_project_transaction(
     store: Store, project_id: str, lease_token: str, fence: int
-) -> str | ProviderStep:
+) -> str | ProviderStep | CheckerStep | PlannerStep:
     """Perform exactly one lifecycle action. Cronner is the only caller with a lease."""
     with store.transaction() as connection:
         _assert_lease(connection, project_id, lease_token, fence)
@@ -94,6 +113,15 @@ def _advance_project_transaction(
             (project_id,),
         ).fetchone()
         if action:
+            action_kind = json.loads(action["action_json"]).get("kind")
+            if action_kind in {
+                "create_project",
+                "restore_project",
+                "bind_project_workspace",
+                "archive_project",
+                "set_project_setting",
+            }:
+                return _apply_project_action(connection, action)
             return _apply_action(connection, action)
 
         task = connection.execute(
@@ -107,6 +135,8 @@ def _advance_project_transaction(
             (project_id, time.time()),
         ).fetchone()
         if task:
+            if task["phase"] == "plan":
+                return _prepare_planner_step(connection, task)
             if task["phase"] == "execute":
                 return execute_task(store, connection, task)
             if task["phase"] == "repair":
@@ -122,6 +152,8 @@ def _advance_project_transaction(
                 return pending_provider_step(connection, task)
             if task["phase"] == "check_call":
                 return _stop_interrupted_checker(connection, task)
+            if task["phase"] == "plan_call":
+                return _stop_interrupted_planner(connection, task)
             return _stop_unknown_phase(connection, task)
 
         blocking = connection.execute(
@@ -213,15 +245,50 @@ def _advance_project_transaction(
 
 def _create_task(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
     now = time.time()
+    connection.execute(
+        "UPDATE projects SET archived_at = NULL WHERE id = ?",
+        (message["project_id"],),
+    )
     goal_id = uuid4().hex
     plan_id = uuid4().hex
     task_id = uuid4().hex
     spec, acceptance = normalize_instruction(message["content"])
-    supported, spec, role_key, provider_key, checker_role, checker_provider, reason = (
-        _runtime_contract(connection, message["project_id"], spec)
-    )
+    classification = classify_instruction(message["content"], str(spec["kind"]))
+    automatic_planning = classification["size"] == "large"
+    if automatic_planning:
+        project = connection.execute(
+            "SELECT host_path FROM projects WHERE id = ?", (message["project_id"],)
+        ).fetchone()
+        project_path = str((project["host_path"] if project else "") or "")
+        supported = bool(project_path)
+        spec = {
+            **spec,
+            "classification": classification,
+            "project_path": project_path,
+        }
+        role_key = "planner"
+        provider_key = _first_provider(connection, message["project_id"], role_key)
+        checker_role = "independent_checker"
+        checker_provider = _first_provider(
+            connection, message["project_id"], checker_role
+        )
+        reason = (
+            None
+            if supported
+            else "project workspace is not bound; set an absolute Host Bridge path"
+        )
+    else:
+        (
+            supported,
+            spec,
+            role_key,
+            provider_key,
+            checker_role,
+            checker_provider,
+            reason,
+        ) = _runtime_contract(connection, message["project_id"], spec)
     public_status = "pending" if supported else "needs_decision"
-    phase = "execute" if supported else "intake"
+    phase = ("plan" if automatic_planning else "execute") if supported else "intake"
     fault = None if supported else (
         "credential" if spec["kind"] == "authorization_required" else "scope"
     )
@@ -243,7 +310,7 @@ def _create_task(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
                 {
                     "writes": (
                         spec.get("project_path")
-                        if spec["kind"] == "provider_task"
+                        if spec["kind"] == "provider_task" or automatic_planning
                         else "task artifact directory only"
                     )
                 }
@@ -255,12 +322,24 @@ def _create_task(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
     connection.execute(
         """
         INSERT INTO plans(id, goal_id, revision, selected, summary_json, created_at)
-        VALUES (?, ?, 1, 1, ?, ?)
+        VALUES (?, ?, 1, ?, ?, ?)
         """,
         (
             plan_id,
             goal_id,
-            canonical_json({"classification": "simple" if supported else "undetermined"}),
+            0 if automatic_planning else 1,
+            canonical_json(
+                {
+                    "classification": classification,
+                    "status": (
+                        "planner_pending"
+                        if automatic_planning and supported
+                        else "direct"
+                        if supported
+                        else "needs_decision"
+                    ),
+                }
+            ),
             now,
         ),
     )
@@ -293,21 +372,32 @@ def _create_task(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
         ),
     )
     if supported:
-        create_task_sessions(
-            connection,
-            message["project_id"],
-            task_id,
-            now,
-            executor_role=role_key,
-            checker_role=checker_role,
-            executor_provider=provider_key,
-            checker_provider=checker_provider,
-            settings_overrides=(
-                {role_key: {"retry_count": 0}}
-                if spec.get("mode") == "minimal"
-                else None
-            ),
-        )
+        if automatic_planning:
+            create_task_session(
+                connection,
+                message["project_id"],
+                task_id,
+                now,
+                role_key,
+                provider_key,
+                False,
+            )
+        else:
+            create_task_sessions(
+                connection,
+                message["project_id"],
+                task_id,
+                now,
+                executor_role=role_key,
+                checker_role=checker_role,
+                executor_provider=provider_key,
+                checker_provider=checker_provider,
+                settings_overrides=(
+                    {role_key: {"retry_count": 0}}
+                    if spec.get("mode") == "minimal"
+                    else None
+                ),
+            )
     connection.execute(
         "UPDATE messages SET action_json = ?, processed_at = ? WHERE id = ?",
         (canonical_json(spec), now, message["id"]),
@@ -321,7 +411,13 @@ def _create_task(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
             message["project_id"],
             task_id,
             "task_created" if supported else "needs_decision",
-            canonical_json({"source_message_id": message["id"], "spec_revision": 1}),
+            canonical_json(
+                {
+                    "source_message_id": message["id"],
+                    "spec_revision": 1,
+                    "classification": classification,
+                }
+            ),
             now,
         ),
     )
@@ -439,6 +535,31 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
     elif (
         kind == "provide_decision"
         and task["public_status"] == "needs_decision"
+        and task["phase"] == "plan"
+        and connection.execute(
+            """
+            SELECT 1 FROM plans
+            WHERE goal_id = ? AND selected = 0 AND revision > 1 LIMIT 1
+            """,
+            (task["goal_id"],),
+        ).fetchone()
+    ):
+        connection.execute(
+            """
+            UPDATE tasks SET wait_reason = ?,
+                fault_code = 'scope', updated_at = ? WHERE id = ?
+            """,
+            (
+                "Planner proposal is awaiting an explicit plan authorization or a replacement plan",
+                now,
+                task["id"],
+            ),
+        )
+        event = "decision_rejected"
+        detail = {"message_id": message["id"], "reason": "plan_authorization_required"}
+    elif (
+        kind == "provide_decision"
+        and task["public_status"] == "needs_decision"
         and connection.execute(
             """
             SELECT 1 FROM host_jobs
@@ -535,9 +656,75 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
             (now, now, task["id"]),
         )
         event, detail = "wake_requested", {"message_id": message["id"]}
+    elif kind == "authorize" and task["public_status"] == "needs_decision":
+        project = connection.execute(
+            "SELECT host_path FROM projects WHERE id = ?", (task["project_id"],)
+        ).fetchone()
+        expected_scope = (
+            project["host_path"] if project and project["host_path"]
+            else f"project:{task['project_id']}"
+        )
+        valid = bool(
+            action.get("action_kind") == "select_plan"
+            and action.get("spec_revision") == task["spec_revision"]
+            and action.get("target_scope") == expected_scope
+            and float(action.get("expires_at") or 0) >= now
+        )
+        proposal = (
+            connection.execute(
+                """
+                SELECT summary_json FROM plans
+                WHERE id = ? AND goal_id = ? AND revision = ? AND selected = 0
+                """,
+                (
+                    action.get("plan_id"),
+                    task["goal_id"],
+                    action.get("plan_revision"),
+                ),
+            ).fetchone()
+            if valid
+            else None
+        )
+        try:
+            proposed = json.loads(proposal["summary_json"]) if proposal else None
+            plan = _materialize_plan(
+                connection,
+                task["project_id"],
+                normalize_plan(proposed["plan"]),
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            connection.execute(
+                """
+                UPDATE tasks SET wait_reason = ?, fault_code = 'scope',
+                    updated_at = ? WHERE id = ?
+                """,
+                (f"authorization rejected: {error}", now, task["id"]),
+            )
+            event = "authorization_rejected"
+            detail = {"message_id": message["id"]}
+        else:
+            _record_event(
+                connection,
+                task,
+                "authorization_granted",
+                {
+                    "message_id": message["id"],
+                    "spec_revision": action["spec_revision"],
+                    "action_kind": action["action_kind"],
+                    "target_scope": action["target_scope"],
+                    "expires_at": action["expires_at"],
+                },
+                now,
+            )
+            _install_plan(connection, task, message["id"], plan, now)
+            return kind
     elif kind == "provide_plan" and task["public_status"] == "needs_decision":
         try:
-            plan = normalize_plan(action["plan"])
+            plan = _materialize_plan(
+                connection,
+                task["project_id"],
+                normalize_plan(action["plan"]),
+            )
         except ValueError as error:
             connection.execute(
                 "UPDATE tasks SET wait_reason = ?, fault_code = 'scope', updated_at = ? WHERE id = ?",
@@ -558,6 +745,433 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
         (message["project_id"], task["id"], event, canonical_json(detail), now),
     )
     return kind
+
+
+def _apply_project_action(
+    connection: sqlite3.Connection, message: sqlite3.Row
+) -> str:
+    now = time.time()
+    action = json.loads(message["action_json"])
+    kind = action["kind"]
+    if kind in {"create_project", "restore_project", "bind_project_workspace"}:
+        connection.execute(
+            """
+            UPDATE projects SET archived_at = NULL,
+                host_path = COALESCE(?, host_path) WHERE id = ?
+            """,
+            (action.get("host_path"), message["project_id"]),
+        )
+    elif kind == "archive_project":
+        if action.get("confirmation") != message["project_id"]:
+            raise ValueError("archive confirmation no longer matches project")
+        if connection.execute(
+            "SELECT 1 FROM tasks WHERE project_id = ? AND outcome IS NULL LIMIT 1",
+            (message["project_id"],),
+        ).fetchone():
+            raise ValueError("project acquired an active task before archive")
+        connection.execute(
+            "UPDATE projects SET archived_at = ? WHERE id = ?",
+            (now, message["project_id"]),
+        )
+    elif kind == "set_project_setting":
+        connection.execute(
+            """
+            INSERT INTO settings(
+                id, scope, project_id, setting_key, value_json, source, updated_at
+            ) VALUES (?, 'project', ?, ?, ?, ?, ?)
+            ON CONFLICT(scope, project_id, setting_key) DO UPDATE SET
+                value_json = excluded.value_json,
+                source = excluded.source,
+                updated_at = excluded.updated_at
+            """,
+            (
+                f"project:{message['project_id']}:{action['setting_key']}",
+                message["project_id"],
+                action["setting_key"],
+                canonical_json(action["value"]),
+                f"owner_message:{message['id']}",
+                now,
+            ),
+        )
+    connection.execute(
+        "UPDATE messages SET processed_at = ? WHERE id = ?", (now, message["id"])
+    )
+    return str(kind)
+
+
+def _prepare_planner_step(
+    connection: sqlite3.Connection, task: sqlite3.Row
+) -> PlannerStep:
+    started_at = time.time()
+    spec = json.loads(task["spec_json"])
+    goal = connection.execute(
+        "SELECT objective FROM goals WHERE id = ?", (task["goal_id"],)
+    ).fetchone()
+    task_session_id, session_generation = current_session(
+        connection, task["id"], "planner"
+    )
+    generation = connection.execute(
+        """
+        SELECT provider_key, external_session_id FROM session_generations
+        WHERE task_session_id = ? AND generation = ?
+        """,
+        (task_session_id, session_generation),
+    ).fetchone()
+    session = connection.execute(
+        "SELECT settings_json FROM task_sessions WHERE id = ?", (task_session_id,)
+    ).fetchone()
+    settings = json.loads(session["settings_json"]).get("values", {})
+    sequence = connection.execute(
+        "SELECT COALESCE(MAX(sequence), 0) + 1 AS value FROM host_jobs WHERE task_id = ?",
+        (task["id"],),
+    ).fetchone()["value"]
+    job_id = str(uuid4())
+    connection.execute(
+        """
+        INSERT INTO host_jobs(
+            id, task_id, task_session_id, session_generation,
+            spec_revision, sequence, purpose, status, started_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 'command', 'dispatching', ?)
+        """,
+        (
+            job_id,
+            task["id"],
+            task_session_id,
+            session_generation,
+            task["spec_revision"],
+            sequence,
+            started_at,
+        ),
+    )
+    connection.execute(
+        """
+        UPDATE tasks SET public_status = 'in_progress', phase = 'plan_call',
+            wait_reason = NULL, fault_code = NULL, next_action_at = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (started_at, started_at, task["id"]),
+    )
+    connection.execute(
+        """
+        INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
+        VALUES (?, ?, 'planner_prepared', ?, ?)
+        """,
+        (
+            task["project_id"],
+            task["id"],
+            canonical_json({"host_job_id": job_id, "sequence": sequence}),
+            started_at,
+        ),
+    )
+    classification = dict(spec.get("classification") or {})
+    return PlannerStep(
+        task["project_id"],
+        task["id"],
+        job_id,
+        generation["provider_key"],
+        str(spec["project_path"]),
+        planner_prompt(
+            str(goal["objective"] if goal else spec.get("instruction") or ""),
+            task["project_id"],
+            classification,
+        ),
+        generation["external_session_id"],
+        int(settings.get("max_runtime_seconds", 600)),
+        classification,
+    )
+
+
+def _apply_planner_step(
+    store: Store,
+    connection: sqlite3.Connection,
+    step: PlannerStep,
+    facts: dict[str, object],
+) -> str:
+    task = connection.execute(
+        "SELECT * FROM tasks WHERE id = ? AND project_id = ?",
+        (step.task_id, step.project_id),
+    ).fetchone()
+    job = connection.execute(
+        "SELECT * FROM host_jobs WHERE id = ? AND task_id = ?",
+        (step.job_id, step.task_id),
+    ).fetchone()
+    if not task or not job or task["outcome"] is not None:
+        return "stale_planner_fact"
+    now = time.time()
+    result = facts.get("result") if facts.get("ok") else None
+    if isinstance(result, dict):
+        if result.get("session_id"):
+            connection.execute(
+                """
+                UPDATE session_generations SET external_session_id = ?
+                WHERE task_session_id = ? AND generation = ?
+                """,
+                (
+                    result["session_id"],
+                    job["task_session_id"],
+                    job["session_generation"],
+                ),
+            )
+        input_tokens = max(0, int(result.get("input_tokens") or 0))
+        cached_tokens = min(
+            input_tokens, max(0, int(result.get("cached_input_tokens") or 0))
+        )
+        record_model_call(
+            connection,
+            task["id"],
+            job["task_session_id"],
+            job["session_generation"],
+            step.provider_key,
+            "single",
+            input_tokens,
+            cached_tokens,
+            max(0, int(result.get("output_tokens") or 0)),
+            str(result.get("model") or step.provider_key),
+        )
+    returncode = int(result.get("returncode") or 0) if isinstance(result, dict) else 1
+    stdout = str(result.get("stdout") or "") if isinstance(result, dict) else ""
+    if not facts.get("ok") or returncode != 0:
+        connection.execute(
+            """
+            UPDATE host_jobs SET status = 'failed', ended_at = ?, returncode = ?,
+                failure_code = ? WHERE id = ?
+            """,
+            (
+                now,
+                returncode,
+                "provider" if facts.get("ok") else "transport",
+                job["id"],
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE tasks SET public_status = 'needs_decision',
+                phase = 'provider_recovery', wait_reason = ?,
+                fault_code = ?, next_action_at = NULL, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                "Planner did not return a usable result; inspect Provider availability before retrying",
+                "provider" if facts.get("ok") else "transport",
+                now,
+                task["id"],
+            ),
+        )
+        _archive_role_generation(connection, task["id"], "planner", now)
+        _record_event(
+            connection,
+            task,
+            "planner_failed",
+            {"host_job_id": job["id"], "error": facts.get("error")},
+            now,
+        )
+        return "needs_decision"
+
+    try:
+        proposal = parse_planner_result(stdout)
+        proposal["plan"] = _materialize_plan(
+            connection, task["project_id"], proposal["plan"]
+        )
+    except ValueError as error:
+        connection.execute(
+            """
+            UPDATE host_jobs SET status = 'failed', ended_at = ?, returncode = 1,
+                failure_code = 'verification' WHERE id = ?
+            """,
+            (now, job["id"]),
+        )
+        connection.execute(
+            """
+            UPDATE tasks SET public_status = 'needs_decision', phase = 'plan',
+                wait_reason = ?, fault_code = 'verification',
+                next_action_at = NULL, updated_at = ? WHERE id = ?
+            """,
+            (f"Planner output is invalid: {error}", now, task["id"]),
+        )
+        _archive_role_generation(connection, task["id"], "planner", now)
+        _record_event(
+            connection,
+            task,
+            "planner_rejected",
+            {"host_job_id": job["id"], "error": str(error)},
+            now,
+        )
+        return "needs_decision"
+
+    artifact_body = canonical_json(proposal).encode()
+    artifact_path = (
+        store.data_root
+        / "projects"
+        / task["project_id"]
+        / "tasks"
+        / task["id"]
+        / "artifacts"
+        / f"revision-{task['spec_revision']:06d}"
+        / f"plan-{job['sequence']:06d}"
+        / "output"
+        / "planner.json"
+    )
+    _write_atomic(artifact_path, artifact_body)
+    artifact_ref = store.relative_data_path(artifact_path)
+    connection.execute(
+        """
+        INSERT INTO artifacts(
+            id, project_id, task_id, kind, path, sha256, bytes,
+            acceptance_id, revision, created_at
+        ) VALUES (?, ?, ?, 'output', ?, ?, ?, 'planner_contract', ?, ?)
+        """,
+        (
+            uuid4().hex,
+            task["project_id"],
+            task["id"],
+            artifact_ref,
+            hashlib.sha256(artifact_body).hexdigest(),
+            len(artifact_body),
+            task["spec_revision"],
+            now,
+        ),
+    )
+    connection.execute(
+        """
+        UPDATE host_jobs SET status = 'succeeded', ended_at = ?, returncode = 0,
+            output_ref = ?, failure_code = NULL WHERE id = ?
+        """,
+        (now, artifact_ref, job["id"]),
+    )
+    _archive_role_generation(connection, task["id"], "planner", now)
+    auto_select = bool(
+        proposal["confidence"] >= 0.95
+        and not step.classification.get("authorization_required")
+    )
+    if auto_select:
+        _install_plan(
+            connection,
+            task,
+            f"planner:{job['id']}",
+            proposal["plan"],
+            now,
+        )
+        return "plan_applied"
+
+    revision = connection.execute(
+        "SELECT COALESCE(MAX(revision), 0) + 1 AS value FROM plans WHERE goal_id = ?",
+        (task["goal_id"],),
+    ).fetchone()["value"]
+    connection.execute(
+        """
+        INSERT INTO plans(id, goal_id, revision, selected, summary_json, created_at)
+        VALUES (?, ?, ?, 0, ?, ?)
+        """,
+        (
+            uuid4().hex,
+            task["goal_id"],
+            revision,
+            canonical_json(proposal),
+            now,
+        ),
+    )
+    selected = proposal["plan"]["alternatives"][proposal["plan"]["selected"]]
+    question = (
+        f"Planner 建议“{selected['name']}”，置信度 {proposal['confidence']:.2f}；"
+        "这是高风险操作，是否批准该方案？"
+        if step.classification.get("authorization_required")
+        else (
+            f"Planner 建议“{selected['name']}”，但置信度只有 "
+            f"{proposal['confidence']:.2f}；是否按该方案继续？"
+        )
+    )
+    connection.execute(
+        """
+        UPDATE tasks SET public_status = 'needs_decision', phase = 'plan',
+            wait_reason = ?, fault_code = 'scope', next_action_at = NULL,
+            updated_at = ? WHERE id = ?
+        """,
+        (question, now, task["id"]),
+    )
+    _record_event(
+        connection,
+        task,
+        "planner_needs_decision",
+        {
+            "host_job_id": job["id"],
+            "plan_revision": revision,
+            "confidence": proposal["confidence"],
+        },
+        now,
+    )
+    return "needs_decision"
+
+
+def _materialize_plan(
+    connection: sqlite3.Connection, project_id: str, plan: dict
+) -> dict:
+    tasks = []
+    for item in plan["tasks"]:
+        (
+            supported,
+            spec,
+            role_key,
+            provider_key,
+            checker_role,
+            checker_provider,
+            reason,
+        ) = _runtime_contract(connection, project_id, item["spec"])
+        if not supported:
+            raise ValueError(f"task {item['key']} cannot run: {reason}")
+        settings = item["settings"]
+        executor_order = settings.get(role_key, {}).get("provider_order")
+        checker_order = settings.get(checker_role, {}).get("provider_order")
+        tasks.append(
+            {
+                **item,
+                "spec": spec,
+                "role_key": role_key,
+                "checker_role": checker_role,
+                "executor_provider": (
+                    str(executor_order[0]) if executor_order else provider_key
+                ),
+                "checker_provider": (
+                    str(checker_order[0]) if checker_order else checker_provider
+                ),
+            }
+        )
+    return {**plan, "tasks": tasks}
+
+
+def _archive_role_generation(
+    connection: sqlite3.Connection, task_id: str, role_key: str, now: float
+) -> None:
+    connection.execute(
+        """
+        UPDATE session_generations SET status = 'archived', ended_at = ?
+        WHERE status = 'active' AND task_session_id IN (
+            SELECT id FROM task_sessions WHERE task_id = ? AND role_key = ?
+        )
+        """,
+        (now, task_id, role_key),
+    )
+
+
+def _record_event(
+    connection: sqlite3.Connection,
+    task: sqlite3.Row,
+    kind: str,
+    detail: dict,
+    now: float,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            task["project_id"],
+            task["id"],
+            kind,
+            canonical_json(detail),
+            now,
+        ),
+    )
 
 
 def _install_plan(
@@ -595,7 +1209,7 @@ def _install_plan(
             phase = 'execute', wait_reason = NULL, fault_code = NULL,
             retry_count = 0, next_retry_at = NULL, next_action_at = ?,
             outcome = NULL, sprint = ?, role_key = ?,
-            checker_role_key = 'deterministic_checker', updated_at = ?
+            checker_role_key = ?, updated_at = ?
         WHERE id = ?
         """,
         (
@@ -605,6 +1219,7 @@ def _install_plan(
             now,
             first["sprint"],
             first["role_key"],
+            first["checker_role"],
             now,
             placeholder["id"],
         ),
@@ -615,7 +1230,9 @@ def _install_plan(
         placeholder["id"],
         now,
         executor_role=first["role_key"],
-        checker_role="deterministic_checker",
+        checker_role=first["checker_role"],
+        executor_provider=first["executor_provider"],
+        checker_provider=first["checker_provider"],
         settings_overrides=first["settings"],
     )
     connection.execute(
@@ -639,7 +1256,7 @@ def _install_plan(
                 phase, next_action_at, created_at, updated_at, plan_id, sprint,
                 role_key, checker_role_key
             ) VALUES (?, ?, ?, ?, ?, 'pending', 'queued', NULL, ?, ?, ?, ?, ?,
-                      'deterministic_checker')
+                      ?)
             """,
             (
                 task_id,
@@ -652,6 +1269,7 @@ def _install_plan(
                 plan_id,
                 item["sprint"],
                 item["role_key"],
+                item["checker_role"],
             ),
         )
         create_task_sessions(
@@ -660,7 +1278,9 @@ def _install_plan(
             task_id,
             now,
             executor_role=item["role_key"],
-            checker_role="deterministic_checker",
+            checker_role=item["checker_role"],
+            executor_provider=item["executor_provider"],
+            checker_provider=item["checker_provider"],
             settings_overrides=item["settings"],
         )
         connection.execute(
@@ -725,6 +1345,78 @@ def _stop_interrupted_checker(
         (task["project_id"], task["id"], now),
     )
     return "needs_decision"
+
+
+def _stop_interrupted_planner(
+    connection: sqlite3.Connection, task: sqlite3.Row
+) -> str:
+    now = time.time()
+    connection.execute(
+        """
+        UPDATE host_jobs SET status = 'interrupted', ended_at = ?,
+            returncode = 1, failure_code = 'unsafe_unknown'
+        WHERE task_id = ? AND purpose = 'command' AND status = 'dispatching'
+        """,
+        (now, task["id"]),
+    )
+    connection.execute(
+        """
+        UPDATE tasks SET public_status = 'needs_decision',
+            phase = 'provider_recovery',
+            wait_reason = 'Planner call was interrupted; automatic paid replay is unsafe',
+            fault_code = 'unsafe_unknown', next_action_at = NULL, updated_at = ?
+        WHERE id = ?
+        """,
+        (now, task["id"]),
+    )
+    _archive_role_generation(connection, task["id"], "planner", now)
+    _record_event(connection, task, "planner_interrupted", {}, now)
+    return "needs_decision"
+
+
+def _ensure_project_question(
+    connection: sqlite3.Connection, project_id: str
+) -> None:
+    task = connection.execute(
+        """
+        SELECT id, spec_revision, phase, fault_code, wait_reason
+        FROM tasks
+        WHERE project_id = ? AND outcome IS NULL
+          AND public_status = 'needs_decision'
+        ORDER BY updated_at DESC, rowid DESC LIMIT 1
+        """,
+        (project_id,),
+    ).fetchone()
+    if not task:
+        return
+    reason = str(task["wait_reason"] or "请确认下一步")
+    fingerprint = hashlib.sha256(
+        f"{task['spec_revision']}:{task['phase']}:{task['fault_code']}:{reason}".encode()
+    ).hexdigest()[:16]
+    now = time.time()
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO messages(
+            id, project_id, role, content, action_json,
+            idempotency_key, created_at, processed_at
+        ) VALUES (?, ?, 'butler', ?, ?, ?, ?, ?)
+        """,
+        (
+            uuid4().hex,
+            project_id,
+            f"我现在只需要你决定一件事：{reason}",
+            canonical_json(
+                {
+                    "kind": "question",
+                    "task_id": task["id"],
+                    "spec_revision": task["spec_revision"],
+                }
+            ),
+            f"question:{task['id']}:{fingerprint}",
+            now,
+            now,
+        ),
+    )
 
 
 def _runtime_contract(

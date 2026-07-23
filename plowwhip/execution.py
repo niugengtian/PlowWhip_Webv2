@@ -58,50 +58,74 @@ def create_task_sessions(
     checker_provider: str = "local",
     settings_overrides: dict | None = None,
 ) -> None:
-    for role_key in (executor_role, checker_role):
-        settings = effective_settings(
-            connection, project_id, (settings_overrides or {}).get(role_key, {})
-        )
-        worker = connection.execute(
-            "SELECT id FROM workers WHERE project_id = ? AND role_key = ?",
-            (project_id, role_key),
-        ).fetchone()
-        worker_id = worker["id"] if worker else uuid4().hex
-        if not worker:
-            connection.execute(
-                "INSERT INTO workers(id, project_id, role_key, created_at) VALUES (?, ?, ?, ?)",
-                (worker_id, project_id, role_key, now),
-            )
-        session_id = uuid4().hex
+    create_task_session(
+        connection,
+        project_id,
+        task_id,
+        now,
+        executor_role,
+        executor_provider,
+        False,
+        (settings_overrides or {}).get(executor_role, {}),
+    )
+    create_task_session(
+        connection,
+        project_id,
+        task_id,
+        now,
+        checker_role,
+        checker_provider,
+        True,
+        (settings_overrides or {}).get(checker_role, {}),
+    )
+
+
+def create_task_session(
+    connection: sqlite3.Connection,
+    project_id: str,
+    task_id: str,
+    now: float,
+    role_key: str,
+    provider_key: str,
+    checker_independent: bool,
+    settings_override: dict | None = None,
+) -> None:
+    settings = effective_settings(connection, project_id, settings_override or {})
+    worker = connection.execute(
+        "SELECT id FROM workers WHERE project_id = ? AND role_key = ?",
+        (project_id, role_key),
+    ).fetchone()
+    worker_id = worker["id"] if worker else uuid4().hex
+    if not worker:
         connection.execute(
-            """
-            INSERT INTO task_sessions(
-                id, task_id, worker_id, role_key, role_snapshot_json, settings_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                session_id,
-                task_id,
-                worker_id,
-                role_key,
-                canonical_json(_role_snapshot(connection, role_key, role_key == checker_role)),
-                canonical_json(settings),
-                now,
-            ),
+            "INSERT INTO workers(id, project_id, role_key, created_at) VALUES (?, ?, ?, ?)",
+            (worker_id, project_id, role_key, now),
         )
-        connection.execute(
-            """
-            INSERT INTO session_generations(
-                id, task_session_id, generation, provider_key, status, created_at
-            ) VALUES (?, ?, 1, ?, 'active', ?)
-            """,
-            (
-                uuid4().hex,
-                session_id,
-                executor_provider if role_key == executor_role else checker_provider,
-                now,
-            ),
-        )
+    session_id = uuid4().hex
+    connection.execute(
+        """
+        INSERT INTO task_sessions(
+            id, task_id, worker_id, role_key, role_snapshot_json, settings_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            session_id,
+            task_id,
+            worker_id,
+            role_key,
+            canonical_json(_role_snapshot(connection, role_key, checker_independent)),
+            canonical_json(settings),
+            now,
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO session_generations(
+            id, task_session_id, generation, provider_key, status, created_at
+        ) VALUES (?, ?, 1, ?, 'active', ?)
+        """,
+        (uuid4().hex, session_id, provider_key, now),
+    )
 
 
 def ensure_task_sessions(
@@ -115,23 +139,26 @@ def ensure_task_sessions(
     checker_provider: str = "local",
     settings_overrides: dict | None = None,
 ) -> None:
-    count = connection.execute(
-        "SELECT COUNT(*) AS count FROM task_sessions WHERE task_id = ?", (task_id,)
-    ).fetchone()["count"]
-    if count == 0:
-        create_task_sessions(
+    roles = (
+        (executor_role, executor_provider, False),
+        (checker_role, checker_provider, True),
+    )
+    for role_key, provider_key, checker_independent in roles:
+        if connection.execute(
+            "SELECT 1 FROM task_sessions WHERE task_id = ? AND role_key = ?",
+            (task_id, role_key),
+        ).fetchone():
+            continue
+        create_task_session(
             connection,
             project_id,
             task_id,
             now,
-            executor_role,
-            checker_role,
-            executor_provider,
-            checker_provider,
-            settings_overrides,
+            role_key,
+            provider_key,
+            checker_independent,
+            (settings_overrides or {}).get(role_key, {}),
         )
-    elif count != 2:
-        raise RuntimeError(f"Task {task_id} has incomplete role ownership")
 
 
 def effective_settings(
@@ -166,6 +193,7 @@ def _role_snapshot(
     template_key = {
         "provider_probe": "provider_probe",
         "fullstack": "code_change",
+        "planner": "code_change",
         "independent_checker": "code_change",
     }.get(role_key, "deterministic_write")
     keys = [role_key, "v1_hard_boundaries", template_key]
@@ -270,7 +298,7 @@ def execute_task(
     if spec["kind"] == "provider_probe":
         return _execute_provider_probe(store, connection, task, spec, purpose)
     if spec["kind"] == "provider_task":
-        return _prepare_provider_task(connection, task, spec, purpose)
+        return _prepare_provider_task(store, connection, task, spec, purpose)
     sequence = connection.execute(
         "SELECT COALESCE(MAX(sequence), 0) + 1 AS value FROM host_jobs WHERE task_id = ?",
         (task["id"],),
@@ -406,11 +434,12 @@ def execute_task(
 
 
 def _prepare_provider_task(
+    store: Store,
     connection: sqlite3.Connection,
     task: sqlite3.Row,
     spec: dict,
     purpose: str,
-) -> ProviderStep:
+) -> str | ProviderStep:
     started_at = time.time()
     sequence = connection.execute(
         "SELECT COALESCE(MAX(sequence), 0) + 1 AS value FROM host_jobs WHERE task_id = ?",
@@ -430,13 +459,33 @@ def _prepare_provider_task(
         "SELECT settings_json FROM task_sessions WHERE id = ?", (task_session_id,)
     ).fetchone()
     settings = json.loads(session["settings_json"]).get("values", {})
+    from .continuity import compile_hot_context
+
+    try:
+        prompt = _provider_prompt(
+            task,
+            spec,
+            purpose,
+            compile_hot_context(store, connection, task, task["role_key"] or "fullstack"),
+        )
+    except ValueError as error:
+        connection.execute(
+            """
+            UPDATE tasks SET public_status = 'needs_decision',
+                phase = 'provider_recovery', wait_reason = ?,
+                fault_code = 'scope', next_action_at = NULL, updated_at = ?
+            WHERE id = ?
+            """,
+            (str(error), started_at, task["id"]),
+        )
+        return "needs_decision"
     job_id = str(uuid4())
     connection.execute(
         """
         INSERT INTO host_jobs(
             id, task_id, task_session_id, session_generation,
-            spec_revision, sequence, purpose, status, started_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'dispatching', ?)
+            spec_revision, sequence, purpose, status, started_at, dispatch_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'dispatching', ?, ?)
         """,
         (
             job_id,
@@ -447,6 +496,12 @@ def _prepare_provider_task(
             sequence,
             purpose,
             started_at,
+            canonical_json(
+                {
+                    "prompt": prompt,
+                    "context_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+                }
+            ),
         ),
     )
     connection.execute(
@@ -476,7 +531,7 @@ def _prepare_provider_task(
         job_id,
         generation["provider_key"],
         str(spec["project_path"]),
-        _provider_prompt(task, spec, purpose),
+        prompt,
         generation["external_session_id"],
         int(settings.get("max_runtime_seconds", 600)),
     )
@@ -522,7 +577,10 @@ def pending_provider_step(
         job["id"],
         generation["provider_key"],
         str(spec["project_path"]),
-        _provider_prompt(task, spec, job["purpose"]),
+        str(
+            json.loads(job["dispatch_json"]).get("prompt")
+            or _provider_prompt(task, spec, job["purpose"])
+        ),
         generation["external_session_id"],
         int(json.loads(session["settings_json"])["values"].get("max_runtime_seconds", 600)),
     )
@@ -642,9 +700,11 @@ def apply_provider_step(
     if step.kind == "snapshot":
         before = facts.get("before")
         before_git = before.get("git") if isinstance(before, dict) else {}
+        dispatch = json.loads(job["dispatch_json"])
+        dispatch["before"] = before_git
         connection.execute(
             "UPDATE host_jobs SET dispatch_json = ? WHERE id = ?",
-            (canonical_json({"before": before_git}), job["id"]),
+            (canonical_json(dispatch), job["id"]),
         )
         connection.execute(
             """
@@ -1041,7 +1101,9 @@ def _provider_output_streams(output: object) -> tuple[str, str]:
     return "".join(streams["stdout"]), "".join(streams["stderr"])
 
 
-def _provider_prompt(task: sqlite3.Row, spec: dict, purpose: str) -> str:
+def _provider_prompt(
+    task: sqlite3.Row, spec: dict, purpose: str, hot_context: str | None = None
+) -> str:
     repair = (
         f"\nRepair context: {task['wait_reason']}"
         if purpose == "repair" and task["wait_reason"]
@@ -1050,6 +1112,8 @@ def _provider_prompt(task: sqlite3.Row, spec: dict, purpose: str) -> str:
     return (
         f"Complete this bounded code Task in the current workspace:\n{spec['instruction']}\n"
         f"Task ID: {task['id']} · spec revision {task['spec_revision']}.{repair}\n"
+        + (f"Bounded context capsule:\n{hot_context}\n" if hot_context else "")
+        +
         "Stay inside the workspace. Make only recoverable changes. Do not commit, deploy, "
         "delete permanently, expose secrets, send external messages, make purchases, or "
         "change permissions. Run the smallest relevant checks and leave the workspace ready "

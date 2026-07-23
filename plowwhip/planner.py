@@ -1,21 +1,148 @@
 from __future__ import annotations
 
+import json
 import re
+from dataclasses import dataclass
 
 from .intake import normalize_instruction
+from .provider import PROVIDERS, run_provider_task
 
 
 TASK_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+PLANNER_RESULT_PREFIX = "PLOWWHIP_PLANNER_RESULT "
+HIGH_RISK_TERMS = (
+    "部署",
+    "上线",
+    "切流",
+    "迁移",
+    "永久删除",
+    "付款",
+    "发布",
+    "权限变更",
+    "生产",
+)
+LARGE_TERMS = (
+    "前端和后端",
+    "前后端",
+    "多角色",
+    "多个项目",
+    "多 sprint",
+    "长期",
+    "比较方案",
+    "架构",
+    *HIGH_RISK_TERMS,
+)
 TASK_SETTING_LIMITS = {
     "max_runtime_seconds": (1, 86_400),
     "stop_grace_seconds": (0, 300),
     "handoff_max_bytes": (512, 1_048_576),
     "checkpoint_max_bytes": (512, 1_048_576),
+    "context_max_bytes": (1_024, 1_048_576),
+    "session_segment_max_bytes": (1_024, 1_048_576),
+    "native_compact_input_tokens": (1_000, 100_000_000),
+    "rotation_input_tokens": (1_000, 100_000_000),
     "monitor_tail_lines": (1, 1_000),
     "monitor_tail_bytes": (256, 1_048_576),
     "retry_count": (0, 10),
     "retry_backoff_seconds": (0, 86_400),
 }
+
+
+@dataclass(frozen=True)
+class PlannerStep:
+    project_id: str
+    task_id: str
+    job_id: str
+    provider_key: str
+    project_path: str
+    prompt: str
+    session_id: str | None
+    timeout_seconds: int
+    classification: dict
+
+
+def classify_instruction(content: str, kind: str) -> dict[str, object]:
+    if kind in {"write_text", "provider_probe"}:
+        return {"size": "simple", "reasons": [kind], "authorization_required": False}
+    lowered = content.lower()
+    numbered_steps = len(
+        re.findall(r"(?m)^\s*(?:[-*]|\d+[.)、])\s*\S+", content)
+    )
+    high_risk = [term for term in HIGH_RISK_TERMS if term in lowered]
+    reasons = [term for term in LARGE_TERMS if term in lowered]
+    if numbered_steps >= 3:
+        reasons.append(f"{numbered_steps}_declared_steps")
+    if reasons:
+        return {
+            "size": "large",
+            "reasons": list(dict.fromkeys(reasons)),
+            "authorization_required": bool(high_risk),
+        }
+    return {
+        "size": "medium",
+        "reasons": ["one_worker_owns_scope"],
+        "authorization_required": False,
+    }
+
+
+def planner_prompt(instruction: str, project_id: str, classification: dict) -> str:
+    return (
+        "Create the smallest executable Plan for this Goal without modifying files.\n"
+        f"Project: {project_id}\nGoal: {instruction}\n"
+        f"Classification facts: {json.dumps(classification, ensure_ascii=False, sort_keys=True)}\n"
+        "Return at least two genuine alternatives comparing name, scope, cost, risk, "
+        "reversible, and acceptance. Select one and emit a serializable Task DAG with "
+        "2-50 bounded tasks. Each task needs key, instruction, depends_on, sprint, "
+        "role_key, and optional settings. Use role_key fullstack for code work or "
+        "deterministic only for exact '写入 relative-path: content' instructions. "
+        "Do not add deployment, deletion, payment, publishing, permission changes, "
+        "or scope absent from the Goal. Finish with one line beginning "
+        f"{PLANNER_RESULT_PREFIX!r} followed by "
+        '{"confidence":0.95,"plan":{"alternatives":[],"selected":0,'
+        '"summary":"...","tasks":[]}}.'
+    )
+
+
+def perform_planner_step(step: PlannerStep) -> dict[str, object]:
+    try:
+        result = run_provider_task(
+            step.provider_key,
+            step.project_path,
+            step.prompt,
+            session_id=step.session_id,
+            access="read",
+            timeout_seconds=step.timeout_seconds,
+        )
+        return {"ok": True, "result": result}
+    except (OSError, RuntimeError, ValueError) as error:
+        return {"ok": False, "error": type(error).__name__}
+
+
+def parse_planner_result(output: str) -> dict:
+    line = next(
+        (
+            value
+            for value in reversed(output.splitlines())
+            if value.startswith(PLANNER_RESULT_PREFIX)
+        ),
+        "",
+    )
+    if not line:
+        raise ValueError("Planner did not return a structured result")
+    try:
+        payload = json.loads(line[len(PLANNER_RESULT_PREFIX) :])
+    except json.JSONDecodeError as error:
+        raise ValueError("Planner returned invalid JSON") from error
+    if not isinstance(payload, dict):
+        raise ValueError("Planner result must be an object")
+    confidence = payload.get("confidence")
+    if (
+        isinstance(confidence, bool)
+        or not isinstance(confidence, (int, float))
+        or not 0 <= confidence <= 1
+    ):
+        raise ValueError("Planner confidence must be between 0 and 1")
+    return {"confidence": float(confidence), "plan": normalize_plan(payload.get("plan"))}
 
 
 def normalize_plan(plan: object) -> dict:
@@ -50,8 +177,12 @@ def normalize_plan(plan: object) -> dict:
             raise ValueError(f"duplicate task key: {key}")
         keys.add(key)
         spec, acceptance = normalize_instruction(str(item.get("instruction", "")))
-        if spec["kind"] != "write_text":
-            raise ValueError(f"task {key} is not deterministic")
+        if spec["kind"] == "write_text":
+            default_role, checker_role = "deterministic", "deterministic_checker"
+        elif spec["kind"] == "provider_task":
+            default_role, checker_role = "fullstack", "independent_checker"
+        else:
+            raise ValueError(f"task {key} is outside the executable boundary")
         dependencies = item.get("depends_on", [])
         if not isinstance(dependencies, list) or not all(
             isinstance(value, str) for value in dependencies
@@ -62,10 +193,12 @@ def normalize_plan(plan: object) -> dict:
         sprint = item.get("sprint", 1)
         if isinstance(sprint, bool) or not isinstance(sprint, int) or not 1 <= sprint <= 10_000:
             raise ValueError(f"task {key} has invalid sprint")
-        role_key = str(item.get("role_key", "deterministic"))
-        if role_key != "deterministic":
-            raise ValueError(f"task {key} requires a disabled Provider")
-        settings = _normalize_task_settings(key, role_key, item.get("settings", {}))
+        role_key = str(item.get("role_key", default_role))
+        if role_key != default_role:
+            raise ValueError(f"task {key} role does not match its instruction")
+        settings = _normalize_task_settings(
+            key, role_key, checker_role, item.get("settings", {})
+        )
         normalized.append(
             {
                 "key": key,
@@ -74,6 +207,7 @@ def normalize_plan(plan: object) -> dict:
                 "depends_on": dependencies,
                 "sprint": sprint,
                 "role_key": role_key,
+                "checker_role": checker_role,
                 "settings": settings,
             }
         )
@@ -99,10 +233,12 @@ def normalize_plan(plan: object) -> dict:
     }
 
 
-def _normalize_task_settings(task_key: str, role_key: str, raw: object) -> dict:
+def _normalize_task_settings(
+    task_key: str, role_key: str, checker_role: str, raw: object
+) -> dict:
     if not isinstance(raw, dict):
         raise ValueError(f"task {task_key} settings must be an object")
-    allowed_roles = {role_key, "deterministic_checker"}
+    allowed_roles = {role_key, checker_role}
     if any(key not in allowed_roles or not isinstance(value, dict) for key, value in raw.items()):
         raise ValueError(f"task {task_key} settings must be keyed by its two roles")
     normalized = {}
@@ -110,8 +246,16 @@ def _normalize_task_settings(task_key: str, role_key: str, raw: object) -> dict:
         role_values = {}
         for name, value in values.items():
             if name == "provider_order":
-                if value != ["local"]:
-                    raise ValueError(f"task {task_key} cannot enable an external Provider")
+                allowed = {"local", *PROVIDERS}
+                if (
+                    not isinstance(value, list)
+                    or not value
+                    or len(value) != len(set(value))
+                    or any(provider not in allowed for provider in value)
+                ):
+                    raise ValueError(f"task {task_key} has invalid Provider order")
+                if role_key == "deterministic" and value != ["local"]:
+                    raise ValueError(f"task {task_key} deterministic role requires local")
                 role_values[name] = value
                 continue
             limits = TASK_SETTING_LIMITS.get(name)

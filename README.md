@@ -44,9 +44,23 @@ POST /api/messages
 → SQLite WAL
 → in-process Cronner
 → advance_project (one action)
-→ execute / verify / bounded repair
+→ classify / optional Planner / execute / verify / bounded repair
 → Done or NeedsDecision
 ```
+
+Large instructions use a read-only Planner that must return at least two
+comparable alternatives and a bounded Task DAG. Confidence of at least 95%
+selects the plan automatically only when no explicit authorization is needed;
+otherwise the project Butler asks one question. Plan authorization is stored as
+a message bound to the project, Task, spec revision, action, workspace scope and
+15-minute expiry.
+
+Runtime continuity has three deliberately small layers: a transient bounded Hot
+Context Capsule, atomic Warm `current.json` handoffs with archives, and
+append-only Cold Session segment manifests. Project numeric settings are
+validated, queued as actions, applied only by `advance_project`, and frozen with
+their source into newly-created TaskSessions. Visible project creation, restore,
+workspace binding and archive also pass through the same action queue.
 
 Only `POST /api/messages` and `POST /api/actions` mutate owner intent. Monitor
 and all GET routes are read-only.
@@ -59,10 +73,12 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 
 The suite covers WAL and fencing, idempotent intake, four-state convergence,
 Evidence, automatic repair, versioned DAGs, cancellation and generation
-rotation, TaskSession ownership, bounded handoffs, token normalization,
-Token dashboards, recoverable project archive, restart recovery, read-only
-Monitor, Provider Probe Tasks, settings/library snapshots, UI/API safety, and
-fail-closed external Providers. Durable HostJob tests also prove that Provider
+rotation, TaskSession ownership, bounded Hot/Warm/Cold continuity, token
+normalization, Token dashboards, recoverable project archive, restart recovery,
+read-only Monitor, Provider Probe Tasks, queued project settings, UI/API safety,
+and fail-closed external Providers. Planner tests cover high-confidence
+selection, one Butler question, scoped authorization and serial DAG
+materialization. Durable HostJob tests also prove that Provider
 and Checker waits release SQLite, different projects advance concurrently,
 terminal failures fall back by generation, and v3 terminal jobs migrate to
 schema v4 without loss. The code-Task regressions use a fake Host Bridge and
