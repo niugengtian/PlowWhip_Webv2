@@ -11,22 +11,22 @@
 - `部分实现` 不计为完成；Task 数、页面存在、容器健康和测试总数都不能替代逐项验收。
 - §23、§25、§26 是环境对比或治理要求，不计入功能完成率。
 
-当前结论：**23 个功能章节已实现，0 个部分实现，0 个未实现，3 个为对比/治理章节。V1 功能实现完成；付费 Provider 实跑、旧数据迁移和生产切换仍是需要主人另行明确授权的运行/发布动作，不是已执行事实。**
+当前结论：**17 个功能章节已实现，6 个部分实现，0 个未实现，3 个为对比/治理章节。V1 功能完成声明已撤回：8750 首次真实 Cursor Task 暴露 Host Bridge 隔离、Session bootstrap、确定拒绝分类、待决定恢复和外部 Git 授权缺口。**
 
 | 基线章节 | 状态 | 当前证据 | 明确缺口 |
 |---|---|---|---|
 | §1 使命 | 已实现 | 自然语言形成 Goal/Task；简单/中型直达执行，大型任务自动形成最小 Plan；模型任务可验证、修复、递补或一次提问 | — |
-| §2 部署边界 | 已实现 | 单镜像内含 Web/API/UI/Cronner/Monitor；SQLite 持久卷；标准库 Host Bridge 固定回环、Token、Project root、Adapter、持久 HostJob、真实退出码、分段输出、取消和重启恢复；Adapter 从宿主 PATH 解析并兼容 Cursor `cursor-agent`；macOS 宿主与 Linux slim 都验证了活动 PID+启动身份恢复；共享 data root 单 Cronner 锁 | 常驻服务安装属于具体部署动作，本阶段未写入宿主 `launchd/systemd` |
+| §2 部署边界 | 部分实现 | 单镜像、SQLite 持久卷、受限 Host Bridge 代码和跨平台测试已存在 | 现场 8750 实际连接 2026-07-21 启动的旧 `plow_whip_web.host_bridge:8765`，clean-room Bridge 尚未以独立端口/namespace 接入 |
 | §3 最终生命周期 | 已实现 | `Intake → Plan → Execute → Verify → Done/NeedsDecision`；执行、Planner、Checker 都使用可恢复 HostJob；compact 事件与 generation 轮转接入 | — |
 | §4 状态模型 | 已实现 | 四个公开状态、正交 phase/fault/outcome、取消归档与 rerun generation | — |
 | §5 唯一生命周期所有者 | 已实现 | Goal/Task 以及可见 Project 创建/恢复/绑定/归档和项目设置均先进入 messages；只有 `advance_project` 改变运行态；外部调用不占 SQLite 写事务；Monitor 只读 | — |
 | §6 业务层级 | 已实现 | Project/Goal/版本化 Plan/Sprint/Task、串行 DAG、同项目单活动 Task；活动期间新主人消息在当前 Task 后、旧 DAG 队列前形成下一紧急 Task | — |
 | §7 指令分类与 Planner | 已实现 | 可解释简单/中型/大型判定；大型任务要求两套完整比较方案；置信度 ≥95% 且无授权风险才自动选择并物化 DAG | — |
 | §8 管家与统一窗口 | 已实现 | 全局管家可用 `@project`、唯一项目或跨项目精确搜索路由；搜索只转接不创建 Task；全局文件只保存转接引用；项目管家长期历史和一次一个问题 | — |
-| §9 Worker/Session/HostJob | 已实现 | Task+role 唯一 TaskSession、generation 和 HostJob 所有权清晰；执行、Planner、Checker 均可按稳定 job_id 跨重启对账、轮询和取消 | — |
-| §10 Provider Pool | 已实现 | 默认与覆盖候选顺序、稳定 TaskSession、generation fallback、handoff、上下文/compact/resume 能力和无周期付费探活均已接线；Cursor CLI 本机合同已核对，读任务用 plan mode 且无 `--force`，写任务才在沙箱内启用；累计 Token 快照按物理 Session 差值归一化 | 按 §21 未经明确授权不发起真实付费模型调用；Monitor 继续把 CLI 探活与真实执行健康分开 |
+| §9 Worker/Session/HostJob | 部分实现 | Task+role 唯一 TaskSession、generation 和 HostJob 所有权及持久对账路径已存在 | Cursor 首次执行没有 external session，Adapter 却要求已有 session；Bridge 明确拒绝后本地 HostJob 仍停在 `dispatching` |
+| §10 Provider Pool | 部分实现 | 候选顺序、fallback、handoff、Token 归一化和零 Token 探活已接线 | 真实 Cursor 首任务未能 bootstrap；CLI available 不能证明 execution health |
 | §11 验证与自动收敛 | 已实现 | 确定性哈希验证；Planner 可冻结 1–20 个细粒度 acceptance；独立 Checker 严格 JSON、逐项 Evidence、有界修复包；只读分析可凭 Evidence 在零 workspace delta 下完成 | — |
-| §12 故障/进展/恢复/超时 | 已实现 | fault 正交字段、有限 retry、稳定 job_id 对账、Provider 递补、deadline/stop_grace 优雅停止、Tick 后 handoff；不明结果不盲重放 | — |
+| §12 故障/进展/恢复/超时 | 部分实现 | fault、retry、稳定 job_id、deadline/stop_grace 和不盲重放已存在 | Bridge HTTP 400 的确定拒绝被压成通用 `RuntimeError`，随后把 `job not found` 错判为 `unsafe_unknown` 并打扰主人 |
 | §13 Cronner | 已实现 | 应用内唯一循环、项目租约、`next_action_at/kind`、deadline、每项目一步、跨项目有界并行、上下文 checkpoint/轮转；共享 data root 单 Cronner 进程锁 | — |
 | §14 Monitor | 已实现 | 只读连接、当前结构化状态、最后 20 行、数据库/Cronner/探针看板；页面显示 TaskSession、HostJob、Artifact 计数 | — |
 | §15 三层记忆与 Token | 已实现 | Hot Capsule byte cap、Warm handoff 原子归档、Cold Session manifests 只追加；Codex 原生 compact 策略/事件和非原生 Provider Token 阈值 generation 轮转；Token 归一化看板 | — |
@@ -34,8 +34,8 @@
 | §17 文件目录 | 已实现 | project/task/role/generation、Cold segment、Artifact/Evidence/handoff/library，以及 global/project conversation 投影均在 data root；SQLite 仍是唯一状态真源 | — |
 | §18 角色/规则/模板/脚本 | 已实现 | 文件正文 + SQLite revision/SHA 索引；Global/Project/Role/Task 合并；TaskSession 冻结；首次 Checker PASS 自动沉淀不含 Task ID/Secret 的项目模板，“以后都这样”才升 revision；无真实脚本需求时保持确定性命令 | — |
 | §19 配置 | 已实现 | Global/Project/Task+role 合并并冻结值与来源；数值阈值、Provider 顺序和项目规则均先入 messages，由 `advance_project` 应用；compact/轮转/观察/超时均有消费者 | — |
-| §20 页面和 API | 已实现 | 七导航、完整 Task 工作台、messages/actions 两类写路由；Project/设置动作只提交意图；本地 Session 分段可查看 | — |
-| §21 权限与不可逆操作 | 已实现 | 三档权限冻结到角色快照；高风险方案授权绑定 project/task/revision/action/scope/expiry；普通文本不能绕过；当前没有实现的永久删除、生产切流、外部发送/付款/权限变更和新付费 Provider 一律拒绝，范围内删除默认改名 `.rm.时间戳` | — |
+| §20 页面和 API | 部分实现 | 七导航、Task 工作台、messages/actions 两类写路由和本地 Session 分段可查看 | 当前 `NeedsDecision` 问题没有可执行的“确认未接收并安全递补”动作；普通决定又会因伪活动 HostJob 被拒绝 |
+| §21 权限与不可逆操作 | 部分实现 | 三档权限、作用域授权快照和不可逆默认拒绝路径已存在 | 明确的 GitHub push 指令被分类为 `authorization_required=false`，同时执行 prompt 又一律禁止 commit/外部发送，授权语义自相矛盾 |
 | §22 模块边界 | 已实现 | 十个职责模块存在；API→intake→lifecycle→store 与只读 monitor 边界清晰 | — |
 | §23 环境对比 | 对比基线 | 旧仓库保持只读；未整体迁入旧状态机 | 不是功能完成项 |
 | §24 迁移与蓝绿门禁 | 已实现 | SQLite Backup API + quick_check；候选 code/data/db/Compose/port/Bridge namespace 隔离；候选 Cronner 关闭；共享 data root 单调度锁；切换门禁固定要求主人授权；回滚门禁验证候选调度锁已释放、无活动租约且数据库完整 | 当前是主人指定的全新 clean-room 项目，因此不迁移旧数据；生产切流/回滚执行仍需单独授权 |
@@ -58,8 +58,9 @@
 | H-20260723-10 | 2026-07-23 | 主人 | Task 页参考原任务页时必须保留任务泳道 | 已完成 | 基线 Revision 4；8750 实测四条公开状态泳道：待决定项目 `0/0/1/0`、探针项目 `0/0/0/3`；卡片点击与详情联动 |
 | H-20260723-11 | 2026-07-23 | 主人 | Task 页必须参考原任务页整体重建，不接受只局部增加泳道的毛坯实现 | 已完成 | 8750：顶部指标、Goal 导航、四态泳道、统一 Goal/Task 详情、驱动/决定与运行证据同屏；`design-qa.md` passed |
 | H-20260723-12 | 2026-07-23 | 主人 | 所有页面适当沿用原版本 UI；项目范围选择项目后不得自动跳项目页 | 已完成 | 8750 逐页实测七个入口选择范围后 `beforeView == afterView`；显式“进入项目”按钮；基线 Revision 5 |
-| H-20260723-13 | 2026-07-23 | 主人 | 不得把阶段完成或少量 Task Done 冒充 V1 完成；继续自动推进全部冻结基线剩余项 | 已完成（功能） | 覆盖矩阵最终为 23 已实现/0 部分/0 未实现；37 项本机回归和 Linux Host Bridge 回归通过；逐项证据不把生产切换或付费调用写成已执行 |
+| H-20260723-13 | 2026-07-23 | 主人 | 不得把阶段完成或少量 Task Done 冒充 V1 完成；继续自动推进全部冻结基线剩余项 | 重新打开 | 真实 Cursor Task 证明此前“23/0/0”结论不成立；当前为 17 已实现/6 部分实现/0 未实现 |
 | H-20260724-14 | 2026-07-24 | 主人 | Cursor CLI 可以使用；说明为什么 Token 消耗为 0 | 已完成 | 8750 最新 Cursor Task `8f28f2e6afc448209eef02bad443b55c` 是 0 Token 版本探针，`model_invoked=false`、ModelCallLedger `calls=0`；真实模型 HostJob 才计 Token |
+| H-20260724-15 | 2026-07-24 | 主人现场验证 | 首次真实 Cursor Task 不应把系统可判定的启动拒绝包装成主人业务决定 | 待修复 | Task `6e59d69d4a584bce80d8396de2825da7`；HostJob `f1f3064a-8531-4752-8c63-4a0f4655fd21` |
 
 ## 发现的问题
 
@@ -101,3 +102,4 @@
 | I-20260724-34 | 2026-07-24 | Linux slim 没有 `ps`，Host Bridge 无法证明重启后 PID 是否仍是原进程 | 仍存活的 HostJob 可能被误判为 `interrupted`，破坏跨平台恢复 | Linux 优先读取 `/proc/<pid>/stat` 的进程启动身份，macOS 保留 `ps lstart`；身份不可证明时继续安全失败 | 已解决 | 同一活动假进程在 Linux slim 和 macOS 宿主均通过 Bridge 重启、`orphan_running` 对账与取消测试 |
 | I-20260724-35 | 2026-07-24 | Cursor CLI 虽可探活，但 Host Bridge 拒绝其只读 Planner/Checker；Provider 又写死 macOS App 路径；页面的 0 Token 容易被误解为漏计 | Cursor fallback 和 Linux Host Bridge 不可用，且 CLI availability 与模型用量语义混淆 | Cursor 只读任务使用 `--mode plan` 且不带 `--force`，写任务才启用；Adapter 从 PATH 解析并兼容 `cursor-agent`；Cursor 可提交需再次确认的极小 Token 探针；补累计 Token/缓存子集归一化测试，Monitor 明示零探针未调用模型 | 已解决 | 本机 `cursor agent --help/create-chat --help` 与 Codex/Cursor 0 Token 探活；`test_cursor_read_mode_and_cumulative_token_normalization`；Cursor minimal intake 合同 |
 | I-20260724-36 | 2026-07-24 | 候选隔离门禁没有实现基线要求的回滚前调度锁和租约释放确认 | 即使候选 Cronner 仍在运行，也可能错误开始回滚 | 新增只读 `rollback-preflight`：要求 manifest 声明 Cronner disabled、同一 `.cronner.lock` 可取得、SQLite quick_check 通过且活动租约为 0；不执行切流 | 已解决 | `test_backup_candidate_isolation_and_single_scheduler_gate` 覆盖 ready、锁仍占用和活动租约三种事实 |
+| I-20260724-37 | 2026-07-24 | 首次真实 Cursor Task 的 Bridge start 未被接收，Bridge 后续明确返回 `host job not found`；客户端丢失 HTTP 400 正文并按不明结果重试两次 | 本可自动判定“未开始”的失败被错误升级为 `unsafe_unknown / NeedsDecision`；取消和普通决定都无法安全解除伪活动 HostJob | 隔离接入 clean-room Bridge；保留 HTTP 拒绝分类；实现 Cursor 新 Session bootstrap；为“明确未接收”增加自动失败与新 generation 递补；Git 远端写入按目标/分支冻结授权 | 待修复 | 8750 SQLite HostJob 仍为 `dispatching`；Bridge `/v1/jobs/status` 返回 HTTP 400 `host job not found`；监听 8765 的 PID 90968 是旧 `plow_whip_web.host_bridge` |
