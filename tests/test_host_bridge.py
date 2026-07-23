@@ -16,6 +16,7 @@ from plowwhip.host_bridge import (
     _load_private_env,
     _parse_usage,
     _resolve_executable,
+    _safe_environment,
     make_server,
 )
 
@@ -406,6 +407,23 @@ else:
         self.assertEqual(status, 200)
         self.assertTrue(result["available"])
         self.assertIn("plowwhip-git-publish", result["detail"])
+
+    def test_host_jobs_inherit_only_the_ssh_agent_socket_not_key_material(self):
+        with patch.dict(
+            os.environ,
+            {
+                "HOME": str(self.root),
+                "PATH": self.old_path,
+                "SSH_AUTH_SOCK": "/private/tmp/test-agent.sock",
+                "UNRELATED_SECRET": "must-not-pass",
+            },
+            clear=True,
+        ):
+            environment = _safe_environment()
+        self.assertEqual(
+            environment["SSH_AUTH_SOCK"], "/private/tmp/test-agent.sock"
+        )
+        self.assertNotIn("UNRELATED_SECRET", environment)
 
 
 if __name__ == "__main__":

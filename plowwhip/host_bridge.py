@@ -831,6 +831,7 @@ def _safe_environment() -> dict[str, str]:
         "LANG",
         "LC_ALL",
         "TERM",
+        "SSH_AUTH_SOCK",
         "CODEX_HOME",
         "CURSOR_API_KEY",
         "DEEPSEEK_MODEL",
