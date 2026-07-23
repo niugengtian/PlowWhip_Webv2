@@ -63,6 +63,7 @@
 | H-20260724-15 | 2026-07-24 | 主人现场验证 | 首次真实 Cursor Task 不应把系统可判定的启动拒绝包装成主人业务决定 | 待修复 | Task `6e59d69d4a584bce80d8396de2825da7`；HostJob `f1f3064a-8531-4752-8c63-4a0f4655fd21` |
 | H-20260724-16 | 2026-07-24 | 主人现场验证 | 项目名称应允许直接使用“审查代码”等中文名称，不应要求主人理解或输入 ASCII 内部 ID | 待修复 | 8750 项目创建表单以 `PROJECT_ID` 正则拒绝中文；应分离主人可见名称与内部稳定 ID |
 | H-20260724-17 | 2026-07-24 | 主人现场验证 | 同一活动项目和同一工作区再次提交时不得重复写创建历史；内部动作不得伪装成主人聊天 | 待修复 | `check-code` 只有一个项目行，但在 01:09:42、01:10:15 写入两条 `create_project` 消息 |
+| H-20260724-18 | 2026-07-24 | 主人架构纠正 | “用 SSH 上传本地代码到指定 GitHub 分支”应优先成为 Simple/确定性 Git 发布 Task，而不是交给 Fullstack Provider 写代码 | 待修复 | 基线 §7、§18.3 要求简单确定性动作优先复用脚本或直接命令；外部写入仍按 §21 冻结精确授权范围 |
 
 ## 发现的问题
 
@@ -107,3 +108,4 @@
 | I-20260724-37 | 2026-07-24 | 首次真实 Cursor Task 的 Bridge start 未被接收，Bridge 后续明确返回 `host job not found`；客户端丢失 HTTP 400 正文并按不明结果重试两次 | 本可自动判定“未开始”的失败被错误升级为 `unsafe_unknown / NeedsDecision`；取消和普通决定都无法安全解除伪活动 HostJob | 隔离接入 clean-room Bridge；保留 HTTP 拒绝分类；实现 Cursor 新 Session bootstrap；为“明确未接收”增加自动失败与新 generation 递补；Git 远端写入按目标/分支冻结授权 | 待修复 | 8750 SQLite HostJob 仍为 `dispatching`；Bridge `/v1/jobs/status` 返回 HTTP 400 `host job not found`；监听 8765 的 PID 90968 是旧 `plow_whip_web.host_bridge` |
 | I-20260724-38 | 2026-07-24 | UI 把主人可见项目名称与文件/URL 使用的内部 `project_id` 合并成一个字段，并用 ASCII 正则限制输入 | 中文项目名称被拒绝，迫使主人把“审查代码”改写为 `check-code` | 增加主人可见项目名称；内部稳定 ID 由系统生成或维护；选择器、看板和管家显示名称，路径/API 继续使用安全 ID | 待修复 | `plowwhip/intake.py` 的 `PROJECT_ID` 与 `plowwhip/ui.py` 的 `pattern`；基线没有 ASCII 项目名称要求 |
 | I-20260724-39 | 2026-07-24 | 项目创建按钮提交期间不禁用且每次生成新 idempotency key；已存在且绑定未变化时后端仍写 `create_project`，管家又原样显示内部 action content | 一个项目产生多条无意义创建历史，主人误以为重复创建，审计消息污染正常会话 | 同一项目+同一路径按当前状态语义去重；提交期间锁定按钮并复用幂等键；返回 `created/restored/bound/unchanged` 明确结果；管家将内部动作转换为系统事件或隐藏 | 待修复 | SQLite 只有一条 `projects.id='check-code'`，但有两条不同幂等键的 `create_project` messages |
+| I-20260724-40 | 2026-07-24 | Intake 只识别固定 `write_text` 和 Provider probe，其余全部降级为 `provider_task`；高风险词没有“上传、push、GitHub”等远端写入语义 | 一个可确定执行和验证的 Git 发布动作被分配给 Fullstack/Cursor；同时通用 Provider prompt 禁止 commit/外部发送，Task 从分类时就不可满足 | 新增结构化 `git_publish` spec（工作区、SSH remote、branch、待发布 revision）；读预检和秘密扫描自动执行，精确外部授权冻结后由项目范围 SimpleWorker 脚本执行；以本地 commit SHA、`git ls-remote` 匹配和秘密扫描 PASS 作为 Evidence | 待修复 | 现场指令被分类为 `medium / one_worker_owns_scope / authorization_required=false`，Task `6e59d69d4a584bce80d8396de2825da7` 绑定 `fullstack / cursor_cli` |
