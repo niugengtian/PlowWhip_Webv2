@@ -14,6 +14,7 @@ from uuid import uuid4
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
     id TEXT PRIMARY KEY,
+    host_path TEXT,
     lease_token TEXT,
     lease_fence INTEGER NOT NULL DEFAULT 0,
     lease_until REAL,
@@ -212,6 +213,7 @@ DEFAULT_SETTINGS = {
     "provider_order": {
         "planner": ["codex_cli", "cursor_cli", "deepseek", "kimi"],
         "fullstack": ["cursor_cli", "codex_cli", "deepseek", "kimi"],
+        "independent_checker": ["codex_cli", "cursor_cli", "deepseek", "kimi"],
         "simple": ["deepseek", "kimi", "codex_cli"],
         "provider_probe": ["codex_cli", "cursor_cli", "deepseek", "kimi"],
         "deterministic": ["local"],
@@ -241,6 +243,14 @@ DEFAULT_LIBRARY = {
         "roles/provider-probe.md",
         "# Provider probe\n\nRun only the declared bounded probe; never turn a zero Token probe into model execution.\n",
     ),
+    ("role", "fullstack"): (
+        "roles/fullstack.md",
+        "# Fullstack Worker\n\nOwn one bounded code Task inside its registered workspace and leave verifiable changes.\n",
+    ),
+    ("role", "independent_checker"): (
+        "roles/independent-checker.md",
+        "# Independent checker\n\nInspect the current workspace read-only and return an evidence-backed verdict.\n",
+    ),
     ("rule", "v1_hard_boundaries"): (
         "rules/v1-hard-boundaries.md",
         "# V1 hard boundaries\n\nNo paid Provider, Docker, production, old-data migration, destructive action or out-of-scope write.\n",
@@ -252,6 +262,10 @@ DEFAULT_LIBRARY = {
     ("worker_template", "provider_probe"): (
         "worker-templates/provider-probe.md",
         "# Provider probe\n\nUse the Host Bridge probe contract and record bounded result, Token facts and evidence.\n",
+    ),
+    ("worker_template", "code_change"): (
+        "worker-templates/code-change.md",
+        "# Code change\n\nUse the registered Host Bridge workspace; do not escape scope, commit, deploy or create external effects.\n",
     ),
 }
 
@@ -297,7 +311,7 @@ class Store:
                     (value_json, now, key, value_json),
                 )
             self._sync_default_library(connection, now)
-            connection.execute("PRAGMA user_version = 2")
+            connection.execute("PRAGMA user_version = 3")
             connection.commit()
         finally:
             connection.close()
@@ -309,6 +323,8 @@ class Store:
         }
         if "archived_at" not in columns:
             connection.execute("ALTER TABLE projects ADD COLUMN archived_at REAL")
+        if "host_path" not in columns:
+            connection.execute("ALTER TABLE projects ADD COLUMN host_path TEXT")
 
     @staticmethod
     def _ensure_task_columns(connection: sqlite3.Connection) -> None:

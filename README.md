@@ -28,6 +28,12 @@ The smallest deterministic instruction is:
 写入 result.txt: 闭环完成
 ```
 
+For a code Task, create or bind the project to an absolute host workspace path
+on the Projects page, then submit an ordinary natural-language development
+instruction. The control plane creates separate Fullstack and independent
+Checker TaskSessions, records ModelCallLedger usage, compares Host Bridge
+workspace snapshots, and requires the read-only Checker verdict before Done.
+
 It follows this path:
 
 ```text
@@ -53,7 +59,8 @@ Evidence, automatic repair, versioned DAGs, cancellation and generation
 rotation, TaskSession ownership, bounded handoffs, token normalization,
 Token dashboards, recoverable project archive, restart recovery, read-only
 Monitor, Provider Probe Tasks, settings/library snapshots, UI/API safety, and
-fail-closed external Providers.
+fail-closed external Providers. The code-Task regression uses a fake Host
+Bridge and therefore spends no external Provider tokens.
 
 ## Deliberate V1 boundary
 

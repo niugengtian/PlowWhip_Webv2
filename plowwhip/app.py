@@ -132,7 +132,10 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/actions":
                 if body.get("kind") == "create_project":
                     identifier = create_project(
-                        store, body["project_id"], body["idempotency_key"]
+                        store,
+                        body["project_id"],
+                        body["idempotency_key"],
+                        body.get("host_path"),
                     )
                 elif body.get("kind") == "archive_project":
                     identifier = archive_project(

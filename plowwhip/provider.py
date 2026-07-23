@@ -40,6 +40,7 @@ PROVIDERS = {
 }
 PROBE_MARKER = "PLOWWHIP_PROBE_OK"
 PROBE_TOKEN_CAP = 4096
+CHECKER_PASS_MARKER = "PLOWWHIP_CHECKER_PASS"
 
 
 PROVIDER_ORDERS = {
@@ -209,6 +210,82 @@ def run_provider_probe(provider_key: str, mode: str) -> dict[str, object]:
     )
 
 
+def workspace_snapshot(project_path: str) -> dict[str, object]:
+    base_url, token = _bridge_configuration()
+    return _bridge_post(
+        base_url,
+        token,
+        "/v1/evidence/snapshot",
+        {"project_path": project_path, "paths": []},
+        30,
+    )
+
+
+def run_provider_task(
+    provider_key: str,
+    project_path: str,
+    prompt: str,
+    *,
+    session_id: str | None = None,
+    access: str = "write",
+    timeout_seconds: int = 600,
+) -> dict[str, object]:
+    provider = PROVIDERS.get(provider_key)
+    if not provider:
+        raise ValueError("unknown Provider")
+    if access not in {"read", "write"}:
+        raise ValueError("Provider access must be read or write")
+    if access == "read" and provider["adapter"] != "codex":
+        raise ValueError("read-only checking requires Codex CLI")
+    base_url, token = _bridge_configuration()
+    response = _bridge_post(
+        base_url,
+        token,
+        "/v1/execute",
+        {
+            "adapter": provider["adapter"],
+            "executable": provider["executable"],
+            "project_path": project_path,
+            "prompt": prompt,
+            "session_id": session_id,
+            "timeout_seconds": min(max(int(timeout_seconds), 10), 86_400),
+            "access": access,
+            "context_policy": {"max_turns": 24, "tool_no_progress_limit": 6},
+        },
+        min(max(int(timeout_seconds) + 20, 30), 86_420),
+        max_bytes=1_048_576,
+    )
+    input_tokens = max(0, int(response.get("input_tokens") or 0))
+    cached_tokens = min(input_tokens, max(0, int(response.get("cached_input_tokens") or 0)))
+    output_tokens = max(0, int(response.get("output_tokens") or 0))
+    return {
+        "provider_key": provider_key,
+        "model": str(response.get("model") or provider_key),
+        "returncode": int(response.get("returncode") or 0),
+        "failure_class": response.get("failure_class"),
+        "stdout": str(response.get("stdout") or ""),
+        "stderr": str(response.get("stderr") or ""),
+        "duration_ms": max(0, int(response.get("duration_ms") or 0)),
+        "input_tokens": input_tokens,
+        "cached_input_tokens": cached_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+        "session_id": str(response.get("session_id") or "") or session_id,
+    }
+
+
+def _bridge_configuration() -> tuple[str, str]:
+    token = os.environ.get("PLOW_WHIP_BRIDGE_TOKEN")
+    if not token:
+        raise RuntimeError("Host Bridge token is not configured")
+    return (
+        os.environ.get(
+            "PLOW_WHIP_BRIDGE_URL", "http://host.docker.internal:8765"
+        ),
+        token,
+    )
+
+
 def _probe_result(
     provider_key: str,
     mode: str,
@@ -251,6 +328,8 @@ def _bridge_post(
     path: str,
     payload: dict[str, object],
     timeout: int,
+    *,
+    max_bytes: int = 65_536,
 ) -> dict[str, object]:
     parsed = urlsplit(base_url)
     if (
@@ -271,13 +350,13 @@ def _bridge_post(
     )
     try:
         with urlopen(request, timeout=timeout) as response:
-            body = response.read(65_537)
+            body = response.read(max_bytes + 1)
     except HTTPError as error:
-        raise RuntimeError(f"Host Bridge rejected probe: HTTP {error.code}") from error
+        raise RuntimeError(f"Host Bridge rejected request: HTTP {error.code}") from error
     except (URLError, TimeoutError, OSError) as error:
         raise RuntimeError(f"Host Bridge is unreachable: {type(error).__name__}") from error
-    if len(body) > 65_536:
-        raise RuntimeError("Host Bridge probe response is too large")
+    if len(body) > max_bytes:
+        raise RuntimeError("Host Bridge response is too large")
     try:
         value = json.loads(body)
     except json.JSONDecodeError as error:

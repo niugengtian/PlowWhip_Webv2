@@ -9,7 +9,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from .intake import canonical_json
-from .provider import record_model_call, run_provider_probe
+from .provider import record_model_call, run_provider_probe, run_provider_task, workspace_snapshot
 from .store import Store
 
 
@@ -31,6 +31,7 @@ def create_task_sessions(
     executor_role: str = "deterministic",
     checker_role: str = "deterministic_checker",
     executor_provider: str = "local",
+    checker_provider: str = "local",
     settings_overrides: dict | None = None,
 ) -> None:
     for role_key in (executor_role, checker_role):
@@ -73,7 +74,7 @@ def create_task_sessions(
             (
                 uuid4().hex,
                 session_id,
-                executor_provider if role_key == executor_role else "local",
+                executor_provider if role_key == executor_role else checker_provider,
                 now,
             ),
         )
@@ -87,6 +88,7 @@ def ensure_task_sessions(
     executor_role: str = "deterministic",
     checker_role: str = "deterministic_checker",
     executor_provider: str = "local",
+    checker_provider: str = "local",
     settings_overrides: dict | None = None,
 ) -> None:
     count = connection.execute(
@@ -101,6 +103,7 @@ def ensure_task_sessions(
             executor_role,
             checker_role,
             executor_provider,
+            checker_provider,
             settings_overrides,
         )
     elif count != 2:
@@ -136,7 +139,11 @@ def _effective_settings(
 def _role_snapshot(
     connection: sqlite3.Connection, role_key: str, checker_independent: bool
 ) -> dict:
-    template_key = "provider_probe" if role_key == "provider_probe" else "deterministic_write"
+    template_key = {
+        "provider_probe": "provider_probe",
+        "fullstack": "code_change",
+        "independent_checker": "code_change",
+    }.get(role_key, "deterministic_write")
     keys = [role_key, "v1_hard_boundaries", template_key]
     rows = connection.execute(
         """
@@ -238,6 +245,8 @@ def execute_task(
     spec = json.loads(task["spec_json"])
     if spec["kind"] == "provider_probe":
         return _execute_provider_probe(store, connection, task, spec, purpose)
+    if spec["kind"] == "provider_task":
+        return _execute_provider_task(store, connection, task, spec, purpose)
     sequence = connection.execute(
         "SELECT COALESCE(MAX(sequence), 0) + 1 AS value FROM host_jobs WHERE task_id = ?",
         (task["id"],),
@@ -370,6 +379,245 @@ def execute_task(
             ("deterministic write failed; automatic path exhausted", ended_at, task["id"]),
         )
         return purpose
+
+
+def _execute_provider_task(
+    store: Store,
+    connection: sqlite3.Connection,
+    task: sqlite3.Row,
+    spec: dict,
+    purpose: str,
+) -> str:
+    started_at = time.time()
+    sequence = connection.execute(
+        "SELECT COALESCE(MAX(sequence), 0) + 1 AS value FROM host_jobs WHERE task_id = ?",
+        (task["id"],),
+    ).fetchone()["value"]
+    task_session_id, session_generation = current_session(
+        connection, task["id"], task["role_key"] or "fullstack"
+    )
+    generation = connection.execute(
+        """
+        SELECT external_session_id FROM session_generations
+        WHERE task_session_id = ? AND generation = ?
+        """,
+        (task_session_id, session_generation),
+    ).fetchone()
+    session = connection.execute(
+        "SELECT settings_json FROM task_sessions WHERE id = ?", (task_session_id,)
+    ).fetchone()
+    settings = json.loads(session["settings_json"]).get("values", {})
+    base = store.data_root / "projects" / task["project_id"] / "tasks" / task["id"]
+    output_path = (
+        base
+        / "artifacts"
+        / f"revision-{task['spec_revision']:06d}"
+        / f"execution-{sequence:06d}"
+        / "output"
+        / "provider-execution.json"
+    )
+    log_path = (
+        base
+        / "sessions"
+        / (task["role_key"] or "fullstack")
+        / f"generation-{session_generation:06d}"
+        / f"sequence-{sequence:06d}.log"
+    )
+    try:
+        before = workspace_snapshot(str(spec["project_path"]))
+        prompt = _provider_prompt(task, spec, purpose)
+        # ponytail: synchronous V1 path; use durable Bridge jobs when concurrent code Tasks are required.
+        result = run_provider_task(
+            str(spec["provider_key"]),
+            str(spec["project_path"]),
+            prompt,
+            session_id=generation["external_session_id"],
+            timeout_seconds=int(settings.get("max_runtime_seconds", 600)),
+        )
+        after = workspace_snapshot(str(spec["project_path"]))
+        before_git = before.get("git") if isinstance(before.get("git"), dict) else {}
+        after_git = after.get("git") if isinstance(after.get("git"), dict) else {}
+        workspace_changed = canonical_json(before_git) != canonical_json(after_git)
+        manifest = {
+            "provider_key": spec["provider_key"],
+            "project_path": spec["project_path"],
+            "returncode": result["returncode"],
+            "failure_class": result["failure_class"],
+            "duration_ms": result["duration_ms"],
+            "workspace_changed": workspace_changed,
+            "before": before_git,
+            "after": after_git,
+            "stdout_tail": _bounded_tail(str(result["stdout"])),
+            "stderr_tail": _bounded_tail(str(result["stderr"])),
+        }
+        body = canonical_json(manifest).encode()
+        log_body = (
+            f"provider={spec['provider_key']} returncode={result['returncode']} "
+            f"workspace_changed={str(workspace_changed).lower()}\n"
+            f"{manifest['stdout_tail']}\n{manifest['stderr_tail']}\n"
+        ).encode()
+        _write_atomic(output_path, body)
+        _write_atomic(log_path, log_body)
+        ended_at = time.time()
+        if result["session_id"]:
+            connection.execute(
+                """
+                UPDATE session_generations SET external_session_id = ?
+                WHERE task_session_id = ? AND generation = ?
+                """,
+                (result["session_id"], task_session_id, session_generation),
+            )
+        record_model_call(
+            connection,
+            task["id"],
+            task_session_id,
+            session_generation,
+            str(spec["provider_key"]),
+            "single",
+            int(result["input_tokens"]),
+            int(result["cached_input_tokens"]),
+            int(result["output_tokens"]),
+            str(result["model"]),
+        )
+        succeeded = int(result["returncode"]) == 0
+        connection.execute(
+            """
+            INSERT INTO host_jobs(
+                id, task_id, task_session_id, session_generation,
+                spec_revision, sequence, purpose, status,
+                started_at, ended_at, returncode, output_ref, failure_code
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                uuid4().hex,
+                task["id"],
+                task_session_id,
+                session_generation,
+                task["spec_revision"],
+                sequence,
+                purpose,
+                "succeeded" if succeeded else "failed",
+                started_at,
+                ended_at,
+                int(result["returncode"]),
+                store.relative_data_path(log_path),
+                None if succeeded else "provider",
+            ),
+        )
+        for kind, path, data in (("output", output_path, body), ("log", log_path, log_body)):
+            connection.execute(
+                """
+                INSERT INTO artifacts(
+                    id, project_id, task_id, kind, path, sha256, bytes,
+                    acceptance_id, revision, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    uuid4().hex,
+                    task["project_id"],
+                    task["id"],
+                    kind,
+                    store.relative_data_path(path),
+                    hashlib.sha256(data).hexdigest(),
+                    len(data),
+                    "independent_checker_pass" if kind == "output" else None,
+                    task["spec_revision"],
+                    ended_at,
+                ),
+            )
+        connection.execute(
+            """
+            UPDATE tasks SET public_status = ?, phase = ?, next_action_at = ?,
+                wait_reason = ?, fault_code = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                "in_progress" if succeeded else "needs_decision",
+                "verify" if succeeded else "execute",
+                ended_at if succeeded else None,
+                None if succeeded else "Provider execution did not exit successfully",
+                None if succeeded else "provider",
+                ended_at,
+                task["id"],
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                task["project_id"],
+                task["id"],
+                "repaired" if purpose == "repair" else "executed",
+                canonical_json(
+                    {
+                        "host_job_sequence": sequence,
+                        "provider_key": spec["provider_key"],
+                        "returncode": result["returncode"],
+                        "workspace_changed": workspace_changed,
+                        "normalized_total": result["total_tokens"],
+                    }
+                ),
+                ended_at,
+            ),
+        )
+        return purpose
+    except (OSError, RuntimeError, ValueError) as error:
+        ended_at = time.time()
+        log_body = f"Provider execution failed: {type(error).__name__}\n".encode()
+        _write_atomic(log_path, log_body)
+        connection.execute(
+            """
+            INSERT INTO host_jobs(
+                id, task_id, task_session_id, session_generation,
+                spec_revision, sequence, purpose, status,
+                started_at, ended_at, returncode, output_ref, failure_code
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'failed', ?, ?, 1, ?, 'provider')
+            """,
+            (
+                uuid4().hex,
+                task["id"],
+                task_session_id,
+                session_generation,
+                task["spec_revision"],
+                sequence,
+                purpose,
+                started_at,
+                ended_at,
+                store.relative_data_path(log_path),
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE tasks SET public_status = 'needs_decision', phase = 'execute',
+                wait_reason = ?, fault_code = 'provider', next_action_at = NULL,
+                updated_at = ? WHERE id = ?
+            """,
+            ("Host Bridge Provider execution is unavailable", ended_at, task["id"]),
+        )
+        return purpose
+
+
+def _provider_prompt(task: sqlite3.Row, spec: dict, purpose: str) -> str:
+    repair = (
+        f"\nRepair context: {task['wait_reason']}"
+        if purpose == "repair" and task["wait_reason"]
+        else ""
+    )
+    return (
+        f"Complete this bounded code Task in the current workspace:\n{spec['instruction']}\n"
+        f"Task ID: {task['id']} · spec revision {task['spec_revision']}.{repair}\n"
+        "Stay inside the workspace. Make only recoverable changes. Do not commit, deploy, "
+        "delete permanently, expose secrets, send external messages, make purchases, or "
+        "change permissions. Run the smallest relevant checks and leave the workspace ready "
+        "for an independent read-only checker."
+    )
+
+
+def _bounded_tail(value: str, byte_cap: int = 16_384) -> str:
+    body = value.encode()
+    return body[-byte_cap:].decode(errors="replace")
 
 
 def _execute_provider_probe(

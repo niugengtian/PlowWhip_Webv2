@@ -158,23 +158,11 @@ def _create_task(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
     plan_id = uuid4().hex
     task_id = uuid4().hex
     spec, acceptance = normalize_instruction(message["content"])
-    supported = spec["kind"] in {"write_text", "provider_probe"}
-    role_key = "provider_probe" if spec["kind"] == "provider_probe" else "deterministic"
-    provider_key = (
-        str(spec["provider_key"]) if spec["kind"] == "provider_probe" else "local"
+    supported, spec, role_key, provider_key, checker_role, checker_provider, reason = (
+        _runtime_contract(connection, message["project_id"], spec)
     )
     public_status = "pending" if supported else "needs_decision"
     phase = "execute" if supported else "intake"
-    reason = (
-        None
-        if supported
-        else str(
-            spec.get(
-                "wait_reason",
-                "supported instruction is: write <relative-path>: <content>",
-            )
-        )
-    )
     fault = None if supported else (
         "credential" if spec["kind"] == "authorization_required" else "scope"
     )
@@ -192,7 +180,15 @@ def _create_task(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
             message["project_id"],
             message["id"],
             message["content"],
-            canonical_json({"writes": "task artifact directory only"}),
+            canonical_json(
+                {
+                    "writes": (
+                        spec.get("project_path")
+                        if spec["kind"] == "provider_task"
+                        else "task artifact directory only"
+                    )
+                }
+            ),
             canonical_json(acceptance),
             now,
         ),
@@ -216,7 +212,7 @@ def _create_task(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
             phase, wait_reason, fault_code, next_action_at, outcome, created_at, updated_at,
             plan_id, sprint, role_key, checker_role_key
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1,
-                  ?, 'deterministic_checker')
+                  ?, ?)
         """,
         (
             task_id,
@@ -234,6 +230,7 @@ def _create_task(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
             now,
             plan_id,
             role_key,
+            checker_role,
         ),
     )
     if supported:
@@ -243,7 +240,9 @@ def _create_task(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
             task_id,
             now,
             executor_role=role_key,
+            checker_role=checker_role,
             executor_provider=provider_key,
+            checker_provider=checker_provider,
             settings_overrides=(
                 {role_key: {"retry_count": 0}}
                 if spec.get("mode") == "minimal"
@@ -300,16 +299,25 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
         event, detail = "cancelled", {"message_id": message["id"]}
     elif kind == "rerun" and task["outcome"] == "cancelled":
         spec = json.loads(task["spec_json"])
-        supported = spec["kind"] in {"write_text", "provider_probe"}
+        (
+            supported,
+            spec,
+            role_key,
+            provider_key,
+            checker_role,
+            checker_provider,
+            _reason,
+        ) = _runtime_contract(connection, task["project_id"], spec)
         if supported:
             ensure_task_sessions(
                 connection,
                 task["project_id"],
                 task["id"],
                 now,
-                executor_role=task["role_key"] or "deterministic",
-                checker_role=task["checker_role_key"] or "deterministic_checker",
-                executor_provider=str(spec.get("provider_key", "local")),
+                executor_role=role_key,
+                checker_role=checker_role,
+                executor_provider=provider_key,
+                checker_provider=checker_provider,
             )
             rotate_task_sessions(connection, task["id"], now)
         connection.execute(
@@ -329,19 +337,26 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
         event, detail = "rerun", {"message_id": message["id"]}
     elif kind == "provide_decision" and task["public_status"] == "needs_decision":
         spec, acceptance = normalize_instruction(action["instruction"])
-        if spec["kind"] in {"write_text", "provider_probe"}:
+        (
+            supported,
+            spec,
+            role_key,
+            provider_key,
+            checker_role,
+            checker_provider,
+            reason,
+        ) = _runtime_contract(connection, task["project_id"], spec)
+        if supported:
             revision = task["spec_revision"] + 1
-            role_key = (
-                "provider_probe" if spec["kind"] == "provider_probe" else "deterministic"
-            )
             ensure_task_sessions(
                 connection,
                 task["project_id"],
                 task["id"],
                 now,
                 executor_role=role_key,
-                checker_role=task["checker_role_key"] or "deterministic_checker",
-                executor_provider=str(spec.get("provider_key", "local")),
+                checker_role=checker_role,
+                executor_provider=provider_key,
+                checker_provider=checker_provider,
                 settings_overrides=(
                     {role_key: {"retry_count": 0}}
                     if spec.get("mode") == "minimal"
@@ -354,6 +369,7 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
                     public_status = 'pending', phase = 'execute', wait_reason = NULL,
                     fault_code = NULL, retry_count = 0, next_retry_at = NULL,
                     next_action_at = ?, outcome = NULL, role_key = ?, updated_at = ?
+                    , checker_role_key = ?
                 WHERE id = ?
                 """,
                 (
@@ -363,6 +379,7 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
                     now,
                     role_key,
                     now,
+                    checker_role,
                     task["id"],
                 ),
             )
@@ -375,12 +392,7 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
                 WHERE id = ?
                 """,
                 (
-                    str(
-                        spec.get(
-                            "wait_reason",
-                            "decision must use a supported deterministic instruction",
-                        )
-                    ),
+                    reason,
                     now,
                     task["id"],
                 ),
@@ -556,3 +568,71 @@ def _stop_unknown_phase(connection: sqlite3.Connection, task: sqlite3.Row) -> st
         (f"unknown lifecycle phase: {task['phase']}", now, task["id"]),
     )
     return "needs_decision"
+
+
+def _runtime_contract(
+    connection: sqlite3.Connection,
+    project_id: str,
+    spec: dict,
+) -> tuple[bool, dict, str, str, str, str, str | None]:
+    kind = spec["kind"]
+    if kind == "write_text":
+        return (
+            True,
+            spec,
+            "deterministic",
+            "local",
+            "deterministic_checker",
+            "local",
+            None,
+        )
+    if kind == "provider_probe":
+        provider = str(spec["provider_key"])
+        return (
+            True,
+            spec,
+            "provider_probe",
+            provider,
+            "deterministic_checker",
+            "local",
+            None,
+        )
+    if kind == "provider_task":
+        project = connection.execute(
+            "SELECT host_path FROM projects WHERE id = ?", (project_id,)
+        ).fetchone()
+        project_path = str(spec.get("project_path") or (project["host_path"] if project else "") or "")
+        if project_path:
+            provider = str(spec.get("provider_key") or "codex_cli")
+            return (
+                True,
+                {**spec, "project_path": project_path},
+                "fullstack",
+                provider,
+                "independent_checker",
+                provider,
+                None,
+            )
+        return (
+            False,
+            spec,
+            "fullstack",
+            "codex_cli",
+            "independent_checker",
+            "codex_cli",
+            "project workspace is not bound; set an absolute Host Bridge path",
+        )
+    return (
+        False,
+        spec,
+        "deterministic",
+        "local",
+        "deterministic_checker",
+        "local",
+        str(
+            spec.get(
+                "wait_reason",
+                "instruction is outside the current safe execution boundary",
+            )
+        ),
+    )

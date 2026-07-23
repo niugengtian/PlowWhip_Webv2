@@ -59,24 +59,68 @@ def submit_message(
     return str(row["id"])
 
 
-def create_project(store: Store, project_id: str, idempotency_key: str) -> str:
+def create_project(
+    store: Store,
+    project_id: str,
+    idempotency_key: str,
+    host_path: str | None = None,
+) -> str:
     _validate_project_action(project_id, idempotency_key)
+    workspace = _normalize_host_path(host_path)
     now = time.time()
     action_id = uuid4().hex
     with store.transaction() as connection:
+        duplicate = connection.execute(
+            "SELECT id FROM messages WHERE project_id = ? AND idempotency_key = ?",
+            (project_id, idempotency_key),
+        ).fetchone()
+        if duplicate:
+            return str(duplicate["id"])
         existing = connection.execute(
-            "SELECT id, archived_at FROM projects WHERE id = ?", (project_id,)
+            "SELECT id, host_path, archived_at FROM projects WHERE id = ?", (project_id,)
         ).fetchone()
         if existing and existing["archived_at"] is None:
+            if workspace and workspace != existing["host_path"]:
+                if connection.execute(
+                    "SELECT 1 FROM tasks WHERE project_id = ? AND outcome IS NULL LIMIT 1",
+                    (project_id,),
+                ).fetchone():
+                    raise ValueError("active project workspace cannot be changed")
+                connection.execute(
+                    "UPDATE projects SET host_path = ? WHERE id = ?",
+                    (workspace, project_id),
+                )
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO messages(
+                        id, project_id, role, content, action_json,
+                        idempotency_key, created_at, processed_at
+                    ) VALUES (?, ?, 'owner', 'bind_project_workspace', ?, ?, ?, ?)
+                    """,
+                    (
+                        action_id,
+                        project_id,
+                        canonical_json({"kind": "bind_project_workspace"}),
+                        idempotency_key,
+                        now,
+                        now,
+                    ),
+                )
             return project_id
         kind = "restore_project" if existing else "create_project"
         if existing:
             connection.execute(
-                "UPDATE projects SET archived_at = NULL WHERE id = ?", (project_id,)
+                """
+                UPDATE projects
+                SET archived_at = NULL, host_path = COALESCE(?, host_path)
+                WHERE id = ?
+                """,
+                (workspace, project_id),
             )
         else:
             connection.execute(
-                "INSERT INTO projects(id, created_at) VALUES (?, ?)", (project_id, now)
+                "INSERT INTO projects(id, host_path, created_at) VALUES (?, ?, ?)",
+                (project_id, workspace, now),
             )
         connection.execute(
             """
@@ -146,6 +190,20 @@ def _validate_project_action(project_id: str, idempotency_key: str) -> None:
         raise ValueError("project_id must be 1-64 safe identifier characters")
     if not idempotency_key or len(idempotency_key) > 128:
         raise ValueError("idempotency_key must contain 1-128 characters")
+
+
+def _normalize_host_path(value: str | None) -> str | None:
+    if value is not None and not isinstance(value, str):
+        raise ValueError("host_path must be a string")
+    if value is None or not value.strip():
+        return None
+    candidate = value.strip()
+    if "\0" in candidate or len(candidate.encode()) > 4096:
+        raise ValueError("host_path must contain at most 4096 safe UTF-8 bytes")
+    path = PurePosixPath(candidate)
+    if not path.is_absolute() or any(part in ("", ".", "..") for part in path.parts[1:]):
+        raise ValueError("host_path must be an absolute path without traversal")
+    return path.as_posix()
 
 
 def submit_action(
@@ -259,8 +317,12 @@ def normalize_instruction(content: str) -> tuple[dict[str, object], list[dict[st
     match = WRITE_INSTRUCTION.fullmatch(content.strip())
     if not match:
         return (
-            {"kind": "unsupported", "instruction": content},
-            [],
+            {
+                "kind": "provider_task",
+                "provider_key": "codex_cli",
+                "instruction": content,
+            },
+            [{"id": "independent_checker_pass", "kind": "checker_verdict"}],
         )
 
     target = PurePosixPath(match.group(1))

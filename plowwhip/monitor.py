@@ -18,6 +18,9 @@ def snapshot(db_path: str | Path, data_root: str | Path, project_id: str) -> dic
     store = Store(db_path, data_root)
     connection = store.connect_readonly()
     try:
+        project = connection.execute(
+            "SELECT host_path FROM projects WHERE id = ?", (project_id,)
+        ).fetchone()
         tasks = _task_summaries(connection, project_id)
         goals = _goal_summaries(connection, project_id)
         task = connection.execute(
@@ -36,6 +39,7 @@ def snapshot(db_path: str | Path, data_root: str | Path, project_id: str) -> dic
         if not task:
             return {
                 "project_id": project_id,
+                "host_path": project["host_path"] if project else None,
                 "task": None,
                 "events": [],
                 "artifacts": [],
@@ -44,6 +48,7 @@ def snapshot(db_path: str | Path, data_root: str | Path, project_id: str) -> dic
                 "goals": goals,
             }
         view = _task_view(connection, store, task)
+        view["host_path"] = project["host_path"] if project else None
         view["tasks"] = tasks
         view["goals"] = goals
         return view
@@ -57,7 +62,7 @@ def projects_snapshot(db_path: str | Path, data_root: str | Path) -> dict:
     try:
         rows = connection.execute(
             """
-            SELECT p.id AS project_id, p.created_at,
+            SELECT p.id AS project_id, p.host_path, p.created_at,
                    t.id AS task_id, t.public_status, t.phase,
                    t.spec_revision, t.outcome, t.updated_at
             FROM projects p
@@ -218,7 +223,7 @@ def monitor_snapshot(db_path: str | Path, data_root: str | Path) -> dict:
             statuses[row["public_status"]] = row["count"]
         projects = connection.execute(
             """
-            SELECT project.id AS project_id, project.archived_at,
+            SELECT project.id AS project_id, project.host_path, project.archived_at,
                    task.id AS task_id, task.public_status,
                    task.phase, task.updated_at
             FROM projects project
@@ -391,6 +396,9 @@ def _task_view(connection, store: Store, task) -> dict:
     goal = connection.execute(
         "SELECT objective FROM goals WHERE id = ?", (task["goal_id"],)
     ).fetchone()
+    project = connection.execute(
+        "SELECT host_path FROM projects WHERE id = ?", (task["project_id"],)
+    ).fetchone()
     events = connection.execute(
         """
         SELECT kind, detail_json, created_at FROM task_events
@@ -469,6 +477,7 @@ def _task_view(connection, store: Store, task) -> dict:
     )
     return {
         "project_id": task["project_id"],
+        "host_path": project["host_path"] if project else None,
         "objective": goal["objective"] if goal else None,
         "task": dict(task),
         "events": [dict(event) for event in events],

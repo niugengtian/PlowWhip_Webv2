@@ -30,7 +30,12 @@ from plowwhip.monitor import (
     token_snapshot,
 )
 from plowwhip.planner import normalize_plan
-from plowwhip.provider import provider_adapter, provider_facts, record_model_call
+from plowwhip.provider import (
+    CHECKER_PASS_MARKER,
+    provider_adapter,
+    provider_facts,
+    record_model_call,
+)
 from plowwhip.store import Store
 
 
@@ -602,7 +607,7 @@ class VerticalSliceTest(unittest.TestCase):
         self.assertTrue(state["read_only"])
         self.assertEqual(state["database"]["journal_mode"], "wal")
         self.assertEqual(state["database"]["quick_check"], ["ok"])
-        self.assertEqual(state["database"]["schema_version"], 2)
+        self.assertEqual(state["database"]["schema_version"], 3)
 
         archive_project(
             self.store, "archive-me", "archive-me", "archive-confirmed"
@@ -634,7 +639,7 @@ class VerticalSliceTest(unittest.TestCase):
     def test_settings_and_library_are_indexed_and_read_only(self):
         state = settings_library_snapshot(self.db, self.data)
         self.assertEqual(len(state["settings"]), 9)
-        self.assertEqual(len(state["library"]), 6)
+        self.assertEqual(len(state["library"]), 9)
         self.assertEqual(
             {item["kind"] for item in state["library"]},
             {"role", "rule", "worker_template"},
@@ -752,6 +757,130 @@ class VerticalSliceTest(unittest.TestCase):
         self.assertEqual([item[0] for item in requests], ["/v1/probe", "/v1/execute"])
         self.assertTrue(all(item[1] == "Bearer test-token" for item in requests))
 
+    def test_general_code_task_uses_registered_workspace_and_independent_checker(self):
+        requests = []
+        snapshots = 0
+
+        class Bridge(BaseHTTPRequestHandler):
+            def do_POST(self):
+                nonlocal snapshots
+                length = int(self.headers["Content-Length"])
+                payload = json.loads(self.rfile.read(length))
+                requests.append((self.path, payload))
+                if self.path == "/v1/evidence/snapshot":
+                    body = {
+                        "project_path": payload["project_path"],
+                        "git": {
+                            "available": True,
+                            "head": "abc123",
+                            "status": "" if snapshots == 0 else " M plowwhip/app.py",
+                            "diff_stat": "" if snapshots == 0 else " 1 file changed",
+                        },
+                    }
+                    snapshots += 1
+                elif payload["access"] == "write":
+                    body = {
+                        "returncode": 0,
+                        "stdout": "implemented and tests passed",
+                        "stderr": "",
+                        "duration_ms": 12,
+                        "input_tokens": 20,
+                        "cached_input_tokens": 5,
+                        "output_tokens": 3,
+                        "model": "codex-test",
+                        "session_id": "executor-session",
+                    }
+                else:
+                    body = {
+                        "returncode": 0,
+                        "stdout": f"reviewed\n{CHECKER_PASS_MARKER}",
+                        "stderr": "",
+                        "duration_ms": 8,
+                        "input_tokens": 10,
+                        "cached_input_tokens": 4,
+                        "output_tokens": 1,
+                        "model": "codex-test",
+                        "session_id": "checker-session",
+                    }
+                data = json.dumps(body).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *_args):
+                return
+
+        bridge = ThreadingHTTPServer(("127.0.0.1", 0), Bridge)
+        thread = threading.Thread(target=bridge.serve_forever, daemon=True)
+        thread.start()
+        try:
+            create_project(
+                self.store,
+                "code-task",
+                "code-project",
+                str(self.root),
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "PLOW_WHIP_BRIDGE_URL": f"http://127.0.0.1:{bridge.server_port}",
+                    "PLOW_WHIP_BRIDGE_TOKEN": "test-token",
+                },
+            ):
+                submit_message(
+                    self.store,
+                    "code-task",
+                    "给项目页增加一个可访问的刷新按钮并运行测试",
+                    "code-message",
+                )
+                self.assertEqual(
+                    [item["action"] for item in run_until_idle(self.store)],
+                    ["intake", "execute", "verify"],
+                )
+        finally:
+            bridge.shutdown()
+            bridge.server_close()
+            thread.join()
+
+        view = snapshot(self.db, self.data, "code-task")
+        self.assertEqual(view["task"]["public_status"], "done")
+        self.assertEqual(view["task"]["outcome"], "done")
+        self.assertEqual(view["host_path"], str(self.root))
+        self.assertEqual(
+            [(item["role_key"], item["provider_key"], item["external_session_id"]) for item in view["sessions"]],
+            [
+                ("fullstack", "codex_cli", "executor-session"),
+                ("independent_checker", "codex_cli", "checker-session"),
+            ],
+        )
+        self.assertEqual(
+            [item["purpose"] for item in reversed(view["host_jobs"])],
+            ["execute", "check"],
+        )
+        self.assertEqual(sum(item["normalized_total"] for item in view["model_usage"]), 34)
+        evidence = json.loads(
+            next(
+                Path(item["path"]).read_text()
+                for item in view["artifacts"]
+                if item["kind"] == "evidence"
+            )
+        )
+        self.assertTrue(evidence["workspace_changed"])
+        self.assertTrue(evidence["passed"])
+        self.assertEqual(
+            [item[0] for item in requests],
+            [
+                "/v1/evidence/snapshot",
+                "/v1/execute",
+                "/v1/evidence/snapshot",
+                "/v1/execute",
+            ],
+        )
+        self.assertEqual(requests[1][1]["access"], "write")
+        self.assertEqual(requests[3][1]["access"], "read")
+
     def _row_counts(self):
         connection = sqlite3.connect(str(self.db))
         try:
@@ -824,7 +953,7 @@ class WebApiTest(unittest.TestCase):
             self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
         with urlopen(self.base + "/api/settings-library", timeout=2) as response:
             settings_library = json.load(response)
-        self.assertEqual(len(settings_library["library"]), 6)
+        self.assertEqual(len(settings_library["library"]), 9)
 
         status, _ = self._post(
             "/api/actions",
