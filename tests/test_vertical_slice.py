@@ -13,6 +13,7 @@ from plowwhip.cronner import run as run_cronner, run_until_idle, tick
 from plowwhip.intake import submit_action, submit_message
 from plowwhip.lifecycle import LeaseLost, advance_project
 from plowwhip.monitor import snapshot
+from plowwhip.planner import normalize_plan
 from plowwhip.store import Store
 
 
@@ -183,6 +184,78 @@ class VerticalSliceTest(unittest.TestCase):
                 "settings",
             },
         )
+
+    def test_versioned_plan_runs_serial_dag(self):
+        submit_message(self.store, "plan", "build two files", "plan-1")
+        run_until_idle(self.store)
+        placeholder = snapshot(self.db, self.data, "plan")["task"]
+        plan = {
+            "summary": "two deterministic steps",
+            "alternatives": [
+                {
+                    "name": "serial",
+                    "scope": "two files",
+                    "cost": "low",
+                    "risk": "low",
+                    "reversible": True,
+                    "acceptance": "two hashes",
+                },
+                {
+                    "name": "manual",
+                    "scope": "two files",
+                    "cost": "high",
+                    "risk": "low",
+                    "reversible": True,
+                    "acceptance": "manual review",
+                },
+            ],
+            "selected": 0,
+            "tasks": [
+                {"key": "first", "instruction": "write first.txt: first"},
+                {
+                    "key": "second",
+                    "instruction": "write second.txt: second",
+                    "depends_on": ["first"],
+                    "sprint": 2,
+                },
+            ],
+        }
+        submit_action(
+            self.store,
+            "plan",
+            placeholder["id"],
+            "provide_plan",
+            "",
+            "plan-2",
+            plan,
+        )
+        self.assertEqual(
+            [item["action"] for item in run_until_idle(self.store)],
+            ["provide_plan", "execute", "verify", "ready", "execute", "verify"],
+        )
+        connection = self.store.connect()
+        try:
+            tasks = connection.execute(
+                "SELECT id, outcome, sprint FROM tasks WHERE project_id = 'plan' ORDER BY rowid"
+            ).fetchall()
+            selected = connection.execute(
+                "SELECT revision FROM plans WHERE selected = 1"
+            ).fetchone()["revision"]
+            dependencies = connection.execute(
+                "SELECT COUNT(*) AS count FROM task_dependencies"
+            ).fetchone()["count"]
+        finally:
+            connection.close()
+        self.assertEqual(tasks[0]["id"], placeholder["id"])
+        self.assertEqual([(row["outcome"], row["sprint"]) for row in tasks], [("done", 1), ("done", 2)])
+        self.assertEqual((selected, dependencies), (2, 1))
+
+        cyclic = {**plan, "tasks": [
+            {"key": "a", "instruction": "write a.txt: a", "depends_on": ["b"]},
+            {"key": "b", "instruction": "write b.txt: b", "depends_on": ["a"]},
+        ]}
+        with self.assertRaisesRegex(ValueError, "cycle"):
+            normalize_plan(cyclic)
 
     def _row_counts(self):
         connection = sqlite3.connect(str(self.db))

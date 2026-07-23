@@ -55,21 +55,26 @@ def submit_action(
     kind: str,
     instruction: str,
     idempotency_key: str,
+    plan: dict | None = None,
 ) -> str:
     if not PROJECT_ID.fullmatch(project_id) or not TASK_ID.fullmatch(task_id):
         raise ValueError("invalid project_id or task_id")
-    if kind not in {"provide_decision", "cancel", "rerun"}:
-        raise ValueError("supported actions: provide_decision, cancel, rerun")
+    if kind not in {"provide_decision", "provide_plan", "cancel", "rerun"}:
+        raise ValueError("supported actions: provide_decision, provide_plan, cancel, rerun")
     if kind == "provide_decision" and not instruction:
         raise ValueError("provide_decision requires instruction")
     if len(instruction.encode()) > 65_536:
         raise ValueError("instruction must contain at most 65536 UTF-8 bytes")
+    if kind == "provide_plan" and not isinstance(plan, dict):
+        raise ValueError("provide_plan requires plan")
     if not idempotency_key or len(idempotency_key) > 128:
         raise ValueError("idempotency_key must contain 1-128 characters")
 
     now = time.time()
     message_id = uuid4().hex
     action = {"kind": kind, "task_id": task_id, "instruction": instruction}
+    if plan is not None:
+        action["plan"] = plan
     with store.transaction() as connection:
         existing = connection.execute(
             "SELECT id FROM messages WHERE project_id = ? AND idempotency_key = ?",
@@ -87,6 +92,10 @@ def submit_action(
             kind == "provide_decision"
             and task["public_status"] == "needs_decision"
             and task["outcome"] != "cancelled"
+        ) or (
+            kind == "provide_plan"
+            and task["public_status"] == "needs_decision"
+            and task["outcome"] is None
         ) or (kind == "cancel" and task["outcome"] is None) or (
             kind == "rerun" and task["outcome"] == "cancelled"
         )

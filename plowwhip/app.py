@@ -72,6 +72,7 @@ class Handler(BaseHTTPRequestHandler):
                     body["kind"],
                     body.get("instruction", ""),
                     body["idempotency_key"],
+                    body.get("plan"),
                 )
             else:
                 self._send(404, {"error": "not_found"})

@@ -30,6 +30,16 @@ def tick(store: Store, limit: int = 100) -> list[dict[str, str]]:
                       AND t.next_action_at <= ?
                 )
                 OR EXISTS (
+                    SELECT 1 FROM tasks queued
+                    WHERE queued.project_id = p.id AND queued.outcome IS NULL
+                      AND queued.phase = 'queued'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM task_dependencies edge
+                          JOIN tasks dependency ON dependency.id = edge.depends_on_task_id
+                          WHERE edge.task_id = queued.id AND dependency.outcome IS NOT 'done'
+                      )
+                )
+                OR EXISTS (
                     SELECT 1 FROM messages action
                     WHERE action.project_id = p.id
                       AND action.processed_at IS NULL

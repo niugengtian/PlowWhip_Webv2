@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from .execution import execute_task
 from .intake import canonical_json, normalize_instruction
+from .planner import normalize_plan
 from .store import Store
 from .verification import verify_task
 
@@ -66,6 +67,35 @@ def advance_project(store: Store, project_id: str, lease_token: str, fence: int)
         ).fetchone()
         if blocking:
             return "blocked"
+
+        ready = connection.execute(
+            """
+            SELECT queued.* FROM tasks queued
+            WHERE queued.project_id = ? AND queued.outcome IS NULL
+              AND queued.phase = 'queued'
+              AND NOT EXISTS (
+                  SELECT 1 FROM task_dependencies edge
+                  JOIN tasks dependency ON dependency.id = edge.depends_on_task_id
+                  WHERE edge.task_id = queued.id AND dependency.outcome IS NOT 'done'
+              )
+            ORDER BY queued.created_at, queued.rowid LIMIT 1
+            """,
+            (project_id,),
+        ).fetchone()
+        if ready:
+            now = time.time()
+            connection.execute(
+                "UPDATE tasks SET phase = 'execute', next_action_at = ?, updated_at = ? WHERE id = ?",
+                (now, now, ready["id"]),
+            )
+            connection.execute(
+                """
+                INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
+                VALUES (?, ?, 'task_ready', '{}', ?)
+                """,
+                (project_id, ready["id"], now),
+            )
+            return "ready"
 
         message = connection.execute(
             """
@@ -235,6 +265,19 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
             )
             event = "decision_rejected"
             detail = {"message_id": message["id"]}
+    elif kind == "provide_plan" and task["public_status"] == "needs_decision":
+        try:
+            plan = normalize_plan(action["plan"])
+        except ValueError as error:
+            connection.execute(
+                "UPDATE tasks SET wait_reason = ?, fault_code = 'scope', updated_at = ? WHERE id = ?",
+                (str(error), now, task["id"]),
+            )
+            event = "plan_rejected"
+            detail = {"message_id": message["id"], "error": str(error)}
+        else:
+            _install_plan(connection, task, message["id"], plan, now)
+            return kind
     else:
         event, detail = "action_rejected", {"message_id": message["id"], "kind": kind}
     connection.execute(
@@ -245,6 +288,107 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
         (message["project_id"], task["id"], event, canonical_json(detail), now),
     )
     return kind
+
+
+def _install_plan(
+    connection: sqlite3.Connection,
+    placeholder: sqlite3.Row,
+    message_id: str,
+    plan: dict,
+    now: float,
+) -> None:
+    revision = connection.execute(
+        "SELECT COALESCE(MAX(revision), 0) + 1 AS value FROM plans WHERE goal_id = ?",
+        (placeholder["goal_id"],),
+    ).fetchone()["value"]
+    plan_id = uuid4().hex
+    connection.execute("UPDATE plans SET selected = 0 WHERE goal_id = ?", (placeholder["goal_id"],))
+    connection.execute(
+        """
+        INSERT INTO plans(id, goal_id, revision, selected, summary_json, created_at)
+        VALUES (?, ?, ?, 1, ?, ?)
+        """,
+        (plan_id, placeholder["goal_id"], revision, canonical_json(plan), now),
+    )
+    connection.execute(
+        "UPDATE goals SET spec_revision = spec_revision + 1 WHERE id = ?",
+        (placeholder["goal_id"],),
+    )
+
+    task_ids = {item["key"]: uuid4().hex for item in plan["tasks"]}
+    first = plan["tasks"][0]
+    task_ids[first["key"]] = placeholder["id"]
+    connection.execute(
+        """
+        UPDATE tasks SET plan_id = ?, spec_revision = spec_revision + 1,
+            spec_json = ?, acceptance_json = ?, public_status = 'pending',
+            phase = 'execute', wait_reason = NULL, fault_code = NULL,
+            next_action_at = ?, outcome = NULL, sprint = ?, role_key = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (
+            plan_id,
+            canonical_json(first["spec"]),
+            canonical_json(first["acceptance"]),
+            now,
+            first["sprint"],
+            first["role_key"],
+            now,
+            placeholder["id"],
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
+        VALUES (?, ?, 'plan_applied', ?, ?)
+        """,
+        (
+            placeholder["project_id"],
+            placeholder["id"],
+            canonical_json({"message_id": message_id, "plan_revision": revision}),
+            now,
+        ),
+    )
+    for item in plan["tasks"][1:]:
+        task_id = task_ids[item["key"]]
+        connection.execute(
+            """
+            INSERT INTO tasks(
+                id, project_id, goal_id, spec_json, acceptance_json, public_status,
+                phase, next_action_at, created_at, updated_at, plan_id, sprint, role_key
+            ) VALUES (?, ?, ?, ?, ?, 'pending', 'queued', NULL, ?, ?, ?, ?, ?)
+            """,
+            (
+                task_id,
+                placeholder["project_id"],
+                placeholder["goal_id"],
+                canonical_json(item["spec"]),
+                canonical_json(item["acceptance"]),
+                now,
+                now,
+                plan_id,
+                item["sprint"],
+                item["role_key"],
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
+            VALUES (?, ?, 'task_created', ?, ?)
+            """,
+            (
+                placeholder["project_id"],
+                task_id,
+                canonical_json({"plan_revision": revision, "task_key": item["key"]}),
+                now,
+            ),
+        )
+    for item in plan["tasks"]:
+        for dependency in item["depends_on"]:
+            connection.execute(
+                "INSERT INTO task_dependencies(task_id, depends_on_task_id) VALUES (?, ?)",
+                (task_ids[item["key"]], task_ids[dependency]),
+            )
 
 
 def _stop_unknown_phase(connection: sqlite3.Connection, task: sqlite3.Row) -> str:
