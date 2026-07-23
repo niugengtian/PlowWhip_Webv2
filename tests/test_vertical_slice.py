@@ -606,6 +606,8 @@ class WebApiTest(unittest.TestCase):
     def test_non_loopback_bind_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "loopback"):
             make_server(self.store, "0.0.0.0", 0)
+        server = make_server(self.store, "0.0.0.0", 0, allow_non_loopback=True)
+        server.server_close()
 
     def _post(self, path, payload):
         request = Request(

@@ -48,6 +48,17 @@ and fail-closed external Providers.
 
 ## Deliberate V1 boundary
 
-This repository does not call paid Providers, run Docker, touch production,
+The application does not call paid Providers, control Docker, touch production,
 migrate old data, or copy the old repository. External Provider candidates are
 represented as unavailable facts; only the local deterministic adapter runs.
+
+## Local Docker check
+
+```bash
+docker build -t plowwhip-web:v1-local .
+docker run -d --name plowwhip-web-v1-8750 \
+  -p 127.0.0.1:8750:8742 plowwhip-web:v1-local
+```
+
+The explicit non-loopback bind exists only inside the container; Docker exposes
+it on the host loopback address above.

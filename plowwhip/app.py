@@ -158,12 +158,14 @@ class Handler(BaseHTTPRequestHandler):
             return False
 
 
-def make_server(store: Store, host: str, port: int) -> ThreadingHTTPServer:
+def make_server(
+    store: Store, host: str, port: int, allow_non_loopback: bool = False
+) -> ThreadingHTTPServer:
     try:
         loopback = host == "localhost" or ipaddress.ip_address(host).is_loopback
     except ValueError as error:
         raise ValueError("V1 Web/API may bind only to localhost or a loopback IP") from error
-    if not loopback:
+    if not loopback and not allow_non_loopback:
         raise ValueError("V1 Web/API may bind only to a loopback address")
     server = ThreadingHTTPServer((host, port), Handler)
     server.store = store  # type: ignore[attr-defined]
@@ -171,11 +173,17 @@ def make_server(store: Store, host: str, port: int) -> ThreadingHTTPServer:
     return server
 
 
-def serve(store: Store, host: str, port: int, interval_seconds: float) -> None:
+def serve(
+    store: Store,
+    host: str,
+    port: int,
+    interval_seconds: float,
+    allow_non_loopback: bool = False,
+) -> None:
     if interval_seconds <= 0:
         raise ValueError("cronner interval must be positive")
     store.initialize()
-    server = make_server(store, host, port)
+    server = make_server(store, host, port, allow_non_loopback)
     stop = threading.Event()
     cronner = threading.Thread(
         target=run_cronner, args=(store, stop, interval_seconds), daemon=True

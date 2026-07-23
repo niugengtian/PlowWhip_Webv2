@@ -18,6 +18,11 @@ def main() -> None:
     server.add_argument("--host", default="127.0.0.1")
     server.add_argument("--port", type=int, default=8742)
     server.add_argument("--cronner-interval", type=float, default=1.0)
+    server.add_argument(
+        "--allow-non-loopback",
+        action="store_true",
+        help="explicitly allow a container-facing bind",
+    )
 
     monitor = commands.add_parser("monitor", help="read current state and bounded output")
     monitor.add_argument("project_id")
@@ -32,6 +37,7 @@ def main() -> None:
         args.host,
         args.port,
         args.cronner_interval,
+        args.allow_non_loopback,
     )
 
 
