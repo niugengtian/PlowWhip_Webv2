@@ -9,6 +9,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from .intake import canonical_json
+from .provider import record_model_call, run_provider_probe
 from .store import Store
 
 
@@ -29,6 +30,7 @@ def create_task_sessions(
     now: float,
     executor_role: str = "deterministic",
     checker_role: str = "deterministic_checker",
+    executor_provider: str = "local",
     settings_overrides: dict | None = None,
 ) -> None:
     for role_key in (executor_role, checker_role):
@@ -66,9 +68,14 @@ def create_task_sessions(
             """
             INSERT INTO session_generations(
                 id, task_session_id, generation, provider_key, status, created_at
-            ) VALUES (?, ?, 1, 'local', 'active', ?)
+            ) VALUES (?, ?, 1, ?, 'active', ?)
             """,
-            (uuid4().hex, session_id, now),
+            (
+                uuid4().hex,
+                session_id,
+                executor_provider if role_key == executor_role else "local",
+                now,
+            ),
         )
 
 
@@ -79,6 +86,7 @@ def ensure_task_sessions(
     now: float,
     executor_role: str = "deterministic",
     checker_role: str = "deterministic_checker",
+    executor_provider: str = "local",
     settings_overrides: dict | None = None,
 ) -> None:
     count = connection.execute(
@@ -92,6 +100,7 @@ def ensure_task_sessions(
             now,
             executor_role,
             checker_role,
+            executor_provider,
             settings_overrides,
         )
     elif count != 2:
@@ -127,7 +136,8 @@ def _effective_settings(
 def _role_snapshot(
     connection: sqlite3.Connection, role_key: str, checker_independent: bool
 ) -> dict:
-    keys = [role_key, "v1_hard_boundaries", "deterministic_write"]
+    template_key = "provider_probe" if role_key == "provider_probe" else "deterministic_write"
+    keys = [role_key, "v1_hard_boundaries", template_key]
     rows = connection.execute(
         """
         SELECT kind, item_key, revision, path, sha256 FROM library_items
@@ -192,7 +202,7 @@ def rotate_task_sessions(connection: sqlite3.Connection, task_id: str, now: floa
     for session in sessions:
         previous = connection.execute(
             """
-            SELECT generation, handoff_ref FROM session_generations
+            SELECT generation, provider_key, handoff_ref FROM session_generations
             WHERE task_session_id = ? ORDER BY generation DESC LIMIT 1
             """,
             (session["id"],),
@@ -203,9 +213,16 @@ def rotate_task_sessions(connection: sqlite3.Connection, task_id: str, now: floa
             INSERT INTO session_generations(
                 id, task_session_id, generation, provider_key, status,
                 handoff_ref, created_at
-            ) VALUES (?, ?, ?, 'local', 'active', ?, ?)
+            ) VALUES (?, ?, ?, ?, 'active', ?, ?)
             """,
-            (uuid4().hex, session["id"], generation, previous["handoff_ref"], now),
+            (
+                uuid4().hex,
+                session["id"],
+                generation,
+                previous["provider_key"],
+                previous["handoff_ref"],
+                now,
+            ),
         )
 
 
@@ -219,6 +236,8 @@ def execute_task(
         raise ValueError("execution purpose must be execute or repair")
     started_at = time.time()
     spec = json.loads(task["spec_json"])
+    if spec["kind"] == "provider_probe":
+        return _execute_provider_probe(store, connection, task, spec, purpose)
     sequence = connection.execute(
         "SELECT COALESCE(MAX(sequence), 0) + 1 AS value FROM host_jobs WHERE task_id = ?",
         (task["id"],),
@@ -349,5 +368,171 @@ def execute_task(
                 outcome = NULL, updated_at = ? WHERE id = ?
             """,
             ("deterministic write failed; automatic path exhausted", ended_at, task["id"]),
+        )
+        return purpose
+
+
+def _execute_provider_probe(
+    store: Store,
+    connection: sqlite3.Connection,
+    task: sqlite3.Row,
+    spec: dict,
+    purpose: str,
+) -> str:
+    started_at = time.time()
+    sequence = connection.execute(
+        "SELECT COALESCE(MAX(sequence), 0) + 1 AS value FROM host_jobs WHERE task_id = ?",
+        (task["id"],),
+    ).fetchone()["value"]
+    task_session_id, session_generation = current_session(
+        connection, task["id"], task["role_key"] or "provider_probe"
+    )
+    base = store.data_root / "projects" / task["project_id"] / "tasks" / task["id"]
+    output_path = (
+        base
+        / "artifacts"
+        / f"revision-{task['spec_revision']:06d}"
+        / f"execution-{sequence:06d}"
+        / "output"
+        / "provider-probe.json"
+    )
+    log_path = (
+        base
+        / "sessions"
+        / (task["role_key"] or "provider_probe")
+        / f"generation-{session_generation:06d}"
+        / f"sequence-{sequence:06d}.log"
+    )
+    try:
+        result = run_provider_probe(spec["provider_key"], spec["mode"])
+        body = canonical_json(result).encode()
+        log_body = (
+            f"provider={spec['provider_key']} mode={spec['mode']} "
+            f"available={result['available']} detail={result['detail']}\n"
+        ).encode()
+        _write_atomic(output_path, body)
+        _write_atomic(log_path, log_body)
+        ended_at = time.time()
+        if result["model_invoked"]:
+            record_model_call(
+                connection,
+                task["id"],
+                task_session_id,
+                session_generation,
+                spec["provider_key"],
+                "single",
+                int(result["input_tokens"]),
+                int(result["cached_input_tokens"]),
+                int(result["output_tokens"]),
+                str(result["model"] or spec["provider_key"]),
+            )
+        connection.execute(
+            """
+            INSERT INTO host_jobs(
+                id, task_id, task_session_id, session_generation,
+                spec_revision, sequence, purpose, status,
+                started_at, ended_at, returncode, output_ref
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'succeeded', ?, ?, 0, ?)
+            """,
+            (
+                uuid4().hex,
+                task["id"],
+                task_session_id,
+                session_generation,
+                task["spec_revision"],
+                sequence,
+                purpose,
+                started_at,
+                ended_at,
+                store.relative_data_path(log_path),
+            ),
+        )
+        for kind, path, data in (("output", output_path, body), ("log", log_path, log_body)):
+            connection.execute(
+                """
+                INSERT INTO artifacts(
+                    id, project_id, task_id, kind, path, sha256, bytes,
+                    acceptance_id, revision, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    uuid4().hex,
+                    task["project_id"],
+                    task["id"],
+                    kind,
+                    store.relative_data_path(path),
+                    hashlib.sha256(data).hexdigest(),
+                    len(data),
+                    (
+                        f"provider_{spec['mode']}_probe"
+                        if kind == "output"
+                        else None
+                    ),
+                    task["spec_revision"],
+                    ended_at,
+                ),
+            )
+        connection.execute(
+            """
+            UPDATE tasks
+            SET public_status = 'in_progress', phase = 'verify', next_action_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (ended_at, ended_at, task["id"]),
+        )
+        connection.execute(
+            """
+            INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
+            VALUES (?, ?, 'provider_probed', ?, ?)
+            """,
+            (
+                task["project_id"],
+                task["id"],
+                canonical_json(
+                    {
+                        "provider_key": spec["provider_key"],
+                        "mode": spec["mode"],
+                        "available": result["available"],
+                        "model_invoked": result["model_invoked"],
+                        "total_tokens": result["total_tokens"],
+                    }
+                ),
+                ended_at,
+            ),
+        )
+        return purpose
+    except (OSError, RuntimeError, ValueError) as error:
+        ended_at = time.time()
+        log_body = f"provider probe failed: {type(error).__name__}\n".encode()
+        _write_atomic(log_path, log_body)
+        connection.execute(
+            """
+            INSERT INTO host_jobs(
+                id, task_id, task_session_id, session_generation,
+                spec_revision, sequence, purpose, status,
+                started_at, ended_at, returncode, output_ref, failure_code
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'failed', ?, ?, 1, ?, 'provider')
+            """,
+            (
+                uuid4().hex,
+                task["id"],
+                task_session_id,
+                session_generation,
+                task["spec_revision"],
+                sequence,
+                purpose,
+                started_at,
+                ended_at,
+                store.relative_data_path(log_path),
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE tasks SET public_status = 'needs_decision', phase = 'execute',
+                wait_reason = ?, fault_code = 'provider', next_action_at = NULL,
+                outcome = NULL, updated_at = ? WHERE id = ?
+            """,
+            ("Provider probe could not produce bounded diagnostic facts", ended_at, task["id"]),
         )
         return purpose

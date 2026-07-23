@@ -14,7 +14,7 @@ python3 -m plowwhip serve
 Open `http://127.0.0.1:8742`. The server intentionally rejects non-loopback
 binds. SQLite and runtime files default to `data/`.
 
-Revision 2 exposes seven focused navigation entries: global Butler, project
+Revision 3 exposes seven focused navigation entries: global Butler, project
 Butler, projects, Tasks, Token, read-only Monitor, and settings/library.
 Human requirements and discovered product issues are tracked in the
 [product ledger](docs/PRODUCT_LEDGER.zh-CN.md).
@@ -49,14 +49,16 @@ The suite covers WAL and fencing, idempotent intake, four-state convergence,
 Evidence, automatic repair, versioned DAGs, cancellation and generation
 rotation, TaskSession ownership, bounded handoffs, token normalization,
 Token dashboards, recoverable project archive, restart recovery, read-only
-Monitor, settings/library snapshots, UI/API safety, and fail-closed external
-Providers.
+Monitor, Provider Probe Tasks, settings/library snapshots, UI/API safety, and
+fail-closed external Providers.
 
 ## Deliberate V1 boundary
 
-The application does not call paid Providers, control Docker, touch production,
-migrate old data, or copy the old repository. External Provider candidates are
-represented as unavailable facts; only the local deterministic adapter runs.
+The application never runs a paid Provider periodically. A 0 Token Host Bridge
+probe is deterministic; the bounded Codex minimal-Token probe requires an exact
+human confirmation and records its ModelCallLedger usage. The application does
+not control Docker, touch production, migrate old data, or copy the old
+repository.
 
 ## Local Docker check
 

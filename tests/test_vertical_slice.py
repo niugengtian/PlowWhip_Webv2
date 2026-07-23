@@ -1,9 +1,11 @@
 import json
+import os
 import sqlite3
 import tempfile
 import threading
 import time
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError
@@ -15,6 +17,7 @@ from plowwhip.cronner import run as run_cronner, run_until_idle, tick
 from plowwhip.intake import (
     archive_project,
     create_project,
+    normalize_instruction,
     submit_action,
     submit_message,
 )
@@ -101,6 +104,71 @@ class VerticalSliceTest(unittest.TestCase):
         self.assertEqual({row["session_generation"] for row in jobs}, {1})
         handoffs = list((self.data / "projects" / "project-a" / "tasks" / view["task"]["id"] / "handoffs").glob("*/current.json"))
         self.assertEqual(len(handoffs), 2)
+
+    def test_default_settings_upgrade_without_overwriting_project_policy(self):
+        old_provider_order = {
+            "deterministic": ["local"],
+            "deterministic_checker": ["local"],
+        }
+        with self.store.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE settings SET value_json = ?
+                WHERE scope = 'global' AND setting_key = 'provider_order'
+                """,
+                (json.dumps(old_provider_order),),
+            )
+            connection.execute(
+                """
+                UPDATE settings SET value_json = '7', source = 'owner'
+                WHERE scope = 'global' AND setting_key = 'retry_count'
+                """
+            )
+
+        self.store.initialize()
+
+        connection = self.store.connect()
+        try:
+            rows = {
+                row["setting_key"]: row
+                for row in connection.execute(
+                    """
+                    SELECT setting_key, value_json, source FROM settings
+                    WHERE scope = 'global'
+                      AND setting_key IN ('provider_order', 'retry_count')
+                    """
+                )
+            }
+        finally:
+            connection.close()
+        provider_order = json.loads(rows["provider_order"]["value_json"])
+        self.assertEqual(
+            provider_order["provider_probe"],
+            ["codex_cli", "cursor_cli", "deepseek", "kimi"],
+        )
+        self.assertEqual(rows["provider_order"]["source"], "v1_default")
+        self.assertEqual(json.loads(rows["retry_count"]["value_json"]), 7)
+        self.assertEqual(rows["retry_count"]["source"], "owner")
+
+    def test_owner_wake_is_queued_but_cronner_remains_the_only_driver(self):
+        submit_message(self.store, "wake", "写入 wake.txt: done", "wake-message")
+        self.assertEqual(tick(self.store)[0]["action"], "intake")
+        waiting = snapshot(self.db, self.data, "wake")
+        submit_action(
+            self.store,
+            "wake",
+            waiting["task"]["id"],
+            "wake",
+            "",
+            "wake-action",
+        )
+        self.assertEqual(
+            [item["action"] for item in run_until_idle(self.store)],
+            ["wake", "execute", "verify"],
+        )
+        done = snapshot(self.db, self.data, "wake")
+        self.assertEqual(done["task"]["public_status"], "done")
+        self.assertIn("wake_requested", {item["kind"] for item in done["events"]})
 
     def test_failed_evidence_converges_to_needs_decision(self):
         with self.store.transaction() as connection:
@@ -560,7 +628,7 @@ class VerticalSliceTest(unittest.TestCase):
     def test_settings_and_library_are_indexed_and_read_only(self):
         state = settings_library_snapshot(self.db, self.data)
         self.assertEqual(len(state["settings"]), 9)
-        self.assertEqual(len(state["library"]), 4)
+        self.assertEqual(len(state["library"]), 6)
         self.assertEqual(
             {item["kind"] for item in state["library"]},
             {"role", "rule", "worker_template"},
@@ -572,6 +640,111 @@ class VerticalSliceTest(unittest.TestCase):
         role = next(item for item in updated["library"] if item["item_key"] == "deterministic")
         self.assertEqual(role["revision"], 2)
         self.assertTrue(all(item["sha256_matches"] for item in updated["library"]))
+
+    def test_provider_probe_tasks_record_zero_and_minimal_token_evidence(self):
+        spec, _ = normalize_instruction("探测 Provider codex_cli: minimal")
+        self.assertEqual(spec["kind"], "authorization_required")
+        requests = []
+
+        class Bridge(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers["Content-Length"])
+                payload = json.loads(self.rfile.read(length))
+                requests.append((self.path, self.headers["Authorization"], payload))
+                if self.path == "/v1/probe":
+                    body = {"available": True, "detail": "codex-cli test"}
+                else:
+                    body = {
+                        "returncode": 0,
+                        "stdout": "PLOWWHIP_PROBE_OK\n",
+                        "stderr": "",
+                        "input_tokens": 30,
+                        "cached_input_tokens": 10,
+                        "output_tokens": 2,
+                        "model": "codex-test",
+                    }
+                data = json.dumps(body).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *_args):
+                return
+
+        bridge = ThreadingHTTPServer(("127.0.0.1", 0), Bridge)
+        thread = threading.Thread(target=bridge.serve_forever, daemon=True)
+        thread.start()
+        environment = {
+            "PLOW_WHIP_BRIDGE_URL": f"http://127.0.0.1:{bridge.server_port}",
+            "PLOW_WHIP_BRIDGE_TOKEN": "test-token",
+            "PLOW_WHIP_PROBE_PROJECT_PATH": str(self.root),
+        }
+        try:
+            with patch.dict(os.environ, environment):
+                submit_message(
+                    self.store,
+                    "monitor-probe-codex_cli",
+                    "探测 Provider codex_cli: 0token",
+                    "probe-zero",
+                )
+                self.assertEqual(
+                    [item["action"] for item in run_until_idle(self.store)],
+                    ["intake", "execute", "verify"],
+                )
+                zero = snapshot(
+                    self.db, self.data, "monitor-probe-codex_cli"
+                )
+                self.assertEqual(zero["task"]["public_status"], "done")
+                executor = next(
+                    item for item in zero["sessions"] if item["role_key"] == "provider_probe"
+                )
+                self.assertEqual(executor["provider_key"], "codex_cli")
+                zero_evidence = json.loads(
+                    next(
+                        Path(item["path"]).read_text()
+                        for item in zero["artifacts"]
+                        if item["kind"] == "evidence"
+                    )
+                )
+                self.assertTrue(zero_evidence["passed"])
+                self.assertFalse(zero_evidence["model_invoked"])
+                self.assertEqual(zero_evidence["total_tokens"], 0)
+
+                submit_message(
+                    self.store,
+                    "monitor-probe-codex_cli",
+                    "探测 Provider codex_cli: minimal 确认 codex_cli",
+                    "probe-minimal",
+                )
+                self.assertEqual(
+                    [item["action"] for item in run_until_idle(self.store)],
+                    ["intake", "execute", "verify"],
+                )
+                minimal = snapshot(
+                    self.db, self.data, "monitor-probe-codex_cli"
+                )
+                self.assertEqual(minimal["task"]["public_status"], "done")
+                self.assertEqual(minimal["model_usage"][0]["normalized_total"], 32)
+                state = monitor_snapshot(self.db, self.data)
+                codex = next(
+                    item
+                    for item in state["providers"]
+                    if item["provider_key"] == "codex_cli"
+                )
+                self.assertEqual(codex["latest_probe"]["result"]["total_tokens"], 32)
+                self.assertEqual(codex["latest_probe"]["public_status"], "done")
+                self.assertEqual(codex["zero_probe"]["result"]["total_tokens"], 0)
+                self.assertEqual(
+                    codex["readiness"]["recent_execution_health"], "healthy"
+                )
+        finally:
+            bridge.shutdown()
+            bridge.server_close()
+            thread.join()
+        self.assertEqual([item[0] for item in requests], ["/v1/probe", "/v1/execute"])
+        self.assertTrue(all(item[1] == "Bearer test-token" for item in requests))
 
     def _row_counts(self):
         connection = sqlite3.connect(str(self.db))
@@ -627,12 +800,17 @@ class WebApiTest(unittest.TestCase):
             self.assertIn("Evidence Trail", html)
             self.assertIn("Token 计量", html)
             self.assertIn("Monitor 只读", html)
+            self.assertIn("Provider 探针", html)
+            self.assertIn("立即唤醒", html)
+            self.assertIn("处理待决定", html)
+            self.assertIn("探测 Provider codex_cli: 0token", html)
+            self.assertIn("Task / HostJob / Session", html)
             self.assertIn("项目管家", html)
             self.assertIn("设置与资源库", html)
             self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
         with urlopen(self.base + "/api/settings-library", timeout=2) as response:
             settings_library = json.load(response)
-        self.assertEqual(len(settings_library["library"]), 4)
+        self.assertEqual(len(settings_library["library"]), 6)
 
         status, _ = self._post(
             "/api/actions",

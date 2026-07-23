@@ -1,9 +1,9 @@
-# PlowWhip 极简重设计基线 V1 · Revision 2
+# PlowWhip 极简重设计基线 V1 · Revision 3
 
 - 状态：**已冻结（FROZEN）**
 - 冻结日期：2026-07-23
 - 决策人：主人
-- 当前 revision：**2**
+- 当前 revision：**3**
 - 适用范围：PlowWhip Web 控制面、Cronner、Monitor、Host Bridge、Provider、Worker、记忆与验证闭环
 - 变更门禁：未经主人明确说“开始改”，不得据此修改代码、SQLite、Docker、任务、Provider 或蓝绿环境
 
@@ -14,6 +14,14 @@ Revision 2 主人决定：
 - 新增 Monitor 导航与独立只读看板。
 - 项目页提供创建、进入和归档等基本操作。
 - 持续维护需求/问题台账，记录人的要求、发现的问题、处理状态和验证证据；台账不是运行时状态真源。
+
+Revision 3 主人决定：
+
+- 在 Monitor 导航展示 Provider 的 0 Token 探针和极小 Token 探针；探针本身复用普通 Task、HostJob、Artifact、Evidence 和 ModelCallLedger，不新增状态表或第二推进器。
+- Monitor 查询仍永远只读。点击探针只通过 `POST /api/messages` 提交 Probe Task；只有 Cronner 可以调用 `advance_project` 推进它。
+- 0 Token 探针必须证明 `model_invoked=false` 且 Input/Cached-input/Output/Total 全为 0；不得用它证明最近真实执行健康。
+- 极小 Token 探针不得周期执行，只允许显式二次确认后调用支持只读执行的 Provider；必须返回确定性标记，记录真实 Token，且单次 Total 不超过 4096。
+- Task 页参考原任务页保留最有用的结构：项目 Task 列表、四态与 phase、等待原因、HostJob、TaskSession/Worker/Provider/generation、最后 20 行、Artifact/Evidence/handoff、立即唤醒、取消、重新执行和决定入口。
 
 ## 1. 使命
 
@@ -534,8 +542,9 @@ Monitor 在 UI 中拥有独立导航和只读看板，至少显示：
 - 控制面、SQLite WAL/完整性、Cronner 应用内唤醒事实。
 - Project、Task 四态、到期动作、租约、TaskSession、HostJob、Artifact 统计。
 - 最近 20 条必要生命周期事件。
+- Provider 0 Token 探针事实和极小 Token 执行健康事实；两者必须分层显示。
 
-Monitor 看板不得创建采样表、心跳历史、第二套状态或任何写入口。
+Monitor 看板不得创建采样表、心跳历史、第二套状态或直接状态写入口。探针按钮只创建普通 Probe Task，不能由 Monitor 直接调用 Provider、写运行态或推进生命周期。
 
 ## 15. 三层记忆、会话落盘与 Token
 
@@ -740,6 +749,7 @@ Task 详情显示：
 - 本地完整会话及历史分段文件。
 - Checker 结论、acceptance、Artifact、Evidence 和 handoff。
 - 取消、重新执行等明确操作。
+- 同项目 Task 历史列表、等待决定的准确原因和立即唤醒；立即唤醒只提交 action，由 Cronner 在后续 Tick 推进。
 
 Worker、Provider、Attempt、Episode、Candidate 不再各占产品页面，只作为 Task 诊断信息按需展开。
 
@@ -751,6 +761,17 @@ POST /api/actions：有限确定性操作，包括 Task 操作及 Project 创建
 ```
 
 两者都只提交意图；只有 `advance_project` 推进状态。查询接口全部只读。外部 API 和 Agent 必须提供 idempotency key。
+
+Provider 探针也使用上述入口：
+
+```text
+POST /api/messages
+→ provider_probe Task
+→ Cronner / advance_project
+→ HostJob
+→ Evidence
+→ Done / NeedsDecision
+```
 
 项目不提供删除操作。归档项目只设置 `projects.archived_at` 并从日常项目列表和选择器隐藏；消息、Task、Artifact、Evidence 和目录全部保留。存在活动 Task 时拒绝归档；再次创建同一项目 ID 等价于恢复归档。
 

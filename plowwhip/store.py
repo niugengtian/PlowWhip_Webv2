@@ -213,6 +213,7 @@ DEFAULT_SETTINGS = {
         "planner": ["codex_cli", "cursor_cli", "deepseek", "kimi"],
         "fullstack": ["cursor_cli", "codex_cli", "deepseek", "kimi"],
         "simple": ["deepseek", "kimi", "codex_cli"],
+        "provider_probe": ["codex_cli", "cursor_cli", "deepseek", "kimi"],
         "deterministic": ["local"],
         "deterministic_checker": ["local"],
     },
@@ -236,6 +237,10 @@ DEFAULT_LIBRARY = {
         "roles/deterministic-checker.md",
         "# Deterministic checker\n\nRead TaskSpec, artifacts and evidence independently; never trust executor claims.\n",
     ),
+    ("role", "provider_probe"): (
+        "roles/provider-probe.md",
+        "# Provider probe\n\nRun only the declared bounded probe; never turn a zero Token probe into model execution.\n",
+    ),
     ("rule", "v1_hard_boundaries"): (
         "rules/v1-hard-boundaries.md",
         "# V1 hard boundaries\n\nNo paid Provider, Docker, production, old-data migration, destructive action or out-of-scope write.\n",
@@ -243,6 +248,10 @@ DEFAULT_LIBRARY = {
     ("worker_template", "deterministic_write"): (
         "worker-templates/deterministic-write.md",
         "# Deterministic write\n\nWrite the declared relative artifact, then verify its SHA-256.\n",
+    ),
+    ("worker_template", "provider_probe"): (
+        "worker-templates/provider-probe.md",
+        "# Provider probe\n\nUse the Host Bridge probe contract and record bounded result, Token facts and evidence.\n",
     ),
 }
 
@@ -269,13 +278,23 @@ class Store:
             )
             now = time.time()
             for key, value in DEFAULT_SETTINGS.items():
+                value_json = json.dumps(value, sort_keys=True)
                 connection.execute(
                     """
                     INSERT OR IGNORE INTO settings(
                         id, scope, project_id, setting_key, value_json, source, updated_at
                     ) VALUES (?, 'global', NULL, ?, ?, 'v1_default', ?)
                     """,
-                    (f"global:{key}", key, json.dumps(value, sort_keys=True), now),
+                    (f"global:{key}", key, value_json, now),
+                )
+                connection.execute(
+                    """
+                    UPDATE settings SET value_json = ?, updated_at = ?
+                    WHERE scope = 'global' AND project_id IS NULL
+                      AND setting_key = ? AND source = 'v1_default'
+                      AND value_json != ?
+                    """,
+                    (value_json, now, key, value_json),
                 )
             self._sync_default_library(connection, now)
             connection.execute("PRAGMA user_version = 2")

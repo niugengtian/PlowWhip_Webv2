@@ -14,6 +14,12 @@ TASK_ID = re.compile(r"^[0-9a-f]{32}$")
 WRITE_INSTRUCTION = re.compile(
     r"^(?:write|写入)\s+([^:\s]+)\s*:\s*([\s\S]*)$", re.IGNORECASE
 )
+PROVIDER_PROBE_INSTRUCTION = re.compile(
+    r"^(?:probe\s+provider|探测\s*Provider)\s+"
+    r"(codex_cli|cursor_cli|deepseek|kimi)\s*:\s*"
+    r"(0token|minimal)(?:\s+确认\s+([a-z0-9_]+))?$",
+    re.IGNORECASE,
+)
 
 
 def submit_message(
@@ -153,8 +159,10 @@ def submit_action(
 ) -> str:
     if not PROJECT_ID.fullmatch(project_id) or not TASK_ID.fullmatch(task_id):
         raise ValueError("invalid project_id or task_id")
-    if kind not in {"provide_decision", "provide_plan", "cancel", "rerun"}:
-        raise ValueError("supported actions: provide_decision, provide_plan, cancel, rerun")
+    if kind not in {"provide_decision", "provide_plan", "cancel", "rerun", "wake"}:
+        raise ValueError(
+            "supported actions: provide_decision, provide_plan, cancel, rerun, wake"
+        )
     if kind == "provide_decision" and not instruction:
         raise ValueError("provide_decision requires instruction")
     if len(instruction.encode()) > 65_536:
@@ -192,6 +200,10 @@ def submit_action(
             and task["outcome"] is None
         ) or (kind == "cancel" and task["outcome"] is None) or (
             kind == "rerun" and task["outcome"] == "cancelled"
+        ) or (
+            kind == "wake"
+            and task["outcome"] is None
+            and task["public_status"] in {"pending", "in_progress"}
         )
         if not allowed:
             raise ValueError(f"action {kind} is not allowed for current task")
@@ -214,7 +226,36 @@ def submit_action(
     return message_id
 
 
-def normalize_instruction(content: str) -> tuple[dict[str, str], list[dict[str, str]]]:
+def normalize_instruction(content: str) -> tuple[dict[str, object], list[dict[str, str]]]:
+    probe = PROVIDER_PROBE_INSTRUCTION.fullmatch(content.strip())
+    if probe:
+        provider_key = probe.group(1).lower()
+        mode = "zero" if probe.group(2).lower() == "0token" else "minimal"
+        if mode == "minimal" and (probe.group(3) or "").lower() != provider_key:
+            return (
+                {
+                    "kind": "authorization_required",
+                    "instruction": content,
+                    "wait_reason": (
+                        f"minimal Token probe requires exact confirmation: {provider_key}"
+                    ),
+                },
+                [],
+            )
+        return (
+            {
+                "kind": "provider_probe",
+                "provider_key": provider_key,
+                "mode": mode,
+            },
+            [
+                {
+                    "id": f"provider_{mode}_probe",
+                    "kind": "provider_probe_contract",
+                }
+            ],
+        )
+
     match = WRITE_INSTRUCTION.fullmatch(content.strip())
     if not match:
         return (

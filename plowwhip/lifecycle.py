@@ -158,11 +158,26 @@ def _create_task(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
     plan_id = uuid4().hex
     task_id = uuid4().hex
     spec, acceptance = normalize_instruction(message["content"])
-    supported = spec["kind"] == "write_text"
+    supported = spec["kind"] in {"write_text", "provider_probe"}
+    role_key = "provider_probe" if spec["kind"] == "provider_probe" else "deterministic"
+    provider_key = (
+        str(spec["provider_key"]) if spec["kind"] == "provider_probe" else "local"
+    )
     public_status = "pending" if supported else "needs_decision"
     phase = "execute" if supported else "intake"
-    reason = None if supported else "supported instruction is: write <relative-path>: <content>"
-    fault = None if supported else "scope"
+    reason = (
+        None
+        if supported
+        else str(
+            spec.get(
+                "wait_reason",
+                "supported instruction is: write <relative-path>: <content>",
+            )
+        )
+    )
+    fault = None if supported else (
+        "credential" if spec["kind"] == "authorization_required" else "scope"
+    )
     outcome = None
 
     connection.execute(
@@ -201,7 +216,7 @@ def _create_task(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
             phase, wait_reason, fault_code, next_action_at, outcome, created_at, updated_at,
             plan_id, sprint, role_key, checker_role_key
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1,
-                  'deterministic', 'deterministic_checker')
+                  ?, 'deterministic_checker')
         """,
         (
             task_id,
@@ -218,10 +233,23 @@ def _create_task(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
             now,
             now,
             plan_id,
+            role_key,
         ),
     )
     if supported:
-        create_task_sessions(connection, message["project_id"], task_id, now)
+        create_task_sessions(
+            connection,
+            message["project_id"],
+            task_id,
+            now,
+            executor_role=role_key,
+            executor_provider=provider_key,
+            settings_overrides=(
+                {role_key: {"retry_count": 0}}
+                if spec.get("mode") == "minimal"
+                else None
+            ),
+        )
     connection.execute(
         "UPDATE messages SET action_json = ?, processed_at = ? WHERE id = ?",
         (canonical_json(spec), now, message["id"]),
@@ -271,15 +299,17 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
         archive_task_sessions(connection, task["id"], now)
         event, detail = "cancelled", {"message_id": message["id"]}
     elif kind == "rerun" and task["outcome"] == "cancelled":
-        supported = json.loads(task["spec_json"])["kind"] == "write_text"
+        spec = json.loads(task["spec_json"])
+        supported = spec["kind"] in {"write_text", "provider_probe"}
         if supported:
             ensure_task_sessions(
                 connection,
                 task["project_id"],
                 task["id"],
                 now,
-                task["role_key"] or "deterministic",
-                task["checker_role_key"] or "deterministic_checker",
+                executor_role=task["role_key"] or "deterministic",
+                checker_role=task["checker_role_key"] or "deterministic_checker",
+                executor_provider=str(spec.get("provider_key", "local")),
             )
             rotate_task_sessions(connection, task["id"], now)
         connection.execute(
@@ -299,22 +329,31 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
         event, detail = "rerun", {"message_id": message["id"]}
     elif kind == "provide_decision" and task["public_status"] == "needs_decision":
         spec, acceptance = normalize_instruction(action["instruction"])
-        if spec["kind"] == "write_text":
+        if spec["kind"] in {"write_text", "provider_probe"}:
             revision = task["spec_revision"] + 1
+            role_key = (
+                "provider_probe" if spec["kind"] == "provider_probe" else "deterministic"
+            )
             ensure_task_sessions(
                 connection,
                 task["project_id"],
                 task["id"],
                 now,
-                task["role_key"] or "deterministic",
-                task["checker_role_key"] or "deterministic_checker",
+                executor_role=role_key,
+                checker_role=task["checker_role_key"] or "deterministic_checker",
+                executor_provider=str(spec.get("provider_key", "local")),
+                settings_overrides=(
+                    {role_key: {"retry_count": 0}}
+                    if spec.get("mode") == "minimal"
+                    else None
+                ),
             )
             connection.execute(
                 """
                 UPDATE tasks SET spec_revision = ?, spec_json = ?, acceptance_json = ?,
                     public_status = 'pending', phase = 'execute', wait_reason = NULL,
                     fault_code = NULL, retry_count = 0, next_retry_at = NULL,
-                    next_action_at = ?, outcome = NULL, updated_at = ?
+                    next_action_at = ?, outcome = NULL, role_key = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -322,6 +361,7 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
                     canonical_json(spec),
                     canonical_json(acceptance),
                     now,
+                    role_key,
                     now,
                     task["id"],
                 ),
@@ -334,10 +374,29 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
                 UPDATE tasks SET wait_reason = ?, fault_code = 'scope', updated_at = ?
                 WHERE id = ?
                 """,
-                ("decision must use: write <relative-path>: <content>", now, task["id"]),
+                (
+                    str(
+                        spec.get(
+                            "wait_reason",
+                            "decision must use a supported deterministic instruction",
+                        )
+                    ),
+                    now,
+                    task["id"],
+                ),
             )
             event = "decision_rejected"
             detail = {"message_id": message["id"]}
+    elif (
+        kind == "wake"
+        and task["outcome"] is None
+        and task["public_status"] in {"pending", "in_progress"}
+    ):
+        connection.execute(
+            "UPDATE tasks SET next_action_at = ?, updated_at = ? WHERE id = ?",
+            (now, now, task["id"]),
+        )
+        event, detail = "wake_requested", {"message_id": message["id"]}
     elif kind == "provide_plan" and task["public_status"] == "needs_decision":
         try:
             plan = normalize_plan(action["plan"])
@@ -417,9 +476,9 @@ def _install_plan(
         placeholder["project_id"],
         placeholder["id"],
         now,
-        first["role_key"],
-        "deterministic_checker",
-        first["settings"],
+        executor_role=first["role_key"],
+        checker_role="deterministic_checker",
+        settings_overrides=first["settings"],
     )
     connection.execute(
         """
@@ -462,9 +521,9 @@ def _install_plan(
             placeholder["project_id"],
             task_id,
             now,
-            item["role_key"],
-            "deterministic_checker",
-            item["settings"],
+            executor_role=item["role_key"],
+            checker_role="deterministic_checker",
+            settings_overrides=item["settings"],
         )
         connection.execute(
             """

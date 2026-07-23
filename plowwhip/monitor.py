@@ -18,6 +18,7 @@ def snapshot(db_path: str | Path, data_root: str | Path, project_id: str) -> dic
     store = Store(db_path, data_root)
     connection = store.connect_readonly()
     try:
+        tasks = _task_summaries(connection, project_id)
         task = connection.execute(
             """
             SELECT * FROM tasks WHERE project_id = ?
@@ -38,8 +39,11 @@ def snapshot(db_path: str | Path, data_root: str | Path, project_id: str) -> dic
                 "events": [],
                 "artifacts": [],
                 "last_output": [],
+                "tasks": tasks,
             }
-        return _task_view(connection, store, task)
+        view = _task_view(connection, store, task)
+        view["tasks"] = tasks
+        return view
     finally:
         connection.close()
 
@@ -81,7 +85,9 @@ def task_snapshot(db_path: str | Path, data_root: str | Path, task_id: str) -> d
         task = connection.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if not task:
             return {"task": None, "events": [], "artifacts": [], "last_output": []}
-        return _task_view(connection, store, task)
+        view = _task_view(connection, store, task)
+        view["tasks"] = _task_summaries(connection, task["project_id"])
+        return view
     finally:
         connection.close()
 
@@ -273,6 +279,7 @@ def monitor_snapshot(db_path: str | Path, data_root: str | Path) -> dict:
         task_sessions = connection.execute(
             "SELECT COUNT(*) FROM task_sessions"
         ).fetchone()[0]
+        providers = _provider_monitor(connection, store)
     finally:
         connection.close()
     return {
@@ -302,6 +309,7 @@ def monitor_snapshot(db_path: str | Path, data_root: str | Path) -> dict:
         "host_jobs": jobs,
         "session_generations": sessions,
         "artifacts": artifacts,
+        "providers": providers,
         "recent_events": [dict(row) for row in recent],
     }
 
@@ -375,6 +383,9 @@ def _ratio(numerator: int, denominator: int) -> float | None:
 
 
 def _task_view(connection, store: Store, task) -> dict:
+    goal = connection.execute(
+        "SELECT objective FROM goals WHERE id = ?", (task["goal_id"],)
+    ).fetchone()
     events = connection.execute(
         """
         SELECT kind, detail_json, created_at FROM task_events
@@ -408,13 +419,24 @@ def _task_view(connection, store: Store, task) -> dict:
     sessions = connection.execute(
         """
         SELECT session.id AS task_session_id, session.role_key,
+               session.worker_id,
                session.role_snapshot_json, session.settings_json,
                generation.generation, generation.provider_key,
-               generation.status, generation.handoff_ref
+               generation.external_session_id, generation.status,
+               generation.handoff_ref
         FROM task_sessions session
         JOIN session_generations generation ON generation.task_session_id = session.id
         WHERE session.task_id = ?
         ORDER BY session.role_key, generation.generation
+        """,
+        (task["id"],),
+    ).fetchall()
+    jobs = connection.execute(
+        """
+        SELECT id, task_session_id, session_generation, spec_revision,
+               sequence, purpose, status, started_at, ended_at,
+               returncode, output_ref, failure_code
+        FROM host_jobs WHERE task_id = ? ORDER BY sequence DESC LIMIT 20
         """,
         (task["id"],),
     ).fetchall()
@@ -442,6 +464,7 @@ def _task_view(connection, store: Store, task) -> dict:
     )
     return {
         "project_id": task["project_id"],
+        "objective": goal["objective"] if goal else None,
         "task": dict(task),
         "events": [dict(event) for event in events],
         "artifacts": [
@@ -459,10 +482,12 @@ def _task_view(connection, store: Store, task) -> dict:
         "sessions": [
             {
                 "task_session_id": session["task_session_id"],
+                "worker_id": session["worker_id"],
                 "role_key": session["role_key"],
                 "generation": session["generation"],
                 "provider_key": session["provider_key"],
                 "status": session["status"],
+                "external_session_id": session["external_session_id"],
                 "handoff_ref": session["handoff_ref"],
                 "model": "deterministic" if session["provider_key"] == "local" else None,
                 "role_snapshot": json.loads(session["role_snapshot_json"]),
@@ -472,9 +497,104 @@ def _task_view(connection, store: Store, task) -> dict:
             for session in sessions
         ],
         "model_usage": [dict(row) for row in model_usage],
+        "host_jobs": [dict(row) for row in jobs],
         "session_files": _session_files(store, task),
         "last_output": last_output,
     }
+
+
+def _task_summaries(connection, project_id: str) -> list[dict]:
+    return [
+        dict(row)
+        for row in connection.execute(
+            """
+            SELECT id, goal_id, spec_revision, public_status, phase,
+                   wait_reason, fault_code, retry_count, outcome,
+                   role_key, checker_role_key, created_at, updated_at
+            FROM tasks WHERE project_id = ?
+            ORDER BY created_at DESC, rowid DESC LIMIT 100
+            """,
+            (project_id,),
+        )
+    ]
+
+
+def _provider_monitor(connection, store: Store) -> list[dict]:
+    latest = {}
+    rows = connection.execute(
+        """
+        SELECT task.id AS task_id, task.spec_json, task.public_status,
+               task.phase, task.wait_reason, task.updated_at,
+               artifact.path AS output_path
+        FROM tasks task
+        LEFT JOIN artifacts artifact ON artifact.rowid = (
+            SELECT recent.rowid FROM artifacts recent
+            WHERE recent.task_id = task.id AND recent.kind = 'output'
+            ORDER BY recent.created_at DESC, recent.rowid DESC LIMIT 1
+        )
+        WHERE task.role_key = 'provider_probe'
+        ORDER BY task.created_at DESC, task.rowid DESC LIMIT 50
+        """
+    ).fetchall()
+    for row in rows:
+        spec = json.loads(row["spec_json"])
+        provider_key = spec.get("provider_key")
+        key = (provider_key, spec.get("mode"))
+        if key in latest:
+            continue
+        result = None
+        if row["output_path"]:
+            path = store.resolve_data_path(row["output_path"])
+            try:
+                result = json.loads(path.read_text())
+            except (OSError, json.JSONDecodeError):
+                result = None
+        latest[key] = {
+            "task_id": row["task_id"],
+            "public_status": row["public_status"],
+            "phase": row["phase"],
+            "wait_reason": row["wait_reason"],
+            "updated_at": row["updated_at"],
+            "result": result,
+        }
+    providers = []
+    for fact in provider_facts("provider_probe"):
+        provider_key = fact["provider_key"]
+        zero = latest.get((provider_key, "zero"))
+        minimal = latest.get((provider_key, "minimal"))
+        zero_result = zero.get("result") if zero else None
+        minimal_result = minimal.get("result") if minimal else None
+        if minimal_result and minimal_result.get("model_invoked"):
+            execution_health = (
+                "healthy" if minimal_result.get("available") else "unhealthy"
+            )
+        else:
+            execution_health = "unknown"
+        providers.append(
+            {
+                **fact,
+                "readiness": {
+                    "installed": (
+                        zero_result.get("available") if zero_result else None
+                    ),
+                    "cli_probe": (
+                        "available"
+                        if zero_result and zero_result.get("available")
+                        else "unavailable" if zero_result else "unknown"
+                    ),
+                    "session_resume_ready": "unknown",
+                    "recent_execution_health": execution_health,
+                },
+                "zero_probe": zero,
+                "minimal_probe": minimal,
+                "latest_probe": max(
+                    (item for item in (zero, minimal) if item),
+                    key=lambda item: item["updated_at"],
+                    default=None,
+                ),
+            }
+        )
+    return providers
 
 
 def _session_files(store: Store, task) -> list[dict]:
