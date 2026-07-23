@@ -1,9 +1,9 @@
-# PlowWhip 极简重设计基线 V1 · Revision 3
+# PlowWhip 极简重设计基线 V1 · Revision 4
 
 - 状态：**已冻结（FROZEN）**
 - 冻结日期：2026-07-23
 - 决策人：主人
-- 当前 revision：**3**
+- 当前 revision：**4**
 - 适用范围：PlowWhip Web 控制面、Cronner、Monitor、Host Bridge、Provider、Worker、记忆与验证闭环
 - 变更门禁：未经主人明确说“开始改”，不得据此修改代码、SQLite、Docker、任务、Provider 或蓝绿环境
 
@@ -22,6 +22,12 @@ Revision 3 主人决定：
 - 0 Token 探针必须证明 `model_invoked=false` 且 Input/Cached-input/Output/Total 全为 0；不得用它证明最近真实执行健康。
 - 极小 Token 探针不得周期执行，只允许显式二次确认后调用支持只读执行的 Provider；必须返回确定性标记，记录真实 Token，且单次 Total 不超过 4096。
 - Task 页参考原任务页保留最有用的结构：项目 Task 列表、四态与 phase、等待原因、HostJob、TaskSession/Worker/Provider/generation、最后 20 行、Artifact/Evidence/handoff、立即唤醒、取消、重新执行和决定入口。
+
+Revision 4 主人决定：
+
+- Task 页恢复原任务页最直观的泳道结构，但只使用 V1 四个公开状态：待执行、进行中、待决定、已完成。
+- 内部 phase、取消 outcome、角色、revision、重试和等待原因只显示在卡片中，不新增泳道、不恢复旧 12 态状态机；取消 Task 进入已完成泳道并保留“已取消”标签。
+- 泳道替代重复的同项目扁平 Task 列表；点击卡片复用同一个 Task 详情、HostJob、TaskSession、Artifact 和 Evidence 观察面。
 
 ## 1. 使命
 
@@ -743,13 +749,14 @@ TaskSession 创建时计算有效值、显示来源并冻结。
 
 Task 详情显示：
 
+- 同项目 Task 的四态泳道；内部 phase 只作为卡片诊断字段。
 - 四态和内部 phase。
 - Worker 角色、Provider、模型和 generation。
 - 当前 HostJob 最后 20 行。
 - 本地完整会话及历史分段文件。
 - Checker 结论、acceptance、Artifact、Evidence 和 handoff。
 - 取消、重新执行等明确操作。
-- 同项目 Task 历史列表、等待决定的准确原因和立即唤醒；立即唤醒只提交 action，由 Cronner 在后续 Tick 推进。
+- 同项目 Task 泳道、等待决定的准确原因和立即唤醒；立即唤醒只提交 action，由 Cronner 在后续 Tick 推进。
 
 Worker、Provider、Attempt、Episode、Candidate 不再各占产品页面，只作为 Task 诊断信息按需展开。
 

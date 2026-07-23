@@ -14,7 +14,7 @@ python3 -m plowwhip serve
 Open `http://127.0.0.1:8742`. The server intentionally rejects non-loopback
 binds. SQLite and runtime files default to `data/`.
 
-Revision 3 exposes seven focused navigation entries: global Butler, project
+Revision 4 exposes seven focused navigation entries: global Butler, project
 Butler, projects, Tasks, Token, read-only Monitor, and settings/library.
 Human requirements and discovered product issues are tracked in the
 [product ledger](docs/PRODUCT_LEDGER.zh-CN.md).
