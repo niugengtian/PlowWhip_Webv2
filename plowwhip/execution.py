@@ -5,12 +5,36 @@ import json
 import os
 import sqlite3
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
 from .intake import canonical_json
-from .provider import record_model_call, run_provider_probe, run_provider_task, workspace_snapshot
+from .provider import (
+    ACTIVE_HOST_JOB_STATUSES,
+    PROVIDERS,
+    cancel_provider_job,
+    provider_job_output,
+    provider_job_status,
+    record_model_call,
+    run_provider_probe,
+    start_provider_job,
+    workspace_snapshot,
+)
 from .store import Store
+
+
+@dataclass(frozen=True)
+class ProviderStep:
+    kind: str
+    project_id: str
+    task_id: str
+    job_id: str
+    provider_key: str
+    project_path: str
+    prompt: str
+    session_id: str | None
+    timeout_seconds: int
 
 
 def _write_atomic(path: Path, body: bytes) -> None:
@@ -35,7 +59,7 @@ def create_task_sessions(
     settings_overrides: dict | None = None,
 ) -> None:
     for role_key in (executor_role, checker_role):
-        settings = _effective_settings(
+        settings = effective_settings(
             connection, project_id, (settings_overrides or {}).get(role_key, {})
         )
         worker = connection.execute(
@@ -110,7 +134,7 @@ def ensure_task_sessions(
         raise RuntimeError(f"Task {task_id} has incomplete role ownership")
 
 
-def _effective_settings(
+def effective_settings(
     connection: sqlite3.Connection, project_id: str, task_role: dict
 ) -> dict:
     rows = connection.execute(
@@ -238,7 +262,7 @@ def execute_task(
     connection: sqlite3.Connection,
     task: sqlite3.Row,
     purpose: str = "execute",
-) -> str:
+) -> str | ProviderStep:
     if purpose not in {"execute", "repair"}:
         raise ValueError("execution purpose must be execute or repair")
     started_at = time.time()
@@ -246,7 +270,7 @@ def execute_task(
     if spec["kind"] == "provider_probe":
         return _execute_provider_probe(store, connection, task, spec, purpose)
     if spec["kind"] == "provider_task":
-        return _execute_provider_task(store, connection, task, spec, purpose)
+        return _prepare_provider_task(connection, task, spec, purpose)
     sequence = connection.execute(
         "SELECT COALESCE(MAX(sequence), 0) + 1 AS value FROM host_jobs WHERE task_id = ?",
         (task["id"],),
@@ -381,13 +405,12 @@ def execute_task(
         return purpose
 
 
-def _execute_provider_task(
-    store: Store,
+def _prepare_provider_task(
     connection: sqlite3.Connection,
     task: sqlite3.Row,
     spec: dict,
     purpose: str,
-) -> str:
+) -> ProviderStep:
     started_at = time.time()
     sequence = connection.execute(
         "SELECT COALESCE(MAX(sequence), 0) + 1 AS value FROM host_jobs WHERE task_id = ?",
@@ -398,7 +421,7 @@ def _execute_provider_task(
     )
     generation = connection.execute(
         """
-        SELECT external_session_id FROM session_generations
+        SELECT provider_key, external_session_id FROM session_generations
         WHERE task_session_id = ? AND generation = ?
         """,
         (task_session_id, session_generation),
@@ -407,196 +430,615 @@ def _execute_provider_task(
         "SELECT settings_json FROM task_sessions WHERE id = ?", (task_session_id,)
     ).fetchone()
     settings = json.loads(session["settings_json"]).get("values", {})
-    base = store.data_root / "projects" / task["project_id"] / "tasks" / task["id"]
-    output_path = (
-        base
-        / "artifacts"
-        / f"revision-{task['spec_revision']:06d}"
-        / f"execution-{sequence:06d}"
-        / "output"
-        / "provider-execution.json"
-    )
-    log_path = (
-        base
-        / "sessions"
-        / (task["role_key"] or "fullstack")
-        / f"generation-{session_generation:06d}"
-        / f"sequence-{sequence:06d}.log"
-    )
-    try:
-        before = workspace_snapshot(str(spec["project_path"]))
-        prompt = _provider_prompt(task, spec, purpose)
-        # ponytail: synchronous V1 path; use durable Bridge jobs when concurrent code Tasks are required.
-        result = run_provider_task(
-            str(spec["provider_key"]),
-            str(spec["project_path"]),
-            prompt,
-            session_id=generation["external_session_id"],
-            timeout_seconds=int(settings.get("max_runtime_seconds", 600)),
-        )
-        after = workspace_snapshot(str(spec["project_path"]))
-        before_git = before.get("git") if isinstance(before.get("git"), dict) else {}
-        after_git = after.get("git") if isinstance(after.get("git"), dict) else {}
-        workspace_changed = canonical_json(before_git) != canonical_json(after_git)
-        manifest = {
-            "provider_key": spec["provider_key"],
-            "project_path": spec["project_path"],
-            "returncode": result["returncode"],
-            "failure_class": result["failure_class"],
-            "duration_ms": result["duration_ms"],
-            "workspace_changed": workspace_changed,
-            "before": before_git,
-            "after": after_git,
-            "stdout_tail": _bounded_tail(str(result["stdout"])),
-            "stderr_tail": _bounded_tail(str(result["stderr"])),
-        }
-        body = canonical_json(manifest).encode()
-        log_body = (
-            f"provider={spec['provider_key']} returncode={result['returncode']} "
-            f"workspace_changed={str(workspace_changed).lower()}\n"
-            f"{manifest['stdout_tail']}\n{manifest['stderr_tail']}\n"
-        ).encode()
-        _write_atomic(output_path, body)
-        _write_atomic(log_path, log_body)
-        ended_at = time.time()
-        if result["session_id"]:
-            connection.execute(
-                """
-                UPDATE session_generations SET external_session_id = ?
-                WHERE task_session_id = ? AND generation = ?
-                """,
-                (result["session_id"], task_session_id, session_generation),
-            )
-        record_model_call(
-            connection,
+    job_id = str(uuid4())
+    connection.execute(
+        """
+        INSERT INTO host_jobs(
+            id, task_id, task_session_id, session_generation,
+            spec_revision, sequence, purpose, status, started_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'dispatching', ?)
+        """,
+        (
+            job_id,
             task["id"],
             task_session_id,
             session_generation,
-            str(spec["provider_key"]),
-            "single",
-            int(result["input_tokens"]),
-            int(result["cached_input_tokens"]),
-            int(result["output_tokens"]),
-            str(result["model"]),
-        )
-        succeeded = int(result["returncode"]) == 0
-        connection.execute(
-            """
-            INSERT INTO host_jobs(
-                id, task_id, task_session_id, session_generation,
-                spec_revision, sequence, purpose, status,
-                started_at, ended_at, returncode, output_ref, failure_code
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                uuid4().hex,
-                task["id"],
-                task_session_id,
-                session_generation,
-                task["spec_revision"],
-                sequence,
-                purpose,
-                "succeeded" if succeeded else "failed",
-                started_at,
-                ended_at,
-                int(result["returncode"]),
-                store.relative_data_path(log_path),
-                None if succeeded else "provider",
-            ),
-        )
-        for kind, path, data in (("output", output_path, body), ("log", log_path, log_body)):
+            task["spec_revision"],
+            sequence,
+            purpose,
+            started_at,
+        ),
+    )
+    connection.execute(
+        """
+        UPDATE tasks SET public_status = 'in_progress', phase = 'execute_snapshot',
+            wait_reason = NULL, fault_code = NULL, next_action_at = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (started_at, started_at, task["id"]),
+    )
+    connection.execute(
+        """
+        INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
+        VALUES (?, ?, 'host_job_prepared', ?, ?)
+        """,
+        (
+            task["project_id"],
+            task["id"],
+            canonical_json({"host_job_id": job_id, "sequence": sequence, "purpose": purpose}),
+            started_at,
+        ),
+    )
+    return ProviderStep(
+        "snapshot",
+        task["project_id"],
+        task["id"],
+        job_id,
+        generation["provider_key"],
+        str(spec["project_path"]),
+        _provider_prompt(task, spec, purpose),
+        generation["external_session_id"],
+        int(settings.get("max_runtime_seconds", 600)),
+    )
+
+
+def pending_provider_step(
+    connection: sqlite3.Connection, task: sqlite3.Row
+) -> ProviderStep:
+    job = connection.execute(
+        """
+        SELECT * FROM host_jobs
+        WHERE task_id = ? AND status IN ('dispatching', 'running', 'cancelling')
+        ORDER BY sequence DESC LIMIT 1
+        """,
+        (task["id"],),
+    ).fetchone()
+    if not job:
+        raise RuntimeError(f"Task {task['id']} has no active HostJob")
+    generation = connection.execute(
+        """
+        SELECT provider_key, external_session_id FROM session_generations
+        WHERE task_session_id = ? AND generation = ?
+        """,
+        (job["task_session_id"], job["session_generation"]),
+    ).fetchone()
+    session = connection.execute(
+        "SELECT settings_json FROM task_sessions WHERE id = ?",
+        (job["task_session_id"],),
+    ).fetchone()
+    spec = json.loads(task["spec_json"])
+    kind = {
+        "execute_snapshot": "snapshot",
+        "execute_dispatch": "start",
+        "execute_wait": "poll",
+        "stopping": "cancel",
+    }.get(task["phase"])
+    if not kind:
+        raise RuntimeError(f"Task {task['id']} is not waiting on a Provider")
+    return ProviderStep(
+        kind,
+        task["project_id"],
+        task["id"],
+        job["id"],
+        generation["provider_key"],
+        str(spec["project_path"]),
+        _provider_prompt(task, spec, job["purpose"]),
+        generation["external_session_id"],
+        int(json.loads(session["settings_json"])["values"].get("max_runtime_seconds", 600)),
+    )
+
+
+def perform_provider_step(step: ProviderStep) -> dict[str, object]:
+    try:
+        if step.kind == "snapshot":
+            return {"ok": True, "before": workspace_snapshot(step.project_path)}
+        if step.kind == "start":
+            state = start_provider_job(
+                step.job_id,
+                step.provider_key,
+                step.project_path,
+                step.prompt,
+                session_id=step.session_id,
+                timeout_seconds=step.timeout_seconds,
+            )
+        elif step.kind == "poll":
+            state = provider_job_status(step.job_id)
+        elif step.kind == "cancel":
+            state = cancel_provider_job(step.job_id)
+        else:
+            raise ValueError("unknown Provider step")
+        output = provider_job_output(step.job_id)
+        facts: dict[str, object] = {"ok": True, "state": state, "output": output}
+        if str(state.get("status")) not in ACTIVE_HOST_JOB_STATUSES:
+            facts["after"] = workspace_snapshot(step.project_path)
+        return facts
+    except (OSError, RuntimeError, ValueError) as error:
+        return {"ok": False, "error": type(error).__name__}
+
+
+def apply_provider_step(
+    store: Store,
+    connection: sqlite3.Connection,
+    step: ProviderStep,
+    facts: dict[str, object],
+) -> str:
+    task = connection.execute(
+        "SELECT * FROM tasks WHERE id = ? AND project_id = ?",
+        (step.task_id, step.project_id),
+    ).fetchone()
+    job = connection.execute(
+        "SELECT * FROM host_jobs WHERE id = ? AND task_id = ?",
+        (step.job_id, step.task_id),
+    ).fetchone()
+    if not task or not job or task["outcome"] is not None:
+        return "stale_provider_fact"
+    now = time.time()
+    if not facts.get("ok"):
+        dispatch = json.loads(job["dispatch_json"])
+        failures = int(dispatch.get("reconcile_failures") or 0) + 1
+        dispatch["reconcile_failures"] = failures
+        settings = connection.execute(
+            "SELECT settings_json FROM task_sessions WHERE id = ?",
+            (job["task_session_id"],),
+        ).fetchone()
+        values = json.loads(settings["settings_json"]).get("values", {})
+        max_retries = int(values.get("retry_count", 0))
+        exhausted = failures > max_retries
+        if exhausted and step.kind == "snapshot":
             connection.execute(
                 """
-                INSERT INTO artifacts(
-                    id, project_id, task_id, kind, path, sha256, bytes,
-                    acceptance_id, revision, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                UPDATE host_jobs SET status = 'failed', ended_at = ?, returncode = 1,
+                    failure_code = 'transport', dispatch_json = ? WHERE id = ?
                 """,
-                (
-                    uuid4().hex,
-                    task["project_id"],
-                    task["id"],
-                    kind,
-                    store.relative_data_path(path),
-                    hashlib.sha256(data).hexdigest(),
-                    len(data),
-                    "independent_checker_pass" if kind == "output" else None,
-                    task["spec_revision"],
-                    ended_at,
-                ),
+                (now, canonical_json(dispatch), job["id"]),
+            )
+        else:
+            connection.execute(
+                "UPDATE host_jobs SET dispatch_json = ? WHERE id = ?",
+                (canonical_json(dispatch), job["id"]),
             )
         connection.execute(
             """
-            UPDATE tasks SET public_status = ?, phase = ?, next_action_at = ?,
-                wait_reason = ?, fault_code = ?, updated_at = ?
+            UPDATE tasks SET public_status = ?, phase = ?, wait_reason = ?,
+                fault_code = ?, next_action_at = ?, updated_at = ?
             WHERE id = ?
             """,
             (
-                "in_progress" if succeeded else "needs_decision",
-                "verify" if succeeded else "execute",
-                ended_at if succeeded else None,
-                None if succeeded else "Provider execution did not exit successfully",
-                None if succeeded else "provider",
-                ended_at,
+                "needs_decision" if exhausted else "in_progress",
+                "provider_recovery" if exhausted else task["phase"],
+                (
+                    f"HostJob {job['id']} outcome is unknown after {failures} reconcile failures"
+                    if exhausted and step.kind != "snapshot"
+                    else (
+                        f"Host Bridge snapshot unavailable after {failures} attempts"
+                        if exhausted
+                        else f"Host Bridge {step.kind} unavailable; idempotent reconcile scheduled"
+                    )
+                ),
+                "unsafe_unknown" if exhausted and step.kind != "snapshot" else "transport",
+                (
+                    None
+                    if exhausted
+                    else now
+                    + max(1, int(values.get("retry_backoff_seconds", 0)))
+                ),
+                now,
                 task["id"],
             ),
         )
         connection.execute(
             """
             INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (?, ?, 'host_job_reconcile_deferred', ?, ?)
             """,
             (
                 task["project_id"],
                 task["id"],
-                "repaired" if purpose == "repair" else "executed",
-                canonical_json(
-                    {
-                        "host_job_sequence": sequence,
-                        "provider_key": spec["provider_key"],
-                        "returncode": result["returncode"],
-                        "workspace_changed": workspace_changed,
-                        "normalized_total": result["total_tokens"],
-                    }
-                ),
-                ended_at,
+                canonical_json({"host_job_id": job["id"], "step": step.kind}),
+                now,
             ),
         )
-        return purpose
-    except (OSError, RuntimeError, ValueError) as error:
-        ended_at = time.time()
-        log_body = f"Provider execution failed: {type(error).__name__}\n".encode()
-        _write_atomic(log_path, log_body)
+        return "needs_decision" if exhausted else step.kind
+    if step.kind == "snapshot":
+        before = facts.get("before")
+        before_git = before.get("git") if isinstance(before, dict) else {}
+        connection.execute(
+            "UPDATE host_jobs SET dispatch_json = ? WHERE id = ?",
+            (canonical_json({"before": before_git}), job["id"]),
+        )
         connection.execute(
             """
-            INSERT INTO host_jobs(
-                id, task_id, task_session_id, session_generation,
-                spec_revision, sequence, purpose, status,
-                started_at, ended_at, returncode, output_ref, failure_code
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'failed', ?, ?, 1, ?, 'provider')
+            UPDATE tasks SET phase = 'execute_dispatch', wait_reason = NULL,
+                fault_code = NULL, next_action_at = ?, updated_at = ? WHERE id = ?
+            """,
+            (now, now, task["id"]),
+        )
+        return "snapshot"
+
+    state = facts["state"]
+    bridge_status = str(state.get("status"))
+    log_path, log_body = _provider_log(store, task, job, facts.get("output"))
+    if log_body:
+        _write_atomic(log_path, log_body)
+    if bridge_status in ACTIVE_HOST_JOB_STATUSES:
+        database_status = "cancelling" if step.kind == "cancel" else "running"
+        connection.execute(
+            """
+            UPDATE host_jobs SET status = ?, output_ref = COALESCE(?, output_ref)
+            WHERE id = ?
+            """,
+            (
+                database_status,
+                store.relative_data_path(log_path) if log_body else None,
+                job["id"],
+            ),
+        )
+        if state.get("session_id"):
+            connection.execute(
+                """
+                UPDATE session_generations SET external_session_id = ?
+                WHERE task_session_id = ? AND generation = ?
+                """,
+                (state["session_id"], job["task_session_id"], job["session_generation"]),
+            )
+        connection.execute(
+            """
+            UPDATE tasks SET phase = ?, wait_reason = ?, fault_code = NULL,
+                next_action_at = ?, updated_at = ? WHERE id = ?
+            """,
+            (
+                "stopping" if step.kind == "cancel" else "execute_wait",
+                "cancellation requested" if step.kind == "cancel" else None,
+                now + 1,
+                now,
+                task["id"],
+            ),
+        )
+        return "cancel" if step.kind == "cancel" else (
+            "dispatch" if step.kind == "start" else "wait"
+        )
+    if step.kind == "cancel":
+        return _finalize_provider_cancel(store, connection, task, job, state, log_path, log_body)
+    return _finalize_provider_job(
+        store, connection, task, job, step, state, facts, log_path, log_body
+    )
+
+
+def _provider_log(
+    store: Store,
+    task: sqlite3.Row,
+    job: sqlite3.Row,
+    output: object,
+) -> tuple[Path, bytes]:
+    streams = {"stdout": [], "stderr": []}
+    if isinstance(output, dict):
+        for chunk in output.get("chunks", []):
+            if isinstance(chunk, dict) and chunk.get("stream") in streams:
+                streams[str(chunk["stream"])].append(str(chunk.get("text") or ""))
+    body = (
+        "".join(streams["stdout"])
+        + ("\n" if streams["stdout"] and streams["stderr"] else "")
+        + "".join(streams["stderr"])
+    ).encode()
+    path = (
+        store.data_root
+        / "projects"
+        / task["project_id"]
+        / "tasks"
+        / task["id"]
+        / "sessions"
+        / (task["role_key"] or "fullstack")
+        / f"generation-{job['session_generation']:06d}"
+        / f"sequence-{job['sequence']:06d}.log"
+    )
+    return path, body
+
+
+def _finalize_provider_job(
+    store: Store,
+    connection: sqlite3.Connection,
+    task: sqlite3.Row,
+    job: sqlite3.Row,
+    step: ProviderStep,
+    state: dict,
+    facts: dict[str, object],
+    log_path: Path,
+    log_body: bytes,
+) -> str:
+    now = time.time()
+    after = facts.get("after")
+    after_git = after.get("git") if isinstance(after, dict) else {}
+    before_git = json.loads(job["dispatch_json"]).get("before", {})
+    workspace_changed = canonical_json(before_git) != canonical_json(after_git)
+    returncode = state.get("returncode")
+    returncode = int(returncode) if isinstance(returncode, int) else 1
+    succeeded = str(state.get("status")) == "completed" and returncode == 0
+    stdout, stderr = _provider_output_streams(facts.get("output"))
+    manifest = {
+        "provider_key": step.provider_key,
+        "project_path": step.project_path,
+        "host_job_id": job["id"],
+        "returncode": returncode,
+        "failure_class": state.get("failure_class"),
+        "duration_ms": max(0, int(state.get("duration_ms") or 0)),
+        "workspace_changed": workspace_changed,
+        "before": before_git,
+        "after": after_git,
+        "stdout_tail": _bounded_tail(stdout),
+        "stderr_tail": _bounded_tail(stderr),
+    }
+    body = canonical_json(manifest).encode()
+    output_path = (
+        store.data_root
+        / "projects"
+        / task["project_id"]
+        / "tasks"
+        / task["id"]
+        / "artifacts"
+        / f"revision-{task['spec_revision']:06d}"
+        / f"execution-{job['sequence']:06d}"
+        / "output"
+        / "provider-execution.json"
+    )
+    if not log_body:
+        log_body = (
+            f"provider={step.provider_key} returncode={returncode} "
+            f"workspace_changed={str(workspace_changed).lower()}\n"
+        ).encode()
+    _write_atomic(output_path, body)
+    _write_atomic(log_path, log_body)
+    connection.execute(
+        """
+        UPDATE host_jobs SET status = ?, ended_at = ?, returncode = ?,
+            output_ref = ?, failure_code = ? WHERE id = ?
+        """,
+        (
+            "succeeded" if succeeded else "failed",
+            now,
+            returncode,
+            store.relative_data_path(log_path),
+            None if succeeded else "provider",
+            job["id"],
+        ),
+    )
+    if state.get("session_id"):
+        connection.execute(
+            """
+            UPDATE session_generations SET external_session_id = ?
+            WHERE task_session_id = ? AND generation = ?
+            """,
+            (state["session_id"], job["task_session_id"], job["session_generation"]),
+        )
+    input_tokens = max(0, int(state.get("input_tokens") or 0))
+    cached_tokens = min(input_tokens, max(0, int(state.get("cached_input_tokens") or 0)))
+    output_tokens = max(0, int(state.get("output_tokens") or 0))
+    record_model_call(
+        connection,
+        task["id"],
+        job["task_session_id"],
+        job["session_generation"],
+        step.provider_key,
+        "single",
+        input_tokens,
+        cached_tokens,
+        output_tokens,
+        str(state.get("model") or step.provider_key),
+    )
+    for kind, path, data in (("output", output_path, body), ("log", log_path, log_body)):
+        connection.execute(
+            """
+            INSERT INTO artifacts(
+                id, project_id, task_id, kind, path, sha256, bytes,
+                acceptance_id, revision, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
             """,
             (
                 uuid4().hex,
+                task["project_id"],
                 task["id"],
-                task_session_id,
-                session_generation,
+                kind,
+                store.relative_data_path(path),
+                hashlib.sha256(data).hexdigest(),
+                len(data),
                 task["spec_revision"],
-                sequence,
-                purpose,
-                started_at,
-                ended_at,
-                store.relative_data_path(log_path),
+                now,
             ),
         )
-        connection.execute(
-            """
-            UPDATE tasks SET public_status = 'needs_decision', phase = 'execute',
-                wait_reason = ?, fault_code = 'provider', next_action_at = NULL,
-                updated_at = ? WHERE id = ?
-            """,
-            ("Host Bridge Provider execution is unavailable", ended_at, task["id"]),
-        )
-        return purpose
+    fallback = (
+        _fallback_provider_generation(connection, task, job, step.provider_key, now)
+        if not succeeded
+        else None
+    )
+    connection.execute(
+        """
+        UPDATE tasks SET public_status = ?, phase = ?, next_action_at = ?,
+            wait_reason = ?, fault_code = ?, updated_at = ? WHERE id = ?
+        """,
+        (
+            "in_progress" if succeeded or fallback else "needs_decision",
+            "verify" if succeeded else ("execute" if fallback else "provider_recovery"),
+            now if succeeded or fallback else None,
+            (
+                None
+                if succeeded
+                else (
+                    f"Provider {step.provider_key} failed; falling back to {fallback}"
+                    if fallback
+                    else "Provider execution did not exit successfully"
+                )
+            ),
+            None if succeeded else "provider",
+            now,
+            task["id"],
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            task["project_id"],
+            task["id"],
+            "repaired" if job["purpose"] == "repair" else "executed",
+            canonical_json(
+                {
+                    "host_job_id": job["id"],
+                    "host_job_sequence": job["sequence"],
+                    "provider_key": step.provider_key,
+                    "returncode": returncode,
+                    "workspace_changed": workspace_changed,
+                    "normalized_total": input_tokens + output_tokens,
+                }
+            ),
+            now,
+        ),
+    )
+    return "provider_fallback" if fallback else job["purpose"]
+
+
+def _fallback_provider_generation(
+    connection: sqlite3.Connection,
+    task: sqlite3.Row,
+    job: sqlite3.Row,
+    provider_key: str,
+    now: float,
+) -> str | None:
+    session = connection.execute(
+        """
+        SELECT role_key, settings_json FROM task_sessions WHERE id = ?
+        """,
+        (job["task_session_id"],),
+    ).fetchone()
+    order = (
+        json.loads(session["settings_json"])
+        .get("values", {})
+        .get("provider_order", {})
+        .get(session["role_key"], [])
+    )
+    try:
+        candidates = order[order.index(provider_key) + 1 :]
+    except ValueError:
+        candidates = order
+    next_provider = next(
+        (
+            str(candidate)
+            for candidate in candidates
+            if candidate != provider_key and candidate in PROVIDERS
+        ),
+        None,
+    )
+    if not next_provider:
+        return None
+    current = connection.execute(
+        """
+        SELECT handoff_ref FROM session_generations
+        WHERE task_session_id = ? AND generation = ?
+        """,
+        (job["task_session_id"], job["session_generation"]),
+    ).fetchone()
+    connection.execute(
+        """
+        UPDATE session_generations SET status = 'archived', ended_at = ?
+        WHERE task_session_id = ? AND generation = ? AND status = 'active'
+        """,
+        (now, job["task_session_id"], job["session_generation"]),
+    )
+    connection.execute(
+        """
+        INSERT INTO session_generations(
+            id, task_session_id, generation, provider_key, status,
+            handoff_ref, created_at
+        ) VALUES (?, ?, ?, ?, 'active', ?, ?)
+        """,
+        (
+            uuid4().hex,
+            job["task_session_id"],
+            job["session_generation"] + 1,
+            next_provider,
+            current["handoff_ref"] if current else None,
+            now,
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
+        VALUES (?, ?, 'provider_fallback', ?, ?)
+        """,
+        (
+            task["project_id"],
+            task["id"],
+            canonical_json(
+                {
+                    "from": provider_key,
+                    "to": next_provider,
+                    "generation": job["session_generation"] + 1,
+                    "host_job_id": job["id"],
+                }
+            ),
+            now,
+        ),
+    )
+    return next_provider
+
+
+def _finalize_provider_cancel(
+    store: Store,
+    connection: sqlite3.Connection,
+    task: sqlite3.Row,
+    job: sqlite3.Row,
+    state: dict,
+    log_path: Path,
+    log_body: bytes,
+) -> str:
+    now = time.time()
+    if log_body:
+        _write_atomic(log_path, log_body)
+    returncode = state.get("returncode")
+    connection.execute(
+        """
+        UPDATE host_jobs SET status = 'cancelled', ended_at = ?, returncode = ?,
+            output_ref = COALESCE(?, output_ref), failure_code = 'process'
+        WHERE id = ?
+        """,
+        (
+            now,
+            int(returncode) if isinstance(returncode, int) else -15,
+            store.relative_data_path(log_path) if log_body else None,
+            job["id"],
+        ),
+    )
+    connection.execute(
+        """
+        UPDATE tasks SET public_status = 'done', outcome = 'cancelled', phase = 'done',
+            next_action_at = NULL, wait_reason = NULL, fault_code = NULL, updated_at = ?
+        WHERE id = ?
+        """,
+        (now, task["id"]),
+    )
+    archive_task_sessions(connection, task["id"], now)
+    connection.execute(
+        """
+        INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
+        VALUES (?, ?, 'cancelled', ?, ?)
+        """,
+        (
+            task["project_id"],
+            task["id"],
+            canonical_json({"host_job_id": job["id"]}),
+            now,
+        ),
+    )
+    return "cancel"
+
+
+def _provider_output_streams(output: object) -> tuple[str, str]:
+    streams = {"stdout": [], "stderr": []}
+    if isinstance(output, dict):
+        for chunk in output.get("chunks", []):
+            if isinstance(chunk, dict) and chunk.get("stream") in streams:
+                streams[str(chunk["stream"])].append(str(chunk.get("text") or ""))
+    return "".join(streams["stdout"]), "".join(streams["stderr"])
 
 
 def _provider_prompt(task: sqlite3.Row, spec: dict, purpose: str) -> str:

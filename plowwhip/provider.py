@@ -40,7 +40,14 @@ PROVIDERS = {
 }
 PROBE_MARKER = "PLOWWHIP_PROBE_OK"
 PROBE_TOKEN_CAP = 4096
-CHECKER_PASS_MARKER = "PLOWWHIP_CHECKER_PASS"
+CHECKER_RESULT_PREFIX = "PLOWWHIP_CHECKER_RESULT "
+ACTIVE_HOST_JOB_STATUSES = {
+    "dispatching",
+    "running",
+    "orphan_running",
+    "cancelling",
+    "recovery_hold",
+}
 
 
 PROVIDER_ORDERS = {
@@ -272,6 +279,80 @@ def run_provider_task(
         "total_tokens": input_tokens + output_tokens,
         "session_id": str(response.get("session_id") or "") or session_id,
     }
+
+
+def start_provider_job(
+    job_id: str,
+    provider_key: str,
+    project_path: str,
+    prompt: str,
+    *,
+    session_id: str | None,
+    timeout_seconds: int,
+) -> dict[str, object]:
+    provider = PROVIDERS.get(provider_key)
+    if not provider:
+        raise ValueError("unknown Provider")
+    base_url, token = _bridge_configuration()
+    return _bridge_post(
+        base_url,
+        token,
+        "/v1/jobs/start",
+        {
+            "job_id": job_id,
+            "adapter": provider["adapter"],
+            "executable": provider["executable"],
+            "project_path": project_path,
+            "prompt": prompt,
+            "session_id": session_id,
+            "timeout_seconds": min(max(int(timeout_seconds), 10), 86_400),
+            "context_policy": {"max_turns": 24, "tool_no_progress_limit": 6},
+        },
+        20,
+        max_bytes=1_048_576,
+    )
+
+
+def provider_job_status(job_id: str) -> dict[str, object]:
+    base_url, token = _bridge_configuration()
+    return _bridge_post(
+        base_url,
+        token,
+        "/v1/jobs/status",
+        {"job_id": job_id},
+        10,
+        max_bytes=1_048_576,
+    )
+
+
+def provider_job_output(job_id: str) -> dict[str, object]:
+    base_url, token = _bridge_configuration()
+    return _bridge_post(
+        base_url,
+        token,
+        "/v1/jobs/output",
+        {
+            "job_id": job_id,
+            "stdout_offset": -1,
+            "stderr_offset": -1,
+            "limit": 32_768,
+            "tail_lines": 20,
+        },
+        10,
+        max_bytes=65_536,
+    )
+
+
+def cancel_provider_job(job_id: str) -> dict[str, object]:
+    base_url, token = _bridge_configuration()
+    return _bridge_post(
+        base_url,
+        token,
+        "/v1/jobs/cancel",
+        {"job_id": job_id},
+        10,
+        max_bytes=1_048_576,
+    )
 
 
 def _bridge_configuration() -> tuple[str, str]:

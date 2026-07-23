@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from uuid import uuid4
 
 from .continuity import checkpoint_project
@@ -73,25 +74,37 @@ def tick(store: Store, limit: int = 100) -> list[dict[str, str]]:
     finally:
         connection.close()
 
-    results = []
-    for project in projects:
-        lease = _claim(store, project["id"])
-        if not lease:
-            continue
-        token, fence = lease
-        try:
-            action = advance_project(store, project["id"], token, fence)
-            checkpoint_project(store, project["id"])
-            results.append(
-                {
-                    "project_id": project["id"],
-                    "action": action,
-                    "status": _latest_status(store, project["id"]),
-                }
-            )
-        finally:
-            _release(store, project["id"], token, fence)
-    return results
+    project_ids = [project["id"] for project in projects]
+    if len(project_ids) == 1:
+        result = _advance_due_project(store, project_ids[0])
+        return [result] if result else []
+    if not project_ids:
+        return []
+    # ponytail: stdlib worker default bounds global project concurrency; same-project
+    # serialization remains enforced by its lease and unique active Task constraint.
+    with ThreadPoolExecutor(thread_name_prefix="plowwhip-project") as pool:
+        return [
+            result
+            for result in pool.map(lambda project_id: _advance_due_project(store, project_id), project_ids)
+            if result
+        ]
+
+
+def _advance_due_project(store: Store, project_id: str) -> dict[str, str] | None:
+    lease = _claim(store, project_id)
+    if not lease:
+        return None
+    token, fence = lease
+    try:
+        action = advance_project(store, project_id, token, fence)
+        checkpoint_project(store, project_id)
+        return {
+            "project_id": project_id,
+            "action": action,
+            "status": _latest_status(store, project_id),
+        }
+    finally:
+        _release(store, project_id, token, fence)
 
 
 def run_until_idle(store: Store, max_actions: int = 100) -> list[dict[str, str]]:

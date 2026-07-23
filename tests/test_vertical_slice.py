@@ -31,12 +31,43 @@ from plowwhip.monitor import (
 )
 from plowwhip.planner import normalize_plan
 from plowwhip.provider import (
-    CHECKER_PASS_MARKER,
+    CHECKER_RESULT_PREFIX,
     provider_adapter,
     provider_facts,
     record_model_call,
 )
 from plowwhip.store import Store
+from plowwhip.verification import _parse_checker_verdict
+
+
+def checker_output(
+    verdict: str = "PASS", failed: tuple[str, ...] = ()
+) -> str:
+    acceptances = []
+    for acceptance_id in ("owner_instruction", "relevant_checks"):
+        passed = acceptance_id not in failed
+        acceptances.append(
+            {
+                "acceptance_id": acceptance_id,
+                "passed": passed,
+                "actual_evidence": (
+                    f"{acceptance_id} verified" if passed else f"{acceptance_id} missing"
+                ),
+                "recheck_command": "python3 -m unittest -q",
+            }
+        )
+    return (
+        "bounded review\n"
+        + CHECKER_RESULT_PREFIX
+        + json.dumps(
+            {
+                "verdict": verdict,
+                "acceptances": acceptances,
+                "decision_reason": None,
+            },
+            sort_keys=True,
+        )
+    )
 
 
 class VerticalSliceTest(unittest.TestCase):
@@ -159,6 +190,84 @@ class VerticalSliceTest(unittest.TestCase):
         self.assertEqual(json.loads(rows["retry_count"]["value_json"]), 7)
         self.assertEqual(rows["retry_count"]["source"], "owner")
 
+    def test_schema_v4_preserves_terminal_jobs_and_accepts_running_jobs(self):
+        submit_message(self.store, "migration", "写入 migrated.txt: ok", "migration")
+        run_until_idle(self.store)
+        connection = self.store.connect()
+        try:
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("ALTER TABLE host_jobs RENAME TO host_jobs_v4")
+            connection.execute(
+                """
+                CREATE TABLE host_jobs (
+                    id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL REFERENCES tasks(id),
+                    task_session_id TEXT,
+                    session_generation INTEGER,
+                    spec_revision INTEGER NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    purpose TEXT NOT NULL CHECK (
+                        purpose IN ('execute', 'check', 'repair', 'command')
+                    ),
+                    status TEXT NOT NULL CHECK (status IN ('succeeded', 'failed')),
+                    started_at REAL NOT NULL,
+                    ended_at REAL NOT NULL,
+                    returncode INTEGER NOT NULL,
+                    output_ref TEXT,
+                    failure_code TEXT,
+                    UNIQUE (task_id, sequence)
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO host_jobs
+                SELECT id, task_id, task_session_id, session_generation,
+                       spec_revision, sequence, purpose, status,
+                       started_at, ended_at, returncode, output_ref, failure_code
+                FROM host_jobs_v4
+                """
+            )
+            connection.execute("DROP TABLE host_jobs_v4")
+            connection.execute("PRAGMA user_version = 3")
+            connection.commit()
+        finally:
+            connection.close()
+
+        self.store.initialize()
+        connection = self.store.connect()
+        try:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 4)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM host_jobs").fetchone()[0], 2)
+            previous = connection.execute(
+                "SELECT * FROM host_jobs ORDER BY sequence LIMIT 1"
+            ).fetchone()
+            connection.execute(
+                """
+                INSERT INTO host_jobs(
+                    id, task_id, task_session_id, session_generation,
+                    spec_revision, sequence, purpose, status, started_at
+                ) VALUES ('00000000-0000-0000-0000-000000000004', ?, ?, ?, ?, 3,
+                          'command', 'running', ?)
+                """,
+                (
+                    previous["task_id"],
+                    previous["task_session_id"],
+                    previous["session_generation"],
+                    previous["spec_revision"],
+                    time.time(),
+                ),
+            )
+            connection.commit()
+            active = connection.execute(
+                "SELECT ended_at, returncode FROM host_jobs WHERE status = 'running'"
+            ).fetchone()
+            self.assertIsNone(active["ended_at"])
+            self.assertIsNone(active["returncode"])
+        finally:
+            connection.close()
+
     def test_owner_wake_is_queued_but_cronner_remains_the_only_driver(self):
         submit_message(self.store, "wake", "写入 wake.txt: done", "wake-message")
         self.assertEqual(tick(self.store)[0]["action"], "intake")
@@ -178,6 +287,41 @@ class VerticalSliceTest(unittest.TestCase):
         done = snapshot(self.db, self.data, "wake")
         self.assertEqual(done["task"]["public_status"], "done")
         self.assertIn("wake_requested", {item["kind"] for item in done["events"]})
+
+    def test_checker_changes_required_is_a_bounded_repair_package(self):
+        expected = [
+            {
+                "id": "owner_instruction",
+                "kind": "checker_evidence",
+                "expected": "refresh button is usable",
+            },
+            {
+                "id": "relevant_checks",
+                "kind": "checker_evidence",
+                "expected": "tests pass",
+            },
+        ]
+        verdict = _parse_checker_verdict(
+            checker_output("CHANGES_REQUIRED", ("owner_instruction",)),
+            expected,
+            "/workspace",
+        )
+        self.assertTrue(verdict["valid"])
+        self.assertFalse(verdict["passed"])
+        self.assertEqual(verdict["verdict"], "CHANGES_REQUIRED")
+        self.assertEqual(
+            verdict["repair_package"],
+            [
+                {
+                    "acceptance_id": "owner_instruction",
+                    "passed": False,
+                    "actual_evidence": "owner_instruction missing",
+                    "expected_result": "refresh button is usable",
+                    "allowed_scope": "/workspace",
+                    "recheck_command": "python3 -m unittest -q",
+                }
+            ],
+        )
 
     def test_failed_evidence_converges_to_needs_decision(self):
         with self.store.transaction() as connection:
@@ -607,7 +751,7 @@ class VerticalSliceTest(unittest.TestCase):
         self.assertTrue(state["read_only"])
         self.assertEqual(state["database"]["journal_mode"], "wal")
         self.assertEqual(state["database"]["quick_check"], ["ok"])
-        self.assertEqual(state["database"]["schema_version"], 3)
+        self.assertEqual(state["database"]["schema_version"], 4)
 
         archive_project(
             self.store, "archive-me", "archive-me", "archive-confirmed"
@@ -778,11 +922,11 @@ class VerticalSliceTest(unittest.TestCase):
                         },
                     }
                     snapshots += 1
-                elif payload["access"] == "write":
+                elif self.path == "/v1/jobs/start":
                     body = {
+                        "job_id": payload["job_id"],
+                        "status": "completed",
                         "returncode": 0,
-                        "stdout": "implemented and tests passed",
-                        "stderr": "",
                         "duration_ms": 12,
                         "input_tokens": 20,
                         "cached_input_tokens": 5,
@@ -790,10 +934,21 @@ class VerticalSliceTest(unittest.TestCase):
                         "model": "codex-test",
                         "session_id": "executor-session",
                     }
+                elif self.path == "/v1/jobs/output":
+                    body = {
+                        "job_id": payload["job_id"],
+                        "status": "completed",
+                        "chunks": [
+                            {
+                                "stream": "stdout",
+                                "text": "implemented and tests passed",
+                            }
+                        ],
+                    }
                 else:
                     body = {
                         "returncode": 0,
-                        "stdout": f"reviewed\n{CHECKER_PASS_MARKER}",
+                        "stdout": checker_output(),
                         "stderr": "",
                         "duration_ms": 8,
                         "input_tokens": 10,
@@ -837,7 +992,7 @@ class VerticalSliceTest(unittest.TestCase):
                 )
                 self.assertEqual(
                     [item["action"] for item in run_until_idle(self.store)],
-                    ["intake", "execute", "verify"],
+                    ["intake", "snapshot", "execute", "verify"],
                 )
         finally:
             bridge.shutdown()
@@ -851,7 +1006,7 @@ class VerticalSliceTest(unittest.TestCase):
         self.assertEqual(
             [(item["role_key"], item["provider_key"], item["external_session_id"]) for item in view["sessions"]],
             [
-                ("fullstack", "codex_cli", "executor-session"),
+                ("fullstack", "cursor_cli", "executor-session"),
                 ("independent_checker", "codex_cli", "checker-session"),
             ],
         )
@@ -873,13 +1028,440 @@ class VerticalSliceTest(unittest.TestCase):
             [item[0] for item in requests],
             [
                 "/v1/evidence/snapshot",
-                "/v1/execute",
+                "/v1/jobs/start",
+                "/v1/jobs/output",
                 "/v1/evidence/snapshot",
                 "/v1/execute",
             ],
         )
-        self.assertEqual(requests[1][1]["access"], "write")
-        self.assertEqual(requests[3][1]["access"], "read")
+        self.assertEqual(requests[1][1]["adapter"], "cursor")
+        self.assertEqual(requests[4][1]["access"], "read")
+
+    def test_terminal_provider_failure_falls_back_with_new_generation(self):
+        snapshots = 0
+        jobs = {}
+        adapters = []
+
+        class Bridge(BaseHTTPRequestHandler):
+            def do_POST(self):
+                nonlocal snapshots
+                length = int(self.headers["Content-Length"])
+                payload = json.loads(self.rfile.read(length))
+                if self.path == "/v1/evidence/snapshot":
+                    states = ["", "", "", " M changed.py"]
+                    body = {
+                        "git": {
+                            "available": True,
+                            "head": "abc123",
+                            "status": states[min(snapshots, len(states) - 1)],
+                            "diff_stat": (
+                                "1 file changed" if snapshots >= len(states) - 1 else ""
+                            ),
+                        }
+                    }
+                    snapshots += 1
+                elif self.path == "/v1/jobs/start":
+                    adapters.append(payload["adapter"])
+                    failed = payload["adapter"] == "cursor"
+                    body = {
+                        "job_id": payload["job_id"],
+                        "status": "completed",
+                        "returncode": 1 if failed else 0,
+                        "failure_class": "provider_unavailable" if failed else None,
+                        "input_tokens": 2,
+                        "cached_input_tokens": 1,
+                        "output_tokens": 1,
+                        "model": f"{payload['adapter']}-test",
+                        "session_id": f"{payload['adapter']}-session",
+                    }
+                    jobs[payload["job_id"]] = body
+                elif self.path == "/v1/jobs/output":
+                    body = {
+                        "job_id": payload["job_id"],
+                        "status": jobs[payload["job_id"]]["status"],
+                        "chunks": [
+                            {
+                                "stream": "stdout",
+                                "text": (
+                                    "provider failed"
+                                    if jobs[payload["job_id"]]["returncode"]
+                                    else "implemented"
+                                ),
+                            }
+                        ],
+                    }
+                else:
+                    body = {
+                        "returncode": 0,
+                        "stdout": checker_output(),
+                        "stderr": "",
+                        "input_tokens": 2,
+                        "cached_input_tokens": 1,
+                        "output_tokens": 1,
+                        "model": "codex-checker",
+                        "session_id": "checker-session",
+                    }
+                data = json.dumps(body).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *_args):
+                return
+
+        bridge = ThreadingHTTPServer(("127.0.0.1", 0), Bridge)
+        thread = threading.Thread(target=bridge.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with patch.dict(
+                os.environ,
+                {
+                    "PLOW_WHIP_BRIDGE_URL": f"http://127.0.0.1:{bridge.server_port}",
+                    "PLOW_WHIP_BRIDGE_TOKEN": "test-token",
+                },
+            ):
+                create_project(self.store, "fallback", "fallback-project", str(self.root))
+                submit_message(
+                    self.store, "fallback", "先失败再自动递补完成", "fallback-message"
+                )
+                self.assertEqual(
+                    [item["action"] for item in run_until_idle(self.store)],
+                    [
+                        "intake",
+                        "snapshot",
+                        "provider_fallback",
+                        "snapshot",
+                        "execute",
+                        "verify",
+                    ],
+                )
+        finally:
+            bridge.shutdown()
+            bridge.server_close()
+            thread.join()
+
+        view = snapshot(self.db, self.data, "fallback")
+        self.assertEqual(view["task"]["outcome"], "done")
+        fullstack = [
+            (item["generation"], item["provider_key"], item["status"])
+            for item in view["sessions"]
+            if item["role_key"] == "fullstack"
+        ]
+        self.assertEqual(
+            fullstack,
+            [(1, "cursor_cli", "archived"), (2, "codex_cli", "archived")],
+        )
+        self.assertEqual(adapters, ["cursor", "codex"])
+        self.assertIn("provider_fallback", {item["kind"] for item in view["events"]})
+
+    def test_running_host_job_releases_sqlite_and_can_reconcile_or_cancel(self):
+        entered = threading.Event()
+        release = threading.Event()
+        checker_entered = threading.Event()
+        checker_release = threading.Event()
+        snapshots = 0
+        jobs = {}
+
+        class Bridge(BaseHTTPRequestHandler):
+            def do_POST(self):
+                nonlocal snapshots
+                length = int(self.headers["Content-Length"])
+                payload = json.loads(self.rfile.read(length))
+                if self.path == "/v1/evidence/snapshot":
+                    body = {
+                        "git": {
+                            "available": True,
+                            "head": "abc123",
+                            "status": "" if snapshots % 2 == 0 else " M changed.py",
+                            "diff_stat": "" if snapshots % 2 == 0 else "1 file changed",
+                        }
+                    }
+                    snapshots += 1
+                elif self.path == "/v1/jobs/start":
+                    entered.set()
+                    release.wait(2)
+                    body = jobs.setdefault(
+                        payload["job_id"],
+                        {
+                            "job_id": payload["job_id"],
+                            "status": "running",
+                            "session_id": "durable-executor",
+                        },
+                    )
+                elif self.path == "/v1/jobs/status":
+                    body = {
+                        **jobs[payload["job_id"]],
+                        "status": "completed",
+                        "returncode": 0,
+                        "input_tokens": 8,
+                        "cached_input_tokens": 3,
+                        "output_tokens": 2,
+                        "model": "codex-test",
+                    }
+                    jobs[payload["job_id"]] = body
+                elif self.path == "/v1/jobs/output":
+                    body = {
+                        "job_id": payload["job_id"],
+                        "status": jobs[payload["job_id"]]["status"],
+                        "chunks": [{"stream": "stdout", "text": "bounded progress\n"}],
+                    }
+                elif self.path == "/v1/jobs/cancel":
+                    body = {
+                        **jobs[payload["job_id"]],
+                        "status": "cancelled",
+                        "returncode": -15,
+                    }
+                    jobs[payload["job_id"]] = body
+                else:
+                    checker_entered.set()
+                    checker_release.wait(2)
+                    body = {
+                        "returncode": 0,
+                        "stdout": checker_output(),
+                        "stderr": "",
+                        "input_tokens": 4,
+                        "cached_input_tokens": 1,
+                        "output_tokens": 1,
+                        "model": "codex-test",
+                        "session_id": "durable-checker",
+                    }
+                data = json.dumps(body).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *_args):
+                return
+
+        bridge = ThreadingHTTPServer(("127.0.0.1", 0), Bridge)
+        bridge_thread = threading.Thread(target=bridge.serve_forever, daemon=True)
+        bridge_thread.start()
+        environment = {
+            "PLOW_WHIP_BRIDGE_URL": f"http://127.0.0.1:{bridge.server_port}",
+            "PLOW_WHIP_BRIDGE_TOKEN": "test-token",
+        }
+        try:
+            with patch.dict(os.environ, environment):
+                create_project(self.store, "durable-code", "durable-project", str(self.root))
+                submit_message(
+                    self.store, "durable-code", "实现持久 HostJob", "durable-message"
+                )
+                self.assertEqual(tick(self.store)[0]["action"], "intake")
+                self.assertEqual(tick(self.store)[0]["action"], "snapshot")
+                dispatched = []
+                dispatch_thread = threading.Thread(
+                    target=lambda: dispatched.extend(tick(self.store)), daemon=True
+                )
+                dispatch_thread.start()
+                self.assertTrue(entered.wait(1))
+                started = time.monotonic()
+                submit_message(
+                    self.store, "side-project", "写入 side.txt: ok", "side-message"
+                )
+                self.assertLess(time.monotonic() - started, 0.5)
+                release.set()
+                dispatch_thread.join(2)
+                self.assertFalse(dispatch_thread.is_alive())
+                self.assertEqual(dispatched[0]["action"], "dispatch")
+                running = snapshot(self.db, self.data, "durable-code")
+                self.assertEqual(running["task"]["phase"], "execute_wait")
+                self.assertEqual(running["host_jobs"][0]["status"], "running")
+                self.assertIsNone(running["host_jobs"][0]["ended_at"])
+                with self.store.transaction() as connection:
+                    connection.execute(
+                        "UPDATE tasks SET next_action_at = ? WHERE project_id = ?",
+                        (time.time() + 60, "durable-code"),
+                    )
+                run_until_idle(self.store)
+                self.assertEqual(
+                    snapshot(self.db, self.data, "side-project")["task"]["outcome"],
+                    "done",
+                )
+                with self.store.transaction() as connection:
+                    connection.execute(
+                        "UPDATE tasks SET next_action_at = ? WHERE project_id = ?",
+                        (time.time(), "durable-code"),
+                    )
+                self.assertEqual(tick(self.store)[0]["action"], "execute")
+                submit_message(
+                    self.store, "checker-side", "写入 checker-side.txt: ok", "checker-side"
+                )
+                verified = []
+                verify_thread = threading.Thread(
+                    target=lambda: verified.extend(tick(self.store)), daemon=True
+                )
+                verify_thread.start()
+                self.assertTrue(checker_entered.wait(1))
+                deadline = time.monotonic() + 0.5
+                checker_side = snapshot(self.db, self.data, "checker-side")
+                while checker_side["task"] is None and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                    checker_side = snapshot(self.db, self.data, "checker-side")
+                self.assertIsNotNone(checker_side["task"])
+                started = time.monotonic()
+                submit_message(
+                    self.store, "checker-write", "写入 write.txt: ok", "checker-write"
+                )
+                self.assertLess(time.monotonic() - started, 0.5)
+                checker_release.set()
+                verify_thread.join(2)
+                self.assertFalse(verify_thread.is_alive())
+                self.assertEqual(
+                    {(item["project_id"], item["action"]) for item in verified},
+                    {("durable-code", "verify"), ("checker-side", "intake")},
+                )
+                self.assertEqual(
+                    snapshot(self.db, self.data, "durable-code")["task"]["outcome"],
+                    "done",
+                )
+                run_until_idle(self.store)
+                self.assertEqual(
+                    snapshot(self.db, self.data, "checker-side")["task"]["outcome"],
+                    "done",
+                )
+                self.assertEqual(
+                    snapshot(self.db, self.data, "checker-write")["task"]["outcome"],
+                    "done",
+                )
+
+                entered.clear()
+                release.set()
+                create_project(self.store, "cancel-code", "cancel-project", str(self.root))
+                submit_message(self.store, "cancel-code", "实现后取消", "cancel-message")
+                self.assertEqual(tick(self.store)[0]["action"], "intake")
+                self.assertEqual(tick(self.store)[0]["action"], "snapshot")
+                self.assertEqual(tick(self.store)[0]["action"], "dispatch")
+                cancel_view = snapshot(self.db, self.data, "cancel-code")
+                submit_action(
+                    self.store,
+                    "cancel-code",
+                    cancel_view["task"]["id"],
+                    "cancel",
+                    "",
+                    "cancel-running",
+                )
+                self.assertEqual(tick(self.store)[0]["action"], "cancel")
+                self.assertEqual(tick(self.store)[0]["action"], "cancel")
+                cancelled = snapshot(self.db, self.data, "cancel-code")
+                self.assertEqual(cancelled["task"]["outcome"], "cancelled")
+                self.assertEqual(cancelled["host_jobs"][0]["status"], "cancelled")
+        finally:
+            release.set()
+            checker_release.set()
+            bridge.shutdown()
+            bridge.server_close()
+            bridge_thread.join()
+
+    def test_ambiguous_dispatch_stops_for_decision_without_blind_replay(self):
+        starts = 0
+
+        class Bridge(BaseHTTPRequestHandler):
+            def do_POST(self):
+                nonlocal starts
+                length = int(self.headers["Content-Length"])
+                payload = json.loads(self.rfile.read(length))
+                if self.path == "/v1/jobs/start":
+                    starts += 1
+                    self.send_response(503)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                if self.path == "/v1/jobs/cancel":
+                    body = {
+                        "job_id": payload["job_id"],
+                        "status": "cancelled",
+                        "returncode": -15,
+                    }
+                elif self.path == "/v1/jobs/output":
+                    body = {
+                        "job_id": payload["job_id"],
+                        "status": "cancelled",
+                        "chunks": [],
+                    }
+                else:
+                    body = {
+                        "git": {
+                            "available": True,
+                            "head": "abc123",
+                            "status": "",
+                            "diff_stat": "",
+                        }
+                    }
+                data = json.dumps(body).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *_args):
+                return
+
+        bridge = ThreadingHTTPServer(("127.0.0.1", 0), Bridge)
+        thread = threading.Thread(target=bridge.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with patch.dict(
+                os.environ,
+                {
+                    "PLOW_WHIP_BRIDGE_URL": f"http://127.0.0.1:{bridge.server_port}",
+                    "PLOW_WHIP_BRIDGE_TOKEN": "test-token",
+                },
+            ):
+                create_project(self.store, "ambiguous", "ambiguous-project", str(self.root))
+                submit_message(
+                    self.store, "ambiguous", "不要盲目重复执行", "ambiguous-message"
+                )
+                self.assertEqual(tick(self.store)[0]["action"], "intake")
+                self.assertEqual(tick(self.store)[0]["action"], "snapshot")
+                self.assertEqual(tick(self.store)[0]["action"], "start")
+                with self.store.transaction() as connection:
+                    connection.execute(
+                        "UPDATE tasks SET next_action_at = ? WHERE project_id = 'ambiguous'",
+                        (time.time(),),
+                    )
+                self.assertEqual(tick(self.store)[0]["action"], "needs_decision")
+                view = snapshot(self.db, self.data, "ambiguous")
+                self.assertEqual(view["task"]["public_status"], "needs_decision")
+                self.assertEqual(view["task"]["fault_code"], "unsafe_unknown")
+                self.assertEqual(view["host_jobs"][0]["status"], "dispatching")
+                self.assertEqual(starts, 2)
+
+                submit_action(
+                    self.store,
+                    "ambiguous",
+                    view["task"]["id"],
+                    "provide_decision",
+                    "重新执行",
+                    "unsafe-replay",
+                )
+                self.assertEqual(tick(self.store)[0]["action"], "provide_decision")
+                self.assertEqual(
+                    snapshot(self.db, self.data, "ambiguous")["task"]["public_status"],
+                    "needs_decision",
+                )
+                submit_action(
+                    self.store,
+                    "ambiguous",
+                    view["task"]["id"],
+                    "cancel",
+                    "",
+                    "safe-cancel",
+                )
+                self.assertEqual(tick(self.store)[0]["action"], "cancel")
+                self.assertEqual(tick(self.store)[0]["action"], "cancel")
+                self.assertEqual(
+                    snapshot(self.db, self.data, "ambiguous")["task"]["outcome"],
+                    "cancelled",
+                )
+        finally:
+            bridge.shutdown()
+            bridge.server_close()
+            thread.join()
 
     def _row_counts(self):
         connection = sqlite3.connect(str(self.db))

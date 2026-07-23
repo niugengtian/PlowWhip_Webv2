@@ -11,7 +11,33 @@ from urllib.parse import quote
 from uuid import uuid4
 
 
-SCHEMA = """
+HOST_JOBS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS host_jobs (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id),
+    task_session_id TEXT,
+    session_generation INTEGER,
+    spec_revision INTEGER NOT NULL,
+    sequence INTEGER NOT NULL,
+    purpose TEXT NOT NULL CHECK (purpose IN ('execute', 'check', 'repair', 'command')),
+    status TEXT NOT NULL CHECK (
+        status IN (
+            'dispatching', 'running', 'cancelling',
+            'succeeded', 'failed', 'cancelled', 'interrupted'
+        )
+    ),
+    started_at REAL NOT NULL,
+    ended_at REAL,
+    returncode INTEGER,
+    output_ref TEXT,
+    failure_code TEXT,
+    dispatch_json TEXT NOT NULL DEFAULT '{}',
+    UNIQUE (task_id, sequence)
+);
+"""
+
+
+SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS projects (
     id TEXT PRIMARY KEY,
     host_path TEXT,
@@ -128,22 +154,7 @@ CREATE TABLE IF NOT EXISTS session_generations (
     UNIQUE (task_session_id, generation)
 );
 
-CREATE TABLE IF NOT EXISTS host_jobs (
-    id TEXT PRIMARY KEY,
-    task_id TEXT NOT NULL REFERENCES tasks(id),
-    task_session_id TEXT,
-    session_generation INTEGER,
-    spec_revision INTEGER NOT NULL,
-    sequence INTEGER NOT NULL,
-    purpose TEXT NOT NULL CHECK (purpose IN ('execute', 'check', 'repair', 'command')),
-    status TEXT NOT NULL CHECK (status IN ('succeeded', 'failed')),
-    started_at REAL NOT NULL,
-    ended_at REAL NOT NULL,
-    returncode INTEGER NOT NULL,
-    output_ref TEXT,
-    failure_code TEXT,
-    UNIQUE (task_id, sequence)
-);
+{HOST_JOBS_SCHEMA}
 
 CREATE TABLE IF NOT EXISTS artifacts (
     id TEXT PRIMARY KEY,
@@ -281,6 +292,7 @@ class Store:
         connection = self.connect()
         try:
             connection.executescript(SCHEMA)
+            self._ensure_host_job_schema(connection)
             self._ensure_project_columns(connection)
             self._ensure_task_columns(connection)
             self._ensure_model_call_columns(connection)
@@ -311,10 +323,44 @@ class Store:
                     (value_json, now, key, value_json),
                 )
             self._sync_default_library(connection, now)
-            connection.execute("PRAGMA user_version = 3")
+            connection.execute("PRAGMA user_version = 4")
             connection.commit()
         finally:
             connection.close()
+
+    @staticmethod
+    def _ensure_host_job_schema(connection: sqlite3.Connection) -> None:
+        definition = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'host_jobs'"
+        ).fetchone()["sql"]
+        if "dispatching" in definition and "dispatch_json" in definition:
+            return
+        connection.commit()
+        connection.execute("PRAGMA foreign_keys = OFF")
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("ALTER TABLE host_jobs RENAME TO host_jobs_v3")
+            connection.execute(HOST_JOBS_SCHEMA.strip().removesuffix(";"))
+            connection.execute(
+                """
+                INSERT INTO host_jobs(
+                    id, task_id, task_session_id, session_generation,
+                    spec_revision, sequence, purpose, status,
+                    started_at, ended_at, returncode, output_ref, failure_code
+                )
+                SELECT id, task_id, task_session_id, session_generation,
+                       spec_revision, sequence, purpose, status,
+                       started_at, ended_at, returncode, output_ref, failure_code
+                FROM host_jobs_v3
+                """
+            )
+            connection.execute("DROP TABLE host_jobs_v3")
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.execute("PRAGMA foreign_keys = ON")
 
     @staticmethod
     def _ensure_project_columns(connection: sqlite3.Connection) -> None:

@@ -175,5 +175,10 @@ def _next_action(session: sqlite3.Row) -> str | None:
     return {
         "queued": "wait_for_dependencies",
         "execute": "execute_task",
+        "execute_snapshot": "snapshot_workspace",
+        "execute_dispatch": "dispatch_host_job",
+        "execute_wait": "reconcile_host_job",
         "verify": "verify_evidence",
+        "repair": "repair_task",
+        "stopping": "stop_host_job",
     }.get(session["phase"], "reconcile_state")

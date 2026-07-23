@@ -32,7 +32,10 @@ For a code Task, create or bind the project to an absolute host workspace path
 on the Projects page, then submit an ordinary natural-language development
 instruction. The control plane creates separate Fullstack and independent
 Checker TaskSessions, records ModelCallLedger usage, compares Host Bridge
-workspace snapshots, and requires the read-only Checker verdict before Done.
+workspace snapshots, dispatches a durable HostJob, and requires structured
+read-only Checker Evidence for every frozen acceptance before Done. A terminal
+Provider failure advances to the next frozen candidate with a new Session
+Generation; an ambiguous dispatch is never blindly replayed.
 
 It follows this path:
 
@@ -59,8 +62,11 @@ Evidence, automatic repair, versioned DAGs, cancellation and generation
 rotation, TaskSession ownership, bounded handoffs, token normalization,
 Token dashboards, recoverable project archive, restart recovery, read-only
 Monitor, Provider Probe Tasks, settings/library snapshots, UI/API safety, and
-fail-closed external Providers. The code-Task regression uses a fake Host
-Bridge and therefore spends no external Provider tokens.
+fail-closed external Providers. Durable HostJob tests also prove that Provider
+and Checker waits release SQLite, different projects advance concurrently,
+terminal failures fall back by generation, and v3 terminal jobs migrate to
+schema v4 without loss. The code-Task regressions use a fake Host Bridge and
+therefore spend no external Provider tokens.
 
 ## Deliberate V1 boundary
 

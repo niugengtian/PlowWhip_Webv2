@@ -6,16 +6,21 @@ import time
 from uuid import uuid4
 
 from .execution import (
+    ProviderStep,
+    apply_provider_step,
     archive_task_sessions,
     create_task_sessions,
+    effective_settings,
     ensure_task_sessions,
     execute_task,
+    pending_provider_step,
+    perform_provider_step,
     rotate_task_sessions,
 )
 from .intake import canonical_json, normalize_instruction
 from .planner import normalize_plan
 from .store import Store
-from .verification import verify_task
+from .verification import CheckerStep, apply_checker_step, perform_checker_step, verify_task
 
 
 class LeaseLost(RuntimeError):
@@ -23,17 +28,62 @@ class LeaseLost(RuntimeError):
 
 
 def advance_project(store: Store, project_id: str, lease_token: str, fence: int) -> str:
+    result = _advance_project_transaction(store, project_id, lease_token, fence)
+    if not isinstance(result, (ProviderStep, CheckerStep)):
+        return result
+    with store.transaction() as connection:
+        _assert_lease(connection, project_id, lease_token, fence)
+        connection.execute(
+            """
+            UPDATE projects SET lease_until = ?
+            WHERE id = ? AND lease_token = ? AND lease_fence = ?
+            """,
+            (
+                time.time()
+                + (
+                    result.timeout_seconds + 30
+                    if isinstance(result, CheckerStep)
+                    else 90
+                ),
+                project_id,
+                lease_token,
+                fence,
+            ),
+        )
+    facts = (
+        perform_checker_step(result)
+        if isinstance(result, CheckerStep)
+        else perform_provider_step(result)
+    )
+    with store.transaction() as connection:
+        _assert_lease(connection, project_id, lease_token, fence)
+        return (
+            apply_checker_step(store, connection, result, facts)
+            if isinstance(result, CheckerStep)
+            else apply_provider_step(store, connection, result, facts)
+        )
+
+
+def _assert_lease(
+    connection: sqlite3.Connection, project_id: str, lease_token: str, fence: int
+) -> None:
+    lease = connection.execute(
+        """
+        SELECT 1 FROM projects
+        WHERE id = ? AND lease_token = ? AND lease_fence = ? AND lease_until >= ?
+        """,
+        (project_id, lease_token, fence, time.time()),
+    ).fetchone()
+    if not lease:
+        raise LeaseLost(project_id)
+
+
+def _advance_project_transaction(
+    store: Store, project_id: str, lease_token: str, fence: int
+) -> str | ProviderStep:
     """Perform exactly one lifecycle action. Cronner is the only caller with a lease."""
     with store.transaction() as connection:
-        lease = connection.execute(
-            """
-            SELECT 1 FROM projects
-            WHERE id = ? AND lease_token = ? AND lease_fence = ? AND lease_until >= ?
-            """,
-            (project_id, lease_token, fence, time.time()),
-        ).fetchone()
-        if not lease:
-            raise LeaseLost(project_id)
+        _assert_lease(connection, project_id, lease_token, fence)
 
         action = connection.execute(
             """
@@ -63,6 +113,15 @@ def advance_project(store: Store, project_id: str, lease_token: str, fence: int)
                 return execute_task(store, connection, task, "repair")
             if task["phase"] == "verify":
                 return verify_task(store, connection, task)
+            if task["phase"] in {
+                "execute_snapshot",
+                "execute_dispatch",
+                "execute_wait",
+                "stopping",
+            }:
+                return pending_provider_step(connection, task)
+            if task["phase"] == "check_call":
+                return _stop_interrupted_checker(connection, task)
             return _stop_unknown_phase(connection, task)
 
         blocking = connection.execute(
@@ -287,16 +346,58 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
 
     kind = action["kind"]
     if kind == "cancel" and task["outcome"] is None:
-        connection.execute(
-            """
-            UPDATE tasks SET outcome = 'cancelled', phase = 'done',
-                next_action_at = NULL, wait_reason = NULL, fault_code = NULL,
-                updated_at = ? WHERE id = ?
-            """,
-            (now, task["id"]),
+        spec = json.loads(task["spec_json"])
+        active_job = (
+            connection.execute(
+                """
+                SELECT id FROM host_jobs
+                WHERE task_id = ? AND status IN ('dispatching', 'running', 'cancelling')
+                ORDER BY sequence DESC LIMIT 1
+                """,
+                (task["id"],),
+            ).fetchone()
+            if spec.get("kind") == "provider_task"
+            else None
         )
-        archive_task_sessions(connection, task["id"], now)
-        event, detail = "cancelled", {"message_id": message["id"]}
+        if active_job and task["phase"] != "execute_snapshot":
+            connection.execute(
+                """
+                UPDATE host_jobs SET status = 'cancelling' WHERE id = ?
+                """,
+                (active_job["id"],),
+            )
+            connection.execute(
+                """
+                UPDATE tasks SET public_status = 'in_progress', phase = 'stopping',
+                    next_action_at = ?, wait_reason = 'cancellation requested',
+                    fault_code = NULL, updated_at = ? WHERE id = ?
+                """,
+                (now, now, task["id"]),
+            )
+            event, detail = "cancel_requested", {
+                "message_id": message["id"],
+                "host_job_id": active_job["id"],
+            }
+        else:
+            if active_job:
+                connection.execute(
+                    """
+                    UPDATE host_jobs SET status = 'cancelled', ended_at = ?,
+                        returncode = -15, failure_code = 'process'
+                    WHERE id = ?
+                    """,
+                    (now, active_job["id"]),
+                )
+            connection.execute(
+                """
+                UPDATE tasks SET public_status = 'done', outcome = 'cancelled', phase = 'done',
+                    next_action_at = NULL, wait_reason = NULL, fault_code = NULL,
+                    updated_at = ? WHERE id = ?
+                """,
+                (now, task["id"]),
+            )
+            archive_task_sessions(connection, task["id"], now)
+            event, detail = "cancelled", {"message_id": message["id"]}
     elif kind == "rerun" and task["outcome"] == "cancelled":
         spec = json.loads(task["spec_json"])
         (
@@ -335,6 +436,31 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
             ),
         )
         event, detail = "rerun", {"message_id": message["id"]}
+    elif (
+        kind == "provide_decision"
+        and task["public_status"] == "needs_decision"
+        and connection.execute(
+            """
+            SELECT 1 FROM host_jobs
+            WHERE task_id = ? AND status IN ('dispatching', 'running', 'cancelling')
+            LIMIT 1
+            """,
+            (task["id"],),
+        ).fetchone()
+    ):
+        connection.execute(
+            """
+            UPDATE tasks SET wait_reason = ?, fault_code = 'unsafe_unknown',
+                updated_at = ? WHERE id = ?
+            """,
+            (
+                "active HostJob outcome must be reconciled or cancelled before changing TaskSpec",
+                now,
+                task["id"],
+            ),
+        )
+        event = "decision_rejected"
+        detail = {"message_id": message["id"], "reason": "active_host_job"}
     elif kind == "provide_decision" and task["public_status"] == "needs_decision":
         spec, acceptance = normalize_instruction(action["instruction"])
         (
@@ -570,6 +696,37 @@ def _stop_unknown_phase(connection: sqlite3.Connection, task: sqlite3.Row) -> st
     return "needs_decision"
 
 
+def _stop_interrupted_checker(
+    connection: sqlite3.Connection, task: sqlite3.Row
+) -> str:
+    now = time.time()
+    connection.execute(
+        """
+        UPDATE host_jobs SET status = 'interrupted', ended_at = ?,
+            returncode = 1, failure_code = 'unsafe_unknown'
+        WHERE task_id = ? AND purpose = 'check' AND status = 'dispatching'
+        """,
+        (now, task["id"]),
+    )
+    connection.execute(
+        """
+        UPDATE tasks SET public_status = 'needs_decision', phase = 'provider_recovery',
+            wait_reason = 'Checker call was interrupted; automatic paid replay is unsafe',
+            fault_code = 'unsafe_unknown', next_action_at = NULL, updated_at = ?
+        WHERE id = ?
+        """,
+        (now, task["id"]),
+    )
+    connection.execute(
+        """
+        INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
+        VALUES (?, ?, 'checker_interrupted', '{}', ?)
+        """,
+        (task["project_id"], task["id"], now),
+    )
+    return "needs_decision"
+
+
 def _runtime_contract(
     connection: sqlite3.Connection,
     project_id: str,
@@ -603,14 +760,19 @@ def _runtime_contract(
         ).fetchone()
         project_path = str(spec.get("project_path") or (project["host_path"] if project else "") or "")
         if project_path:
-            provider = str(spec.get("provider_key") or "codex_cli")
+            provider = _first_provider(
+                connection, project_id, "fullstack", spec.get("provider_key")
+            )
+            checker_provider = _first_provider(
+                connection, project_id, "independent_checker"
+            )
             return (
                 True,
-                {**spec, "project_path": project_path},
+                {**spec, "project_path": project_path, "provider_key": provider},
                 "fullstack",
                 provider,
                 "independent_checker",
-                provider,
+                checker_provider,
                 None,
             )
         return (
@@ -636,3 +798,21 @@ def _runtime_contract(
             )
         ),
     )
+
+
+def _first_provider(
+    connection: sqlite3.Connection,
+    project_id: str,
+    role_key: str,
+    requested: object = None,
+) -> str:
+    order = (
+        effective_settings(connection, project_id, {})["values"]
+        .get("provider_order", {})
+        .get(role_key, [])
+    )
+    if requested and str(requested) in order:
+        return str(requested)
+    if not order:
+        raise ValueError(f"Provider order is empty for role {role_key}")
+    return str(order[0])

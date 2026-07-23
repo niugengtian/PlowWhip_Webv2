@@ -319,10 +319,20 @@ def normalize_instruction(content: str) -> tuple[dict[str, object], list[dict[st
         return (
             {
                 "kind": "provider_task",
-                "provider_key": "codex_cli",
                 "instruction": content,
             },
-            [{"id": "independent_checker_pass", "kind": "checker_verdict"}],
+            [
+                {
+                    "id": "owner_instruction",
+                    "kind": "checker_evidence",
+                    "expected": content,
+                },
+                {
+                    "id": "relevant_checks",
+                    "kind": "checker_evidence",
+                    "expected": "smallest relevant deterministic checks pass",
+                },
+            ],
         )
 
     target = PurePosixPath(match.group(1))
