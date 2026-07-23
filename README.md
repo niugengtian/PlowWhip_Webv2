@@ -37,6 +37,15 @@ read-only Checker Evidence for every frozen acceptance before Done. A terminal
 Provider failure advances to the next frozen candidate with a new Session
 Generation; an ambiguous dispatch is never blindly replayed.
 
+An explicit GitHub SSH publish instruction is normalized into a deterministic
+`git_publish` Task rather than sent to a model Worker. Its one-file host script
+requires a clean tree and an unexpired remote/branch authorization, rejects
+tracked secret-like files and credential patterns, pushes the frozen HEAD, then
+compares `git ls-remote` with the local commit. It records Evidence but no model
+Token. A Host Bridge rejection before job acceptance is terminal; a genuinely
+unknown accepted job remains `NeedsDecision`, where the Task page exposes the
+exact HostJob confirmation needed for safe recovery.
+
 It follows this path:
 
 ```text
@@ -97,7 +106,9 @@ minimal Linux container. Cursor read-only Planner/Checker work uses CLI plan
 mode without `--force`; write Tasks enable `--force` only inside the configured
 workspace sandbox. Adapter executables resolve from the host service `PATH`
 instead of a macOS-only path; Cursor also accepts the `cursor-agent` binary
-name used by its standalone installer.
+name used by its standalone installer. A first Cursor job creates one chat
+session before invoking `--resume`; later retries of the same Task reuse that
+physical session.
 
 The global Butler accepts an optional Project ID or an `@project-id` prefix. An
 exact search such as `找 result.txt 任务` routes to a unique Project without
@@ -131,7 +142,8 @@ restart reconciliation, and zero-secret state. The suite also covers deadline st
 compact/rotation, global routing, Project rules/templates, consistent SQLite
 backup, candidate isolation and the single-Cronner lock. The code-Task
 regressions use a fake Host Bridge and therefore spend no external Provider
-tokens.
+tokens. Git publishing is tested against a local bare repository, including
+authorization scope, tracked-secret rejection and exact remote SHA evidence.
 
 ## Deliberate V1 boundary
 

@@ -274,6 +274,10 @@ DEFAULT_LIBRARY = {
         "roles/independent-checker.md",
         "# Independent checker\n\nInspect the current workspace read-only and return an evidence-backed verdict.\n",
     ),
+    ("role", "git_publisher"): (
+        "roles/git-publisher.md",
+        "# Git publisher\n\nExecute only the frozen Git remote and branch authorization with deterministic secret and SHA checks.\n",
+    ),
     ("rule", "v1_hard_boundaries"): (
         "rules/v1-hard-boundaries.md",
         "# V1 hard boundaries\n\nNo paid Provider, Docker, production, old-data migration, destructive action or out-of-scope write.\n",
@@ -289,6 +293,10 @@ DEFAULT_LIBRARY = {
     ("worker_template", "code_change"): (
         "worker-templates/code-change.md",
         "# Code change\n\nUse the registered Host Bridge workspace; do not escape scope, commit, deploy or create external effects.\n",
+    ),
+    ("worker_template", "git_publish"): (
+        "worker-templates/git-publish.md",
+        "# Git publish\n\nRequire a clean tree and unexpired exact authorization, reject tracked secrets, push the frozen HEAD, then verify the remote SHA.\n",
     ),
 }
 

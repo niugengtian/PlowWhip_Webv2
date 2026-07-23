@@ -360,6 +360,53 @@ else:
                 "/usr/local/bin/cursor-agent",
             )
 
+    def test_cursor_first_job_bootstraps_one_session(self):
+        cursor = self.root / "cursor"
+        cursor.write_text(
+            """#!/usr/bin/env python3
+import json
+import sys
+
+if sys.argv[1:] == ["agent", "create-chat"]:
+    print("cursor-chat-created")
+elif "--version" in sys.argv:
+    print("cursor 1.0")
+else:
+    print(json.dumps({"type": "result", "session_id": "cursor-chat-created"}))
+""",
+            encoding="utf-8",
+        )
+        cursor.chmod(0o700)
+        job_id = uuid4().hex
+        status, started = self._post(
+            "/v1/jobs/start",
+            {
+                "job_id": job_id,
+                "adapter": "cursor",
+                "executable": "cursor",
+                "project_path": str(self.project),
+                "prompt": "bounded fixture",
+                "timeout_seconds": 10,
+                "access": "read",
+                "context_policy": {},
+            },
+        )
+        self.assertEqual(status, 202)
+        self.assertEqual(started["session_id"], "cursor-chat-created")
+        terminal = self._wait_terminal(job_id)
+        self.assertEqual(terminal["status"], "completed")
+        self.assertEqual(terminal["returncode"], 0)
+        self.assertEqual(terminal["session_id"], "cursor-chat-created")
+
+    def test_git_publish_adapter_is_internal_and_probeable(self):
+        status, result = self._post(
+            "/v1/probe",
+            {"adapter": "git-publish", "executable": "git-publish"},
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(result["available"])
+        self.assertIn("plowwhip-git-publish", result["detail"])
+
 
 if __name__ == "__main__":
     unittest.main()

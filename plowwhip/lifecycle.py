@@ -301,6 +301,21 @@ def _create_task(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
     plan_id = uuid4().hex
     task_id = uuid4().hex
     spec, acceptance = normalize_instruction(message["content"])
+    if spec["kind"] == "git_publish":
+        spec = {
+            **spec,
+            "authorization": {
+                "source_message_id": message["id"],
+                "project_id": message["project_id"],
+                "task_id": task_id,
+                "spec_revision": 1,
+                "action_kind": "git_publish",
+                "target_scope": (
+                    f"{spec['remote_ssh']}#refs/heads/{spec['branch']}"
+                ),
+                "expires_at": now + 900,
+            },
+        }
     classification = classify_instruction(message["content"], str(spec["kind"]))
     automatic_planning = classification["size"] == "large"
     if automatic_planning:
@@ -358,7 +373,8 @@ def _create_task(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
                 {
                     "writes": (
                         spec.get("project_path")
-                        if spec["kind"] == "provider_task" or automatic_planning
+                        if spec["kind"] in {"provider_task", "git_publish"}
+                        or automatic_planning
                         else "task artifact directory only"
                     )
                 }
@@ -444,6 +460,7 @@ def _create_task(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
                 settings_overrides=(
                     {role_key: {"retry_count": 0}}
                     if spec.get("mode") == "minimal"
+                    or spec.get("kind") == "git_publish"
                     else None
                 ),
             )
@@ -470,6 +487,19 @@ def _create_task(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
             now,
         ),
     )
+    if spec["kind"] == "git_publish" and supported:
+        connection.execute(
+            """
+            INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
+            VALUES (?, ?, 'authorization_granted', ?, ?)
+            """,
+            (
+                message["project_id"],
+                task_id,
+                canonical_json(spec["authorization"]),
+                now,
+            ),
+        )
     return "intake"
 
 
@@ -490,7 +520,50 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
         return "decision_rejected"
 
     kind = action["kind"]
-    if kind == "cancel" and task["outcome"] is None:
+    if kind == "confirm_not_executed" and task["outcome"] is None:
+        job = connection.execute(
+            """
+            SELECT id FROM host_jobs
+            WHERE id = ? AND task_id = ? AND status = 'dispatching'
+            """,
+            (action.get("host_job_id"), task["id"]),
+        ).fetchone()
+        if not (
+            job
+            and task["public_status"] == "needs_decision"
+            and task["fault_code"] == "unsafe_unknown"
+        ):
+            event = "decision_rejected"
+            detail = {
+                "message_id": message["id"],
+                "reason": "host_job_is_not_confirmable_as_unexecuted",
+            }
+        else:
+            connection.execute(
+                """
+                UPDATE host_jobs SET status = 'failed', ended_at = ?,
+                    returncode = 125, failure_code = 'not_accepted'
+                WHERE id = ?
+                """,
+                (now, job["id"]),
+            )
+            connection.execute(
+                """
+                UPDATE tasks SET public_status = 'done', outcome = 'cancelled',
+                    phase = 'done', next_action_at = NULL, next_action_kind = NULL,
+                    wait_reason = NULL, fault_code = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (now, task["id"]),
+            )
+            archive_task_sessions(connection, task["id"], now)
+            event = "host_job_confirmed_not_executed"
+            detail = {
+                "message_id": message["id"],
+                "host_job_id": job["id"],
+                "next": "submit a corrected TaskSpec",
+            }
+    elif kind == "cancel" and task["outcome"] is None:
         spec = json.loads(task["spec_json"])
         active_job = (
             connection.execute(
@@ -1770,6 +1843,49 @@ def _runtime_contract(
             "independent_checker",
             "codex_cli",
             "project workspace is not bound; set an absolute Host Bridge path",
+        )
+    if kind == "git_publish":
+        project = connection.execute(
+            "SELECT host_path FROM projects WHERE id = ?", (project_id,)
+        ).fetchone()
+        project_path = str(
+            spec.get("project_path")
+            or (project["host_path"] if project else "")
+            or ""
+        )
+        authorization = spec.get("authorization")
+        expected_scope = (
+            f"{spec.get('remote_ssh')}#refs/heads/{spec.get('branch')}"
+        )
+        authorized = bool(
+            isinstance(authorization, dict)
+            and authorization.get("project_id") == project_id
+            and authorization.get("action_kind") == "git_publish"
+            and authorization.get("target_scope") == expected_scope
+            and float(authorization.get("expires_at") or 0) >= time.time()
+        )
+        if project_path and authorized:
+            return (
+                True,
+                {**spec, "project_path": project_path},
+                "git_publisher",
+                "git_publish",
+                "deterministic_checker",
+                "local",
+                None,
+            )
+        return (
+            False,
+            {**spec, "project_path": project_path},
+            "git_publisher",
+            "git_publish",
+            "deterministic_checker",
+            "local",
+            (
+                "Git publish authorization is missing or expired"
+                if project_path
+                else "project workspace is not bound; set an absolute Host Bridge path"
+            ),
         )
     return (
         False,

@@ -37,6 +37,12 @@ PROVIDERS = {
         "executable": "kimi-worker",
         "minimal_probe": False,
     },
+    "git_publish": {
+        "display_name": "Deterministic Git publisher",
+        "adapter": "git-publish",
+        "executable": "git-publish",
+        "minimal_probe": False,
+    },
 }
 PROBE_MARKER = "PLOWWHIP_PROBE_OK"
 PROBE_TOKEN_CAP = 4096
@@ -48,6 +54,17 @@ ACTIVE_HOST_JOB_STATUSES = {
     "cancelling",
     "recovery_hold",
 }
+
+
+class HostBridgeError(RuntimeError):
+    def __init__(self, message: str, *, status: int | None = None, detail: str = ""):
+        super().__init__(message)
+        self.status = status
+        self.detail = detail
+
+    @property
+    def rejected(self) -> bool:
+        return self.status is not None and 400 <= self.status < 500
 
 
 PROVIDER_ORDERS = {
@@ -378,9 +395,23 @@ def _bridge_post(
         with urlopen(request, timeout=timeout) as response:
             body = response.read(max_bytes + 1)
     except HTTPError as error:
-        raise RuntimeError(f"Host Bridge rejected request: HTTP {error.code}") from error
+        raw = error.read(1_025)
+        detail = ""
+        if len(raw) <= 1_024:
+            try:
+                value = json.loads(raw)
+                if isinstance(value, dict):
+                    detail = str(value.get("detail") or "")[:500]
+            except json.JSONDecodeError:
+                detail = ""
+        message = f"Host Bridge rejected request: HTTP {error.code}"
+        if detail:
+            message += f" ({detail})"
+        raise HostBridgeError(message, status=error.code, detail=detail) from error
     except (URLError, TimeoutError, OSError) as error:
-        raise RuntimeError(f"Host Bridge is unreachable: {type(error).__name__}") from error
+        raise HostBridgeError(
+            f"Host Bridge is unreachable: {type(error).__name__}"
+        ) from error
     if len(body) > max_bytes:
         raise RuntimeError("Host Bridge response is too large")
     try:

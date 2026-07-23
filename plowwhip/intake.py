@@ -25,6 +25,12 @@ READ_ONLY_INSTRUCTION = re.compile(
     r"^\s*(?:分析|审查|检查|查询|只读|audit|review|inspect|analy[sz]e)",
     re.IGNORECASE,
 )
+GITHUB_TREE_URL = re.compile(
+    r"https://github\.com/"
+    r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/tree/"
+    r"([A-Za-z0-9][A-Za-z0-9._/-]{0,126})",
+    re.IGNORECASE,
+)
 PROJECT_SETTING_LIMITS = {
     "max_runtime_seconds": (1, 86_400),
     "stop_grace_seconds": (0, 300),
@@ -406,11 +412,13 @@ def submit_action(
         "provide_plan",
         "authorize",
         "cancel",
+        "confirm_not_executed",
         "rerun",
         "wake",
     }:
         raise ValueError(
-            "supported actions: provide_decision, provide_plan, authorize, cancel, rerun, wake"
+            "supported actions: provide_decision, provide_plan, authorize, cancel, "
+            "confirm_not_executed, rerun, wake"
         )
     if kind == "provide_decision" and not instruction:
         raise ValueError("provide_decision requires instruction")
@@ -436,6 +444,7 @@ def submit_action(
         task = connection.execute(
             """
             SELECT task.public_status, task.phase, task.outcome, task.spec_revision,
+                   task.fault_code,
                    project.host_path
             FROM tasks task JOIN projects project ON project.id = task.project_id
             WHERE task.id = ? AND task.project_id = ?
@@ -444,6 +453,24 @@ def submit_action(
         ).fetchone()
         if not task:
             raise ValueError("task not found")
+        if kind == "confirm_not_executed":
+            job = connection.execute(
+                """
+                SELECT id FROM host_jobs
+                WHERE task_id = ? AND status = 'dispatching'
+                ORDER BY sequence DESC LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+            if not job or instruction != job["id"]:
+                raise ValueError(
+                    "confirm_not_executed requires the exact active HostJob ID"
+                )
+            action = {
+                "kind": kind,
+                "task_id": task_id,
+                "host_job_id": job["id"],
+            }
         if kind == "authorize":
             if instruction != task_id:
                 raise ValueError("authorize requires exact Task ID confirmation")
@@ -483,6 +510,11 @@ def submit_action(
             and task["phase"] == "plan"
             and task["outcome"] is None
         ) or (kind == "cancel" and task["outcome"] is None) or (
+            kind == "confirm_not_executed"
+            and task["public_status"] == "needs_decision"
+            and task["fault_code"] == "unsafe_unknown"
+            and task["outcome"] is None
+        ) or (
             kind == "rerun" and task["outcome"] == "cancelled"
         ) or (
             kind == "wake"
@@ -537,6 +569,32 @@ def normalize_instruction(content: str) -> tuple[dict[str, object], list[dict[st
                     "id": f"provider_{mode}_probe",
                     "kind": "provider_probe_contract",
                 }
+            ],
+        )
+
+    github = GITHUB_TREE_URL.search(content)
+    lowered = content.lower()
+    if github and (
+        "上传" in content
+        or "推送" in content
+        or "push" in lowered
+    ) and "ssh" in lowered:
+        owner, repository, branch = github.groups()
+        repository = repository.removesuffix(".git")
+        remote = f"git@github.com:{owner}/{repository}.git"
+        return (
+            {
+                "kind": "git_publish",
+                "instruction": content,
+                "remote_ssh": remote,
+                "branch": branch,
+                "workspace_change_required": True,
+            },
+            [
+                {
+                    "id": "git_publish_contract",
+                    "kind": "secret_scan_and_remote_sha",
+                },
             ],
         )
 

@@ -27,6 +27,7 @@ SUPPORTED_EXECUTABLES = {
     "codex": {"codex"},
     "cursor": {"cursor", "cursor-agent"},
     "json-worker": {"simple-worker", "kimi-worker"},
+    "git-publish": {"git-publish"},
 }
 KNOWN_EXECUTABLE_PATHS = {
     "codex": {Path("/Applications/ChatGPT.app/Contents/Resources/codex")},
@@ -34,6 +35,7 @@ KNOWN_EXECUTABLE_PATHS = {
         Path("/Applications/Cursor.app/Contents/Resources/app/bin/cursor")
     },
     "json-worker": set(),
+    "git-publish": set(),
 }
 ACTIVE_STATUSES = {
     "dispatching",
@@ -239,16 +241,47 @@ class HostJobManager:
             ).encode()
             digest.update(encoded)
             records.append(item)
-        return {
-            "git": {
-                "kind": "workspace",
-                "available": True,
-                "fingerprint": digest.hexdigest(),
-                "files": len(records),
-                "sample": records[:20],
-                "truncated": truncated,
-            }
+        git: dict[str, object] = {
+            "kind": "workspace",
+            "available": True,
+            "fingerprint": digest.hexdigest(),
+            "files": len(records),
+            "sample": records[:20],
+            "truncated": truncated,
         }
+        try:
+            head = subprocess.run(
+                ["git", "-C", str(project), "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+                env=_safe_environment(),
+            )
+            status = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(project),
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+                env=_safe_environment(),
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            git["available"] = False
+        else:
+            if head.returncode == 0 and status.returncode == 0:
+                git["head"] = head.stdout.strip()
+                git["status"] = _redact(status.stdout)[:8_192]
+            else:
+                git["available"] = False
+        return {"git": git}
 
     def start(self, payload: dict[str, Any]) -> dict[str, object]:
         job_id = _job_id(payload.get("job_id"))
@@ -625,10 +658,13 @@ def _resolve_executable(value: object, adapter: str) -> str | None:
         "codex": "codex",
         "cursor": "cursor",
         "json-worker": "simple-worker",
+        "git-publish": "git-publish",
     }[adapter]
     candidate = candidate or fallback
     if Path(candidate).name not in SUPPORTED_EXECUTABLES[adapter]:
         raise ValueError("executable is not allowed for this adapter")
+    if adapter == "git-publish":
+        return sys.executable
     if Path(candidate).is_absolute():
         path = Path(candidate).resolve()
         discovered = shutil.which(path.name)
@@ -649,6 +685,8 @@ def _version_argv(adapter: str, executable: str) -> list[str]:
         return [executable, "agent", "--version"]
     if adapter == "json-worker":
         return [executable, "--probe"]
+    if adapter == "git-publish":
+        return [executable, str(_git_publish_script()), "--version"]
     return [executable, "--version"]
 
 
@@ -661,6 +699,10 @@ def _execution_argv(
     access: str,
     context: dict[str, object],
 ) -> list[str]:
+    if adapter == "git-publish":
+        if access != "write":
+            raise ValueError("Git publish requires external-write access")
+        return [executable, str(_git_publish_script())]
     if adapter == "codex":
         sandbox = "read-only" if access == "read" else "workspace-write"
         compact = int(context["provider_compaction_token_limit"])
@@ -741,6 +783,10 @@ def _execution_argv(
         "--tool-no-progress-limit",
         str(context["tool_no_progress_limit"]),
     ]
+
+
+def _git_publish_script() -> Path:
+    return Path(__file__).with_name("git_publish_worker.py").resolve()
 
 
 def _context_policy(value: object) -> dict[str, object]:

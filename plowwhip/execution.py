@@ -12,6 +12,7 @@ from uuid import uuid4
 from .intake import canonical_json
 from .provider import (
     ACTIVE_HOST_JOB_STATUSES,
+    HostBridgeError,
     PROVIDERS,
     PROBE_MARKER,
     PROBE_TOKEN_CAP,
@@ -212,6 +213,7 @@ def _role_snapshot(
         "fullstack": "code_change",
         "planner": "code_change",
         "independent_checker": "code_change",
+        "git_publisher": "git_publish",
     }.get(role_key, "deterministic_write")
     keys = [role_key, "v1_hard_boundaries", template_key]
     rows = connection.execute(
@@ -238,15 +240,19 @@ def _role_snapshot(
     return {
         "role_key": role_key,
         "permission": (
-            "read_only"
-            if role_key
-            in {
-                "planner",
-                "independent_checker",
-                "deterministic_checker",
-                "provider_probe",
-            }
-            else "recoverable_workspace_change"
+            "external_effect"
+            if role_key == "git_publisher"
+            else (
+                "read_only"
+                if role_key
+                in {
+                    "planner",
+                    "independent_checker",
+                    "deterministic_checker",
+                    "provider_probe",
+                }
+                else "recoverable_workspace_change"
+            )
         ),
         "checker_independent": checker_independent,
         "library": [dict(row) for row in rows],
@@ -329,7 +335,7 @@ def execute_task(
     spec = json.loads(task["spec_json"])
     if spec["kind"] == "provider_probe":
         return _prepare_provider_probe(connection, task, spec, purpose)
-    if spec["kind"] == "provider_task":
+    if spec["kind"] in {"provider_task", "git_publish"}:
         return _prepare_provider_task(store, connection, task, spec, purpose)
     sequence = connection.execute(
         "SELECT COALESCE(MAX(sequence), 0) + 1 AS value FROM host_jobs WHERE task_id = ?",
@@ -633,6 +639,7 @@ def pending_provider_step(
 
 
 def perform_provider_step(step: ProviderStep) -> dict[str, object]:
+    stage = step.kind
     try:
         if step.kind == "snapshot":
             return {"ok": True, "before": workspace_snapshot(step.project_path)}
@@ -647,17 +654,34 @@ def perform_provider_step(step: ProviderStep) -> dict[str, object]:
                 context_policy=step.context_policy,
                 access=step.access,
             )
+            stage = "output"
         elif step.kind == "poll":
             state = provider_job_status(step.job_id)
+            stage = "output"
         elif step.kind == "cancel":
             state = cancel_provider_job(step.job_id)
+            stage = "output"
         else:
             raise ValueError("unknown Provider step")
         output = provider_job_output(step.job_id)
         facts: dict[str, object] = {"ok": True, "state": state, "output": output}
         if str(state.get("status")) not in ACTIVE_HOST_JOB_STATUSES:
+            stage = "snapshot_after"
             facts["after"] = workspace_snapshot(step.project_path)
         return facts
+    except HostBridgeError as error:
+        return {
+            "ok": False,
+            "error": type(error).__name__,
+            "failure_kind": (
+                "rejected"
+                if step.kind == "start" and stage == "start" and error.rejected
+                else "transport"
+            ),
+            "failure_stage": stage,
+            "error_status": error.status,
+            "error_detail": error.detail,
+        }
     except (OSError, RuntimeError, ValueError) as error:
         return {"ok": False, "error": type(error).__name__}
 
@@ -680,6 +704,8 @@ def apply_provider_step(
         return "stale_provider_fact"
     now = time.time()
     if not facts.get("ok"):
+        if step.kind == "start" and facts.get("failure_kind") == "rejected":
+            return _reject_provider_start(connection, task, job, step, facts, now)
         dispatch = json.loads(job["dispatch_json"])
         failures = int(dispatch.get("reconcile_failures") or 0) + 1
         dispatch["reconcile_failures"] = failures
@@ -750,6 +776,17 @@ def apply_provider_step(
         before_git = before.get("git") if isinstance(before, dict) else {}
         dispatch = json.loads(job["dispatch_json"])
         dispatch["before"] = before_git
+        spec = json.loads(task["spec_json"])
+        if spec["kind"] == "git_publish":
+            dispatch["prompt"] = canonical_json(
+                {
+                    "kind": "git_publish",
+                    "remote_ssh": spec["remote_ssh"],
+                    "branch": spec["branch"],
+                    "authorization": spec["authorization"],
+                    "expected_head": before_git.get("head"),
+                }
+            )
         connection.execute(
             "UPDATE host_jobs SET dispatch_json = ? WHERE id = ?",
             (canonical_json(dispatch), job["id"]),
@@ -888,6 +925,8 @@ def _finalize_provider_job(
         "stdout_tail": _bounded_tail(stdout),
         "stderr_tail": _bounded_tail(stderr),
     }
+    if step.provider_key == "git_publish":
+        manifest["script_result"] = _last_json_object(stdout)
     body = canonical_json(manifest).encode()
     output_path = (
         store.data_root
@@ -933,18 +972,19 @@ def _finalize_provider_job(
     input_tokens = max(0, int(state.get("input_tokens") or 0))
     cached_tokens = min(input_tokens, max(0, int(state.get("cached_input_tokens") or 0)))
     output_tokens = max(0, int(state.get("output_tokens") or 0))
-    record_model_call(
-        connection,
-        task["id"],
-        job["task_session_id"],
-        job["session_generation"],
-        step.provider_key,
-        "single",
-        input_tokens,
-        cached_tokens,
-        output_tokens,
-        str(state.get("model") or step.provider_key),
-    )
+    if step.provider_key != "git_publish":
+        record_model_call(
+            connection,
+            task["id"],
+            job["task_session_id"],
+            job["session_generation"],
+            step.provider_key,
+            "single",
+            input_tokens,
+            cached_tokens,
+            output_tokens,
+            str(state.get("model") or step.provider_key),
+        )
     for event in context_events:
         connection.execute(
             """
@@ -990,7 +1030,7 @@ def _finalize_provider_job(
         if not succeeded
         else None
     )
-    if succeeded and step.provider_key != "codex_cli":
+    if succeeded and step.provider_key not in {"codex_cli", "git_publish"}:
         _rotate_context_generation(connection, task, job, step.provider_key, now)
     connection.execute(
         """
@@ -1284,6 +1324,16 @@ def _provider_output_streams(output: object) -> tuple[str, str]:
 def _provider_prompt(
     task: sqlite3.Row, spec: dict, purpose: str, hot_context: str | None = None
 ) -> str:
+    if spec["kind"] == "git_publish":
+        return canonical_json(
+            {
+                "kind": "git_publish",
+                "remote_ssh": spec["remote_ssh"],
+                "branch": spec["branch"],
+                "authorization": spec["authorization"],
+                "expected_head": "",
+            }
+        )
     repair = (
         f"\nRepair context: {task['wait_reason']}"
         if purpose == "repair" and task["wait_reason"]
@@ -1300,14 +1350,93 @@ def _provider_prompt(
         f"Task ID: {task['id']} · spec revision {task['spec_revision']}.{repair}\n"
         + (f"Bounded context capsule:\n{hot_context}\n" if hot_context else "")
         + access
-        +
-        "Stay inside the workspace. Make only recoverable changes. Do not commit, deploy, "
+        + "Stay inside the workspace. Make only recoverable changes. Do not commit, deploy, "
         "delete permanently, expose secrets, send external messages, make purchases, or "
         "change permissions. A scoped deletion must move the target to "
         "original-name.rm.YYYYMMDDHHMMSS instead of unlinking it. Run the smallest relevant "
         "checks and leave the workspace ready "
         "for an independent read-only checker."
     )
+
+
+def _last_json_object(value: str) -> dict[str, object] | None:
+    for line in reversed(value.splitlines()):
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _reject_provider_start(
+    connection: sqlite3.Connection,
+    task: sqlite3.Row,
+    job: sqlite3.Row,
+    step: ProviderStep,
+    facts: dict[str, object],
+    now: float,
+) -> str:
+    dispatch = json.loads(job["dispatch_json"])
+    dispatch["rejection"] = {
+        "status": facts.get("error_status"),
+        "detail": str(facts.get("error_detail") or "")[:500],
+    }
+    connection.execute(
+        """
+        UPDATE host_jobs SET status = 'failed', ended_at = ?, returncode = 125,
+            failure_code = 'rejected', dispatch_json = ? WHERE id = ?
+        """,
+        (now, canonical_json(dispatch), job["id"]),
+    )
+    fallback = (
+        None
+        if step.provider_key == "git_publish"
+        else _fallback_provider_generation(
+            connection, task, job, step.provider_key, now
+        )
+    )
+    connection.execute(
+        """
+        UPDATE tasks SET public_status = ?, phase = ?, wait_reason = ?,
+            fault_code = 'provider', next_action_at = ?, next_action_kind = ?,
+            updated_at = ? WHERE id = ?
+        """,
+        (
+            "in_progress" if fallback else "needs_decision",
+            "execute" if fallback else "provider_recovery",
+            (
+                f"Provider start was rejected; falling back to {fallback}"
+                if fallback
+                else "Host Bridge rejected the job before acceptance"
+            ),
+            now if fallback else None,
+            "execute" if fallback else None,
+            now,
+            task["id"],
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
+        VALUES (?, ?, 'host_job_rejected', ?, ?)
+        """,
+        (
+            task["project_id"],
+            task["id"],
+            canonical_json(
+                {
+                    "host_job_id": job["id"],
+                    "provider_key": step.provider_key,
+                    "http_status": facts.get("error_status"),
+                    "fallback": fallback,
+                }
+            ),
+            now,
+        ),
+    )
+    return "provider_fallback" if fallback else "needs_decision"
 
 
 def _bounded_tail(value: str, byte_cap: int = 16_384) -> str:

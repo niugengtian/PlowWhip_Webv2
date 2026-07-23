@@ -71,6 +71,12 @@ class PlannerStep:
 def classify_instruction(content: str, kind: str) -> dict[str, object]:
     if kind in {"write_text", "provider_probe"}:
         return {"size": "simple", "reasons": [kind], "authorization_required": False}
+    if kind == "git_publish":
+        return {
+            "size": "simple",
+            "reasons": ["deterministic_external_git_publish"],
+            "authorization_required": True,
+        }
     lowered = content.lower()
     numbered_steps = len(
         re.findall(r"(?m)^\s*(?:[-*]|\d+[.)、])\s*\S+", content)

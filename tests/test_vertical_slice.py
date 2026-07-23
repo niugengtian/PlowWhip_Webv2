@@ -20,6 +20,7 @@ from plowwhip.cronner import (
     run_until_idle,
     tick,
 )
+from plowwhip.execution import ProviderStep, perform_provider_step
 from plowwhip.intake import (
     archive_project,
     create_project,
@@ -45,6 +46,7 @@ from plowwhip.planner import (
 )
 from plowwhip.provider import (
     CHECKER_RESULT_PREFIX,
+    HostBridgeError,
     parse_context_events,
     provider_adapter,
     provider_facts,
@@ -1529,7 +1531,7 @@ class VerticalSliceTest(unittest.TestCase):
     def test_settings_and_library_are_indexed_and_read_only(self):
         state = settings_library_snapshot(self.db, self.data)
         self.assertEqual(len(state["settings"]), 13)
-        self.assertEqual(len(state["library"]), 10)
+        self.assertEqual(len(state["library"]), 12)
         self.assertEqual(
             {item["kind"] for item in state["library"]},
             {"role", "rule", "worker_template"},
@@ -2587,20 +2589,263 @@ class VerticalSliceTest(unittest.TestCase):
                     self.store,
                     "ambiguous",
                     view["task"]["id"],
-                    "cancel",
-                    "",
-                    "safe-cancel",
+                    "confirm_not_executed",
+                    view["host_jobs"][0]["id"],
+                    "confirmed-not-accepted",
                 )
-                self.assertEqual(tick(self.store)[0]["action"], "cancel")
-                self.assertEqual(tick(self.store)[0]["action"], "cancel")
                 self.assertEqual(
-                    snapshot(self.db, self.data, "ambiguous")["task"]["outcome"],
-                    "cancelled",
+                    tick(self.store)[0]["action"], "confirm_not_executed"
+                )
+                resolved = snapshot(self.db, self.data, "ambiguous")
+                self.assertEqual(resolved["task"]["outcome"], "cancelled")
+                self.assertEqual(resolved["host_jobs"][0]["status"], "failed")
+                self.assertEqual(
+                    resolved["host_jobs"][0]["failure_code"], "not_accepted"
                 )
         finally:
             bridge.shutdown()
             bridge.server_close()
             thread.join()
+
+    def test_git_publish_uses_structured_worker_and_deterministic_evidence(self):
+        requests = []
+        head = "a" * 40
+        result = {
+            "kind": "git_publish",
+            "remote_ssh": "git@github.com:niugengtian/PlowWhip_Webv2.git",
+            "branch": "blue",
+            "local_head": head,
+            "remote_head": head,
+            "pushed": True,
+            "secret_scan_passed": True,
+            "files_scanned": 12,
+            "bytes_scanned": 2048,
+        }
+
+        class Bridge(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers["Content-Length"])
+                payload = json.loads(self.rfile.read(length))
+                requests.append((self.path, payload))
+                if self.path == "/v1/evidence/snapshot":
+                    body = {
+                        "git": {
+                            "kind": "workspace",
+                            "available": True,
+                            "fingerprint": "fixture",
+                            "head": head,
+                            "status": "",
+                        }
+                    }
+                elif self.path == "/v1/jobs/start":
+                    body = {
+                        "job_id": payload["job_id"],
+                        "status": "completed",
+                        "returncode": 0,
+                        "duration_ms": 4,
+                    }
+                elif self.path == "/v1/jobs/output":
+                    body = {
+                        "job_id": payload["job_id"],
+                        "status": "completed",
+                        "chunks": [
+                            {
+                                "stream": "stdout",
+                                "text": json.dumps(result),
+                            }
+                        ],
+                    }
+                else:
+                    self.send_error(404)
+                    return
+                data = json.dumps(body).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *_args):
+                return
+
+        bridge = ThreadingHTTPServer(("127.0.0.1", 0), Bridge)
+        thread = threading.Thread(target=bridge.serve_forever, daemon=True)
+        thread.start()
+        instruction = (
+            "你将本地代码上传到github 注意避免上传.env之类的指令。用ssh 上传到"
+            "https://github.com/niugengtian/PlowWhip_Webv2/tree/blue"
+        )
+        try:
+            self._create_project(
+                "git-publish", "git-publish-project", str(self.root)
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "PLOW_WHIP_BRIDGE_URL": (
+                        f"http://127.0.0.1:{bridge.server_port}"
+                    ),
+                    "PLOW_WHIP_BRIDGE_TOKEN": "test-token",
+                },
+            ):
+                submit_message(
+                    self.store,
+                    "git-publish",
+                    instruction,
+                    "git-publish-message",
+                )
+                self.assertEqual(
+                    [item["action"] for item in run_until_idle(self.store)],
+                    ["intake", "snapshot", "execute", "verify"],
+                )
+        finally:
+            bridge.shutdown()
+            bridge.server_close()
+            thread.join()
+
+        view = snapshot(self.db, self.data, "git-publish")
+        spec = json.loads(view["task"]["spec_json"])
+        self.assertEqual(view["task"]["outcome"], "done")
+        self.assertEqual(view["task"]["role_key"], "git_publisher")
+        self.assertEqual(view["task"]["checker_role_key"], "deterministic_checker")
+        self.assertEqual(spec["kind"], "git_publish")
+        self.assertEqual(spec["branch"], "blue")
+        self.assertEqual(
+            spec["remote_ssh"],
+            "git@github.com:niugengtian/PlowWhip_Webv2.git",
+        )
+        self.assertEqual(view["model_usage"], [])
+        self.assertEqual(
+            {
+                item["role_key"]: item["provider_key"]
+                for item in view["sessions"]
+            },
+            {
+                "git_publisher": "git_publish",
+                "deterministic_checker": "local",
+            },
+        )
+        evidence = json.loads(
+            next(
+                Path(item["path"]).read_text()
+                for item in view["artifacts"]
+                if item["kind"] == "evidence"
+            )
+        )
+        self.assertTrue(evidence["passed"])
+        self.assertEqual(evidence["remote_head"], head)
+        start = next(payload for path, payload in requests if path == "/v1/jobs/start")
+        self.assertEqual(start["adapter"], "git-publish")
+        self.assertEqual(start["access"], "write")
+        dispatch = json.loads(start["prompt"])
+        self.assertEqual(dispatch["expected_head"], head)
+        self.assertEqual(dispatch["authorization"]["target_scope"], (
+            "git@github.com:niugengtian/PlowWhip_Webv2.git#refs/heads/blue"
+        ))
+
+    def test_rejected_start_is_terminal_not_unknown(self):
+        class Bridge(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers["Content-Length"])
+                payload = json.loads(self.rfile.read(length))
+                if self.path == "/v1/evidence/snapshot":
+                    body = {
+                        "git": {
+                            "available": True,
+                            "fingerprint": "fixture",
+                            "head": "b" * 40,
+                            "status": "",
+                        }
+                    }
+                    data = json.dumps(body).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                if self.path == "/v1/jobs/start":
+                    data = json.dumps(
+                        {"detail": f"host job not found: {payload['job_id']}"}
+                    ).encode()
+                    self.send_response(400)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                self.send_error(404)
+
+            def log_message(self, *_args):
+                return
+
+        bridge = ThreadingHTTPServer(("127.0.0.1", 0), Bridge)
+        thread = threading.Thread(target=bridge.serve_forever, daemon=True)
+        thread.start()
+        try:
+            self._create_project("rejected", "rejected-project", str(self.root))
+            with patch.dict(
+                os.environ,
+                {
+                    "PLOW_WHIP_BRIDGE_URL": (
+                        f"http://127.0.0.1:{bridge.server_port}"
+                    ),
+                    "PLOW_WHIP_BRIDGE_TOKEN": "test-token",
+                },
+            ):
+                submit_message(
+                    self.store,
+                    "rejected",
+                    "检查当前代码并给出结论",
+                    "rejected-message",
+                )
+                self.assertEqual(tick(self.store)[0]["action"], "intake")
+                self.assertEqual(tick(self.store)[0]["action"], "snapshot")
+                self.assertEqual(tick(self.store)[0]["action"], "provider_fallback")
+        finally:
+            bridge.shutdown()
+            bridge.server_close()
+            thread.join()
+        state = snapshot(self.db, self.data, "rejected")
+        first = state["host_jobs"][0]
+        self.assertEqual(first["status"], "failed")
+        self.assertEqual(first["failure_code"], "rejected")
+        self.assertNotEqual(state["task"]["fault_code"], "unsafe_unknown")
+
+    def test_failure_after_start_acceptance_is_not_misclassified_as_rejection(self):
+        step = ProviderStep(
+            "start",
+            "project",
+            "task",
+            "job",
+            "git_publish",
+            str(self.root),
+            "{}",
+            None,
+            60,
+            "write",
+            {},
+        )
+        with (
+            patch(
+                "plowwhip.execution.start_provider_job",
+                return_value={"status": "completed", "returncode": 0},
+            ),
+            patch(
+                "plowwhip.execution.provider_job_output",
+                return_value={"chunks": []},
+            ),
+            patch(
+                "plowwhip.execution.workspace_snapshot",
+                side_effect=HostBridgeError(
+                    "snapshot rejected",
+                    status=400,
+                    detail="workspace not found",
+                ),
+            ),
+        ):
+            facts = perform_provider_step(step)
+        self.assertFalse(facts["ok"])
+        self.assertEqual(facts["failure_kind"], "transport")
+        self.assertEqual(facts["failure_stage"], "snapshot_after")
 
     def _row_counts(self):
         connection = sqlite3.connect(str(self.db))
@@ -2680,7 +2925,7 @@ class WebApiTest(unittest.TestCase):
             self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
         with urlopen(self.base + "/api/settings-library", timeout=2) as response:
             settings_library = json.load(response)
-        self.assertEqual(len(settings_library["library"]), 10)
+        self.assertEqual(len(settings_library["library"]), 12)
 
         status, _ = self._post(
             "/api/actions",

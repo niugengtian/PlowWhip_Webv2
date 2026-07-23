@@ -51,6 +51,8 @@ def verify_task(
     acceptance_id = (
         f"provider_{spec['mode']}_probe"
         if spec["kind"] == "provider_probe"
+        else "git_publish_contract"
+        if spec["kind"] == "git_publish"
         else "artifact_content_sha256"
     )
     artifact = connection.execute(
@@ -116,6 +118,52 @@ def verify_task(
             "status": "PASS" if passed else "CHANGES_REQUIRED",
             "allowed_scope": "Host Bridge diagnostic only",
             "recheck": "provider_probe_contract",
+        }
+    elif spec["kind"] == "git_publish":
+        try:
+            manifest = json.loads(output_path.read_text()) if output_path else {}
+        except (OSError, json.JSONDecodeError):
+            manifest = {}
+        result = (
+            manifest.get("script_result")
+            if isinstance(manifest, dict)
+            else None
+        )
+        target_scope = (
+            f"{spec['remote_ssh']}#refs/heads/{spec['branch']}"
+        )
+        passed = bool(
+            exists
+            and isinstance(result, dict)
+            and manifest.get("provider_key") == "git_publish"
+            and manifest.get("returncode") == 0
+            and result.get("kind") == "git_publish"
+            and result.get("remote_ssh") == spec["remote_ssh"]
+            and result.get("branch") == spec["branch"]
+            and result.get("secret_scan_passed") is True
+            and result.get("pushed") is True
+            and result.get("local_head")
+            and result.get("local_head") == result.get("remote_head")
+        )
+        evidence = {
+            "acceptance_id": acceptance_id,
+            "target_scope": target_scope,
+            "local_head": result.get("local_head") if isinstance(result, dict) else None,
+            "remote_head": result.get("remote_head") if isinstance(result, dict) else None,
+            "secret_scan_passed": (
+                result.get("secret_scan_passed")
+                if isinstance(result, dict)
+                else False
+            ),
+            "files_scanned": (
+                int(result.get("files_scanned") or 0)
+                if isinstance(result, dict)
+                else 0
+            ),
+            "passed": passed,
+            "status": "PASS" if passed else "CHANGES_REQUIRED",
+            "allowed_scope": target_scope,
+            "recheck": "secret_scan_and_remote_sha",
         }
     else:
         expected = hashlib.sha256(spec["content"].encode()).hexdigest()
@@ -205,9 +253,10 @@ def verify_task(
         ),
     )
     if passed:
-        _promote_verified_worker_template(
-            store, connection, task, evidence_path, now
-        )
+        if spec["kind"] != "git_publish":
+            _promote_verified_worker_template(
+                store, connection, task, evidence_path, now
+            )
         connection.execute(
             """
             UPDATE tasks SET public_status = 'done', phase = 'done', wait_reason = NULL,
@@ -231,7 +280,11 @@ def verify_task(
                 (
                     "Provider probe contract failed; bounded retry scheduled"
                     if spec["kind"] == "provider_probe"
-                    else "output hash mismatch; deterministic repair scheduled"
+                    else (
+                        "Git publish proof failed; bounded retry scheduled"
+                        if spec["kind"] == "git_publish"
+                        else "output hash mismatch; deterministic repair scheduled"
+                    )
                 ),
                 now,
                 now,
@@ -250,7 +303,11 @@ def verify_task(
                 (
                     "minimal Token probe did not produce verified terminal evidence"
                     if spec["kind"] == "provider_probe"
-                    else "output hash does not satisfy acceptance"
+                    else (
+                        "Git publish evidence did not prove secret scan and remote SHA"
+                        if spec["kind"] == "git_publish"
+                        else "output hash does not satisfy acceptance"
+                    )
                 ),
                 now,
                 task["id"],
