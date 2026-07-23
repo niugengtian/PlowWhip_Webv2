@@ -111,6 +111,25 @@ class VerticalSliceTest(unittest.TestCase):
         self.assertEqual(view["task"]["fault_code"], "scope")
         self.assertEqual(view["artifacts"], [])
 
+    def test_restart_recovers_queue_in_strict_project_order(self):
+        submit_message(self.store, "restart", "write first.txt: first", "restart-1")
+        submit_message(self.store, "restart", "write second.txt: second", "restart-2")
+        self.assertEqual(tick(self.store)[0]["action"], "intake")
+
+        restarted = Store(self.db, self.data)
+        self.assertEqual(
+            [item["action"] for item in run_until_idle(restarted)],
+            ["execute", "verify", "intake", "execute", "verify"],
+        )
+        connection = restarted.connect()
+        try:
+            rows = connection.execute(
+                "SELECT public_status, outcome FROM tasks ORDER BY created_at, rowid"
+            ).fetchall()
+        finally:
+            connection.close()
+        self.assertEqual([tuple(row) for row in rows], [("done", "done"), ("done", "done")])
+
     def _row_counts(self):
         connection = sqlite3.connect(str(self.db))
         try:
@@ -186,6 +205,15 @@ class WebApiTest(unittest.TestCase):
             ["needs_decision", "decision_applied", "executed", "verified"],
         )
         self.assertEqual({item["revision"] for item in done["artifacts"]}, {2})
+
+        with urlopen(f"{self.base}/api/projects", timeout=2) as response:
+            projects = json.load(response)
+        self.assertEqual(projects["projects"][0]["task_id"], done["task"]["id"])
+        with urlopen(
+            f"{self.base}/api/tasks/{done['task']['id']}", timeout=2
+        ) as response:
+            task = json.load(response)
+        self.assertEqual(task["task"]["id"], done["task"]["id"])
 
         status, duplicate = self._post(
             "/api/actions",

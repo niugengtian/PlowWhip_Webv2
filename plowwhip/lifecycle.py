@@ -33,7 +33,7 @@ def advance_project(store: Store, project_id: str, lease_token: str, fence: int)
             SELECT * FROM tasks
             WHERE project_id = ? AND public_status IN ('pending', 'in_progress')
               AND next_action_at <= ?
-            ORDER BY created_at LIMIT 1
+            ORDER BY created_at, rowid LIMIT 1
             """,
             (project_id, time.time()),
         ).fetchone()
@@ -48,7 +48,7 @@ def advance_project(store: Store, project_id: str, lease_token: str, fence: int)
             """
             SELECT * FROM messages
             WHERE project_id = ? AND processed_at IS NULL AND action_json IS NOT NULL
-            ORDER BY created_at LIMIT 1
+            ORDER BY created_at, rowid LIMIT 1
             """,
             (project_id,),
         ).fetchone()
@@ -69,7 +69,7 @@ def advance_project(store: Store, project_id: str, lease_token: str, fence: int)
             """
             SELECT * FROM messages
             WHERE project_id = ? AND processed_at IS NULL AND action_json IS NULL
-            ORDER BY created_at LIMIT 1
+            ORDER BY created_at, rowid LIMIT 1
             """,
             (project_id,),
         ).fetchone()

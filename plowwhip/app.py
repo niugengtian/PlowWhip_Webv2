@@ -7,8 +7,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit
 
 from .cronner import run as run_cronner
-from .intake import submit_action, submit_message
-from .monitor import snapshot
+from .intake import PROJECT_ID, TASK_ID, submit_action, submit_message
+from .monitor import projects_snapshot, snapshot, task_snapshot
 from .store import Store
 
 
@@ -26,13 +26,30 @@ class Handler(BaseHTTPRequestHandler):
                 connection.close()
             self._send(200, {"status": "ok"})
             return
+        if path == "/api/projects":
+            store = self.server.store  # type: ignore[attr-defined]
+            self._send(200, projects_snapshot(store.db_path, store.data_root))
+            return
         prefix = "/api/projects/"
         if path.startswith(prefix) and path != prefix:
             store = self.server.store  # type: ignore[attr-defined]
+            project_id = unquote(path[len(prefix) :])
+            if not PROJECT_ID.fullmatch(project_id):
+                self._send(400, {"error": "invalid project_id"})
+                return
             self._send(
                 200,
-                snapshot(store.db_path, store.data_root, unquote(path[len(prefix) :])),
+                snapshot(store.db_path, store.data_root, project_id),
             )
+            return
+        prefix = "/api/tasks/"
+        if path.startswith(prefix) and path != prefix:
+            store = self.server.store  # type: ignore[attr-defined]
+            task_id = unquote(path[len(prefix) :])
+            if not TASK_ID.fullmatch(task_id):
+                self._send(400, {"error": "invalid task_id"})
+                return
+            self._send(200, task_snapshot(store.db_path, store.data_root, task_id))
             return
         self._send(404, {"error": "not_found"})
 
