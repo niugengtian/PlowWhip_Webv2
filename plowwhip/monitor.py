@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 from .provider import provider_facts
@@ -14,7 +16,13 @@ def snapshot(db_path: str | Path, data_root: str | Path, project_id: str) -> dic
         task = connection.execute(
             """
             SELECT * FROM tasks WHERE project_id = ?
-            ORDER BY created_at DESC, rowid DESC LIMIT 1
+            ORDER BY
+              CASE
+                WHEN outcome IS NULL AND phase <> 'queued' THEN 0
+                WHEN outcome IS NULL THEN 1
+                ELSE 2
+              END,
+              created_at DESC, rowid DESC LIMIT 1
             """,
             (project_id,),
         ).fetchone()
@@ -44,7 +52,13 @@ def projects_snapshot(db_path: str | Path, data_root: str | Path) -> dict:
             LEFT JOIN tasks t ON t.rowid = (
                 SELECT latest.rowid FROM tasks latest
                 WHERE latest.project_id = p.id
-                ORDER BY latest.created_at DESC, latest.rowid DESC LIMIT 1
+                ORDER BY
+                  CASE
+                    WHEN latest.outcome IS NULL AND latest.phase <> 'queued' THEN 0
+                    WHEN latest.outcome IS NULL THEN 1
+                    ELSE 2
+                  END,
+                  latest.created_at DESC, latest.rowid DESC LIMIT 1
             )
             ORDER BY p.created_at, p.rowid
             """
@@ -62,6 +76,53 @@ def task_snapshot(db_path: str | Path, data_root: str | Path, task_id: str) -> d
         if not task:
             return {"task": None, "events": [], "artifacts": [], "last_output": []}
         return _task_view(connection, store, task)
+    finally:
+        connection.close()
+
+
+def settings_library_snapshot(db_path: str | Path, data_root: str | Path) -> dict:
+    store = Store(db_path, data_root)
+    connection = store.connect_readonly()
+    try:
+        settings = connection.execute(
+            """
+            SELECT scope, project_id, setting_key, value_json, source, updated_at
+            FROM settings ORDER BY scope, project_id, setting_key
+            """
+        ).fetchall()
+        items = connection.execute(
+            """
+            SELECT scope, project_id, kind, item_key, revision, path, sha256, created_at
+            FROM library_items current
+            WHERE revision = (
+                SELECT MAX(latest.revision) FROM library_items latest
+                WHERE latest.scope = current.scope
+                  AND latest.project_id IS current.project_id
+                  AND latest.kind = current.kind
+                  AND latest.item_key = current.item_key
+            )
+            ORDER BY scope, project_id, kind, item_key
+            """
+        ).fetchall()
+        library = []
+        for item in items:
+            path = store.resolve_data_path(item["path"])
+            body = path.read_bytes() if path.is_file() else b""
+            library.append(
+                {
+                    **dict(item),
+                    "content": body[:65_536].decode(errors="replace"),
+                    "truncated": len(body) > 65_536,
+                    "sha256_matches": hashlib.sha256(body).hexdigest() == item["sha256"],
+                }
+            )
+        return {
+            "settings": [
+                {**dict(row), "value": json.loads(row["value_json"])}
+                for row in settings
+            ],
+            "library": library,
+        }
     finally:
         connection.close()
 
@@ -117,8 +178,20 @@ def _task_view(connection, store: Store, task) -> dict:
         """,
         (task["id"],),
     ).fetchall()
+    tail_values = {}
+    for session in sessions:
+        if session["role_key"] == (task["role_key"] or "deterministic"):
+            tail_values = json.loads(session["settings_json"]).get("values", {})
+            break
     last_output = (
-        _tail(store.data_root, job["output_ref"]) if job and job["output_ref"] else []
+        _tail(
+            store.data_root,
+            job["output_ref"],
+            int(tail_values.get("monitor_tail_lines", 20)),
+            int(tail_values.get("monitor_tail_bytes", 8192)),
+        )
+        if job and job["output_ref"]
+        else []
     )
     return {
         "project_id": task["project_id"],
@@ -139,6 +212,9 @@ def _task_view(connection, store: Store, task) -> dict:
         "sessions": [
             {
                 **dict(session),
+                "model": "deterministic" if session["provider_key"] == "local" else None,
+                "role_snapshot": json.loads(session["role_snapshot_json"]),
+                "settings": json.loads(session["settings_json"]),
                 "provider_candidates": provider_facts(session["role_key"]),
             }
             for session in sessions

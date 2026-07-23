@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 from urllib.parse import quote
+from uuid import uuid4
 
 
 SCHEMA = """
@@ -218,8 +220,28 @@ DEFAULT_SETTINGS = {
     "checkpoint_max_bytes": 8192,
     "monitor_tail_lines": 20,
     "monitor_tail_bytes": 8192,
-    "retry_count": 0,
+    "retry_count": 1,
     "retry_backoff_seconds": 0,
+}
+
+
+DEFAULT_LIBRARY = {
+    ("role", "deterministic"): (
+        "roles/deterministic.md",
+        "# Deterministic executor\n\nPerform only the bounded action in TaskSpec and report files and hashes.\n",
+    ),
+    ("role", "deterministic_checker"): (
+        "roles/deterministic-checker.md",
+        "# Deterministic checker\n\nRead TaskSpec, artifacts and evidence independently; never trust executor claims.\n",
+    ),
+    ("rule", "v1_hard_boundaries"): (
+        "rules/v1-hard-boundaries.md",
+        "# V1 hard boundaries\n\nNo paid Provider, Docker, production, old-data migration, destructive action or out-of-scope write.\n",
+    ),
+    ("worker_template", "deterministic_write"): (
+        "worker-templates/deterministic-write.md",
+        "# Deterministic write\n\nWrite the declared relative artifact, then verify its SHA-256.\n",
+    ),
 }
 
 
@@ -251,6 +273,7 @@ class Store:
                     """,
                     (f"global:{key}", key, json.dumps(value, sort_keys=True), now),
                 )
+            self._sync_default_library(connection, now)
             connection.execute("PRAGMA user_version = 1")
             connection.commit()
         finally:
@@ -268,6 +291,45 @@ class Store:
         for name, declaration in additions.items():
             if name not in columns:
                 connection.execute(f"ALTER TABLE tasks ADD COLUMN {name} {declaration}")
+
+    def _sync_default_library(self, connection: sqlite3.Connection, now: float) -> None:
+        for (kind, item_key), (relative, default_body) in DEFAULT_LIBRARY.items():
+            path = self.data_root / "library" / relative
+            path.resolve().relative_to(self.data_root)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if not path.exists():
+                path.write_text(default_body)
+            body = path.read_bytes()
+            digest = hashlib.sha256(body).hexdigest()
+            latest = connection.execute(
+                """
+                SELECT revision, sha256 FROM library_items
+                WHERE scope = 'global' AND project_id IS NULL
+                  AND kind = ? AND item_key = ?
+                ORDER BY revision DESC LIMIT 1
+                """,
+                (kind, item_key),
+            ).fetchone()
+            if latest and latest["sha256"] == digest:
+                continue
+            revision = 1 if not latest else latest["revision"] + 1
+            connection.execute(
+                """
+                INSERT INTO library_items(
+                    id, scope, project_id, kind, item_key, revision,
+                    path, sha256, created_at
+                ) VALUES (?, 'global', NULL, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    uuid4().hex,
+                    kind,
+                    item_key,
+                    revision,
+                    self.relative_data_path(path),
+                    digest,
+                    now,
+                ),
+            )
 
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path, timeout=5)

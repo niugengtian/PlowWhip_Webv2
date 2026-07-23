@@ -34,10 +34,17 @@ def tick(store: Store, limit: int = 100) -> list[dict[str, str]]:
                     SELECT 1 FROM tasks queued
                     WHERE queued.project_id = p.id AND queued.outcome IS NULL
                       AND queued.phase = 'queued'
-                      AND NOT EXISTS (
-                          SELECT 1 FROM task_dependencies edge
-                          JOIN tasks dependency ON dependency.id = edge.depends_on_task_id
-                          WHERE edge.task_id = queued.id AND dependency.outcome IS NOT 'done'
+                      AND (
+                        NOT EXISTS (
+                            SELECT 1 FROM task_dependencies edge
+                            JOIN tasks dependency ON dependency.id = edge.depends_on_task_id
+                            WHERE edge.task_id = queued.id AND dependency.outcome IS NOT 'done'
+                        )
+                        OR EXISTS (
+                            SELECT 1 FROM task_dependencies edge
+                            JOIN tasks dependency ON dependency.id = edge.depends_on_task_id
+                            WHERE edge.task_id = queued.id AND dependency.outcome = 'cancelled'
+                        )
                       )
                 )
                 OR EXISTS (
@@ -112,7 +119,14 @@ def _latest_status(store: Store, project_id: str) -> str:
         row = connection.execute(
             """
             SELECT public_status, outcome FROM tasks
-            WHERE project_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1
+            WHERE project_id = ?
+            ORDER BY
+              CASE
+                WHEN outcome IS NULL AND phase <> 'queued' THEN 0
+                WHEN outcome IS NULL THEN 1
+                ELSE 2
+              END,
+              created_at DESC, rowid DESC LIMIT 1
             """,
             (project_id,),
         ).fetchone()

@@ -8,6 +8,7 @@ from uuid import uuid4
 from .execution import (
     archive_task_sessions,
     create_task_sessions,
+    ensure_task_sessions,
     execute_task,
     rotate_task_sessions,
 )
@@ -58,6 +59,8 @@ def advance_project(store: Store, project_id: str, lease_token: str, fence: int)
         if task:
             if task["phase"] == "execute":
                 return execute_task(store, connection, task)
+            if task["phase"] == "repair":
+                return execute_task(store, connection, task, "repair")
             if task["phase"] == "verify":
                 return verify_task(store, connection, task)
             return _stop_unknown_phase(connection, task)
@@ -72,6 +75,40 @@ def advance_project(store: Store, project_id: str, lease_token: str, fence: int)
         ).fetchone()
         if blocking:
             return "blocked"
+
+        broken = connection.execute(
+            """
+            SELECT queued.* FROM tasks queued
+            WHERE queued.project_id = ? AND queued.outcome IS NULL
+              AND queued.phase = 'queued'
+              AND EXISTS (
+                  SELECT 1 FROM task_dependencies edge
+                  JOIN tasks dependency ON dependency.id = edge.depends_on_task_id
+                  WHERE edge.task_id = queued.id AND dependency.outcome = 'cancelled'
+              )
+            ORDER BY queued.created_at, queued.rowid LIMIT 1
+            """,
+            (project_id,),
+        ).fetchone()
+        if broken:
+            now = time.time()
+            connection.execute(
+                """
+                UPDATE tasks SET public_status = 'needs_decision', phase = 'plan',
+                    wait_reason = 'a required dependency was cancelled',
+                    fault_code = 'scope', next_action_at = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (now, broken["id"]),
+            )
+            connection.execute(
+                """
+                INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
+                VALUES (?, ?, 'dependency_blocked', '{}', ?)
+                """,
+                (project_id, broken["id"], now),
+            )
+            return "dependency_blocked"
 
         ready = connection.execute(
             """
@@ -183,7 +220,8 @@ def _create_task(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
             plan_id,
         ),
     )
-    create_task_sessions(connection, message["project_id"], task_id, now)
+    if supported:
+        create_task_sessions(connection, message["project_id"], task_id, now)
     connection.execute(
         "UPDATE messages SET action_json = ?, processed_at = ? WHERE id = ?",
         (canonical_json(spec), now, message["id"]),
@@ -233,24 +271,50 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
         archive_task_sessions(connection, task["id"], now)
         event, detail = "cancelled", {"message_id": message["id"]}
     elif kind == "rerun" and task["outcome"] == "cancelled":
+        supported = json.loads(task["spec_json"])["kind"] == "write_text"
+        if supported:
+            ensure_task_sessions(
+                connection,
+                task["project_id"],
+                task["id"],
+                now,
+                task["role_key"] or "deterministic",
+                task["checker_role_key"] or "deterministic_checker",
+            )
+            rotate_task_sessions(connection, task["id"], now)
         connection.execute(
             """
-            UPDATE tasks SET public_status = 'pending', phase = 'execute',
-                outcome = NULL, next_action_at = ?, updated_at = ? WHERE id = ?
+            UPDATE tasks SET public_status = ?, phase = ?, outcome = NULL,
+                retry_count = 0, next_retry_at = NULL,
+                next_action_at = ?, updated_at = ? WHERE id = ?
             """,
-            (now, now, task["id"]),
+            (
+                "pending" if supported else "needs_decision",
+                "execute" if supported else "intake",
+                now if supported else None,
+                now,
+                task["id"],
+            ),
         )
-        rotate_task_sessions(connection, task["id"], now)
         event, detail = "rerun", {"message_id": message["id"]}
     elif kind == "provide_decision" and task["public_status"] == "needs_decision":
         spec, acceptance = normalize_instruction(action["instruction"])
         if spec["kind"] == "write_text":
             revision = task["spec_revision"] + 1
+            ensure_task_sessions(
+                connection,
+                task["project_id"],
+                task["id"],
+                now,
+                task["role_key"] or "deterministic",
+                task["checker_role_key"] or "deterministic_checker",
+            )
             connection.execute(
                 """
                 UPDATE tasks SET spec_revision = ?, spec_json = ?, acceptance_json = ?,
                     public_status = 'pending', phase = 'execute', wait_reason = NULL,
-                    fault_code = NULL, next_action_at = ?, outcome = NULL, updated_at = ?
+                    fault_code = NULL, retry_count = 0, next_retry_at = NULL,
+                    next_action_at = ?, outcome = NULL, updated_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -332,7 +396,8 @@ def _install_plan(
         UPDATE tasks SET plan_id = ?, spec_revision = spec_revision + 1,
             spec_json = ?, acceptance_json = ?, public_status = 'pending',
             phase = 'execute', wait_reason = NULL, fault_code = NULL,
-            next_action_at = ?, outcome = NULL, sprint = ?, role_key = ?,
+            retry_count = 0, next_retry_at = NULL, next_action_at = ?,
+            outcome = NULL, sprint = ?, role_key = ?,
             checker_role_key = 'deterministic_checker', updated_at = ?
         WHERE id = ?
         """,
@@ -346,6 +411,15 @@ def _install_plan(
             now,
             placeholder["id"],
         ),
+    )
+    ensure_task_sessions(
+        connection,
+        placeholder["project_id"],
+        placeholder["id"],
+        now,
+        first["role_key"],
+        "deterministic_checker",
+        first["settings"],
     )
     connection.execute(
         """
@@ -389,6 +463,8 @@ def _install_plan(
             task_id,
             now,
             item["role_key"],
+            "deterministic_checker",
+            item["settings"],
         )
         connection.execute(
             """

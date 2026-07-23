@@ -9,7 +9,7 @@ from .store import Store
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="PlowWhip V1 minimal vertical slice")
+    parser = argparse.ArgumentParser(description="PlowWhip Web frozen V1 local runtime")
     parser.add_argument("--db", default="data/plowwhip.db")
     parser.add_argument("--data-root", default="data")
     commands = parser.add_subparsers(dest="command", required=True)

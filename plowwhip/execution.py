@@ -29,9 +29,12 @@ def create_task_sessions(
     now: float,
     executor_role: str = "deterministic",
     checker_role: str = "deterministic_checker",
+    settings_overrides: dict | None = None,
 ) -> None:
-    settings = _effective_settings(connection, project_id)
     for role_key in (executor_role, checker_role):
+        settings = _effective_settings(
+            connection, project_id, (settings_overrides or {}).get(role_key, {})
+        )
         worker = connection.execute(
             "SELECT id FROM workers WHERE project_id = ? AND role_key = ?",
             (project_id, role_key),
@@ -54,14 +57,7 @@ def create_task_sessions(
                 task_id,
                 worker_id,
                 role_key,
-                canonical_json(
-                    {
-                        "role_key": role_key,
-                        "revision": 1,
-                        "permission": "recoverable_workspace_change",
-                        "checker_independent": role_key == checker_role,
-                    }
-                ),
+                canonical_json(_role_snapshot(connection, role_key, role_key == checker_role)),
                 canonical_json(settings),
                 now,
             ),
@@ -76,7 +72,35 @@ def create_task_sessions(
         )
 
 
-def _effective_settings(connection: sqlite3.Connection, project_id: str) -> dict:
+def ensure_task_sessions(
+    connection: sqlite3.Connection,
+    project_id: str,
+    task_id: str,
+    now: float,
+    executor_role: str = "deterministic",
+    checker_role: str = "deterministic_checker",
+    settings_overrides: dict | None = None,
+) -> None:
+    count = connection.execute(
+        "SELECT COUNT(*) AS count FROM task_sessions WHERE task_id = ?", (task_id,)
+    ).fetchone()["count"]
+    if count == 0:
+        create_task_sessions(
+            connection,
+            project_id,
+            task_id,
+            now,
+            executor_role,
+            checker_role,
+            settings_overrides,
+        )
+    elif count != 2:
+        raise RuntimeError(f"Task {task_id} has incomplete role ownership")
+
+
+def _effective_settings(
+    connection: sqlite3.Connection, project_id: str, task_role: dict
+) -> dict:
     rows = connection.execute(
         """
         SELECT scope, setting_key, value_json, source FROM settings
@@ -94,7 +118,38 @@ def _effective_settings(connection: sqlite3.Connection, project_id: str) -> dict
             if row["scope"] == "project"
             else row["source"]
         )
+    for key, value in task_role.items():
+        values[key] = value
+        sources[key] = "task_role"
     return {"values": values, "sources": sources}
+
+
+def _role_snapshot(
+    connection: sqlite3.Connection, role_key: str, checker_independent: bool
+) -> dict:
+    keys = [role_key, "v1_hard_boundaries", "deterministic_write"]
+    rows = connection.execute(
+        """
+        SELECT kind, item_key, revision, path, sha256 FROM library_items
+        WHERE scope = 'global' AND project_id IS NULL
+          AND item_key IN (?, ?, ?)
+          AND revision = (
+              SELECT MAX(latest.revision) FROM library_items latest
+              WHERE latest.scope = library_items.scope
+                AND latest.project_id IS library_items.project_id
+                AND latest.kind = library_items.kind
+                AND latest.item_key = library_items.item_key
+          )
+        ORDER BY kind, item_key
+        """,
+        keys,
+    ).fetchall()
+    return {
+        "role_key": role_key,
+        "permission": "recoverable_workspace_change",
+        "checker_independent": checker_independent,
+        "library": [dict(row) for row in rows],
+    }
 
 
 def current_session(
@@ -135,24 +190,33 @@ def rotate_task_sessions(connection: sqlite3.Connection, task_id: str, now: floa
         "SELECT id FROM task_sessions WHERE task_id = ?", (task_id,)
     ).fetchall()
     for session in sessions:
-        generation = connection.execute(
+        previous = connection.execute(
             """
-            SELECT COALESCE(MAX(generation), 0) + 1 AS value
-            FROM session_generations WHERE task_session_id = ?
+            SELECT generation, handoff_ref FROM session_generations
+            WHERE task_session_id = ? ORDER BY generation DESC LIMIT 1
             """,
             (session["id"],),
-        ).fetchone()["value"]
+        ).fetchone()
+        generation = previous["generation"] + 1
         connection.execute(
             """
             INSERT INTO session_generations(
-                id, task_session_id, generation, provider_key, status, created_at
-            ) VALUES (?, ?, ?, 'local', 'active', ?)
+                id, task_session_id, generation, provider_key, status,
+                handoff_ref, created_at
+            ) VALUES (?, ?, ?, 'local', 'active', ?, ?)
             """,
-            (uuid4().hex, session["id"], generation, now),
+            (uuid4().hex, session["id"], generation, previous["handoff_ref"], now),
         )
 
 
-def execute_task(store: Store, connection: sqlite3.Connection, task: sqlite3.Row) -> str:
+def execute_task(
+    store: Store,
+    connection: sqlite3.Connection,
+    task: sqlite3.Row,
+    purpose: str = "execute",
+) -> str:
+    if purpose not in {"execute", "repair"}:
+        raise ValueError("execution purpose must be execute or repair")
     started_at = time.time()
     spec = json.loads(task["spec_json"])
     sequence = connection.execute(
@@ -194,7 +258,7 @@ def execute_task(store: Store, connection: sqlite3.Connection, task: sqlite3.Row
                 id, task_id, task_session_id, session_generation,
                 spec_revision, sequence, purpose, status,
                 started_at, ended_at, returncode, output_ref
-            ) VALUES (?, ?, ?, ?, ?, ?, 'execute', 'succeeded', ?, ?, 0, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'succeeded', ?, ?, 0, ?)
             """,
             (
                 uuid4().hex,
@@ -203,6 +267,7 @@ def execute_task(store: Store, connection: sqlite3.Connection, task: sqlite3.Row
                 session_generation,
                 task["spec_revision"],
                 sequence,
+                purpose,
                 started_at,
                 ended_at,
                 output_ref,
@@ -241,16 +306,17 @@ def execute_task(store: Store, connection: sqlite3.Connection, task: sqlite3.Row
         connection.execute(
             """
             INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
-            VALUES (?, ?, 'executed', ?, ?)
+            VALUES (?, ?, ?, ?, ?)
             """,
             (
                 task["project_id"],
                 task["id"],
+                "repaired" if purpose == "repair" else "executed",
                 canonical_json({"host_job_sequence": sequence, "sha256": digest}),
                 ended_at,
             ),
         )
-        return "execute"
+        return purpose
     except OSError as error:
         ended_at = time.time()
         log_body = f"execution failed: {type(error).__name__}\n".encode()
@@ -261,7 +327,7 @@ def execute_task(store: Store, connection: sqlite3.Connection, task: sqlite3.Row
                 id, task_id, task_session_id, session_generation,
                 spec_revision, sequence, purpose, status,
                 started_at, ended_at, returncode, output_ref, failure_code
-            ) VALUES (?, ?, ?, ?, ?, ?, 'execute', 'failed', ?, ?, 1, ?, 'process')
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'failed', ?, ?, 1, ?, 'process')
             """,
             (
                 uuid4().hex,
@@ -270,6 +336,7 @@ def execute_task(store: Store, connection: sqlite3.Connection, task: sqlite3.Row
                 session_generation,
                 task["spec_revision"],
                 sequence,
+                purpose,
                 started_at,
                 ended_at,
                 store.relative_data_path(log_path),
@@ -283,4 +350,4 @@ def execute_task(store: Store, connection: sqlite3.Connection, task: sqlite3.Row
             """,
             ("deterministic write failed; automatic path exhausted", ended_at, task["id"]),
         )
-        return "execute"
+        return purpose

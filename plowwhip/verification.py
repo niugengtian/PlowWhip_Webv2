@@ -28,6 +28,16 @@ def verify_task(store: Store, connection: sqlite3.Connection, task: sqlite3.Row)
     observed = hashlib.sha256(output_path.read_bytes()).hexdigest() if exists else None
     passed = exists and observed == expected
     now = time.time()
+    executor = connection.execute(
+        """
+        SELECT settings_json FROM task_sessions
+        WHERE task_id = ? AND role_key = ?
+        """,
+        (task["id"], task["role_key"] or "deterministic"),
+    ).fetchone()
+    settings = json.loads(executor["settings_json"]) if executor else {"values": {}}
+    max_retries = int(settings.get("values", {}).get("retry_count", 0))
+    will_repair = not passed and task["retry_count"] < max_retries
     sequence = connection.execute(
         "SELECT COALESCE(MAX(sequence), 0) + 1 AS value FROM host_jobs WHERE task_id = ?",
         (task["id"],),
@@ -41,7 +51,10 @@ def verify_task(store: Store, connection: sqlite3.Connection, task: sqlite3.Row)
         "observed_sha256": observed,
         "output_exists": exists,
         "passed": passed,
-        "status": "PASS" if passed else "FAIL",
+        "status": "PASS" if passed else "CHANGES_REQUIRED",
+        "allowed_scope": spec["target"],
+        "recheck": "sha256_matches_spec",
+        "next": "repair" if will_repair else ("done" if passed else "needs_decision"),
         "verified_at": now,
     }
     evidence_body = json.dumps(evidence, ensure_ascii=False, sort_keys=True).encode()
@@ -106,6 +119,16 @@ def verify_task(store: Store, connection: sqlite3.Connection, task: sqlite3.Row)
             (now, task["id"]),
         )
         archive_task_sessions(connection, task["id"], now)
+    elif will_repair:
+        connection.execute(
+            """
+            UPDATE tasks SET public_status = 'in_progress', phase = 'repair',
+                wait_reason = 'output hash mismatch; deterministic repair scheduled',
+                fault_code = 'verification', retry_count = retry_count + 1,
+                next_action_at = ?, updated_at = ? WHERE id = ?
+            """,
+            (now, now, task["id"]),
+        )
     else:
         connection.execute(
             """
