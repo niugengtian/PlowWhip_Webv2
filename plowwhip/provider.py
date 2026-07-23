@@ -62,6 +62,7 @@ def record_model_call(
     input_tokens: int,
     cached_input_tokens: int,
     output_tokens: int,
+    model: str | None = None,
 ) -> int:
     if usage_kind not in {"single", "cumulative"}:
         raise ValueError("usage_kind must be single or cumulative")
@@ -74,7 +75,7 @@ def record_model_call(
     if usage_kind == "cumulative":
         previous = connection.execute(
             """
-            SELECT input_tokens, output_tokens FROM model_calls
+            SELECT input_tokens, cached_input_tokens, output_tokens FROM model_calls
             WHERE task_session_id = ? AND session_generation = ?
               AND provider_key = ? AND usage_kind = 'cumulative'
             ORDER BY created_at DESC, rowid DESC LIMIT 1
@@ -84,7 +85,10 @@ def record_model_call(
         if previous:
             if (
                 input_tokens < previous["input_tokens"]
+                or cached_input_tokens < previous["cached_input_tokens"]
                 or output_tokens < previous["output_tokens"]
+                or input_tokens - cached_input_tokens
+                < previous["input_tokens"] - previous["cached_input_tokens"]
             ):
                 raise ValueError("cumulative usage cannot decrease within one generation")
             normalized = (
@@ -97,9 +101,9 @@ def record_model_call(
         """
         INSERT INTO model_calls(
             id, task_id, task_session_id, session_generation, provider_key,
-            usage_kind, input_tokens, cached_input_tokens, output_tokens,
+            model, usage_kind, input_tokens, cached_input_tokens, output_tokens,
             normalized_total, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             uuid4().hex,
@@ -107,6 +111,7 @@ def record_model_call(
             task_session_id,
             session_generation,
             provider_key,
+            model or ("deterministic" if provider_key == "local" else provider_key),
             usage_kind,
             input_tokens,
             cached_input_tokens,

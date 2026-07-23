@@ -38,3 +38,31 @@ def search(db_path: str | Path, data_root: str | Path, query: str) -> dict:
         return {"query": query, "results": [dict(row) for row in rows]}
     finally:
         connection.close()
+
+
+def conversation(
+    db_path: str | Path, data_root: str | Path, project_id: str
+) -> dict:
+    """Read the bounded project Butler history without invoking a Provider."""
+    store = Store(db_path, data_root)
+    connection = store.connect_readonly()
+    try:
+        project = connection.execute(
+            "SELECT id, created_at FROM projects WHERE id = ?", (project_id,)
+        ).fetchone()
+        if not project:
+            return {"project": None, "messages": []}
+        rows = connection.execute(
+            """
+            SELECT id, role, content, action_json, created_at, processed_at
+            FROM messages WHERE project_id = ?
+            ORDER BY created_at DESC, rowid DESC LIMIT 50
+            """,
+            (project_id,),
+        ).fetchall()
+        return {
+            "project": dict(project),
+            "messages": [dict(row) for row in reversed(rows)],
+        }
+    finally:
+        connection.close()

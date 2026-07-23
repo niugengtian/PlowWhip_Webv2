@@ -33,6 +33,11 @@ def submit_message(
             "INSERT OR IGNORE INTO projects(id, created_at) VALUES (?, ?)",
             (project_id, now),
         )
+        project = connection.execute(
+            "SELECT archived_at FROM projects WHERE id = ?", (project_id,)
+        ).fetchone()
+        if project["archived_at"] is not None:
+            raise ValueError("project is archived; restore it before sending messages")
         connection.execute(
             """
             INSERT OR IGNORE INTO messages(
@@ -46,6 +51,95 @@ def submit_message(
             (project_id, idempotency_key),
         ).fetchone()
     return str(row["id"])
+
+
+def create_project(store: Store, project_id: str, idempotency_key: str) -> str:
+    _validate_project_action(project_id, idempotency_key)
+    now = time.time()
+    action_id = uuid4().hex
+    with store.transaction() as connection:
+        existing = connection.execute(
+            "SELECT id, archived_at FROM projects WHERE id = ?", (project_id,)
+        ).fetchone()
+        if existing and existing["archived_at"] is None:
+            return project_id
+        kind = "restore_project" if existing else "create_project"
+        if existing:
+            connection.execute(
+                "UPDATE projects SET archived_at = NULL WHERE id = ?", (project_id,)
+            )
+        else:
+            connection.execute(
+                "INSERT INTO projects(id, created_at) VALUES (?, ?)", (project_id, now)
+            )
+        connection.execute(
+            """
+            INSERT INTO messages(
+                id, project_id, role, content, action_json,
+                idempotency_key, created_at, processed_at
+            ) VALUES (?, ?, 'owner', ?, ?, ?, ?, ?)
+            """,
+            (
+                action_id,
+                project_id,
+                kind,
+                canonical_json({"kind": kind}),
+                idempotency_key,
+                now,
+                now,
+            ),
+        )
+    return action_id
+
+
+def archive_project(
+    store: Store, project_id: str, confirmation: str, idempotency_key: str
+) -> str:
+    _validate_project_action(project_id, idempotency_key)
+    if confirmation != project_id:
+        raise ValueError("confirmation must exactly match project_id")
+    now = time.time()
+    action_id = uuid4().hex
+    with store.transaction() as connection:
+        project = connection.execute(
+            "SELECT archived_at FROM projects WHERE id = ?", (project_id,)
+        ).fetchone()
+        if not project:
+            raise ValueError("project not found")
+        if project["archived_at"] is not None:
+            return project_id
+        if connection.execute(
+            "SELECT 1 FROM tasks WHERE project_id = ? AND outcome IS NULL LIMIT 1",
+            (project_id,),
+        ).fetchone():
+            raise ValueError("project with an active task cannot be archived")
+        connection.execute(
+            """
+            INSERT INTO messages(
+                id, project_id, role, content, action_json,
+                idempotency_key, created_at, processed_at
+            ) VALUES (?, ?, 'owner', 'archive_project', ?, ?, ?, ?)
+            """,
+            (
+                action_id,
+                project_id,
+                canonical_json({"kind": "archive_project"}),
+                idempotency_key,
+                now,
+                now,
+            ),
+        )
+        connection.execute(
+            "UPDATE projects SET archived_at = ? WHERE id = ?", (now, project_id)
+        )
+    return action_id
+
+
+def _validate_project_action(project_id: str, idempotency_key: str) -> None:
+    if not PROJECT_ID.fullmatch(project_id):
+        raise ValueError("project_id must be 1-64 safe identifier characters")
+    if not idempotency_key or len(idempotency_key) > 128:
+        raise ValueError("idempotency_key must contain 1-128 characters")
 
 
 def submit_action(

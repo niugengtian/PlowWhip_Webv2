@@ -7,10 +7,24 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from .butler import search
+from .butler import conversation, search
 from .cronner import run as run_cronner
-from .intake import PROJECT_ID, TASK_ID, submit_action, submit_message
-from .monitor import projects_snapshot, settings_library_snapshot, snapshot, task_snapshot
+from .intake import (
+    PROJECT_ID,
+    TASK_ID,
+    archive_project,
+    create_project,
+    submit_action,
+    submit_message,
+)
+from .monitor import (
+    monitor_snapshot,
+    projects_snapshot,
+    settings_library_snapshot,
+    snapshot,
+    task_snapshot,
+    token_snapshot,
+)
 from .store import Store
 from .ui import HTML
 
@@ -42,6 +56,27 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/settings-library":
             store = self.server.store  # type: ignore[attr-defined]
             self._send(200, settings_library_snapshot(store.db_path, store.data_root))
+            return
+        if path == "/api/token":
+            store = self.server.store  # type: ignore[attr-defined]
+            self._send(200, token_snapshot(store.db_path, store.data_root))
+            return
+        if path == "/api/monitor":
+            store = self.server.store  # type: ignore[attr-defined]
+            self._send(200, monitor_snapshot(store.db_path, store.data_root))
+            return
+        if path == "/api/butler":
+            store = self.server.store  # type: ignore[attr-defined]
+            project_id = parse_qs(urlsplit(self.path).query).get(
+                "project_id", [""]
+            )[0]
+            if not PROJECT_ID.fullmatch(project_id):
+                self._send(400, {"error": "invalid project_id"})
+                return
+            self._send(
+                200,
+                conversation(store.db_path, store.data_root, project_id),
+            )
             return
         if path == "/api/search":
             store = self.server.store  # type: ignore[attr-defined]
@@ -95,15 +130,27 @@ class Handler(BaseHTTPRequestHandler):
                     body["idempotency_key"],
                 )
             elif path == "/api/actions":
-                identifier = submit_action(
-                    store,
-                    body["project_id"],
-                    body["task_id"],
-                    body["kind"],
-                    body.get("instruction", ""),
-                    body["idempotency_key"],
-                    body.get("plan"),
-                )
+                if body.get("kind") == "create_project":
+                    identifier = create_project(
+                        store, body["project_id"], body["idempotency_key"]
+                    )
+                elif body.get("kind") == "archive_project":
+                    identifier = archive_project(
+                        store,
+                        body["project_id"],
+                        body.get("confirmation", ""),
+                        body["idempotency_key"],
+                    )
+                else:
+                    identifier = submit_action(
+                        store,
+                        body["project_id"],
+                        body["task_id"],
+                        body["kind"],
+                        body.get("instruction", ""),
+                        body["idempotency_key"],
+                        body.get("plan"),
+                    )
             else:
                 self._send(404, {"error": "not_found"})
                 return

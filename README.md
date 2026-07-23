@@ -14,6 +14,11 @@ python3 -m plowwhip serve
 Open `http://127.0.0.1:8742`. The server intentionally rejects non-loopback
 binds. SQLite and runtime files default to `data/`.
 
+Revision 2 exposes seven focused navigation entries: global Butler, project
+Butler, projects, Tasks, Token, read-only Monitor, and settings/library.
+Human requirements and discovered product issues are tracked in the
+[product ledger](docs/PRODUCT_LEDGER.zh-CN.md).
+
 The smallest deterministic instruction is:
 
 ```text
@@ -43,8 +48,9 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 The suite covers WAL and fencing, idempotent intake, four-state convergence,
 Evidence, automatic repair, versioned DAGs, cancellation and generation
 rotation, TaskSession ownership, bounded handoffs, token normalization,
-restart recovery, read-only Monitor, settings/library snapshots, UI/API safety,
-and fail-closed external Providers.
+Token dashboards, recoverable project archive, restart recovery, read-only
+Monitor, settings/library snapshots, UI/API safety, and fail-closed external
+Providers.
 
 ## Deliberate V1 boundary
 

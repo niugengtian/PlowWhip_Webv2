@@ -5,14 +5,27 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from plowwhip.app import make_server
+from plowwhip.butler import conversation
 from plowwhip.cronner import run as run_cronner, run_until_idle, tick
-from plowwhip.intake import submit_action, submit_message
+from plowwhip.intake import (
+    archive_project,
+    create_project,
+    submit_action,
+    submit_message,
+)
 from plowwhip.lifecycle import LeaseLost, advance_project
-from plowwhip.monitor import settings_library_snapshot, snapshot
+from plowwhip.monitor import (
+    monitor_snapshot,
+    projects_snapshot,
+    settings_library_snapshot,
+    snapshot,
+    token_snapshot,
+)
 from plowwhip.planner import normalize_plan
 from plowwhip.provider import provider_adapter, provider_facts, record_model_call
 from plowwhip.store import Store
@@ -445,6 +458,16 @@ class VerticalSliceTest(unittest.TestCase):
                     connection, row["task_id"], row["session_id"], 1,
                     "local", "single", 1, 2, 0,
                 )
+            with self.assertRaisesRegex(ValueError, "cannot decrease"):
+                record_model_call(
+                    connection, row["task_id"], row["session_id"], 1,
+                    "local", "cumulative", 140, 89, 30,
+                )
+            with self.assertRaisesRegex(ValueError, "cannot decrease"):
+                record_model_call(
+                    connection, row["task_id"], row["session_id"], 1,
+                    "local", "cumulative", 140, 105, 30,
+                )
             connection.commit()
             totals = [
                 item["normalized_total"]
@@ -453,11 +476,86 @@ class VerticalSliceTest(unittest.TestCase):
         finally:
             connection.close()
         self.assertEqual(totals, [12, 120, 35])
+        usage = token_snapshot(self.db, self.data)
+        self.assertEqual(
+            {
+                key: usage["all_history"][key]
+                for key in (
+                    "total_tokens",
+                    "input_tokens",
+                    "cached_input_tokens",
+                    "uncached_input_tokens",
+                    "output_tokens",
+                )
+            },
+            {
+                "total_tokens": 167,
+                "input_tokens": 140,
+                "cached_input_tokens": 98,
+                "uncached_input_tokens": 42,
+                "output_tokens": 27,
+            },
+        )
+        self.assertAlmostEqual(
+            usage["all_history"]["ratios"]["input_per_output"], 140 / 27
+        )
+        self.assertAlmostEqual(
+            usage["all_history"]["ratios"]["cached_per_uncached"], 98 / 42
+        )
+        self.assertEqual(usage["today"]["total_tokens"], 167)
+        self.assertEqual(usage["trend"][-1]["total_tokens"], 167)
+        self.assertEqual(usage["projects"][0]["project_id"], "usage")
+        self.assertEqual(usage["models"][0]["model"], "deterministic")
+        self.assertEqual(usage["sessions"][0]["task_session_id"], row["session_id"])
+        self.assertTrue(usage["sessions"][0]["worker_id"])
+        self.assertEqual(usage["sessions"][0]["worker_role"], "deterministic")
         self.assertEqual(provider_facts("deterministic")[0]["available"], True)
         self.assertTrue(all(not item["available"] for item in provider_facts("planner")))
         self.assertIsNone(provider_adapter("local").report_context_usage())
         with self.assertRaisesRegex(RuntimeError, "disabled"):
             provider_adapter("codex_cli")
+
+    def test_project_archive_preserves_history_and_monitor_is_read_only(self):
+        create_project(self.store, "archive-me", "archive-create")
+        history = conversation(self.db, self.data, "archive-me")
+        self.assertEqual(history["project"]["id"], "archive-me")
+        self.assertEqual(history["messages"][0]["content"], "create_project")
+
+        before = self._row_counts()
+        state = monitor_snapshot(self.db, self.data)
+        after = self._row_counts()
+        self.assertEqual(before, after)
+        self.assertTrue(state["read_only"])
+        self.assertEqual(state["database"]["journal_mode"], "wal")
+        self.assertEqual(state["database"]["quick_check"], ["ok"])
+        self.assertEqual(state["database"]["schema_version"], 2)
+
+        archive_project(
+            self.store, "archive-me", "archive-me", "archive-confirmed"
+        )
+        self.assertEqual(projects_snapshot(self.db, self.data)["projects"], [])
+        archived_history = conversation(self.db, self.data, "archive-me")
+        self.assertEqual(
+            [item["content"] for item in archived_history["messages"]],
+            ["create_project", "archive_project"],
+        )
+        state = monitor_snapshot(self.db, self.data)
+        self.assertEqual(state["summary"]["projects"], 0)
+        self.assertEqual(state["summary"]["archived_projects"], 1)
+
+        create_project(self.store, "archive-me", "archive-restore")
+        self.assertEqual(
+            projects_snapshot(self.db, self.data)["projects"][0]["project_id"],
+            "archive-me",
+        )
+        submit_message(
+            self.store, "archive-me", "写入 active.txt: active", "archive-active"
+        )
+        self.assertEqual(tick(self.store)[0]["action"], "intake")
+        with self.assertRaisesRegex(ValueError, "active task"):
+            archive_project(
+                self.store, "archive-me", "archive-me", "archive-rejected"
+            )
 
     def test_settings_and_library_are_indexed_and_read_only(self):
         state = settings_library_snapshot(self.db, self.data)
@@ -525,13 +623,36 @@ class WebApiTest(unittest.TestCase):
             html = response.read().decode()
             self.assertIn("Plow Whip · 无人值守控制台", html)
             self.assertIn("SQLite WAL", html)
-            self.assertEqual(html.count("data-view="), 4)
+            self.assertEqual(html.count("data-view="), 7)
             self.assertIn("Evidence Trail", html)
+            self.assertIn("Token 计量", html)
+            self.assertIn("Monitor 只读", html)
+            self.assertIn("项目管家", html)
             self.assertIn("设置与资源库", html)
             self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
         with urlopen(self.base + "/api/settings-library", timeout=2) as response:
             settings_library = json.load(response)
         self.assertEqual(len(settings_library["library"]), 4)
+
+        status, _ = self._post(
+            "/api/actions",
+            {
+                "kind": "create_project",
+                "project_id": "empty-web",
+                "idempotency_key": "empty-web-create",
+            },
+        )
+        self.assertEqual(status, 202)
+        status, _ = self._post(
+            "/api/actions",
+            {
+                "kind": "archive_project",
+                "project_id": "empty-web",
+                "confirmation": "empty-web",
+                "idempotency_key": "empty-web-archive",
+            },
+        )
+        self.assertEqual(status, 202)
 
         status, _ = self._post(
             "/api/messages",
@@ -572,11 +693,27 @@ class WebApiTest(unittest.TestCase):
         with urlopen(f"{self.base}/api/projects", timeout=2) as response:
             projects = json.load(response)
         self.assertEqual(projects["projects"][0]["task_id"], done["task"]["id"])
+        self.assertNotIn(
+            "empty-web", {project["project_id"] for project in projects["projects"]}
+        )
         with urlopen(
             f"{self.base}/api/tasks/{done['task']['id']}", timeout=2
         ) as response:
             task = json.load(response)
         self.assertEqual(task["task"]["id"], done["task"]["id"])
+        with urlopen(self.base + "/api/token", timeout=2) as response:
+            usage = json.load(response)
+        self.assertEqual(usage["all_history"]["total_tokens"], 0)
+        with urlopen(self.base + "/api/monitor", timeout=2) as response:
+            monitor = json.load(response)
+        self.assertTrue(monitor["read_only"])
+        self.assertEqual(monitor["summary"]["archived_projects"], 1)
+        with urlopen(
+            self.base + "/api/butler?project_id=web", timeout=2
+        ) as response:
+            butler = json.load(response)
+        self.assertEqual(butler["project"]["id"], "web")
+        self.assertGreaterEqual(len(butler["messages"]), 2)
 
         status, duplicate = self._post(
             "/api/actions",

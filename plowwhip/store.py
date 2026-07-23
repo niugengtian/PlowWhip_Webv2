@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS projects (
     lease_token TEXT,
     lease_fence INTEGER NOT NULL DEFAULT 0,
     lease_until REAL,
+    archived_at REAL,
     created_at REAL NOT NULL
 );
 
@@ -172,6 +173,7 @@ CREATE TABLE IF NOT EXISTS model_calls (
     task_session_id TEXT NOT NULL REFERENCES task_sessions(id),
     session_generation INTEGER NOT NULL,
     provider_key TEXT NOT NULL,
+    model TEXT NOT NULL,
     usage_kind TEXT NOT NULL CHECK (usage_kind IN ('single', 'cumulative')),
     input_tokens INTEGER NOT NULL,
     cached_input_tokens INTEGER NOT NULL,
@@ -256,7 +258,9 @@ class Store:
         connection = self.connect()
         try:
             connection.executescript(SCHEMA)
+            self._ensure_project_columns(connection)
             self._ensure_task_columns(connection)
+            self._ensure_model_call_columns(connection)
             connection.execute(
                 """
                 UPDATE tasks SET outcome = NULL
@@ -274,10 +278,18 @@ class Store:
                     (f"global:{key}", key, json.dumps(value, sort_keys=True), now),
                 )
             self._sync_default_library(connection, now)
-            connection.execute("PRAGMA user_version = 1")
+            connection.execute("PRAGMA user_version = 2")
             connection.commit()
         finally:
             connection.close()
+
+    @staticmethod
+    def _ensure_project_columns(connection: sqlite3.Connection) -> None:
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(projects)")
+        }
+        if "archived_at" not in columns:
+            connection.execute("ALTER TABLE projects ADD COLUMN archived_at REAL")
 
     @staticmethod
     def _ensure_task_columns(connection: sqlite3.Connection) -> None:
@@ -291,6 +303,15 @@ class Store:
         for name, declaration in additions.items():
             if name not in columns:
                 connection.execute(f"ALTER TABLE tasks ADD COLUMN {name} {declaration}")
+
+    @staticmethod
+    def _ensure_model_call_columns(connection: sqlite3.Connection) -> None:
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(model_calls)")
+        }
+        if "model" not in columns:
+            connection.execute("ALTER TABLE model_calls ADD COLUMN model TEXT")
+            connection.execute("UPDATE model_calls SET model = provider_key")
 
     def _sync_default_library(self, connection: sqlite3.Connection, now: float) -> None:
         for (kind, item_key), (relative, default_body) in DEFAULT_LIBRARY.items():

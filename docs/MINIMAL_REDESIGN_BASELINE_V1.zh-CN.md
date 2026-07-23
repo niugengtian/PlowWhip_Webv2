@@ -1,10 +1,19 @@
-# PlowWhip 极简重设计基线 V1
+# PlowWhip 极简重设计基线 V1 · Revision 2
 
 - 状态：**已冻结（FROZEN）**
 - 冻结日期：2026-07-23
 - 决策人：主人
+- 当前 revision：**2**
 - 适用范围：PlowWhip Web 控制面、Cronner、Monitor、Host Bridge、Provider、Worker、记忆与验证闭环
 - 变更门禁：未经主人明确说“开始改”，不得据此修改代码、SQLite、Docker、任务、Provider 或蓝绿环境
+
+Revision 2 主人决定：
+
+- 保留独立的全局管家和项目管家入口。
+- 新增 Token 导航与完整计量看板。
+- 新增 Monitor 导航与独立只读看板。
+- 项目页提供创建、进入和归档等基本操作。
+- 持续维护需求/问题台账，记录人的要求、发现的问题、处理状态和验证证据；台账不是运行时状态真源。
 
 ## 1. 使命
 
@@ -234,6 +243,11 @@ Planner 必须：
 简单 → 中型 → 大型只允许单向升级，并记录原因；不把升级算作失败。
 
 ## 8. 管家与统一窗口
+
+UI 保留两个清晰入口：
+
+- 全局管家：跨项目检索、选择/定位项目、将消息路由到项目。
+- 项目管家：只读取和写入当前项目消息历史，并一次只处理当前项目的一条主人指令。
 
 ### 8.1 项目内唯一对话出口
 
@@ -515,6 +529,14 @@ Cronner 每次 Tick：
 
 Monitor 永远只读。恢复后读取当前 SQLite、workspace revision、Artifact/Evidence、最新 handoff 和最后 20 行，不回放全部日志。
 
+Monitor 在 UI 中拥有独立导航和只读看板，至少显示：
+
+- 控制面、SQLite WAL/完整性、Cronner 应用内唤醒事实。
+- Project、Task 四态、到期动作、租约、TaskSession、HostJob、Artifact 统计。
+- 最近 20 条必要生命周期事件。
+
+Monitor 看板不得创建采样表、心跳历史、第二套状态或任何写入口。
+
 ## 15. 三层记忆、会话落盘与 Token
 
 ### 15.1 两条机制长期并行
@@ -547,6 +569,15 @@ handoff 只包含稳定 ID/revision、已确认完成项及 Evidence、当前未
 - Checker 用量计入当前 Task，但按 Checker TaskSession 分开显示。
 - 文件 stat、切割、哈希和确定性 handoff 是零模型 Token。
 - Provider 原生 compact 如果上报用量，则正常计入。
+
+Token 在 UI 中拥有独立导航和看板，固定使用 Asia/Shanghai 日界，至少显示：
+
+- 全历史与今日的 Total、Input、Cached-input、Uncached-input、Output。
+- 全历史与今日的 Input/Output、Cached-input/Uncached-input 可见比值；分母为零时显示无值。
+- Token 日趋势和项目消费占比。
+- 按项目、Task、model、TaskSession 的消费明细；Session 明细必须显示 `task_session_id` 及归属 Worker。
+
+计量看板只解释 ModelCallLedger，不参与预算准入、调度、熔断、进展判断或质量终态。
 
 ## 16. SQLite 与消息队列
 
@@ -691,12 +722,15 @@ TaskSession 创建时计算有效值、显示来源并冻结。
 
 ## 20. 主人页面和 API
 
-页面只保留四个主要区域：
+页面保留七个导航入口：
 
-1. 全局首页。
-2. 项目详情。
-3. Task 详情。
-4. 设置与资源库。
+1. 全局管家。
+2. 项目管家。
+3. 项目。
+4. Task。
+5. Token。
+6. Monitor。
+7. 设置与资源库。
 
 Task 详情显示：
 
@@ -713,10 +747,12 @@ Worker、Provider、Attempt、Episode、Candidate 不再各占产品页面，只
 
 ```text
 POST /api/messages：所有自然语言
-POST /api/actions：有限确定性操作
+POST /api/actions：有限确定性操作，包括 Task 操作及 Project 创建/归档
 ```
 
 两者都只提交意图；只有 `advance_project` 推进状态。查询接口全部只读。外部 API 和 Agent 必须提供 idempotency key。
+
+项目不提供删除操作。归档项目只设置 `projects.archived_at` 并从日常项目列表和选择器隐藏；消息、Task、Artifact、Evidence 和目录全部保留。存在活动 Task 时拒绝归档；再次创建同一项目 ID 等价于恢复归档。
 
 ## 21. 权限与不可逆操作
 
@@ -861,3 +897,12 @@ Planner、Checker、Monitor、Provider Pool 都是代码模块，不拆成网络
 3. V1 变更必须记录主人决定并升级为新 revision。
 4. 未收到主人明确“开始改”前，只允许分析、对比和制作改造清单。
 5. 实施阶段必须保护当前未提交工作，不覆盖主人已有变更。
+
+## 26. 需求与问题台账
+
+仓库维护 `docs/PRODUCT_LEDGER.zh-CN.md`：
+
+- 人的每项新增/变更要求单独编号，不把模型推断伪装成人的要求。
+- 实施中发现的问题单独编号，写清影响、决定、状态和最小验证证据。
+- 台账随实现同步更新；不复制完整日志、聊天或运行时状态。
+- SQLite、Workspace、Artifact、Evidence 和确定性测试仍是运行时与完成证据，台账只负责产品决策连续性。
