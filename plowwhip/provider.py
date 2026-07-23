@@ -16,14 +16,14 @@ PROVIDERS = {
     "codex_cli": {
         "display_name": "Codex CLI",
         "adapter": "codex",
-        "executable": "/Applications/ChatGPT.app/Contents/Resources/codex",
+        "executable": "codex",
         "minimal_probe": True,
     },
     "cursor_cli": {
         "display_name": "Cursor CLI",
         "adapter": "cursor",
-        "executable": "/Applications/Cursor.app/Contents/Resources/app/bin/cursor",
-        "minimal_probe": False,
+        "executable": "cursor",
+        "minimal_probe": True,
     },
     "deepseek": {
         "display_name": "DeepSeek",

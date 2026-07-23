@@ -92,6 +92,12 @@ persistent host installation is approved. Service startup and `/v1/probe` do
 not invoke a model. Keep the environment file outside the repository; it may
 contain only the Bridge token and supported Provider variables and must remain
 mode `0600`. Job state never stores prompts, argv, or credentials.
+The same active-process restart/cancel contract is tested on macOS and in a
+minimal Linux container. Cursor read-only Planner/Checker work uses CLI plan
+mode without `--force`; write Tasks enable `--force` only inside the configured
+workspace sandbox. Adapter executables resolve from the host service `PATH`
+instead of a macOS-only path; Cursor also accepts the `cursor-agent` binary
+name used by its standalone installer.
 
 The global Butler accepts an optional Project ID or an `@project-id` prefix. An
 exact search such as `找 result.txt 任务` routes to a unique Project without
@@ -135,6 +141,10 @@ human confirmation and records its ModelCallLedger usage. The application does
 not control Docker, touch production, migrate old data, or copy the old
 repository.
 
+“CLI available” on Monitor means the zero-Token version probe succeeded. It
+does not mean a model was invoked: Token remains zero until a real Provider
+HostJob reports usage into ModelCallLedger.
+
 ## Candidate gate
 
 Create a consistent database copy without copying a live `.db` away from its
@@ -157,6 +167,16 @@ python3 -m plowwhip candidate-preflight production.json candidate.json
 
 The result never authorizes cutover. Production switching, old-data reconcile
 and rollback remain separate owner-approval actions.
+
+Before an approved rollback, verify that the candidate Cronner is disabled, its
+shared scheduler lock is released, SQLite passes `quick_check`, and no active
+project lease remains:
+
+```bash
+python3 -m plowwhip rollback-preflight candidate.json
+```
+
+This command is a gate only; it does not switch traffic or mutate Task state.
 
 ## Local Docker check
 

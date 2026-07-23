@@ -25,7 +25,7 @@ MAX_OUTPUT_BYTES = 32_768
 MAX_JOB_SECONDS = 86_400
 SUPPORTED_EXECUTABLES = {
     "codex": {"codex"},
-    "cursor": {"cursor"},
+    "cursor": {"cursor", "cursor-agent"},
     "json-worker": {"simple-worker", "kimi-worker"},
 }
 KNOWN_EXECUTABLE_PATHS = {
@@ -268,8 +268,8 @@ class HostJobManager:
         access = str(payload.get("access") or "write")
         if access not in {"read", "write"}:
             raise ValueError("unsupported access mode")
-        if access == "read" and adapter != "codex":
-            raise ValueError("read-only execution requires the Codex adapter")
+        if access == "read" and adapter not in {"codex", "cursor"}:
+            raise ValueError("read-only execution requires Codex or Cursor")
         timeout_seconds = min(
             max(int(payload.get("timeout_seconds") or 600), 10),
             MAX_JOB_SECONDS,
@@ -638,7 +638,10 @@ def _resolve_executable(value: object, adapter: str) -> str | None:
         if not allowed:
             raise ValueError("absolute executable is not an approved adapter path")
         return str(path) if path.is_file() and os.access(path, os.X_OK) else None
-    return shutil.which(candidate)
+    discovered = shutil.which(candidate)
+    if discovered is None and adapter == "cursor" and candidate == "cursor":
+        discovered = shutil.which("cursor-agent")
+    return discovered
 
 
 def _version_argv(adapter: str, executable: str) -> list[str]:
@@ -698,7 +701,7 @@ def _execution_argv(
     if adapter == "cursor":
         if not session_id:
             raise ValueError("Cursor session is required")
-        return [
+        argv = [
             executable,
             "agent",
             "-p",
@@ -707,13 +710,17 @@ def _execution_argv(
             "--sandbox",
             "enabled",
             "--trust",
-            "--force",
             "--workspace",
             str(project),
             "--resume",
             session_id,
-            prompt,
         ]
+        if access == "read":
+            argv.extend(["--mode", "plan"])
+        else:
+            argv.append("--force")
+        argv.append(prompt)
+        return argv
     if not session_id:
         raise ValueError("JSON Worker session is required")
     return [
@@ -955,6 +962,13 @@ def _is_within(path: Path, root: Path) -> bool:
 def _process_identity(pid: int) -> str | None:
     if pid <= 0:
         return None
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        fields = stat[stat.rfind(")") + 2 :].split()
+        if len(fields) >= 20:
+            return f"proc:{fields[19]}"
+    except (OSError, ValueError):
+        pass
     try:
         completed = subprocess.run(
             ["ps", "-p", str(pid), "-o", "lstart="],

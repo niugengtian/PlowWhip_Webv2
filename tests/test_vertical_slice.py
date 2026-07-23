@@ -50,7 +50,7 @@ from plowwhip.provider import (
     provider_facts,
     record_model_call,
 )
-from plowwhip.store import Store, candidate_preflight
+from plowwhip.store import Store, candidate_preflight, rollback_preflight
 from plowwhip.verification import _parse_checker_verdict
 
 
@@ -496,6 +496,35 @@ class VerticalSliceTest(unittest.TestCase):
             scheduler.close()
         replacement = acquire_scheduler_lock(self.data)
         replacement.close()
+        rollback_manifest = {
+            **candidate,
+            "code_root": str(self.root / "candidate-code"),
+            "data_root": str(backup_path.parent),
+            "db_path": str(backup_path),
+        }
+        rollback_gate = rollback_preflight(rollback_manifest)
+        self.assertTrue(rollback_gate["rollback_ready"])
+        self.assertTrue(rollback_gate["scheduler_lock_released"])
+        candidate_scheduler = acquire_scheduler_lock(backup_path.parent)
+        try:
+            with self.assertRaisesRegex(ValueError, "scheduler lock"):
+                rollback_preflight(rollback_manifest)
+        finally:
+            candidate_scheduler.close()
+        backup = sqlite3.connect(backup_path)
+        try:
+            backup.execute(
+                """
+                UPDATE projects SET lease_token = 'still-active', lease_until = ?
+                WHERE id = 'backup-source'
+                """,
+                (time.time() + 60,),
+            )
+            backup.commit()
+        finally:
+            backup.close()
+        with self.assertRaisesRegex(ValueError, "active project lease"):
+            rollback_preflight(rollback_manifest)
 
     def test_owner_wake_is_queued_but_cronner_remains_the_only_driver(self):
         submit_message(self.store, "wake", "写入 wake.txt: done", "wake-message")
@@ -1726,6 +1755,13 @@ class VerticalSliceTest(unittest.TestCase):
     def test_provider_probe_tasks_record_zero_and_minimal_token_evidence(self):
         spec, _ = normalize_instruction("探测 Provider codex_cli: minimal")
         self.assertEqual(spec["kind"], "authorization_required")
+        spec, _ = normalize_instruction("探测 Provider cursor_cli: minimal")
+        self.assertEqual(spec["kind"], "authorization_required")
+        spec, _ = normalize_instruction(
+            "探测 Provider cursor_cli: minimal 确认 cursor_cli"
+        )
+        self.assertEqual(spec["kind"], "provider_probe")
+        self.assertEqual(spec["provider_key"], "cursor_cli")
         requests = []
         store = self.store
 
@@ -2626,6 +2662,8 @@ class WebApiTest(unittest.TestCase):
             self.assertIn("立即唤醒", html)
             self.assertIn("处理待决定", html)
             self.assertIn("探测 Provider codex_cli: 0token", html)
+            self.assertIn("0 Token 版本探活", html)
+            self.assertIn("未调用模型", html)
             self.assertIn("任务泳道", html)
             self.assertEqual(html.count("data-task-lane="), 4)
             self.assertIn("HostJob / Session", html)

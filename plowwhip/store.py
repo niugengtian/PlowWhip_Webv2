@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import hashlib
 import os
@@ -302,44 +303,59 @@ def write_atomic(path: Path, body: bytes) -> None:
         temporary.unlink(missing_ok=True)
 
 
+ENVIRONMENT_FIELDS = {
+    "code_root",
+    "data_root",
+    "db_path",
+    "compose_project",
+    "port",
+    "host_bridge_namespace",
+    "cronner_enabled",
+}
+
+
+def _environment_manifest(
+    source: dict[str, object], name: str, cronner_enabled: bool
+) -> dict[str, object]:
+    if set(source) != ENVIRONMENT_FIELDS:
+        raise ValueError(f"{name} must declare the exact isolation fields")
+    if source["cronner_enabled"] is not cronner_enabled:
+        state = "enabled" if cronner_enabled else "disabled"
+        raise ValueError(f"{name} Cronner must be {state}")
+    normalized: dict[str, object] = {}
+    for field in ("code_root", "data_root", "db_path"):
+        value = source[field]
+        if not isinstance(value, str) or not Path(value).is_absolute():
+            raise ValueError(f"{name}.{field} must be an absolute path")
+        normalized[field] = str(Path(value).resolve())
+    for field in ("compose_project", "host_bridge_namespace"):
+        value = source[field]
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{name}.{field} must be a non-empty string")
+        normalized[field] = value.strip()
+    port = source["port"]
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65_535:
+        raise ValueError(f"{name}.port must be a valid TCP port")
+    normalized["port"] = port
+    normalized["cronner_enabled"] = cronner_enabled
+    try:
+        db_inside_data = os.path.commonpath(
+            [str(normalized["data_root"]), str(normalized["db_path"])]
+        ) == normalized["data_root"]
+    except ValueError:
+        db_inside_data = False
+    if not db_inside_data:
+        raise ValueError(f"{name}.db_path must be inside {name}.data_root")
+    return normalized
+
+
 def candidate_preflight(
     production: dict[str, object], candidate: dict[str, object]
 ) -> dict[str, object]:
-    required = {
-        "code_root",
-        "data_root",
-        "db_path",
-        "compose_project",
-        "port",
-        "host_bridge_namespace",
-        "cronner_enabled",
+    normalized = {
+        "production": _environment_manifest(production, "production", True),
+        "candidate": _environment_manifest(candidate, "candidate", False),
     }
-    if set(production) != required or set(candidate) != required:
-        raise ValueError(
-            "production and candidate must declare the exact isolation fields"
-        )
-    if candidate["cronner_enabled"] is not False:
-        raise ValueError("candidate Cronner must be disabled before cutover approval")
-    if production["cronner_enabled"] is not True:
-        raise ValueError("production manifest must identify the active Cronner")
-    path_fields = ("code_root", "data_root", "db_path")
-    normalized: dict[str, dict[str, object]] = {"production": {}, "candidate": {}}
-    for name, source in (("production", production), ("candidate", candidate)):
-        for field in path_fields:
-            value = source[field]
-            if not isinstance(value, str) or not Path(value).is_absolute():
-                raise ValueError(f"{name}.{field} must be an absolute path")
-            normalized[name][field] = str(Path(value).resolve())
-        for field in ("compose_project", "host_bridge_namespace"):
-            value = source[field]
-            if not isinstance(value, str) or not value.strip():
-                raise ValueError(f"{name}.{field} must be a non-empty string")
-            normalized[name][field] = value.strip()
-        port = source["port"]
-        if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65_535:
-            raise ValueError(f"{name}.port must be a valid TCP port")
-        normalized[name]["port"] = port
-        normalized[name]["cronner_enabled"] = source["cronner_enabled"]
     isolated_fields = (
         "code_root",
         "data_root",
@@ -357,14 +373,6 @@ def candidate_preflight(
         raise ValueError(
             "candidate isolation collision: " + ", ".join(collisions)
         )
-    candidate_data = str(normalized["candidate"]["data_root"])
-    candidate_db = str(normalized["candidate"]["db_path"])
-    try:
-        inside_data_root = os.path.commonpath([candidate_data, candidate_db]) == candidate_data
-    except ValueError:
-        inside_data_root = False
-    if not inside_data_root:
-        raise ValueError("candidate db_path must be inside candidate data_root")
     return {
         "isolated": True,
         "backup_required": "sqlite_backup_api",
@@ -374,6 +382,48 @@ def candidate_preflight(
         "production": normalized["production"],
         "candidate": normalized["candidate"],
     }
+
+
+def rollback_preflight(candidate: dict[str, object]) -> dict[str, object]:
+    normalized = _environment_manifest(candidate, "candidate", False)
+    data_root = Path(str(normalized["data_root"]))
+    db_path = Path(str(normalized["db_path"]))
+    if not data_root.is_dir() or not db_path.is_file():
+        raise ValueError("candidate data_root and db_path must exist")
+    lock = (data_root / ".cronner.lock").open("a+b")
+    try:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError("candidate scheduler lock is still owned") from None
+        connection = Store(db_path, data_root).connect_readonly()
+        try:
+            quick_check = [
+                row[0] for row in connection.execute("PRAGMA quick_check").fetchall()
+            ]
+            active_leases = connection.execute(
+                """
+                SELECT COUNT(*) FROM projects
+                WHERE lease_token IS NOT NULL AND lease_until >= ?
+                """,
+                (time.time(),),
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        if quick_check != ["ok"]:
+            raise ValueError("candidate database quick_check failed")
+        if active_leases:
+            raise ValueError("candidate still has an active project lease")
+        return {
+            "rollback_ready": True,
+            "candidate_cronner_enabled": False,
+            "scheduler_lock_released": True,
+            "active_leases": 0,
+            "quick_check": quick_check,
+            "candidate": normalized,
+        }
+    finally:
+        lock.close()
 
 
 class Store:

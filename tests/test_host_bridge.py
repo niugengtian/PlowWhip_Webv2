@@ -10,7 +10,14 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from uuid import uuid4
 
-from plowwhip.host_bridge import HostJobManager, _load_private_env, make_server
+from plowwhip.host_bridge import (
+    HostJobManager,
+    _execution_argv,
+    _load_private_env,
+    _parse_usage,
+    _resolve_executable,
+    make_server,
+)
 
 
 class HostBridgeTest(unittest.TestCase):
@@ -255,6 +262,103 @@ else:
         terminal = self._wait_terminal(job_id)
         self.assertEqual(terminal["status"], "cancelled")
         self.assertEqual(terminal["returncode"], 130)
+
+    def test_running_process_is_reconciled_and_cancelled_after_bridge_restart(self):
+        job_id = uuid4().hex
+        status, started = self._post(
+            "/v1/jobs/start",
+            {
+                "job_id": job_id,
+                "adapter": "json-worker",
+                "executable": str(self.worker),
+                "project_path": str(self.project),
+                "prompt": "SLEEP",
+                "timeout_seconds": 60,
+                "access": "write",
+                "context_policy": {},
+            },
+        )
+        self.assertEqual(status, 202)
+        self.assertEqual(started["status"], "running")
+        if not started["process_identity"]:
+            self.server.manager.cancel(job_id)  # type: ignore[attr-defined]
+            self._wait_terminal(job_id)
+            self.skipTest("process start identity is unavailable in this sandbox")
+
+        restarted = HostJobManager(self.state, (self.root.resolve(),))
+        reconciled = restarted.status(job_id)
+        self.assertEqual(reconciled["status"], "orphan_running")
+        self.assertTrue(reconciled["process_identity"])
+        restarted.cancel(job_id)
+        for _ in range(100):
+            terminal = restarted.status(job_id)
+            if terminal["status"] == "cancelled":
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("restarted Bridge did not reconcile cancellation")
+        self.assertEqual(terminal["returncode"], 130)
+
+    def test_cursor_read_mode_and_cumulative_token_normalization(self):
+        context = {
+            "provider_compaction_token_limit": 120_000,
+            "rotation_max_bytes": 65_536,
+            "hot_max_bytes": 16_384,
+            "warm_max_bytes": 8_192,
+            "max_turns": 24,
+            "tool_no_progress_limit": 6,
+        }
+        read_argv = _execution_argv(
+            "cursor",
+            "cursor",
+            self.project,
+            "cursor-session",
+            "review only",
+            "read",
+            context,
+        )
+        self.assertEqual(read_argv[-3:], ["--mode", "plan", "review only"])
+        self.assertNotIn("--force", read_argv)
+        write_argv = _execution_argv(
+            "cursor",
+            "cursor",
+            self.project,
+            "cursor-session",
+            "implement",
+            "write",
+            context,
+        )
+        self.assertIn("--force", write_argv)
+        self.assertNotIn("--mode", write_argv)
+
+        usage = _parse_usage(
+            "\n".join(
+                (
+                    '{"type":"system","session_id":"cursor-session","model":"composer"}',
+                    '{"type":"result","usage":{"inputTokens":10,'
+                    '"cacheReadTokens":4,"outputTokens":2}}',
+                    '{"type":"result","usage":{"inputTokens":20,'
+                    '"cacheReadTokens":8,"outputTokens":5}}',
+                )
+            )
+        )
+        self.assertEqual(usage["session_id"], "cursor-session")
+        self.assertEqual(usage["model"], "composer")
+        self.assertEqual(usage["input_tokens"], 28)
+        self.assertEqual(usage["cached_input_tokens"], 8)
+        self.assertEqual(usage["output_tokens"], 5)
+        with patch(
+            "plowwhip.host_bridge.shutil.which",
+            side_effect=lambda name: (
+                "/usr/local/bin/cursor-agent"
+                if name == "cursor-agent"
+                else None
+            ),
+        ):
+            self.assertEqual(
+                _resolve_executable("cursor", "cursor"),
+                "/usr/local/bin/cursor-agent",
+            )
 
 
 if __name__ == "__main__":

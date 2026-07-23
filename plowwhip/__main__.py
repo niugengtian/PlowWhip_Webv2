@@ -5,7 +5,7 @@ import json
 
 from .app import serve
 from .monitor import snapshot
-from .store import Store, candidate_preflight
+from .store import Store, candidate_preflight, rollback_preflight
 
 
 def main() -> None:
@@ -40,6 +40,11 @@ def main() -> None:
     )
     preflight.add_argument("production_manifest")
     preflight.add_argument("candidate_manifest")
+    rollback = commands.add_parser(
+        "rollback-preflight",
+        help="verify candidate Cronner and leases are released before rollback",
+    )
+    rollback.add_argument("candidate_manifest")
 
     args = parser.parse_args()
     if args.command == "monitor":
@@ -56,6 +61,12 @@ def main() -> None:
         with open(args.candidate_manifest, encoding="utf-8") as handle:
             candidate = json.load(handle)
         result = candidate_preflight(production, candidate)
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
+        return
+    if args.command == "rollback-preflight":
+        with open(args.candidate_manifest, encoding="utf-8") as handle:
+            candidate = json.load(handle)
+        result = rollback_preflight(candidate)
         print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
         return
     serve(
