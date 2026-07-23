@@ -5,7 +5,12 @@ import sqlite3
 import time
 from uuid import uuid4
 
-from .execution import execute_task
+from .execution import (
+    archive_task_sessions,
+    create_task_sessions,
+    execute_task,
+    rotate_task_sessions,
+)
 from .intake import canonical_json, normalize_instruction
 from .planner import normalize_plan
 from .store import Store
@@ -157,8 +162,9 @@ def _create_task(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
         INSERT INTO tasks(
             id, project_id, goal_id, spec_json, acceptance_json, public_status,
             phase, wait_reason, fault_code, next_action_at, outcome, created_at, updated_at,
-            plan_id, sprint, role_key
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'deterministic')
+            plan_id, sprint, role_key, checker_role_key
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1,
+                  'deterministic', 'deterministic_checker')
         """,
         (
             task_id,
@@ -177,6 +183,7 @@ def _create_task(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
             plan_id,
         ),
     )
+    create_task_sessions(connection, message["project_id"], task_id, now)
     connection.execute(
         "UPDATE messages SET action_json = ?, processed_at = ? WHERE id = ?",
         (canonical_json(spec), now, message["id"]),
@@ -223,6 +230,7 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
             """,
             (now, task["id"]),
         )
+        archive_task_sessions(connection, task["id"], now)
         event, detail = "cancelled", {"message_id": message["id"]}
     elif kind == "rerun" and task["outcome"] == "cancelled":
         connection.execute(
@@ -232,6 +240,7 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
             """,
             (now, now, task["id"]),
         )
+        rotate_task_sessions(connection, task["id"], now)
         event, detail = "rerun", {"message_id": message["id"]}
     elif kind == "provide_decision" and task["public_status"] == "needs_decision":
         spec, acceptance = normalize_instruction(action["instruction"])
@@ -323,7 +332,8 @@ def _install_plan(
         UPDATE tasks SET plan_id = ?, spec_revision = spec_revision + 1,
             spec_json = ?, acceptance_json = ?, public_status = 'pending',
             phase = 'execute', wait_reason = NULL, fault_code = NULL,
-            next_action_at = ?, outcome = NULL, sprint = ?, role_key = ?, updated_at = ?
+            next_action_at = ?, outcome = NULL, sprint = ?, role_key = ?,
+            checker_role_key = 'deterministic_checker', updated_at = ?
         WHERE id = ?
         """,
         (
@@ -355,8 +365,10 @@ def _install_plan(
             """
             INSERT INTO tasks(
                 id, project_id, goal_id, spec_json, acceptance_json, public_status,
-                phase, next_action_at, created_at, updated_at, plan_id, sprint, role_key
-            ) VALUES (?, ?, ?, ?, ?, 'pending', 'queued', NULL, ?, ?, ?, ?, ?)
+                phase, next_action_at, created_at, updated_at, plan_id, sprint,
+                role_key, checker_role_key
+            ) VALUES (?, ?, ?, ?, ?, 'pending', 'queued', NULL, ?, ?, ?, ?, ?,
+                      'deterministic_checker')
             """,
             (
                 task_id,
@@ -370,6 +382,13 @@ def _install_plan(
                 item["sprint"],
                 item["role_key"],
             ),
+        )
+        create_task_sessions(
+            connection,
+            placeholder["project_id"],
+            task_id,
+            now,
+            item["role_key"],
         )
         connection.execute(
             """

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .provider import provider_facts
 from .store import Store
 
 
@@ -88,6 +89,34 @@ def _task_view(connection, store: Store, task) -> dict:
         """,
         (task["id"],),
     ).fetchall()
+    handoffs = connection.execute(
+        """
+        SELECT path, sha256, acceptance_id, revision FROM artifacts
+        WHERE task_id = ? AND kind = 'handoff'
+        ORDER BY created_at DESC, rowid DESC LIMIT 20
+        """,
+        (task["id"],),
+    ).fetchall()
+    sessions = connection.execute(
+        """
+        SELECT session.id AS task_session_id, session.role_key,
+               session.role_snapshot_json, session.settings_json,
+               generation.generation, generation.provider_key,
+               generation.status, generation.handoff_ref
+        FROM task_sessions session
+        JOIN session_generations generation ON generation.task_session_id = session.id
+        WHERE session.task_id = ?
+        ORDER BY session.role_key, generation.generation
+        """,
+        (task["id"],),
+    ).fetchall()
+    model_usage = connection.execute(
+        """
+        SELECT task_session_id, SUM(normalized_total) AS normalized_total
+        FROM model_calls WHERE task_id = ? GROUP BY task_session_id
+        """,
+        (task["id"],),
+    ).fetchall()
     last_output = (
         _tail(store.data_root, job["output_ref"]) if job and job["output_ref"] else []
     )
@@ -103,8 +132,42 @@ def _task_view(connection, store: Store, task) -> dict:
             }
             for artifact in artifacts
         ],
+        "handoffs": [
+            {**dict(handoff), "path": str(store.resolve_data_path(handoff["path"]))}
+            for handoff in handoffs
+        ],
+        "sessions": [
+            {
+                **dict(session),
+                "provider_candidates": provider_facts(session["role_key"]),
+            }
+            for session in sessions
+        ],
+        "model_usage": [dict(row) for row in model_usage],
+        "session_files": _session_files(store, task),
         "last_output": last_output,
     }
+
+
+def _session_files(store: Store, task) -> list[dict]:
+    root = (
+        store.data_root
+        / "projects"
+        / task["project_id"]
+        / "tasks"
+        / task["id"]
+        / "sessions"
+    )
+    if not root.is_dir():
+        return []
+    files = sorted((path for path in root.rglob("*") if path.is_file()), reverse=True)[:100]
+    return [
+        {
+            "path": str(path),
+            "bytes": path.stat().st_size,
+        }
+        for path in files
+    ]
 
 
 def _tail(data_root: Path, relative: str, lines: int = 20, byte_cap: int = 8192) -> list[str]:

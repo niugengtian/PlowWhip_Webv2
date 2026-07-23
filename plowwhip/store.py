@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import sqlite3
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -143,7 +145,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL REFERENCES projects(id),
     task_id TEXT NOT NULL REFERENCES tasks(id),
-    kind TEXT NOT NULL CHECK (kind IN ('output', 'evidence', 'log')),
+    kind TEXT NOT NULL CHECK (kind IN ('output', 'evidence', 'handoff', 'log')),
     path TEXT NOT NULL,
     sha256 TEXT NOT NULL,
     bytes INTEGER NOT NULL,
@@ -202,6 +204,25 @@ CREATE TABLE IF NOT EXISTS settings (
 """
 
 
+DEFAULT_SETTINGS = {
+    "provider_order": {
+        "planner": ["codex_cli", "cursor_cli", "deepseek", "kimi"],
+        "fullstack": ["cursor_cli", "codex_cli", "deepseek", "kimi"],
+        "simple": ["deepseek", "kimi", "codex_cli"],
+        "deterministic": ["local"],
+        "deterministic_checker": ["local"],
+    },
+    "max_runtime_seconds": 600,
+    "stop_grace_seconds": 10,
+    "handoff_max_bytes": 8192,
+    "checkpoint_max_bytes": 8192,
+    "monitor_tail_lines": 20,
+    "monitor_tail_bytes": 8192,
+    "retry_count": 0,
+    "retry_backoff_seconds": 0,
+}
+
+
 class Store:
     def __init__(self, db_path: str | Path, data_root: str | Path):
         self.db_path = Path(db_path).resolve()
@@ -220,6 +241,16 @@ class Store:
                 WHERE public_status = 'needs_decision' AND outcome = 'needs_decision'
                 """
             )
+            now = time.time()
+            for key, value in DEFAULT_SETTINGS.items():
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO settings(
+                        id, scope, project_id, setting_key, value_json, source, updated_at
+                    ) VALUES (?, 'global', NULL, ?, ?, 'v1_default', ?)
+                    """,
+                    (f"global:{key}", key, json.dumps(value, sort_keys=True), now),
+                )
             connection.execute("PRAGMA user_version = 1")
             connection.commit()
         finally:

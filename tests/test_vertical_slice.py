@@ -14,6 +14,7 @@ from plowwhip.intake import submit_action, submit_message
 from plowwhip.lifecycle import LeaseLost, advance_project
 from plowwhip.monitor import snapshot
 from plowwhip.planner import normalize_plan
+from plowwhip.provider import provider_adapter, provider_facts, record_model_call
 from plowwhip.store import Store
 
 
@@ -64,8 +65,26 @@ class VerticalSliceTest(unittest.TestCase):
             self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0], "wal")
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 1)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM host_jobs").fetchone()[0], 2)
+            sessions = connection.execute(
+                "SELECT role_key, settings_json FROM task_sessions ORDER BY role_key"
+            ).fetchall()
+            generations = connection.execute(
+                "SELECT generation, status, handoff_ref FROM session_generations"
+            ).fetchall()
+            jobs = connection.execute(
+                "SELECT task_session_id, session_generation, purpose FROM host_jobs ORDER BY sequence"
+            ).fetchall()
         finally:
             connection.close()
+        self.assertEqual([row["role_key"] for row in sessions], ["deterministic", "deterministic_checker"])
+        self.assertTrue(all(json.loads(row["settings_json"])["sources"] for row in sessions))
+        self.assertEqual([(row["generation"], row["status"]) for row in generations], [(1, "archived"), (1, "archived")])
+        self.assertTrue(all(row["handoff_ref"] for row in generations))
+        self.assertEqual([row["purpose"] for row in jobs], ["execute", "check"])
+        self.assertEqual(len({row["task_session_id"] for row in jobs}), 2)
+        self.assertEqual({row["session_generation"] for row in jobs}, {1})
+        handoffs = list((self.data / "projects" / "project-a" / "tasks" / view["task"]["id"] / "handoffs").glob("*/current.json"))
+        self.assertEqual(len(handoffs), 2)
 
     def test_failed_evidence_converges_to_needs_decision(self):
         submit_message(self.store, "project-b", "write result.txt: expected", "request-2")
@@ -143,6 +162,14 @@ class VerticalSliceTest(unittest.TestCase):
         cancelled = snapshot(self.db, self.data, "cancel")
         self.assertEqual(cancelled["task"]["outcome"], "cancelled")
         self.assertEqual(tick(self.store), [])
+        connection = self.store.connect()
+        try:
+            self.assertEqual(
+                {tuple(row) for row in connection.execute("SELECT generation, status FROM session_generations")},
+                {(1, "archived")},
+            )
+        finally:
+            connection.close()
 
         submit_action(self.store, "cancel", task["id"], "rerun", "", "cancel-3")
         self.assertEqual(
@@ -162,6 +189,12 @@ class VerticalSliceTest(unittest.TestCase):
                     "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
                 )
             }
+            generations = connection.execute(
+                "SELECT generation, status FROM session_generations ORDER BY task_session_id, generation"
+            ).fetchall()
+            jobs = connection.execute(
+                "SELECT sequence, session_generation, purpose FROM host_jobs ORDER BY sequence"
+            ).fetchall()
         finally:
             connection.close()
         self.assertEqual(
@@ -183,6 +216,14 @@ class VerticalSliceTest(unittest.TestCase):
                 "library_items",
                 "settings",
             },
+        )
+        self.assertEqual(
+            [(row["generation"], row["status"]) for row in generations],
+            [(1, "archived"), (2, "archived"), (1, "archived"), (2, "archived")],
+        )
+        self.assertEqual(
+            [tuple(row) for row in jobs],
+            [(1, 1, "execute"), (2, 2, "execute"), (3, 2, "check")],
         )
 
     def test_versioned_plan_runs_serial_dag(self):
@@ -244,11 +285,15 @@ class VerticalSliceTest(unittest.TestCase):
             dependencies = connection.execute(
                 "SELECT COUNT(*) AS count FROM task_dependencies"
             ).fetchone()["count"]
+            session_count = connection.execute(
+                "SELECT COUNT(*) AS count FROM task_sessions"
+            ).fetchone()["count"]
         finally:
             connection.close()
         self.assertEqual(tasks[0]["id"], placeholder["id"])
         self.assertEqual([(row["outcome"], row["sprint"]) for row in tasks], [("done", 1), ("done", 2)])
         self.assertEqual((selected, dependencies), (2, 1))
+        self.assertEqual(session_count, 4)
 
         cyclic = {**plan, "tasks": [
             {"key": "a", "instruction": "write a.txt: a", "depends_on": ["b"]},
@@ -256,6 +301,58 @@ class VerticalSliceTest(unittest.TestCase):
         ]}
         with self.assertRaisesRegex(ValueError, "cycle"):
             normalize_plan(cyclic)
+
+    def test_provider_facts_and_token_normalization_are_fail_closed(self):
+        submit_message(self.store, "usage", "write result.txt: usage", "usage-1")
+        self.assertEqual(tick(self.store)[0]["action"], "intake")
+        connection = self.store.connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT task.id AS task_id, session.id AS session_id
+                FROM tasks task JOIN task_sessions session ON session.task_id = task.id
+                WHERE task.project_id = 'usage' AND session.role_key = 'deterministic'
+                """
+            ).fetchone()
+            self.assertEqual(
+                record_model_call(
+                    connection, row["task_id"], row["session_id"], 1,
+                    "local", "single", 10, 8, 2,
+                ),
+                12,
+            )
+            self.assertEqual(
+                record_model_call(
+                    connection, row["task_id"], row["session_id"], 1,
+                    "local", "cumulative", 100, 60, 20,
+                ),
+                120,
+            )
+            self.assertEqual(
+                record_model_call(
+                    connection, row["task_id"], row["session_id"], 1,
+                    "local", "cumulative", 130, 90, 25,
+                ),
+                35,
+            )
+            with self.assertRaisesRegex(ValueError, "subset"):
+                record_model_call(
+                    connection, row["task_id"], row["session_id"], 1,
+                    "local", "single", 1, 2, 0,
+                )
+            connection.commit()
+            totals = [
+                item["normalized_total"]
+                for item in connection.execute("SELECT normalized_total FROM model_calls ORDER BY rowid")
+            ]
+        finally:
+            connection.close()
+        self.assertEqual(totals, [12, 120, 35])
+        self.assertEqual(provider_facts("deterministic")[0]["available"], True)
+        self.assertTrue(all(not item["available"] for item in provider_facts("planner")))
+        self.assertIsNone(provider_adapter("local").report_context_usage())
+        with self.assertRaisesRegex(RuntimeError, "disabled"):
+            provider_adapter("codex_cli")
 
     def _row_counts(self):
         connection = sqlite3.connect(str(self.db))

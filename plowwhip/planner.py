@@ -41,6 +41,9 @@ def normalize_plan(plan: object) -> dict:
             isinstance(value, str) for value in dependencies
         ):
             raise ValueError(f"task {key} has invalid dependencies")
+        role_key = str(item.get("role_key", "deterministic"))
+        if role_key != "deterministic":
+            raise ValueError(f"task {key} requires a disabled Provider")
         normalized.append(
             {
                 "key": key,
@@ -48,7 +51,7 @@ def normalize_plan(plan: object) -> dict:
                 "acceptance": acceptance,
                 "depends_on": dependencies,
                 "sprint": int(item.get("sprint", 1)),
-                "role_key": str(item.get("role_key", "deterministic")),
+                "role_key": role_key,
             }
         )
 

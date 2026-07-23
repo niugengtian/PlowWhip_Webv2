@@ -6,7 +6,7 @@ import sqlite3
 import time
 from uuid import uuid4
 
-from .execution import _write_atomic
+from .execution import _write_atomic, archive_task_sessions, current_session
 from .intake import canonical_json
 from .store import Store
 
@@ -32,6 +32,9 @@ def verify_task(store: Store, connection: sqlite3.Connection, task: sqlite3.Row)
         "SELECT COALESCE(MAX(sequence), 0) + 1 AS value FROM host_jobs WHERE task_id = ?",
         (task["id"],),
     ).fetchone()["value"]
+    task_session_id, session_generation = current_session(
+        connection, task["id"], task["checker_role_key"] or "deterministic_checker"
+    )
     evidence = {
         "acceptance_id": "artifact_content_sha256",
         "expected_sha256": expected,
@@ -76,13 +79,16 @@ def verify_task(store: Store, connection: sqlite3.Connection, task: sqlite3.Row)
     connection.execute(
         """
         INSERT INTO host_jobs(
-            id, task_id, spec_revision, sequence, purpose, status,
+            id, task_id, task_session_id, session_generation,
+            spec_revision, sequence, purpose, status,
             started_at, ended_at, returncode, output_ref
-        ) VALUES (?, ?, ?, ?, 'check', 'succeeded', ?, ?, 0, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, 'check', 'succeeded', ?, ?, 0, ?)
         """,
         (
             uuid4().hex,
             task["id"],
+            task_session_id,
+            session_generation,
             task["spec_revision"],
             sequence,
             started_at,
@@ -99,6 +105,7 @@ def verify_task(store: Store, connection: sqlite3.Connection, task: sqlite3.Row)
             """,
             (now, task["id"]),
         )
+        archive_task_sessions(connection, task["id"], now)
     else:
         connection.execute(
             """

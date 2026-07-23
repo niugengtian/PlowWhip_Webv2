@@ -5,6 +5,7 @@ import threading
 import time
 from uuid import uuid4
 
+from .continuity import checkpoint_project
 from .lifecycle import advance_project
 from .store import Store
 
@@ -73,6 +74,7 @@ def tick(store: Store, limit: int = 100) -> list[dict[str, str]]:
         token, fence = lease
         try:
             action = advance_project(store, project["id"], token, fence)
+            checkpoint_project(store, project["id"])
             results.append(
                 {
                     "project_id": project["id"],

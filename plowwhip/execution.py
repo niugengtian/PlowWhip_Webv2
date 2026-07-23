@@ -22,6 +22,136 @@ def _write_atomic(path: Path, body: bytes) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def create_task_sessions(
+    connection: sqlite3.Connection,
+    project_id: str,
+    task_id: str,
+    now: float,
+    executor_role: str = "deterministic",
+    checker_role: str = "deterministic_checker",
+) -> None:
+    settings = _effective_settings(connection, project_id)
+    for role_key in (executor_role, checker_role):
+        worker = connection.execute(
+            "SELECT id FROM workers WHERE project_id = ? AND role_key = ?",
+            (project_id, role_key),
+        ).fetchone()
+        worker_id = worker["id"] if worker else uuid4().hex
+        if not worker:
+            connection.execute(
+                "INSERT INTO workers(id, project_id, role_key, created_at) VALUES (?, ?, ?, ?)",
+                (worker_id, project_id, role_key, now),
+            )
+        session_id = uuid4().hex
+        connection.execute(
+            """
+            INSERT INTO task_sessions(
+                id, task_id, worker_id, role_key, role_snapshot_json, settings_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session_id,
+                task_id,
+                worker_id,
+                role_key,
+                canonical_json(
+                    {
+                        "role_key": role_key,
+                        "revision": 1,
+                        "permission": "recoverable_workspace_change",
+                        "checker_independent": role_key == checker_role,
+                    }
+                ),
+                canonical_json(settings),
+                now,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO session_generations(
+                id, task_session_id, generation, provider_key, status, created_at
+            ) VALUES (?, ?, 1, 'local', 'active', ?)
+            """,
+            (uuid4().hex, session_id, now),
+        )
+
+
+def _effective_settings(connection: sqlite3.Connection, project_id: str) -> dict:
+    rows = connection.execute(
+        """
+        SELECT scope, setting_key, value_json, source FROM settings
+        WHERE scope = 'global' OR (scope = 'project' AND project_id = ?)
+        ORDER BY CASE scope WHEN 'global' THEN 0 ELSE 1 END, rowid
+        """,
+        (project_id,),
+    ).fetchall()
+    values: dict[str, object] = {}
+    sources: dict[str, str] = {}
+    for row in rows:
+        values[row["setting_key"]] = json.loads(row["value_json"])
+        sources[row["setting_key"]] = (
+            f"project:{project_id}:{row['source']}"
+            if row["scope"] == "project"
+            else row["source"]
+        )
+    return {"values": values, "sources": sources}
+
+
+def current_session(
+    connection: sqlite3.Connection, task_id: str, role_key: str
+) -> tuple[str, int]:
+    row = connection.execute(
+        """
+        SELECT task_session.id, generation.generation
+        FROM task_sessions task_session
+        JOIN session_generations generation
+          ON generation.task_session_id = task_session.id
+        WHERE task_session.task_id = ? AND task_session.role_key = ?
+          AND generation.status = 'active'
+        ORDER BY generation.generation DESC LIMIT 1
+        """,
+        (task_id, role_key),
+    ).fetchone()
+    if not row:
+        raise RuntimeError(f"missing active TaskSession for {task_id}:{role_key}")
+    return row["id"], row["generation"]
+
+
+def archive_task_sessions(connection: sqlite3.Connection, task_id: str, now: float) -> None:
+    connection.execute(
+        """
+        UPDATE session_generations SET status = 'archived', ended_at = ?
+        WHERE status = 'active' AND task_session_id IN (
+            SELECT id FROM task_sessions WHERE task_id = ?
+        )
+        """,
+        (now, task_id),
+    )
+
+
+def rotate_task_sessions(connection: sqlite3.Connection, task_id: str, now: float) -> None:
+    archive_task_sessions(connection, task_id, now)
+    sessions = connection.execute(
+        "SELECT id FROM task_sessions WHERE task_id = ?", (task_id,)
+    ).fetchall()
+    for session in sessions:
+        generation = connection.execute(
+            """
+            SELECT COALESCE(MAX(generation), 0) + 1 AS value
+            FROM session_generations WHERE task_session_id = ?
+            """,
+            (session["id"],),
+        ).fetchone()["value"]
+        connection.execute(
+            """
+            INSERT INTO session_generations(
+                id, task_session_id, generation, provider_key, status, created_at
+            ) VALUES (?, ?, ?, 'local', 'active', ?)
+            """,
+            (uuid4().hex, session["id"], generation, now),
+        )
+
+
 def execute_task(store: Store, connection: sqlite3.Connection, task: sqlite3.Row) -> str:
     started_at = time.time()
     spec = json.loads(task["spec_json"])
@@ -30,7 +160,16 @@ def execute_task(store: Store, connection: sqlite3.Connection, task: sqlite3.Row
         (task["id"],),
     ).fetchone()["value"]
     base = store.data_root / "projects" / task["project_id"] / "tasks" / task["id"]
-    log_path = base / "sessions" / "deterministic" / f"sequence-{sequence:06d}.log"
+    task_session_id, session_generation = current_session(
+        connection, task["id"], task["role_key"] or "deterministic"
+    )
+    log_path = (
+        base
+        / "sessions"
+        / (task["role_key"] or "deterministic")
+        / f"generation-{session_generation:06d}"
+        / f"sequence-{sequence:06d}.log"
+    )
 
     try:
         body = spec["content"].encode()
@@ -52,13 +191,16 @@ def execute_task(store: Store, connection: sqlite3.Connection, task: sqlite3.Row
         connection.execute(
             """
             INSERT INTO host_jobs(
-                id, task_id, spec_revision, sequence, purpose, status,
+                id, task_id, task_session_id, session_generation,
+                spec_revision, sequence, purpose, status,
                 started_at, ended_at, returncode, output_ref
-            ) VALUES (?, ?, ?, ?, 'command', 'succeeded', ?, ?, 0, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, 'execute', 'succeeded', ?, ?, 0, ?)
             """,
             (
                 uuid4().hex,
                 task["id"],
+                task_session_id,
+                session_generation,
                 task["spec_revision"],
                 sequence,
                 started_at,
@@ -116,13 +258,16 @@ def execute_task(store: Store, connection: sqlite3.Connection, task: sqlite3.Row
         connection.execute(
             """
             INSERT INTO host_jobs(
-                id, task_id, spec_revision, sequence, purpose, status,
+                id, task_id, task_session_id, session_generation,
+                spec_revision, sequence, purpose, status,
                 started_at, ended_at, returncode, output_ref, failure_code
-            ) VALUES (?, ?, ?, ?, 'command', 'failed', ?, ?, 1, ?, 'process')
+            ) VALUES (?, ?, ?, ?, ?, ?, 'execute', 'failed', ?, ?, 1, ?, 'process')
             """,
             (
                 uuid4().hex,
                 task["id"],
+                task_session_id,
+                session_generation,
                 task["spec_revision"],
                 sequence,
                 started_at,
@@ -134,7 +279,7 @@ def execute_task(store: Store, connection: sqlite3.Connection, task: sqlite3.Row
             """
             UPDATE tasks SET public_status = 'needs_decision', phase = 'execute',
                 wait_reason = ?, fault_code = 'process', next_action_at = NULL,
-                outcome = 'needs_decision', updated_at = ? WHERE id = ?
+                outcome = NULL, updated_at = ? WHERE id = ?
             """,
             ("deterministic write failed; automatic path exhausted", ended_at, task["id"]),
         )
