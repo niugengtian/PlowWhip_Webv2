@@ -249,7 +249,15 @@ def normalize_plan(plan: object) -> dict:
         if key in keys:
             raise ValueError(f"duplicate task key: {key}")
         keys.add(key)
-        spec, acceptance = normalize_instruction(str(item.get("instruction", "")))
+        instruction = item.get("instruction")
+        if instruction is None and isinstance(item.get("spec"), dict):
+            # Real Planner output sometimes wraps the requested instruction in
+            # `spec`. Re-derive every executable field from that instruction;
+            # never trust model-supplied kind, path, Provider, or Git target.
+            instruction = item["spec"].get("instruction")
+        if not isinstance(instruction, str) or not instruction.strip():
+            raise ValueError(f"task {key} requires an instruction")
+        spec, acceptance = normalize_instruction(instruction)
         if spec["kind"] == "write_text":
             default_role, checker_role = "deterministic", "deterministic_checker"
         elif spec["kind"] == "provider_task":

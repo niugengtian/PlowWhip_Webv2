@@ -1283,6 +1283,24 @@ class VerticalSliceTest(unittest.TestCase):
                 ],
             },
         }
+        nested_spec_plan = json.loads(json.dumps(planned["plan"]))
+        for item in nested_spec_plan["tasks"]:
+            item["spec"] = {
+                "instruction": item.pop("instruction"),
+                "kind": "write_text",
+                "provider_key": "untrusted",
+                "remote_ssh": "git@example.invalid:wrong/repository.git",
+            }
+        normalized_nested = normalize_plan(nested_spec_plan)
+        self.assertEqual(
+            [item["spec"]["kind"] for item in normalized_nested["tasks"]],
+            ["git_publish", "provider_task", "provider_task"],
+        )
+        self.assertEqual(
+            normalized_nested["tasks"][0]["spec"]["remote_ssh"],
+            "git@github.com:niugengtian/PlowWhip_Webv2.git",
+        )
+        self.assertNotIn("provider_key", normalized_nested["tasks"][0]["spec"])
         overplanned = json.loads(json.dumps(planned["plan"]))
         overplanned["tasks"].append(
             {
