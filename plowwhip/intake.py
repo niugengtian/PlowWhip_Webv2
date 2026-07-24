@@ -36,6 +36,10 @@ GITHUB_TREE_URL = re.compile(
     r"([A-Za-z0-9][A-Za-z0-9._/-]{0,126})",
     re.IGNORECASE,
 )
+DECLARED_NUMBERED_STEP = re.compile(
+    r"(?:^|[。；;!\n])\s*\d+[.)、]\s*\S+",
+    re.MULTILINE,
+)
 PROJECT_SETTING_LIMITS = {
     "max_runtime_seconds": (1, 86_400),
     "stop_grace_seconds": (0, 300),
@@ -753,6 +757,32 @@ def submit_action(
     return message_id
 
 
+def declared_step_count(content: str) -> int:
+    numbered = len(DECLARED_NUMBERED_STEP.findall(content))
+    bullets = len(re.findall(r"(?m)^\s*[-*]\s+\S+", content))
+    return numbered + bullets
+
+
+def extract_git_publish_spec(content: str) -> dict[str, object] | None:
+    github = GITHUB_TREE_URL.search(content)
+    lowered = content.lower()
+    if not (
+        github
+        and ("上传" in content or "推送" in content or "push" in lowered)
+        and "ssh" in lowered
+    ):
+        return None
+    owner, repository, branch = github.groups()
+    repository = repository.removesuffix(".git")
+    return {
+        "kind": "git_publish",
+        "instruction": content,
+        "remote_ssh": f"git@github.com:{owner}/{repository}.git",
+        "branch": branch,
+        "workspace_change_required": True,
+    }
+
+
 def normalize_instruction(content: str) -> tuple[dict[str, object], list[dict[str, str]]]:
     probe = PROVIDER_PROBE_INSTRUCTION.fullmatch(content.strip())
     if probe:
@@ -783,24 +813,10 @@ def normalize_instruction(content: str) -> tuple[dict[str, object], list[dict[st
             ],
         )
 
-    github = GITHUB_TREE_URL.search(content)
-    lowered = content.lower()
-    if github and (
-        "上传" in content
-        or "推送" in content
-        or "push" in lowered
-    ) and "ssh" in lowered:
-        owner, repository, branch = github.groups()
-        repository = repository.removesuffix(".git")
-        remote = f"git@github.com:{owner}/{repository}.git"
+    git_publish = extract_git_publish_spec(content)
+    if git_publish and declared_step_count(content) <= 1:
         return (
-            {
-                "kind": "git_publish",
-                "instruction": content,
-                "remote_ssh": remote,
-                "branch": branch,
-                "workspace_change_required": True,
-            },
+            git_publish,
             [
                 {
                     "id": "git_publish_contract",

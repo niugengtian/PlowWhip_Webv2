@@ -1076,6 +1076,171 @@ class VerticalSliceTest(unittest.TestCase):
         )
         self.assertEqual(parse_planner_result(PLANNER_RESULT_PREFIX + json.dumps(planned))["confidence"], 0.97)
 
+    def test_composite_git_cursor_codex_goal_uses_planner_and_keeps_all_steps(self):
+        self._create_project(
+            "composite-plan",
+            "project-create",
+            "/workspace/composite-plan",
+        )
+        instruction = (
+            "1、你将本地代码上传到 GitHub，注意避免上传 .env 等秘密文件；"
+            "使用 SSH 上传到 "
+            "https://github.com/niugengtian/PlowWhip_Webv2/tree/blue。"
+            "2、指定使用 Cursor 对代码进行多维度审查，重点考虑稳健性、"
+            "无人值守、省 Token、代码规范和安全。"
+            "3、根据审查结果，指定使用 Codex 进行修复和优化，并完成验证。"
+        )
+        spec, _ = normalize_instruction(instruction)
+        self.assertEqual(spec["kind"], "provider_task")
+        self.assertEqual(
+            classify_instruction(instruction, spec["kind"])["size"],
+            "large",
+        )
+        source_message_id = submit_message(
+            self.store,
+            "composite-plan",
+            instruction,
+            "composite-message",
+        )
+        self.assertEqual(tick(self.store)[0]["action"], "intake")
+        publish = (
+            "使用 SSH 上传到 "
+            "https://github.com/niugengtian/PlowWhip_Webv2/tree/blue，"
+            "注意避免上传 .env 等秘密文件"
+        )
+        planned = {
+            "confidence": 0.98,
+            "plan": {
+                "summary": "publish, review, repair, then publish repaired HEAD",
+                "alternatives": [
+                    {
+                        "name": "serial evidence chain",
+                        "scope": "publish, Cursor review, Codex repair, final publish",
+                        "cost": "bounded",
+                        "risk": "low",
+                        "reversible": True,
+                        "acceptance": "remote SHA covers the verified repaired HEAD",
+                    },
+                    {
+                        "name": "review without final publish",
+                        "scope": "review and repair only",
+                        "cost": "lower",
+                        "risk": "remote becomes stale",
+                        "reversible": True,
+                        "acceptance": "local checks only",
+                    },
+                ],
+                "selected": 0,
+                "tasks": [
+                    {
+                        "key": "initial-publish",
+                        "instruction": publish,
+                        "depends_on": [],
+                        "role_key": "git_publisher",
+                    },
+                    {
+                        "key": "cursor-review",
+                        "instruction": "审查当前代码并生成有界多维 Evidence",
+                        "depends_on": ["initial-publish"],
+                        "role_key": "fullstack",
+                        "settings": {
+                            "fullstack": {
+                                "provider_order": ["cursor_cli"],
+                            }
+                        },
+                    },
+                    {
+                        "key": "codex-repair",
+                        "instruction": "根据审查 Evidence 修复和优化并运行相关验证",
+                        "depends_on": ["cursor-review"],
+                        "role_key": "fullstack",
+                        "settings": {
+                            "fullstack": {
+                                "provider_order": ["codex_cli"],
+                            }
+                        },
+                    },
+                    {
+                        "key": "final-publish",
+                        "instruction": publish,
+                        "depends_on": ["codex-repair"],
+                        "role_key": "git_publisher",
+                    },
+                ],
+            },
+        }
+        with (
+            patch(
+                "plowwhip.planner.start_provider_job",
+                return_value={
+                    "status": "completed",
+                    "returncode": 0,
+                    "session_id": "composite-planner-session",
+                    "input_tokens": 100,
+                    "cached_input_tokens": 80,
+                    "output_tokens": 50,
+                    "model": "test-planner",
+                },
+            ),
+            patch(
+                "plowwhip.planner.provider_job_output",
+                return_value={
+                    "chunks": [
+                        {
+                            "stream": "stdout",
+                            "text": PLANNER_RESULT_PREFIX + json.dumps(planned),
+                        }
+                    ]
+                },
+            ),
+        ):
+            self.assertEqual(tick(self.store)[0]["action"], "plan_applied")
+        connection = self.store.connect()
+        try:
+            tasks = connection.execute(
+                """
+                SELECT id, role_key, checker_role_key, spec_revision, spec_json
+                FROM tasks WHERE project_id = 'composite-plan' ORDER BY rowid
+                """
+            ).fetchall()
+            providers = {
+                row["id"]: {
+                    session["role_key"]: session["provider_key"]
+                    for session in connection.execute(
+                        """
+                        SELECT session.role_key, generation.provider_key
+                        FROM task_sessions session
+                        JOIN session_generations generation
+                          ON generation.task_session_id = session.id
+                        WHERE session.task_id = ?
+                        ORDER BY generation.generation
+                        """,
+                        (row["id"],),
+                    )
+                }
+                for row in tasks
+            }
+        finally:
+            connection.close()
+        self.assertEqual(
+            [row["role_key"] for row in tasks],
+            ["git_publisher", "fullstack", "fullstack", "git_publisher"],
+        )
+        self.assertEqual(providers[tasks[1]["id"]]["fullstack"], "cursor_cli")
+        self.assertEqual(providers[tasks[2]["id"]]["fullstack"], "codex_cli")
+        self.assertEqual(providers[tasks[3]["id"]]["git_publisher"], "git_publish")
+        for row in (tasks[0], tasks[3]):
+            authorization = json.loads(row["spec_json"])["authorization"]
+            self.assertEqual(
+                authorization["source_message_id"],
+                source_message_id,
+            )
+            self.assertEqual(authorization["task_id"], row["id"])
+            self.assertEqual(
+                authorization["spec_revision"],
+                row["spec_revision"],
+            )
+
     def test_running_planner_host_job_reconciles_after_store_restart(self):
         self._create_project(
             "planner-restart", "planner-restart-create", "/workspace/planner"

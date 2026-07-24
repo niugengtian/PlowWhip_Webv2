@@ -28,7 +28,7 @@ from .execution import (
     perform_provider_step,
     rotate_task_sessions,
 )
-from .intake import canonical_json, normalize_instruction
+from .intake import canonical_json, extract_git_publish_spec, normalize_instruction
 from .planner import (
     PlannerStep,
     classify_instruction,
@@ -1027,6 +1027,7 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
             plan = _materialize_plan(
                 connection,
                 task["project_id"],
+                task["goal_id"],
                 normalize_plan(proposed["plan"]),
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
@@ -1060,6 +1061,7 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
             plan = _materialize_plan(
                 connection,
                 task["project_id"],
+                task["goal_id"],
                 normalize_plan(action["plan"]),
             )
         except ValueError as error:
@@ -1536,7 +1538,7 @@ def _apply_planner_step(
     try:
         proposal = parse_planner_result(stdout)
         proposal["plan"] = _materialize_plan(
-            connection, task["project_id"], proposal["plan"]
+            connection, task["project_id"], task["goal_id"], proposal["plan"]
         )
     except ValueError as error:
         connection.execute(
@@ -1671,19 +1673,54 @@ def _apply_planner_step(
 
 
 def _materialize_plan(
-    connection: sqlite3.Connection, project_id: str, plan: dict
+    connection: sqlite3.Connection, project_id: str, goal_id: str, plan: dict
 ) -> dict:
+    source = connection.execute(
+        """
+        SELECT message.id, message.content
+        FROM goals goal JOIN messages message ON message.id = goal.source_message_id
+        WHERE goal.id = ?
+        """,
+        (goal_id,),
+    ).fetchone()
+    explicit_git = (
+        extract_git_publish_spec(str(source["content"])) if source else None
+    )
     tasks = []
     for item in plan["tasks"]:
-        (
-            supported,
-            spec,
-            role_key,
-            provider_key,
-            checker_role,
-            checker_provider,
-            reason,
-        ) = _runtime_contract(connection, project_id, item["spec"])
+        if item["spec"]["kind"] == "git_publish":
+            spec = item["spec"]
+            if not (
+                explicit_git
+                and spec.get("remote_ssh") == explicit_git["remote_ssh"]
+                and spec.get("branch") == explicit_git["branch"]
+            ):
+                raise ValueError(
+                    f"task {item['key']} Git target was not explicitly authorized"
+                )
+            project = connection.execute(
+                "SELECT host_path FROM projects WHERE id = ?", (project_id,)
+            ).fetchone()
+            project_path = str((project["host_path"] if project else "") or "")
+            supported = bool(project_path)
+            spec = {**spec, "project_path": project_path}
+            role_key, provider_key = "git_publisher", "git_publish"
+            checker_role, checker_provider = "deterministic_checker", "local"
+            reason = (
+                None
+                if supported
+                else "project workspace is not bound; set an absolute Host Bridge path"
+            )
+        else:
+            (
+                supported,
+                spec,
+                role_key,
+                provider_key,
+                checker_role,
+                checker_provider,
+                reason,
+            ) = _runtime_contract(connection, project_id, item["spec"])
         if not supported:
             raise ValueError(f"task {item['key']} cannot run: {reason}")
         settings = item["settings"]
@@ -1772,9 +1809,22 @@ def _install_plan(
         (placeholder["goal_id"],),
     )
 
+    source = connection.execute(
+        "SELECT source_message_id FROM goals WHERE id = ?",
+        (placeholder["goal_id"],),
+    ).fetchone()
+    source_message_id = str(source["source_message_id"]) if source else ""
     task_ids = {item["key"]: uuid4().hex for item in plan["tasks"]}
     first = plan["tasks"][0]
     task_ids[first["key"]] = placeholder["id"]
+    first_spec = _bind_planned_git_authorization(
+        first["spec"],
+        source_message_id,
+        placeholder["project_id"],
+        placeholder["id"],
+        int(placeholder["spec_revision"]) + 1,
+        now,
+    )
     connection.execute(
         """
         UPDATE tasks SET plan_id = ?, spec_revision = spec_revision + 1,
@@ -1788,7 +1838,7 @@ def _install_plan(
         """,
         (
             plan_id,
-            canonical_json(first["spec"]),
+            canonical_json(first_spec),
             canonical_json(first["acceptance"]),
             now + first["earliest_start_delay_seconds"],
             (
@@ -1826,8 +1876,24 @@ def _install_plan(
             now,
         ),
     )
+    if first_spec["kind"] == "git_publish":
+        _record_event(
+            connection,
+            placeholder,
+            "authorization_granted",
+            first_spec["authorization"],
+            now,
+        )
     for item in plan["tasks"][1:]:
         task_id = task_ids[item["key"]]
+        item_spec = _bind_planned_git_authorization(
+            item["spec"],
+            source_message_id,
+            placeholder["project_id"],
+            task_id,
+            1,
+            now,
+        )
         connection.execute(
             """
             INSERT INTO tasks(
@@ -1842,7 +1908,7 @@ def _install_plan(
                 task_id,
                 placeholder["project_id"],
                 placeholder["goal_id"],
-                canonical_json(item["spec"]),
+                canonical_json(item_spec),
                 canonical_json(item["acceptance"]),
                 (
                     now + item["deadline_seconds"]
@@ -1880,12 +1946,51 @@ def _install_plan(
                 now,
             ),
         )
+        if item_spec["kind"] == "git_publish":
+            connection.execute(
+                """
+                INSERT INTO task_events(
+                    project_id, task_id, kind, detail_json, created_at
+                ) VALUES (?, ?, 'authorization_granted', ?, ?)
+                """,
+                (
+                    placeholder["project_id"],
+                    task_id,
+                    canonical_json(item_spec["authorization"]),
+                    now,
+                ),
+            )
     for item in plan["tasks"]:
         for dependency in item["depends_on"]:
             connection.execute(
                 "INSERT INTO task_dependencies(task_id, depends_on_task_id) VALUES (?, ?)",
                 (task_ids[item["key"]], task_ids[dependency]),
             )
+
+
+def _bind_planned_git_authorization(
+    spec: dict,
+    source_message_id: str,
+    project_id: str,
+    task_id: str,
+    spec_revision: int,
+    now: float,
+) -> dict:
+    if spec["kind"] != "git_publish":
+        return spec
+    target_scope = f"{spec['remote_ssh']}#refs/heads/{spec['branch']}"
+    return {
+        **spec,
+        "authorization": {
+            "source_message_id": source_message_id,
+            "project_id": project_id,
+            "task_id": task_id,
+            "spec_revision": spec_revision,
+            "action_kind": "git_publish",
+            "target_scope": target_scope,
+            "expires_at": now + 900,
+        },
+    }
 
 
 def _handle_task_deadline(

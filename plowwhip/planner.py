@@ -4,7 +4,7 @@ import json
 import re
 from dataclasses import dataclass
 
-from .intake import normalize_instruction
+from .intake import declared_step_count, normalize_instruction
 from .provider import (
     PROVIDERS,
     provider_job_output,
@@ -78,9 +78,7 @@ def classify_instruction(content: str, kind: str) -> dict[str, object]:
             "authorization_required": True,
         }
     lowered = content.lower()
-    numbered_steps = len(
-        re.findall(r"(?m)^\s*(?:[-*]|\d+[.)、])\s*\S+", content)
-    )
+    numbered_steps = declared_step_count(content)
     high_risk = [term for term in HIGH_RISK_TERMS if term in lowered]
     reasons = [term for term in LARGE_TERMS if term in lowered]
     if numbered_steps >= 3:
@@ -110,6 +108,13 @@ def planner_prompt(instruction: str, project_id: str, classification: dict) -> s
         "optional earliest_start_delay_seconds, optional deadline_seconds, and optional "
         "settings. Use role_key fullstack for code work or "
         "deterministic only for exact '写入 relative-path: content' instructions. "
+        "Honor an explicit Cursor assignment with "
+        'settings.fullstack.provider_order=["cursor_cli"] and an explicit Codex '
+        'assignment with settings.fullstack.provider_order=["codex_cli"]. '
+        "For an explicitly requested GitHub SSH publish, keep the exact URL and branch "
+        "in a bounded publish instruction and use role_key git_publisher. If later "
+        "tasks can change code, add a final dependent publish task so the verified "
+        "remote SHA covers the repaired HEAD. "
         "Do not add deployment, deletion, payment, publishing, permission changes, "
         "or scope absent from the Goal. Finish with one line beginning "
         f"{PLANNER_RESULT_PREFIX!r} followed by "
@@ -206,6 +211,8 @@ def normalize_plan(plan: object) -> dict:
             default_role, checker_role = "deterministic", "deterministic_checker"
         elif spec["kind"] == "provider_task":
             default_role, checker_role = "fullstack", "independent_checker"
+        elif spec["kind"] == "git_publish":
+            default_role, checker_role = "git_publisher", "deterministic_checker"
         else:
             raise ValueError(f"task {key} is outside the executable boundary")
         dependencies = item.get("depends_on", [])
@@ -221,6 +228,8 @@ def normalize_plan(plan: object) -> dict:
         role_key = str(item.get("role_key", default_role))
         if role_key != default_role:
             raise ValueError(f"task {key} role does not match its instruction")
+        if default_role == "git_publisher" and item.get("settings"):
+            raise ValueError(f"task {key} Git publisher does not accept Provider settings")
         settings = _normalize_task_settings(
             key, role_key, checker_role, item.get("settings", {})
         )
