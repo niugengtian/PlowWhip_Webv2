@@ -1001,13 +1001,17 @@ def _checker_result(
 
 def _checker_prompt(task: sqlite3.Row, spec: dict, execution: dict) -> str:
     acceptance = json.loads(task["acceptance_json"])
+    report = str(execution.get("provider_report") or "")
+    report_truncated = bool(execution.get("provider_report_truncated"))
     return (
         "Independently inspect the current workspace read-only. Verify this Task against "
         f"the actual files and smallest relevant checks:\n{spec['instruction']}\n"
         f"Task ID: {task['id']} · spec revision {task['spec_revision']}.\n"
         f"Frozen acceptance contract: {canonical_json(acceptance)}\n"
         f"Control-plane workspace delta recorded: {bool(execution.get('workspace_changed'))}.\n"
-        f"Executor tail:\n{str(execution.get('stdout_tail') or '')[-4000:]}\n"
+        f"Control-plane executor provider: {execution.get('provider_key')}.\n"
+        f"Complete bounded executor report (truncated={report_truncated}):\n"
+        f"{report if report else str(execution.get('stdout_tail') or '')[-4000:]}\n"
         f"Finish with one line beginning {CHECKER_RESULT_PREFIX!r} followed by one JSON object. "
         'Use {"verdict":"PASS|CHANGES_REQUIRED|NEEDS_DECISION",'
         '"acceptances":[{"acceptance_id":"...","passed":true,'

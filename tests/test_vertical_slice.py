@@ -2837,7 +2837,16 @@ class VerticalSliceTest(unittest.TestCase):
                     "chunks": [
                         {
                             "stream": "stdout",
-                            "text": "bounded findings with file references",
+                            "text": json.dumps(
+                                {
+                                    "type": "result",
+                                    "subtype": "success",
+                                    "result": (
+                                        "F-001 · High · plowwhip/app.py:1 · "
+                                        "bounded findings with file references"
+                                    ),
+                                }
+                            ),
                         }
                     ]
                 },
@@ -2853,7 +2862,7 @@ class VerticalSliceTest(unittest.TestCase):
                     "model": "codex-test",
                     "session_id": "analysis-checker",
                 },
-            ),
+            ) as checker_start,
             patch(
                 "plowwhip.verification.provider_job_output",
                 return_value={
@@ -2868,8 +2877,20 @@ class VerticalSliceTest(unittest.TestCase):
                 ["snapshot", "execute", "verify"],
             )
         self.assertEqual(executor_start.call_args.kwargs["access"], "read")
+        checker_prompt = checker_start.call_args.args[3]
+        self.assertIn("Control-plane executor provider: cursor_cli", checker_prompt)
+        self.assertIn("F-001 · High", checker_prompt)
         state = snapshot(self.db, self.data, "analysis")
         self.assertEqual(state["task"]["outcome"], "done")
+        execution_manifest = next(
+            json.loads(Path(item["path"]).read_text())
+            for item in state["artifacts"]
+            if item["kind"] == "artifact"
+            and item["path"].endswith("provider-execution.json")
+        )
+        self.assertEqual(execution_manifest["provider_key"], "cursor_cli")
+        self.assertIn("F-001 · High", execution_manifest["provider_report"])
+        self.assertFalse(execution_manifest["provider_report_truncated"])
         evidence = next(
             json.loads(Path(item["path"]).read_text())
             for item in state["artifacts"]

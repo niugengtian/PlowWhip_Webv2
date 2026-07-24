@@ -19,6 +19,7 @@ from .provider import (
     PROBE_TOKEN_CAP,
     cancel_provider_job,
     parse_context_events,
+    provider_agent_text,
     provider_job_output,
     provider_job_status,
     model_budget_reached,
@@ -1179,6 +1180,7 @@ def _finalize_provider_job(
     succeeded = str(state.get("status")) == "completed" and returncode == 0
     stdout, stderr = _provider_output_streams(facts.get("output"))
     context_events = parse_context_events(stdout)
+    report, report_truncated = _bounded_report(provider_agent_text(stdout))
     manifest = {
         "provider_key": step.provider_key,
         "project_path": step.project_path,
@@ -1191,6 +1193,8 @@ def _finalize_provider_job(
         "after": after_git,
         "stdout_tail": _bounded_tail(stdout),
         "stderr_tail": _bounded_tail(stderr),
+        "provider_report": report,
+        "provider_report_truncated": report_truncated,
     }
     script_result = None
     if step.provider_key == "git_publish":
@@ -1887,6 +1891,11 @@ def _reject_provider_start(
 def _bounded_tail(value: str, byte_cap: int = 16_384) -> str:
     body = value.encode()
     return body[-byte_cap:].decode(errors="replace")
+
+
+def _bounded_report(value: str, byte_cap: int = 32_768) -> tuple[str, bool]:
+    body = value.encode()
+    return body[:byte_cap].decode(errors="replace"), len(body) > byte_cap
 
 
 def _context_policy(settings: dict) -> dict[str, object]:

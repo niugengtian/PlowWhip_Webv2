@@ -71,6 +71,13 @@ def provider_agent_text(output: str) -> str:
             and isinstance(item.get("text"), str)
         ):
             messages.append(item["text"])
+        if (
+            isinstance(event, dict)
+            and event.get("type") == "result"
+            and event.get("subtype") == "success"
+            and isinstance(event.get("result"), str)
+        ):
+            messages.append(event["result"])
     return "\n".join(messages) if messages else output
 
 
@@ -265,11 +272,11 @@ def provider_job_output(job_id: str) -> dict[str, object]:
             "job_id": job_id,
             "stdout_offset": -1,
             "stderr_offset": -1,
-            "limit": 32_768,
-            "tail_lines": 20,
+            "limit": 65_536,
+            "tail_lines": 100,
         },
         10,
-        max_bytes=65_536,
+        max_bytes=131_072,
     )
 
 
