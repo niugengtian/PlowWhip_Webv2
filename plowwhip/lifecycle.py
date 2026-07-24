@@ -53,6 +53,8 @@ from .verification import (
     verify_task,
 )
 
+CONTINUE_DECISIONS = {"继续", "继续啊", "继续执行", "重试", "再试", "重新执行"}
+
 
 class LeaseLost(RuntimeError):
     pass
@@ -626,6 +628,41 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
             event, detail = "cancelled", {"message_id": message["id"]}
     elif kind == "rerun" and task["outcome"] == "cancelled":
         spec = json.loads(task["spec_json"])
+        acceptance = json.loads(task["acceptance_json"])
+        spec_changed = False
+        if (
+            task["plan_id"]
+            and str(spec.get("instruction") or "").strip() in CONTINUE_DECISIONS
+        ):
+            created = connection.execute(
+                """
+                SELECT detail_json FROM task_events
+                WHERE task_id = ? AND kind = 'task_created'
+                ORDER BY created_at LIMIT 1
+                """,
+                (task["id"],),
+            ).fetchone()
+            planned = connection.execute(
+                "SELECT summary_json FROM plans WHERE id = ?", (task["plan_id"],)
+            ).fetchone()
+            task_key = (
+                str(json.loads(created["detail_json"]).get("task_key") or "")
+                if created
+                else ""
+            )
+            plan = json.loads(planned["summary_json"]) if planned else {}
+            original = next(
+                (
+                    item
+                    for item in plan.get("tasks", [])
+                    if item.get("key") == task_key
+                ),
+                None,
+            )
+            if original:
+                spec = dict(original["spec"])
+                acceptance = list(original["acceptance"])
+                spec_changed = True
         normalized_spec, _normalized_acceptance = normalize_instruction(
             str(spec.get("instruction") or "")
         )
@@ -636,9 +673,8 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
             and not normalized_spec.get("workspace_change_required", True)
         ):
             spec = {**spec, "workspace_change_required": False}
-            spec_revision = task["spec_revision"] + 1
-        else:
-            spec_revision = task["spec_revision"]
+            spec_changed = True
+        spec_revision = task["spec_revision"] + (1 if spec_changed else 0)
         planner_rerun = bool(
             task["role_key"] == "planner"
             and dict(spec.get("classification") or {}).get("size") == "large"
@@ -703,7 +739,7 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
         connection.execute(
             """
             UPDATE tasks SET public_status = ?, phase = ?, outcome = NULL,
-                spec_json = ?, spec_revision = ?,
+                spec_json = ?, acceptance_json = ?, spec_revision = ?,
                 retry_count = 0, next_retry_at = NULL,
                 next_action_at = ?, next_action_kind = ?,
                 wait_reason = NULL, fault_code = NULL,
@@ -719,6 +755,7 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
                     else "intake"
                 ),
                 canonical_json(spec),
+                canonical_json(acceptance),
                 spec_revision,
                 now if supported else None,
                 (
@@ -990,6 +1027,55 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
         )
         event = "decision_rejected"
         detail = {"message_id": message["id"], "reason": "active_host_job"}
+    elif (
+        kind == "provide_decision"
+        and task["public_status"] == "needs_decision"
+        and task["phase"] == "provider_recovery"
+        and action["instruction"].strip() in CONTINUE_DECISIONS
+    ):
+        spec = json.loads(task["spec_json"])
+        (
+            supported,
+            spec,
+            role_key,
+            provider_key,
+            checker_role,
+            checker_provider,
+            reason,
+        ) = _runtime_contract(connection, task["project_id"], spec)
+        if supported:
+            ensure_task_sessions(
+                connection,
+                task["project_id"],
+                task["id"],
+                now,
+                executor_role=role_key,
+                checker_role=checker_role,
+                executor_provider=provider_key,
+                checker_provider=checker_provider,
+            )
+            rotate_task_sessions(connection, task["id"], now)
+            connection.execute(
+                """
+                UPDATE tasks SET public_status = 'pending', phase = 'execute',
+                    wait_reason = NULL, fault_code = NULL, retry_count = 0,
+                    next_retry_at = NULL, next_action_at = ?,
+                    next_action_kind = 'execute', updated_at = ?
+                WHERE id = ?
+                """,
+                (now, now, task["id"]),
+            )
+            event = "decision_retry"
+        else:
+            connection.execute(
+                """
+                UPDATE tasks SET wait_reason = ?, fault_code = 'scope',
+                    updated_at = ? WHERE id = ?
+                """,
+                (reason, now, task["id"]),
+            )
+            event = "decision_rejected"
+        detail = {"message_id": message["id"]}
     elif kind == "provide_decision" and task["public_status"] == "needs_decision":
         spec, acceptance = normalize_instruction(action["instruction"])
         (

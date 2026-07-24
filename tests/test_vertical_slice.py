@@ -1421,7 +1421,6 @@ class VerticalSliceTest(unittest.TestCase):
         with self.store.transaction() as connection:
             legacy_spec = json.loads(tasks[1]["spec_json"])
             self.assertFalse(legacy_spec["workspace_change_required"])
-            legacy_spec["workspace_change_required"] = True
             connection.execute(
                 """
                 UPDATE tasks SET public_status = 'done', outcome = 'done',
@@ -1430,6 +1429,38 @@ class VerticalSliceTest(unittest.TestCase):
                 """,
                 (tasks[0]["id"],),
             )
+            connection.execute(
+                """
+                UPDATE tasks SET public_status = 'needs_decision',
+                    phase = 'provider_recovery', wait_reason = 'provider failed',
+                    fault_code = 'provider', next_action_at = NULL,
+                    next_action_kind = NULL
+                WHERE id = ?
+                """,
+                (tasks[1]["id"],),
+            )
+        submit_action(
+            self.store,
+            "composite-plan",
+            tasks[1]["id"],
+            "provide_decision",
+            "继续啊",
+            "continue-without-replacing-planned-spec",
+        )
+        self.assertEqual(tick(self.store)[0]["action"], "provide_decision")
+        connection = self.store.connect_readonly()
+        try:
+            continued = connection.execute(
+                "SELECT spec_revision, spec_json FROM tasks WHERE id = ?",
+                (tasks[1]["id"],),
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(continued["spec_revision"], 1)
+        self.assertIn("只读审查", json.loads(continued["spec_json"])["instruction"])
+        legacy_spec["instruction"] = "继续啊"
+        legacy_spec["workspace_change_required"] = True
+        with self.store.transaction() as connection:
             connection.execute(
                 """
                 UPDATE tasks SET public_status = 'done', outcome = 'cancelled',
@@ -1467,6 +1498,10 @@ class VerticalSliceTest(unittest.TestCase):
         )
         self.assertFalse(
             json.loads(rerun_rows[0]["spec_json"])["workspace_change_required"]
+        )
+        self.assertIn(
+            "只读审查",
+            json.loads(rerun_rows[0]["spec_json"])["instruction"],
         )
         self.assertEqual(
             tuple(rerun_rows[1])[:5],
