@@ -13,6 +13,7 @@ from .execution import (
     _context_policy,
     _fallback_provider_generation,
     _provider_output_streams,
+    activate_task_session_roles,
     apply_probe_step,
     apply_provider_step,
     archive_task_sessions,
@@ -655,7 +656,15 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
                 executor_provider=provider_key,
                 checker_provider=checker_provider,
             )
-            rotate_task_sessions(connection, task["id"], now)
+            if planner_rerun:
+                activate_task_session_roles(
+                    connection,
+                    task["id"],
+                    {role_key, checker_role},
+                    now,
+                )
+            else:
+                rotate_task_sessions(connection, task["id"], now)
         connection.execute(
             """
             UPDATE tasks SET public_status = ?, phase = ?, outcome = NULL,
@@ -1953,6 +1962,12 @@ def _install_plan(
         executor_provider=first["executor_provider"],
         checker_provider=first["checker_provider"],
         settings_overrides=first["settings"],
+    )
+    activate_task_session_roles(
+        connection,
+        placeholder["id"],
+        {first["role_key"], first["checker_role"]},
+        now,
     )
     connection.execute(
         """

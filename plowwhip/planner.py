@@ -8,6 +8,7 @@ from .intake import declared_step_count, normalize_instruction
 from .provider import (
     HostBridgeError,
     PROVIDERS,
+    provider_agent_text,
     provider_job_output,
     provider_job_status,
     start_provider_job,
@@ -165,6 +166,7 @@ def perform_planner_step(step: PlannerStep) -> dict[str, object]:
 
 
 def parse_planner_result(output: str) -> dict:
+    output = provider_agent_text(output)
     line = next(
         (
             value

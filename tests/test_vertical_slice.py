@@ -850,6 +850,14 @@ class VerticalSliceTest(unittest.TestCase):
             "fullstack",
             {item["role_key"] for item in rerun["sessions"]},
         )
+        self.assertEqual(
+            {
+                item["role_key"]
+                for item in rerun["sessions"]
+                if item["status"] == "active"
+            },
+            {"planner", "independent_checker"},
+        )
         with (
             patch(
                 "plowwhip.planner.start_provider_job",
@@ -1136,6 +1144,16 @@ class VerticalSliceTest(unittest.TestCase):
             "large",
         )
         self.assertEqual(parse_planner_result(PLANNER_RESULT_PREFIX + json.dumps(planned))["confidence"], 0.97)
+        codex_jsonl = json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "agent_message",
+                    "text": PLANNER_RESULT_PREFIX + json.dumps(planned),
+                },
+            }
+        )
+        self.assertEqual(parse_planner_result(codex_jsonl)["confidence"], 0.97)
 
     def test_composite_git_cursor_codex_goal_uses_planner_and_keeps_all_steps(self):
         self._create_project(
@@ -1290,6 +1308,27 @@ class VerticalSliceTest(unittest.TestCase):
         self.assertEqual(providers[tasks[1]["id"]]["fullstack"], "cursor_cli")
         self.assertEqual(providers[tasks[2]["id"]]["fullstack"], "codex_cli")
         self.assertEqual(providers[tasks[3]["id"]]["git_publisher"], "git_publish")
+        connection = self.store.connect_readonly()
+        try:
+            active_first_roles = {
+                row["role_key"]
+                for row in connection.execute(
+                    """
+                    SELECT session.role_key
+                    FROM task_sessions session
+                    JOIN session_generations generation
+                      ON generation.task_session_id = session.id
+                    WHERE session.task_id = ? AND generation.status = 'active'
+                    """,
+                    (tasks[0]["id"],),
+                )
+            }
+        finally:
+            connection.close()
+        self.assertEqual(
+            active_first_roles,
+            {"git_publisher", "deterministic_checker"},
+        )
         for row in (tasks[0], tasks[3]):
             authorization = json.loads(row["spec_json"])["authorization"]
             self.assertEqual(

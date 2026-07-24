@@ -56,6 +56,24 @@ ACTIVE_HOST_JOB_STATUSES = {
 }
 
 
+def provider_agent_text(output: str) -> str:
+    """Return final agent messages from JSONL Providers, or the original text."""
+    messages = []
+    for line in output.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        item = event.get("item") if isinstance(event, dict) else None
+        if (
+            isinstance(item, dict)
+            and item.get("type") == "agent_message"
+            and isinstance(item.get("text"), str)
+        ):
+            messages.append(item["text"])
+    return "\n".join(messages) if messages else output
+
+
 class HostBridgeError(RuntimeError):
     def __init__(self, message: str, *, status: int | None = None, detail: str = ""):
         super().__init__(message)

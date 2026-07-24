@@ -323,6 +323,67 @@ def rotate_task_sessions(connection: sqlite3.Connection, task_id: str, now: floa
         )
 
 
+def activate_task_session_roles(
+    connection: sqlite3.Connection,
+    task_id: str,
+    role_keys: set[str],
+    now: float,
+) -> None:
+    """Keep only the selected Task roles active and restore any archived selection."""
+    if not role_keys:
+        raise ValueError("at least one TaskSession role is required")
+    sessions = connection.execute(
+        "SELECT id, role_key FROM task_sessions WHERE task_id = ?",
+        (task_id,),
+    ).fetchall()
+    for session in sessions:
+        if session["role_key"] not in role_keys:
+            connection.execute(
+                """
+                UPDATE session_generations SET status = 'archived', ended_at = ?
+                WHERE task_session_id = ? AND status = 'active'
+                """,
+                (now, session["id"]),
+            )
+            continue
+        active = connection.execute(
+            """
+            SELECT 1 FROM session_generations
+            WHERE task_session_id = ? AND status = 'active'
+            """,
+            (session["id"],),
+        ).fetchone()
+        if active:
+            continue
+        previous = connection.execute(
+            """
+            SELECT generation, provider_key, handoff_ref
+            FROM session_generations
+            WHERE task_session_id = ?
+            ORDER BY generation DESC LIMIT 1
+            """,
+            (session["id"],),
+        ).fetchone()
+        if not previous:
+            raise RuntimeError(f"TaskSession {session['id']} has no generation")
+        connection.execute(
+            """
+            INSERT INTO session_generations(
+                id, task_session_id, generation, provider_key, status,
+                handoff_ref, created_at
+            ) VALUES (?, ?, ?, ?, 'active', ?, ?)
+            """,
+            (
+                uuid4().hex,
+                session["id"],
+                previous["generation"] + 1,
+                previous["provider_key"],
+                previous["handoff_ref"],
+                now,
+            ),
+        )
+
+
 def execute_task(
     store: Store,
     connection: sqlite3.Connection,

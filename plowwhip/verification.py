@@ -18,6 +18,7 @@ from .provider import (
     CHECKER_RESULT_PREFIX,
     ACTIVE_HOST_JOB_STATUSES,
     PROBE_TOKEN_CAP,
+    provider_agent_text,
     provider_job_output,
     provider_job_status,
     record_model_call,
@@ -754,7 +755,9 @@ def apply_checker_step(
     )
     expected_acceptance = json.loads(task["acceptance_json"])
     verdict = _parse_checker_verdict(
-        checker_stdout, expected_acceptance, spec["project_path"]
+        provider_agent_text(checker_stdout),
+        expected_acceptance,
+        spec["project_path"],
     )
     if workspace_change_required and not workspace_changed:
         for item in verdict["acceptances"]:
