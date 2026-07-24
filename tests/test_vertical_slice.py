@@ -20,7 +20,11 @@ from plowwhip.cronner import (
     run_until_idle,
     tick,
 )
-from plowwhip.execution import ProviderStep, perform_provider_step
+from plowwhip.execution import (
+    ProviderStep,
+    _fallback_provider_generation,
+    perform_provider_step,
+)
 from plowwhip.intake import (
     archive_project,
     create_project,
@@ -1335,6 +1339,28 @@ class VerticalSliceTest(unittest.TestCase):
                 }
                 for row in tasks
             }
+            cursor_task = connection.execute(
+                "SELECT * FROM tasks WHERE id = ?", (tasks[1]["id"],)
+            ).fetchone()
+            cursor_session = connection.execute(
+                """
+                SELECT id FROM task_sessions
+                WHERE task_id = ? AND role_key = 'fullstack'
+                """,
+                (tasks[1]["id"],),
+            ).fetchone()
+            self.assertIsNone(
+                _fallback_provider_generation(
+                    connection,
+                    cursor_task,
+                    {
+                        "task_session_id": cursor_session["id"],
+                        "session_generation": 1,
+                    },
+                    "cursor_cli",
+                    time.time(),
+                )
+            )
         finally:
             connection.close()
         self.assertEqual(

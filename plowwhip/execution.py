@@ -1528,11 +1528,15 @@ def _fallback_provider_generation(
         """,
         (job["task_session_id"],),
     ).fetchone()
-    order = (
+    configured = (
         json.loads(session["settings_json"])
         .get("values", {})
         .get("provider_order", {})
-        .get(session["role_key"], [])
+    )
+    order = (
+        configured
+        if isinstance(configured, list)
+        else configured.get(session["role_key"], [])
     )
     try:
         candidates = order[order.index(provider_key) + 1 :]
