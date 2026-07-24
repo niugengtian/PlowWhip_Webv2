@@ -204,8 +204,13 @@ This command is a gate only; it does not switch traffic or mutate Task state.
 ```bash
 docker build -t plowwhip-web:v1-local .
 docker run -d --name plowwhip-web-v1-8750 \
+  --env-file /absolute/private/plowwhip-web.env \
+  --add-host host.docker.internal:host-gateway \
+  -v plowwhip-web-v1-8750-data:/data \
   -p 127.0.0.1:8750:8742 plowwhip-web:v1-local
 ```
 
 The explicit non-loopback bind exists only inside the container; Docker exposes
-it on the host loopback address above.
+it on the host loopback address above. Keep the environment file outside the
+repository with mode `0600`; it supplies the Host Bridge URL and token. The
+explicit host mapping is required for container-to-host Provider probes.
