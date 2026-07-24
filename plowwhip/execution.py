@@ -981,6 +981,7 @@ def _previous_git_publish_failure(
                     "non-fast-forward",
                     "fetch first",
                     "remote contains work that you do not have locally",
+                    "一个仓库已向该引用进行了推送",
                 )
             ):
                 reason = "remote_history_conflict"

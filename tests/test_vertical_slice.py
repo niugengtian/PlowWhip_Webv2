@@ -2973,7 +2973,10 @@ class VerticalSliceTest(unittest.TestCase):
                         else {
                             "kind": "git_publish",
                             "status": "failed",
-                            "error": "rejected (non-fast-forward)",
+                            "error": (
+                                "提示： 一个仓库已向该引用进行了推送。"
+                                "如果您希望先与远程变更合并，请在推送前执行 'git pull'。"
+                            ),
                         }
                     )
                     body = {
@@ -2984,7 +2987,7 @@ class VerticalSliceTest(unittest.TestCase):
                                 "stream": (
                                     "stdout" if operation == "inspect" else "stderr"
                                 ),
-                                "text": json.dumps(result),
+                                "text": json.dumps(result, ensure_ascii=False),
                             }
                         ],
                     }
