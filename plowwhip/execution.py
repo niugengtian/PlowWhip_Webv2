@@ -1344,7 +1344,18 @@ def _finalize_provider_job(
         )
         return "inspect"
     fallback = (
-        _fallback_provider_generation(connection, task, job, step.provider_key, now)
+        _fallback_provider_generation(
+            connection,
+            task,
+            job,
+            step.provider_key,
+            now,
+            retry_same_provider=(
+                step.provider_key != "git_publish"
+                and str(state.get("failure_class") or "")
+                in {"process", "provider_unavailable", "transport"}
+            ),
+        )
         if not succeeded
         else None
     )
@@ -1372,7 +1383,11 @@ def _finalize_provider_job(
                 )
             )
         elif fallback:
-            wait_reason = f"Provider {step.provider_key} failed; falling back to {fallback}"
+            wait_reason = (
+                f"Provider {step.provider_key} failed; scheduled bounded retry"
+                if fallback == step.provider_key
+                else f"Provider {step.provider_key} failed; falling back to {fallback}"
+            )
         else:
             wait_reason = "Provider execution did not exit successfully"
     connection.execute(
@@ -1521,6 +1536,7 @@ def _fallback_provider_generation(
     job: sqlite3.Row,
     provider_key: str,
     now: float,
+    retry_same_provider: bool = False,
 ) -> str | None:
     session = connection.execute(
         """
@@ -1528,11 +1544,8 @@ def _fallback_provider_generation(
         """,
         (job["task_session_id"],),
     ).fetchone()
-    configured = (
-        json.loads(session["settings_json"])
-        .get("values", {})
-        .get("provider_order", {})
-    )
+    values = json.loads(session["settings_json"]).get("values", {})
+    configured = values.get("provider_order", {})
     order = (
         configured
         if isinstance(configured, list)
@@ -1550,6 +1563,14 @@ def _fallback_provider_generation(
         ),
         None,
     )
+    retrying = bool(
+        not next_provider
+        and retry_same_provider
+        and provider_key in PROVIDERS
+        and task["retry_count"] < int(values.get("retry_count", 0))
+    )
+    if retrying:
+        next_provider = provider_key
     if not next_provider:
         return None
     current = connection.execute(
@@ -1583,13 +1604,18 @@ def _fallback_provider_generation(
         ),
     )
     connection.execute(
+        "UPDATE tasks SET retry_count = retry_count + ? WHERE id = ?",
+        (1 if retrying else 0, task["id"]),
+    )
+    connection.execute(
         """
         INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
-        VALUES (?, ?, 'provider_fallback', ?, ?)
+        VALUES (?, ?, ?, ?, ?)
         """,
         (
             task["project_id"],
             task["id"],
+            "provider_retry" if retrying else "provider_fallback",
             canonical_json(
                 {
                     "from": provider_key,

@@ -1349,18 +1349,35 @@ class VerticalSliceTest(unittest.TestCase):
                 """,
                 (tasks[1]["id"],),
             ).fetchone()
-            self.assertIsNone(
+            self.assertEqual(
                 _fallback_provider_generation(
                     connection,
                     cursor_task,
                     {
+                        "id": "cursor-retry-fixture",
                         "task_session_id": cursor_session["id"],
                         "session_generation": 1,
                     },
                     "cursor_cli",
                     time.time(),
-                )
+                    retry_same_provider=True,
+                ),
+                "cursor_cli",
             )
+            retry = connection.execute(
+                """
+                SELECT task.retry_count, generation.generation,
+                       generation.provider_key
+                FROM tasks task
+                JOIN task_sessions session ON session.task_id = task.id
+                JOIN session_generations generation
+                  ON generation.task_session_id = session.id
+                WHERE task.id = ? AND session.role_key = 'fullstack'
+                  AND generation.status = 'active'
+                """,
+                (tasks[1]["id"],),
+            ).fetchone()
+            self.assertEqual(tuple(retry), (1, 2, "cursor_cli"))
         finally:
             connection.close()
         self.assertEqual(
