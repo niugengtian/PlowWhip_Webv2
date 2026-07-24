@@ -115,9 +115,12 @@ def planner_prompt(instruction: str, project_id: str, classification: dict) -> s
         'assignment with settings.fullstack.provider_order=["codex_cli"]. '
         "For an explicitly requested GitHub SSH publish, keep the exact URL and branch "
         "in a bounded instruction that explicitly says SSH 上传, 推送, or 发布, and use "
-        "role_key git_publisher. If later "
-        "tasks can change code, add a final dependent publish task so the verified "
-        "remote SHA covers the repaired HEAD. "
+        "role_key git_publisher. When the Goal explicitly enumerates Git publish, "
+        "Cursor review, and Codex repair as three steps, return exactly those three "
+        "serial tasks in that order. The Git publisher already performs secret "
+        "scanning; do not add a separate preflight or a final publish unless the Goal "
+        "explicitly asks for one. Set reversible to a JSON boolean; a bounded "
+        "explanatory string is also accepted for compatibility. "
         "Do not add deployment, deletion, payment, publishing, permission changes, "
         "or scope absent from the Goal. Finish with one line beginning "
         f"{PLANNER_RESULT_PREFIX!r} followed by "
@@ -207,7 +210,13 @@ def normalize_plan(plan: object) -> dict:
         not isinstance(item, dict)
         or not comparison <= item.keys()
         or not all(str(item[key]).strip() for key in comparison - {"reversible"})
-        or not isinstance(item["reversible"], bool)
+        or not (
+            isinstance(item["reversible"], bool)
+            or (
+                isinstance(item["reversible"], str)
+                and 0 < len(item["reversible"].encode()) <= 512
+            )
+        )
         for item in alternatives
     ):
         raise ValueError("each alternative must compare scope, cost, risk, reversibility and acceptance")

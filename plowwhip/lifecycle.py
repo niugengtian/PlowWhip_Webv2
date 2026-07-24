@@ -29,7 +29,12 @@ from .execution import (
     perform_provider_step,
     rotate_task_sessions,
 )
-from .intake import canonical_json, extract_git_publish_spec, normalize_instruction
+from .intake import (
+    canonical_json,
+    declared_step_count,
+    extract_git_publish_spec,
+    normalize_instruction,
+)
 from .planner import (
     PlannerStep,
     classify_instruction,
@@ -1785,6 +1790,7 @@ def _materialize_plan(
     explicit_git = (
         extract_git_publish_spec(str(source["content"])) if source else None
     )
+    source_content = str(source["content"]) if source else ""
     tasks = []
     for item in plan["tasks"]:
         if item["spec"]["kind"] == "git_publish":
@@ -1844,6 +1850,25 @@ def _materialize_plan(
                 ),
             }
         )
+    explicit_three_provider_flow = bool(
+        explicit_git
+        and declared_step_count(source_content) == 3
+        and "cursor" in source_content.lower()
+        and "codex" in source_content.lower()
+    )
+    if explicit_three_provider_flow:
+        expected_providers = ["git_publish", "cursor_cli", "codex_cli"]
+        if (
+            len(tasks) != 3
+            or [item["executor_provider"] for item in tasks]
+            != expected_providers
+            or tasks[0]["depends_on"]
+            or tasks[1]["depends_on"] != [tasks[0]["key"]]
+            or tasks[2]["depends_on"] != [tasks[1]["key"]]
+        ):
+            raise ValueError(
+                "explicit Git/Cursor/Codex workflow requires exactly three serial tasks"
+            )
     return {**plan, "tasks": tasks}
 
 

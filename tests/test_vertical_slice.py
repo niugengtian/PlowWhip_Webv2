@@ -30,7 +30,7 @@ from plowwhip.intake import (
     submit_action,
     submit_message,
 )
-from plowwhip.lifecycle import LeaseLost, advance_project
+from plowwhip.lifecycle import LeaseLost, _materialize_plan, advance_project
 from plowwhip.monitor import (
     monitor_snapshot,
     projects_snapshot,
@@ -1154,6 +1154,16 @@ class VerticalSliceTest(unittest.TestCase):
             }
         )
         self.assertEqual(parse_planner_result(codex_jsonl)["confidence"], 0.97)
+        descriptive_reversibility = json.loads(json.dumps(planned))
+        descriptive_reversibility["plan"]["alternatives"][0][
+            "reversible"
+        ] = "高：可通过提交回退"
+        self.assertEqual(
+            parse_planner_result(
+                PLANNER_RESULT_PREFIX + json.dumps(descriptive_reversibility)
+            )["confidence"],
+            0.97,
+        )
 
     def test_composite_git_cursor_codex_goal_uses_planner_and_keeps_all_steps(self):
         self._create_project(
@@ -1195,23 +1205,23 @@ class VerticalSliceTest(unittest.TestCase):
         planned = {
             "confidence": 0.98,
             "plan": {
-                "summary": "publish, review, repair, then publish repaired HEAD",
+                "summary": "publish, review, then repair",
                 "alternatives": [
                     {
                         "name": "serial evidence chain",
-                        "scope": "publish, Cursor review, Codex repair, final publish",
+                        "scope": "publish, Cursor review, Codex repair",
                         "cost": "bounded",
                         "risk": "low",
                         "reversible": True,
-                        "acceptance": "remote SHA covers the verified repaired HEAD",
+                        "acceptance": "three assigned Providers complete in order",
                     },
                     {
-                        "name": "review without final publish",
-                        "scope": "review and repair only",
+                        "name": "combined Provider task",
+                        "scope": "one Provider attempts all three steps",
                         "cost": "lower",
-                        "risk": "remote becomes stale",
+                        "risk": "loses named Provider boundaries",
                         "reversible": True,
-                        "acceptance": "local checks only",
+                        "acceptance": "not selected",
                     },
                 ],
                 "selected": 0,
@@ -1244,15 +1254,32 @@ class VerticalSliceTest(unittest.TestCase):
                             }
                         },
                     },
-                    {
-                        "key": "final-publish",
-                        "instruction": publish,
-                        "depends_on": ["codex-repair"],
-                        "role_key": "git_publisher",
-                    },
                 ],
             },
         }
+        overplanned = json.loads(json.dumps(planned["plan"]))
+        overplanned["tasks"].append(
+            {
+                "key": "unrequested-final-publish",
+                "instruction": publish,
+                "depends_on": ["codex-repair"],
+                "role_key": "git_publisher",
+            }
+        )
+        connection = self.store.connect()
+        try:
+            goal_id = connection.execute(
+                "SELECT goal_id FROM tasks WHERE project_id = 'composite-plan'"
+            ).fetchone()["goal_id"]
+            with self.assertRaisesRegex(ValueError, "exactly three serial tasks"):
+                _materialize_plan(
+                    connection,
+                    "composite-plan",
+                    goal_id,
+                    normalize_plan(overplanned),
+                )
+        finally:
+            connection.close()
         with (
             patch(
                 "plowwhip.planner.start_provider_job",
@@ -1308,11 +1335,10 @@ class VerticalSliceTest(unittest.TestCase):
             connection.close()
         self.assertEqual(
             [row["role_key"] for row in tasks],
-            ["git_publisher", "fullstack", "fullstack", "git_publisher"],
+            ["git_publisher", "fullstack", "fullstack"],
         )
         self.assertEqual(providers[tasks[1]["id"]]["fullstack"], "cursor_cli")
         self.assertEqual(providers[tasks[2]["id"]]["fullstack"], "codex_cli")
-        self.assertEqual(providers[tasks[3]["id"]]["git_publisher"], "git_publish")
         connection = self.store.connect_readonly()
         try:
             active_first_roles = {
@@ -1334,17 +1360,13 @@ class VerticalSliceTest(unittest.TestCase):
             active_first_roles,
             {"git_publisher", "deterministic_checker"},
         )
-        for row in (tasks[0], tasks[3]):
-            authorization = json.loads(row["spec_json"])["authorization"]
-            self.assertEqual(
-                authorization["source_message_id"],
-                source_message_id,
-            )
-            self.assertEqual(authorization["task_id"], row["id"])
-            self.assertEqual(
-                authorization["spec_revision"],
-                row["spec_revision"],
-            )
+        authorization = json.loads(tasks[0]["spec_json"])["authorization"]
+        self.assertEqual(authorization["source_message_id"], source_message_id)
+        self.assertEqual(authorization["task_id"], tasks[0]["id"])
+        self.assertEqual(
+            authorization["spec_revision"],
+            tasks[0]["spec_revision"],
+        )
 
     def test_running_planner_host_job_reconciles_after_store_restart(self):
         self._create_project(
