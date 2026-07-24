@@ -2915,6 +2915,10 @@ class VerticalSliceTest(unittest.TestCase):
         checker_prompt = checker_start.call_args.args[3]
         self.assertIn("Control-plane executor provider: cursor_cli", checker_prompt)
         self.assertIn("F-001 · High", checker_prompt)
+        self.assertIn("Frozen execution target HEAD: abc123", checker_prompt)
+        self.assertIn(
+            "do not fail solely because live HEAD differs", checker_prompt
+        )
         state = snapshot(self.db, self.data, "analysis")
         self.assertEqual(state["task"]["outcome"], "done")
         execution_manifest = next(

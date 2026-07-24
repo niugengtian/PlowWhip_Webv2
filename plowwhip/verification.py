@@ -1048,13 +1048,32 @@ def _checker_prompt(
     task: sqlite3.Row, spec: dict, execution: dict, report: str
 ) -> str:
     acceptance = json.loads(task["acceptance_json"])
+    before = execution.get("before")
+    after = execution.get("after")
+    frozen_head = (
+        str(before.get("head") or "")
+        if isinstance(before, dict)
+        and isinstance(after, dict)
+        and before.get("head")
+        and before.get("head") == after.get("head")
+        else ""
+    )
     return (
-        "Independently inspect the current workspace read-only. Verify this Task against "
+        "Independently inspect the Task target read-only. Verify this Task against "
         f"the actual files and smallest relevant checks:\n{spec['instruction']}\n"
         f"Task ID: {task['id']} · spec revision {task['spec_revision']}.\n"
         f"Frozen acceptance contract: {canonical_json(acceptance)}\n"
         f"Control-plane workspace delta recorded: {bool(execution.get('workspace_changed'))}.\n"
         f"Control-plane executor provider: {execution.get('provider_key')}.\n"
+        f"Frozen execution target HEAD: {frozen_head or 'unavailable'}.\n"
+        + (
+            "The before/after execution evidence binds this read-only Task to that "
+            "frozen HEAD. If the live checkout moved later, inspect the frozen target "
+            "with git show/diff; do not fail solely because live HEAD differs.\n"
+            if frozen_head and not spec.get("workspace_change_required", True)
+            else ""
+        )
+        +
         "Persisted Provider report artifact "
         f"{execution.get('provider_report_ref')} "
         f"(sha256={execution.get('provider_report_sha256')}, "
