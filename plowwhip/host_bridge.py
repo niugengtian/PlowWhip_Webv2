@@ -47,8 +47,9 @@ ACTIVE_STATUSES = {
     "recovery_hold",
 }
 _SECRET = re.compile(
-    r"(?i)(?:bearer\s+|(?:api[_-]?key|token|secret)\s*[=:]\s*)"
-    r"[A-Za-z0-9._~+/=-]{12,}"
+    r"(?i)(?:bearer\s+|(?:api[_-]?key|token|secret|password)\s*[=:]\s*)"
+    r"[A-Za-z0-9._~+/=-]{12,}|"
+    r"\b(?:sk-|ghp_|github_pat_|glpat-|xox[baprs]-)[A-Za-z0-9_-]{10,}\b"
 )
 
 
@@ -224,32 +225,31 @@ class HostJobManager:
         project = self._project(payload["project_path"])
         records: list[dict[str, object]] = []
         digest = hashlib.sha256()
-        hashed_bytes = 0
-        truncated = False
+        file_count = 0
         for path in sorted(project.rglob("*")):
             if not path.is_file() or _excluded(path.relative_to(project)):
                 continue
-            if len(records) >= 256:
-                truncated = True
-                break
             stat = path.stat()
             relative = path.relative_to(project).as_posix()
-            item: dict[str, object] = {"path": relative, "bytes": stat.st_size}
-            if hashed_bytes + stat.st_size <= 16_777_216:
-                item["sha256"] = _sha256(path)
-                hashed_bytes += stat.st_size
+            item: dict[str, object] = {
+                "path": relative,
+                "bytes": stat.st_size,
+                "sha256": _sha256(path),
+            }
             encoded = json.dumps(
                 item, sort_keys=True, separators=(",", ":")
             ).encode()
             digest.update(encoded)
-            records.append(item)
+            file_count += 1
+            if len(records) < 20:
+                records.append(item)
         git: dict[str, object] = {
             "kind": "workspace",
             "available": True,
             "fingerprint": digest.hexdigest(),
-            "files": len(records),
-            "sample": records[:20],
-            "truncated": truncated,
+            "files": file_count,
+            "sample": records,
+            "truncated": file_count > len(records),
         }
         try:
             head = subprocess.run(

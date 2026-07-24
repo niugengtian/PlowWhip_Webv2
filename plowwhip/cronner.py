@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from uuid import uuid4
 
 from .continuity import checkpoint_project
+from .intake import canonical_json
 from .lifecycle import advance_project
 from .store import Store
 
@@ -115,7 +116,43 @@ def _advance_due_project(store: Store, project_id: str) -> dict[str, str] | None
     token, fence = lease
     try:
         action = advance_project(store, project_id, token, fence)
-        checkpoint_project(store, project_id)
+        try:
+            checkpoint_project(store, project_id)
+        except ValueError as error:
+            now = time.time()
+            with store.transaction() as connection:
+                task = connection.execute(
+                    """
+                    SELECT id FROM tasks
+                    WHERE project_id = ? AND outcome IS NULL
+                    ORDER BY created_at, rowid LIMIT 1
+                    """,
+                    (project_id,),
+                ).fetchone()
+                if task:
+                    connection.execute(
+                        """
+                        UPDATE tasks SET public_status = 'needs_decision',
+                            phase = 'provider_recovery', fault_code = 'scope',
+                            wait_reason = ?, next_action_at = NULL,
+                            next_action_kind = NULL, updated_at = ? WHERE id = ?
+                        """,
+                        (str(error)[:500], now, task["id"]),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO task_events(
+                            project_id, task_id, kind, detail_json, created_at
+                        ) VALUES (?, ?, 'checkpoint_failed', ?, ?)
+                        """,
+                        (
+                            project_id,
+                            task["id"],
+                            canonical_json({"error": str(error)[:500]}),
+                            now,
+                        ),
+                    )
+            action = "checkpoint_needs_decision"
         return {
             "project_id": project_id,
             "action": action,

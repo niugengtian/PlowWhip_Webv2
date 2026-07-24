@@ -17,6 +17,7 @@ from .intake import canonical_json
 from .provider import (
     CHECKER_RESULT_PREFIX,
     ACTIVE_HOST_JOB_STATUSES,
+    HostBridgeError,
     PROBE_TOKEN_CAP,
     provider_agent_text,
     provider_job_output,
@@ -584,6 +585,19 @@ def perform_checker_step(step: CheckerStep) -> dict[str, object]:
             "state": state,
             "output": provider_job_output(step.job_id),
         }
+    except HostBridgeError as error:
+        return {
+            "ok": False,
+            "error": type(error).__name__,
+            "failure_kind": (
+                "rejected"
+                if step.kind == "start" and error.rejected
+                else "transport"
+            ),
+            "failure_stage": step.kind,
+            "error_status": error.status,
+            "error_detail": error.detail,
+        }
     except (OSError, RuntimeError, ValueError) as error:
         return {"ok": False, "error": type(error).__name__}
 
@@ -606,6 +620,63 @@ def apply_checker_step(
         return "stale_checker_fact"
     if not facts.get("ok"):
         now = time.time()
+        if step.kind == "start" and facts.get("failure_kind") == "rejected":
+            dispatch = json.loads(job["dispatch_json"])
+            dispatch["rejection"] = {
+                "status": facts.get("error_status"),
+                "detail": str(facts.get("error_detail") or "")[:500],
+            }
+            connection.execute(
+                """
+                UPDATE host_jobs SET status = 'failed', ended_at = ?, returncode = 125,
+                    failure_code = 'rejected', dispatch_json = ? WHERE id = ?
+                """,
+                (now, canonical_json(dispatch), job["id"]),
+            )
+            fallback = _fallback_provider_generation(
+                connection, task, job, step.provider_key, now
+            )
+            connection.execute(
+                """
+                UPDATE tasks SET public_status = ?, phase = ?, wait_reason = ?,
+                    fault_code = 'provider', next_action_at = ?,
+                    next_action_kind = ?, updated_at = ? WHERE id = ?
+                """,
+                (
+                    "in_progress" if fallback else "needs_decision",
+                    "verify" if fallback else "provider_recovery",
+                    (
+                        f"Checker start was rejected; falling back to {fallback}"
+                        if fallback
+                        else "Host Bridge rejected the Checker before acceptance"
+                    ),
+                    now if fallback else None,
+                    "check" if fallback else None,
+                    now,
+                    task["id"],
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
+                VALUES (?, ?, 'host_job_rejected', ?, ?)
+                """,
+                (
+                    task["project_id"],
+                    task["id"],
+                    canonical_json(
+                        {
+                            "host_job_id": job["id"],
+                            "purpose": "check",
+                            "provider_key": step.provider_key,
+                            "http_status": facts.get("error_status"),
+                            "fallback": fallback,
+                        }
+                    ),
+                    now,
+                ),
+            )
+            return "checker_fallback" if fallback else "needs_decision"
         dispatch = json.loads(job["dispatch_json"])
         failures = int(dispatch.get("reconcile_failures") or 0) + 1
         dispatch["reconcile_failures"] = failures

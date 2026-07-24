@@ -12,8 +12,9 @@ from plowwhip.execution import (
     _write_interruption_is_unsafe,
 )
 from plowwhip.host_bridge import HostJobManager
-from plowwhip.provider import record_model_call
+from plowwhip.provider import HostBridgeError, record_model_call
 from plowwhip.store import Store
+from plowwhip.verification import CheckerStep, perform_checker_step
 
 
 class ReviewFixesTest(unittest.TestCase):
@@ -52,7 +53,9 @@ class ReviewFixesTest(unittest.TestCase):
     def test_bridge_terminal_streams_are_private_redacted_and_bounded(self):
         with tempfile.TemporaryDirectory() as root:
             root_path = Path(root)
-            manager = HostJobManager(root_path / "state", (root_path,))
+            manager = HostJobManager(
+                root_path / "state", (root_path.resolve(),)
+            )
             job_id = "b" * 32
             directory = manager._output_directory(job_id)
             directory.mkdir()
@@ -60,6 +63,8 @@ class ReviewFixesTest(unittest.TestCase):
             stderr = directory / "stderr.segment-000001.log"
             stdout.write_text(
                 "token=abcdefghijklmnop\n"
+                "ghp_abcdefghijklmnopqrstuvwxyz\n"
+                "sk-abcdefghijklmnopqrstuvwxyz\n"
                 + ("x" * 300_000)
                 + '\n{"input_tokens":1,"output_tokens":1}\n'
             )
@@ -75,6 +80,48 @@ class ReviewFixesTest(unittest.TestCase):
                 self.assertEqual(path.stat().st_mode & 0o777, 0o600)
                 self.assertLessEqual(path.stat().st_size, 262_144)
                 self.assertNotIn("abcdefghijklmnop", path.read_text())
+                self.assertNotIn("ghp_abcdefghijklmnopqrstuvwxyz", path.read_text())
+                self.assertNotIn("sk-abcdefghijklmnopqrstuvwxyz", path.read_text())
+
+    def test_checker_start_rejection_is_classified_as_rejected(self):
+        step = CheckerStep(
+            "start",
+            "project",
+            "task",
+            "job",
+            "codex_cli",
+            "/workspace",
+            "check",
+            None,
+            60,
+            {},
+            {},
+        )
+        with patch(
+            "plowwhip.verification.start_provider_job",
+            side_effect=HostBridgeError(
+                "rejected", status=400, detail="read access unsupported"
+            ),
+        ):
+            facts = perform_checker_step(step)
+        self.assertFalse(facts["ok"])
+        self.assertEqual(facts["failure_kind"], "rejected")
+        self.assertEqual(facts["failure_stage"], "start")
+
+    def test_non_git_snapshot_fingerprints_changes_after_256th_file(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            for index in range(257):
+                (root_path / f"{index:04d}.txt").write_text("before")
+            manager = HostJobManager(
+                root_path / "state", (root_path.resolve(),)
+            )
+            before = manager.snapshot({"project_path": str(root_path)})["git"]
+            (root_path / "0256.txt").write_text("after!")
+            after = manager.snapshot({"project_path": str(root_path)})["git"]
+            self.assertEqual(before["files"], after["files"])
+            self.assertTrue(before["truncated"])
+            self.assertNotEqual(before["fingerprint"], after["fingerprint"])
 
     def test_restart_watchdog_enforces_persisted_timeout(self):
         with tempfile.TemporaryDirectory() as root:

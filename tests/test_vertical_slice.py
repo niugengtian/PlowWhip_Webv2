@@ -2338,6 +2338,9 @@ class VerticalSliceTest(unittest.TestCase):
         finally:
             connection.close()
         self.assertLessEqual(len(capsule.encode()), 16_384)
+        capsule_payload = json.loads(capsule)
+        self.assertNotIn("objective", capsule_payload["goal"])
+        self.assertRegex(capsule_payload["goal"]["objective_sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(len(segment_rows), 2)
         manifests = [
             json.loads(self.store.resolve_data_path(row["path"]).read_text())
@@ -2352,6 +2355,29 @@ class VerticalSliceTest(unittest.TestCase):
         before = [path for path in self.data.rglob("segment-*.json")]
         checkpoint_project(self.store, "continuity")
         self.assertEqual(before, [path for path in self.data.rglob("segment-*.json")])
+
+    def test_checkpoint_overflow_converges_to_explicit_needs_decision(self):
+        self._create_project(
+            "checkpoint-overflow", "checkpoint-overflow", str(self.root)
+        )
+        submit_message(
+            self.store,
+            "checkpoint-overflow",
+            "检查当前代码并给出结论",
+            "checkpoint-overflow-message",
+        )
+        with patch(
+            "plowwhip.cronner.checkpoint_project",
+            side_effect=ValueError("handoff exceeds configured 512-byte cap"),
+        ):
+            result = tick(self.store)[0]
+        self.assertEqual(result["action"], "checkpoint_needs_decision")
+        state = snapshot(self.db, self.data, "checkpoint-overflow")
+        self.assertEqual(state["task"]["public_status"], "needs_decision")
+        self.assertEqual(state["task"]["fault_code"], "scope")
+        self.assertIn(
+            "checkpoint_failed", {event["kind"] for event in state["events"]}
+        )
 
     def test_deadline_reconciles_and_gracefully_stops_active_host_job(self):
         self._create_project(
