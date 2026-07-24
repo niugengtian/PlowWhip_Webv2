@@ -768,7 +768,12 @@ def extract_git_publish_spec(content: str) -> dict[str, object] | None:
     lowered = content.lower()
     if not (
         github
-        and ("上传" in content or "推送" in content or "push" in lowered)
+        and (
+            "上传" in content
+            or "推送" in content
+            or "发布" in content
+            or "push" in lowered
+        )
         and "ssh" in lowered
     ):
         return None

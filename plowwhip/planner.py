@@ -114,7 +114,8 @@ def planner_prompt(instruction: str, project_id: str, classification: dict) -> s
         'settings.fullstack.provider_order=["cursor_cli"] and an explicit Codex '
         'assignment with settings.fullstack.provider_order=["codex_cli"]. '
         "For an explicitly requested GitHub SSH publish, keep the exact URL and branch "
-        "in a bounded publish instruction and use role_key git_publisher. If later "
+        "in a bounded instruction that explicitly says SSH 上传, 推送, or 发布, and use "
+        "role_key git_publisher. If later "
         "tasks can change code, add a final dependent publish task so the verified "
         "remote SHA covers the repaired HEAD. "
         "Do not add deployment, deletion, payment, publishing, permission changes, "

@@ -1171,6 +1171,11 @@ class VerticalSliceTest(unittest.TestCase):
         )
         spec, _ = normalize_instruction(instruction)
         self.assertEqual(spec["kind"], "provider_task")
+        planned_publish, _ = normalize_instruction(
+            "使用 SSH 认证，将本地代码发布到 "
+            "https://github.com/niugengtian/PlowWhip_Webv2/tree/blue"
+        )
+        self.assertEqual(planned_publish["kind"], "git_publish")
         self.assertEqual(
             classify_instruction(instruction, spec["kind"])["size"],
             "large",
