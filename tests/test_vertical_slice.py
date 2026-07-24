@@ -1556,7 +1556,9 @@ class VerticalSliceTest(unittest.TestCase):
         dependency_body = json.dumps(dependency_verdict).encode()
         dependency_path.write_bytes(dependency_body)
         dependency_report_path = self.data / "dependency-review-report.md"
-        dependency_report_body = b"F-001 High: bounded review finding\n"
+        dependency_report_body = (
+            "F-001 High: bounded review finding\n" + "evidence " * 1_350
+        ).encode()
         dependency_report_path.write_bytes(dependency_report_body)
         with self.store.transaction() as connection:
             connection.execute(
@@ -1606,15 +1608,19 @@ class VerticalSliceTest(unittest.TestCase):
             tasks[1]["id"],
         )
         self.assertEqual(
-            capsule["dependency_results"][0]["acceptances"][0][
-                "recheck_command"
-            ],
-            "read bounded Cursor transcript",
+            capsule["dependency_results"][0]["acceptances"],
+            [{"acceptance_id": "review-findings"}],
         )
         self.assertEqual(
             capsule["dependency_results"][0]["provider_report"]["content"],
             dependency_report_body.decode(),
         )
+        self.assertNotIn("objective", capsule["goal"])
+        self.assertEqual(
+            capsule["goal"]["objective_sha256"],
+            hashlib.sha256(instruction.encode()).hexdigest(),
+        )
+        self.assertLessEqual(len(canonical_json(capsule).encode()), 16_384)
         with self.store.transaction() as connection:
             legacy_spec = json.loads(tasks[1]["spec_json"])
             self.assertFalse(legacy_spec["workspace_change_required"])

@@ -79,6 +79,7 @@ def compile_hot_context(
         except (OSError, json.JSONDecodeError, ValueError):
             warm = {"path": handoff["path"], "sha256": handoff["sha256"]}
     dependency_results = _dependency_results(store, connection, task["id"])
+    goal_objective = str(goal["objective"] if goal else "")
     capsule = {
         "version": 1,
         "project_id": task["project_id"],
@@ -86,7 +87,11 @@ def compile_hot_context(
         "role_key": role_key,
         "task_spec_revision": task["spec_revision"],
         "goal": {
-            "objective": goal["objective"] if goal else None,
+            "objective_sha256": (
+                hashlib.sha256(goal_objective.encode()).hexdigest()
+                if goal_objective
+                else None
+            ),
             "boundary": json.loads(goal["boundary_json"]) if goal else None,
         },
         "task_spec": json.loads(task["spec_json"]),
@@ -196,6 +201,11 @@ def _dependency_results(
                 }
             except (OSError, ValueError):
                 report = None
+        if report:
+            acceptances = [
+                {"acceptance_id": item["acceptance_id"]}
+                for item in acceptances
+            ]
         results.append(
             {
                 "task_id": row["task_id"],
