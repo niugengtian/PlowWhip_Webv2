@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from .intake import declared_step_count, normalize_instruction
 from .provider import (
+    HostBridgeError,
     PROVIDERS,
     provider_job_output,
     provider_job_status,
@@ -124,6 +125,7 @@ def planner_prompt(instruction: str, project_id: str, classification: dict) -> s
 
 
 def perform_planner_step(step: PlannerStep) -> dict[str, object]:
+    stage = step.kind
     try:
         state = (
             start_provider_job(
@@ -139,10 +141,24 @@ def perform_planner_step(step: PlannerStep) -> dict[str, object]:
             if step.kind == "start"
             else provider_job_status(step.job_id)
         )
+        stage = "output"
         return {
             "ok": True,
             "state": state,
             "output": provider_job_output(step.job_id),
+        }
+    except HostBridgeError as error:
+        return {
+            "ok": False,
+            "error": type(error).__name__,
+            "failure_kind": (
+                "rejected"
+                if step.kind == "start" and stage == "start" and error.rejected
+                else "transport"
+            ),
+            "failure_stage": stage,
+            "error_status": error.status,
+            "error_detail": error.detail,
         }
     except (OSError, RuntimeError, ValueError) as error:
         return {"ok": False, "error": type(error).__name__}

@@ -1361,6 +1361,10 @@ def _apply_planner_step(
         return "stale_planner_fact"
     now = time.time()
     if not facts.get("ok"):
+        if step.kind == "start" and facts.get("failure_kind") == "rejected":
+            return _reject_planner_start(
+                connection, task, job, step, facts, now
+            )
         dispatch = json.loads(job["dispatch_json"])
         failures = int(dispatch.get("reconcile_failures") or 0) + 1
         dispatch["reconcile_failures"] = failures
@@ -1670,6 +1674,64 @@ def _apply_planner_step(
         now,
     )
     return "needs_decision"
+
+
+def _reject_planner_start(
+    connection: sqlite3.Connection,
+    task: sqlite3.Row,
+    job: sqlite3.Row,
+    step: PlannerStep,
+    facts: dict[str, object],
+    now: float,
+) -> str:
+    dispatch = json.loads(job["dispatch_json"])
+    dispatch["rejection"] = {
+        "status": facts.get("error_status"),
+        "detail": str(facts.get("error_detail") or "")[:500],
+    }
+    connection.execute(
+        """
+        UPDATE host_jobs SET status = 'failed', ended_at = ?, returncode = 125,
+            failure_code = 'rejected', dispatch_json = ? WHERE id = ?
+        """,
+        (now, canonical_json(dispatch), job["id"]),
+    )
+    fallback = _fallback_provider_generation(
+        connection, task, job, step.provider_key, now
+    )
+    connection.execute(
+        """
+        UPDATE tasks SET public_status = ?, phase = ?, wait_reason = ?,
+            fault_code = 'provider', next_action_at = ?, next_action_kind = ?,
+            updated_at = ? WHERE id = ?
+        """,
+        (
+            "in_progress" if fallback else "needs_decision",
+            "plan" if fallback else "provider_recovery",
+            (
+                f"Planner start was rejected; falling back to {fallback}"
+                if fallback
+                else "Host Bridge rejected Planner before acceptance"
+            ),
+            now if fallback else None,
+            "plan" if fallback else None,
+            now,
+            task["id"],
+        ),
+    )
+    _record_event(
+        connection,
+        task,
+        "host_job_rejected",
+        {
+            "host_job_id": job["id"],
+            "provider_key": step.provider_key,
+            "http_status": facts.get("error_status"),
+            "fallback": fallback,
+        },
+        now,
+    )
+    return "provider_fallback" if fallback else "needs_decision"
 
 
 def _materialize_plan(

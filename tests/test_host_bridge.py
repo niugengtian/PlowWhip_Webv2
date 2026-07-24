@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from plowwhip.host_bridge import (
     HostJobManager,
+    KNOWN_EXECUTABLE_PATHS,
     _execution_argv,
     _load_private_env,
     _parse_usage,
@@ -359,6 +360,20 @@ else:
             self.assertEqual(
                 _resolve_executable("cursor", "cursor"),
                 "/usr/local/bin/cursor-agent",
+            )
+        bundled_codex = self.root / "codex"
+        bundled_codex.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        bundled_codex.chmod(0o700)
+        with (
+            patch("plowwhip.host_bridge.shutil.which", return_value=None),
+            patch.dict(
+                KNOWN_EXECUTABLE_PATHS,
+                {"codex": {bundled_codex}},
+            ),
+        ):
+            self.assertEqual(
+                _resolve_executable("codex", "codex"),
+                str(bundled_codex),
             )
 
     def test_cursor_first_job_bootstraps_one_session(self):

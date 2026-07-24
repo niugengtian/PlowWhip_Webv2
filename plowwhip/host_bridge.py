@@ -679,6 +679,15 @@ def _resolve_executable(value: object, adapter: str) -> str | None:
     discovered = shutil.which(candidate)
     if discovered is None and adapter == "cursor" and candidate == "cursor":
         discovered = shutil.which("cursor-agent")
+    if discovered is None:
+        discovered = next(
+            (
+                str(path)
+                for path in KNOWN_EXECUTABLE_PATHS[adapter]
+                if path.is_file() and os.access(path, os.X_OK)
+            ),
+            None,
+        )
     return discovered
 
 

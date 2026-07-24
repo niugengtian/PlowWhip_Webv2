@@ -1398,6 +1398,55 @@ class VerticalSliceTest(unittest.TestCase):
             ],
         )
 
+    def test_planner_start_rejection_falls_back_instead_of_unknown_outcome(self):
+        self._create_project(
+            "planner-rejected",
+            "planner-rejected-create",
+            "/workspace/planner",
+        )
+        submit_message(
+            self.store,
+            "planner-rejected",
+            "前端和后端比较方案后分别实现",
+            "planner-rejected-message",
+        )
+        self.assertEqual(tick(self.store)[0]["action"], "intake")
+        with patch(
+            "plowwhip.planner.start_provider_job",
+            side_effect=HostBridgeError(
+                "Host Bridge rejected request",
+                status=400,
+                detail="executable not found",
+            ),
+        ):
+            self.assertEqual(tick(self.store)[0]["action"], "provider_fallback")
+        state = snapshot(self.db, self.data, "planner-rejected")
+        self.assertEqual(state["task"]["public_status"], "in_progress")
+        self.assertEqual(state["task"]["phase"], "plan")
+        self.assertEqual(state["task"]["fault_code"], "provider")
+        job = next(
+            item for item in state["host_jobs"] if item["purpose"] == "command"
+        )
+        self.assertEqual(job["status"], "failed")
+        self.assertEqual(job["returncode"], 125)
+        self.assertEqual(job["failure_code"], "rejected")
+        self.assertIn(
+            "host_job_rejected",
+            {item["kind"] for item in state["events"]},
+        )
+        planner = [
+            (item["generation"], item["provider_key"], item["status"])
+            for item in state["sessions"]
+            if item["role_key"] == "planner"
+        ]
+        self.assertEqual(
+            planner,
+            [
+                (1, "codex_cli", "archived"),
+                (2, "cursor_cli", "active"),
+            ],
+        )
+
     def test_high_risk_plan_asks_exactly_one_project_butler_question(self):
         self._create_project("risk-plan", "project-1", "/workspace/risk-plan")
         submit_message(
