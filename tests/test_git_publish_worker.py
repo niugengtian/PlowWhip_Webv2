@@ -104,7 +104,7 @@ class GitPublishWorkerTest(unittest.TestCase):
 
     def test_common_high_confidence_secret_patterns_are_rejected(self):
         patterns = {
-            "aws.txt": "ASIAABCDEFGHIJKLMNOP",
+            "aws.txt": "AS" + "IA" + "ABCDEFGHIJKLMNOP",
             "google.txt": "AIza" + "A" * 35,
             "slack.txt": "xoxb-" + "A" * 20,
             "gitlab.txt": "glpat-" + "A" * 20,
