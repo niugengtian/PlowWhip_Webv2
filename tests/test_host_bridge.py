@@ -376,6 +376,76 @@ else:
                 str(bundled_codex),
             )
 
+    def test_codex_read_job_uses_disposable_workspace_and_temp(self):
+        codex = self.root / "codex"
+        codex.write_text(
+            """#!/usr/bin/env python3
+import json
+import pathlib
+import sys
+import tempfile
+
+pathlib.Path("provider-write.txt").write_text("isolated", encoding="utf-8")
+temporary = tempfile.mkdtemp()
+print(json.dumps({
+    "argv": sys.argv[1:],
+    "cwd": str(pathlib.Path.cwd()),
+    "temporary": temporary,
+}))
+""",
+            encoding="utf-8",
+        )
+        codex.chmod(0o700)
+        (self.project / "source.txt").write_text("canonical", encoding="utf-8")
+        job_id = uuid4().hex
+
+        status, _ = self._post(
+            "/v1/jobs/start",
+            {
+                "job_id": job_id,
+                "adapter": "codex",
+                "executable": "codex",
+                "project_path": str(self.project),
+                "prompt": "verify without changing the source workspace",
+                "timeout_seconds": 10,
+                "access": "read",
+                "context_policy": {},
+            },
+        )
+        self.assertEqual(status, 202)
+        terminal = self._wait_terminal(job_id)
+        self.assertEqual(terminal["status"], "completed")
+        self.assertEqual(terminal["returncode"], 0)
+        self.assertTrue(terminal["isolated_workspace"])
+        self.assertFalse((self.project / "provider-write.txt").exists())
+        self.assertEqual((self.project / "source.txt").read_text(), "canonical")
+        self.assertFalse((self.state / job_id / "workspace").exists())
+        self.assertFalse((self.state / job_id / "tmp").exists())
+
+        _, output = self._post(
+            "/v1/jobs/output",
+            {
+                "job_id": job_id,
+                "stdout_offset": -1,
+                "stderr_offset": -1,
+                "limit": 32768,
+                "tail_lines": 20,
+            },
+        )
+        stdout = "".join(
+            chunk["text"]
+            for chunk in output["chunks"]
+            if chunk["stream"] == "stdout"
+        )
+        result = json.loads(stdout)
+        self.assertNotEqual(result["cwd"], str(self.project))
+        self.assertIn(str(self.state / job_id), result["cwd"])
+        self.assertIn(str(self.state / job_id), result["temporary"])
+        self.assertEqual(
+            result["argv"][result["argv"].index("--sandbox") + 1],
+            "workspace-write",
+        )
+
     def test_cursor_first_job_bootstraps_one_session(self):
         cursor = self.root / "cursor"
         cursor.write_text(

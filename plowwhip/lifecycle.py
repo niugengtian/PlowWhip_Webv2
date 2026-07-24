@@ -1988,6 +1988,26 @@ def _materialize_plan(
             raise ValueError(
                 "explicit Git/Cursor/Codex workflow requires exactly three serial tasks"
             )
+        repair_acceptance = tasks[2]["acceptance"]
+        if not any(
+            item["id"] == "review-findings-disposition"
+            for item in repair_acceptance
+        ):
+            if len(repair_acceptance) >= 20:
+                raise ValueError(
+                    "Codex repair task has no room for findings disposition acceptance"
+                )
+            repair_acceptance.append(
+                {
+                    "id": "review-findings-disposition",
+                    "kind": "planner_acceptance",
+                    "expected": (
+                        "逐项列出 Cursor 审查的每个编号发现，并给出已修复、"
+                        "不适用或明确延期的结论及代码、测试或事实依据；"
+                        "不得遗漏 Critical 或 High 发现"
+                    ),
+                }
+            )
     return {**plan, "tasks": tasks}
 
 

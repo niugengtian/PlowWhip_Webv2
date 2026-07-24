@@ -315,17 +315,34 @@ class HostJobManager:
         if adapter == "json-worker" and session_id is None:
             session_id = uuid4().hex
         context_policy = _context_policy(payload.get("context_policy"))
+        directory = self._output_directory(job_id)
+        directory.mkdir(parents=True, exist_ok=True)
+        directory.chmod(0o700)
+        isolated = adapter == "codex" and access == "read"
+        execution_project = project
+        environment = _safe_environment()
+        if isolated:
+            if _is_within(directory, project):
+                raise ValueError(
+                    "Host Bridge state must be outside the project for read-only Codex"
+                )
+            execution_project = _isolated_workspace(
+                project, directory / "workspace"
+            )
+            temporary = directory / "tmp"
+            temporary.mkdir(mode=0o700, exist_ok=True)
+            temporary.chmod(0o700)
+            environment["TMPDIR"] = str(temporary)
         argv = _execution_argv(
             adapter,
             executable,
-            project,
+            execution_project,
             session_id,
             prompt,
             access,
             context_policy,
+            isolated=isolated,
         )
-        directory = self._output_directory(job_id)
-        directory.mkdir(parents=True, exist_ok=True)
         stdout_path = directory / "stdout.segment-000001.log"
         stderr_path = directory / "stderr.segment-000001.log"
         now = time.time()
@@ -350,6 +367,7 @@ class HostJobManager:
             "cancel_requested": False,
             "output_ref": f"{job_id}/",
             "context_policy": context_policy,
+            "isolated_workspace": isolated,
         }
         with self._lock:
             existing = self._read(job_id, required=False)
@@ -362,11 +380,11 @@ class HostJobManager:
             ) as stderr:
                 process = subprocess.Popen(
                     argv,
-                    cwd=project,
+                    cwd=execution_project,
                     stdin=subprocess.PIPE if adapter != "cursor" else subprocess.DEVNULL,
                     stdout=stdout,
                     stderr=stderr,
-                    env=_safe_environment(),
+                    env=environment,
                     start_new_session=True,
                 )
         except OSError as error:
@@ -380,7 +398,7 @@ class HostJobManager:
             )
             stderr_path.write_text(_redact(str(error))[:500], encoding="utf-8")
             with self._lock:
-                self._write(record)
+                self._finish(record)
             return dict(record)
         if process.stdin is not None:
             try:
@@ -610,6 +628,15 @@ class HostJobManager:
         record["duration_ms"] = max(
             0, int((record["ended_at"] - record["started_at"]) * 1_000)
         )
+        if record.get("isolated_workspace"):
+            shutil.rmtree(
+                self._output_directory(record["job_id"]) / "workspace",
+                ignore_errors=True,
+            )
+            shutil.rmtree(
+                self._output_directory(record["job_id"]) / "tmp",
+                ignore_errors=True,
+            )
         self._write(record)
 
     def _project(self, value: object) -> Path:
@@ -691,6 +718,28 @@ def _resolve_executable(value: object, adapter: str) -> str | None:
     return discovered
 
 
+def _isolated_workspace(source: Path, target: Path) -> Path:
+    def ignore(_directory: str, names: list[str]) -> set[str]:
+        return {
+            name
+            for name in names
+            if name == "__pycache__"
+            or name == ".env"
+            or (
+                name.startswith(".env.")
+                and name not in {".env.example", ".env.sample", ".env.template"}
+            )
+        }
+
+    try:
+        shutil.copytree(source, target, symlinks=True, ignore=ignore)
+        target.chmod(0o700)
+    except Exception:
+        shutil.rmtree(target, ignore_errors=True)
+        raise
+    return target
+
+
 def _version_argv(adapter: str, executable: str) -> list[str]:
     if adapter == "cursor":
         return [executable, "agent", "--version"]
@@ -709,6 +758,8 @@ def _execution_argv(
     prompt: str,
     access: str,
     context: dict[str, object],
+    *,
+    isolated: bool = False,
 ) -> list[str]:
     if adapter == "git-publish":
         try:
@@ -722,7 +773,11 @@ def _execution_argv(
             )
         return [executable, str(_git_publish_script())]
     if adapter == "codex":
-        sandbox = "read-only" if access == "read" else "workspace-write"
+        sandbox = (
+            "workspace-write"
+            if access == "write" or isolated
+            else "read-only"
+        )
         compact = int(context["provider_compaction_token_limit"])
         shared = [
             "--json",

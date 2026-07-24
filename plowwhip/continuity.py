@@ -78,6 +78,7 @@ def compile_hot_context(
             warm = json.loads(store.resolve_data_path(handoff["path"]).read_text())
         except (OSError, json.JSONDecodeError, ValueError):
             warm = {"path": handoff["path"], "sha256": handoff["sha256"]}
+    dependency_results = _dependency_results(store, connection, task["id"])
     capsule = {
         "version": 1,
         "project_id": task["project_id"],
@@ -96,6 +97,7 @@ def compile_hot_context(
             "blocker": task["wait_reason"],
         },
         "warm_handoff": warm,
+        "dependency_results": dependency_results,
         "recent_evidence_and_artifacts": [dict(row) for row in reversed(artifacts)],
     }
     body = canonical_json(capsule)
@@ -124,6 +126,58 @@ def compile_hot_context(
             "increase context_max_bytes or narrow the Task"
         )
     return body
+
+
+def _dependency_results(
+    store: Store, connection: sqlite3.Connection, task_id: str
+) -> list[dict[str, object]]:
+    rows = connection.execute(
+        """
+        SELECT dependency.depends_on_task_id AS task_id, artifact.path, artifact.sha256
+        FROM task_dependencies dependency
+        JOIN artifacts artifact ON artifact.task_id = dependency.depends_on_task_id
+        WHERE dependency.task_id = ? AND artifact.kind = 'evidence'
+          AND artifact.acceptance_id IS NULL
+        ORDER BY artifact.created_at DESC, artifact.rowid DESC
+        """,
+        (task_id,),
+    ).fetchall()
+    results = []
+    seen = set()
+    for row in rows:
+        if row["task_id"] in seen or len(results) >= 2:
+            continue
+        seen.add(row["task_id"])
+        try:
+            path = store.resolve_data_path(row["path"])
+            with path.open("rb") as handle:
+                body = handle.read(65_537)
+            if len(body) > 65_536:
+                raise ValueError("dependency verdict exceeds bound")
+            verdict = json.loads(body)
+            if not isinstance(verdict, dict):
+                raise ValueError("dependency verdict must be an object")
+            acceptances = [
+                {
+                    "acceptance_id": str(item.get("acceptance_id") or ""),
+                    "actual_evidence": str(item.get("actual_evidence") or "")[:500],
+                    "recheck_command": str(item.get("recheck_command") or "")[:800],
+                }
+                for item in verdict.get("acceptances", [])[:8]
+                if isinstance(item, dict)
+            ]
+        except (OSError, ValueError, json.JSONDecodeError):
+            acceptances = []
+            verdict = {}
+        results.append(
+            {
+                "task_id": row["task_id"],
+                "verdict": verdict.get("checker_verdict"),
+                "evidence": {"path": row["path"], "sha256": row["sha256"]},
+                "acceptances": acceptances,
+            }
+        )
+    return results
 
 
 def _segment_session(

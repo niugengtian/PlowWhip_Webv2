@@ -1322,7 +1322,8 @@ class VerticalSliceTest(unittest.TestCase):
         try:
             tasks = connection.execute(
                 """
-                SELECT id, role_key, checker_role_key, spec_revision, spec_json
+                SELECT id, role_key, checker_role_key, spec_revision, spec_json,
+                       acceptance_json
                 FROM tasks WHERE project_id = 'composite-plan' ORDER BY rowid
                 """
             ).fetchall()
@@ -1417,6 +1418,60 @@ class VerticalSliceTest(unittest.TestCase):
         self.assertEqual(
             authorization["spec_revision"],
             tasks[0]["spec_revision"],
+        )
+        repair_acceptances = json.loads(tasks[2]["acceptance_json"])
+        self.assertIn(
+            "review-findings-disposition",
+            {item["id"] for item in repair_acceptances},
+        )
+        dependency_verdict = {
+            "checker_verdict": "PASS",
+            "acceptances": [
+                {
+                    "acceptance_id": "review-findings",
+                    "actual_evidence": "Cursor produced ten numbered findings.",
+                    "recheck_command": "read bounded Cursor transcript",
+                }
+            ],
+        }
+        dependency_path = self.data / "dependency-review-verdict.json"
+        dependency_body = json.dumps(dependency_verdict).encode()
+        dependency_path.write_bytes(dependency_body)
+        with self.store.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO artifacts(
+                    id, project_id, task_id, kind, path, sha256, bytes,
+                    acceptance_id, revision, created_at
+                ) VALUES (?, ?, ?, 'evidence', ?, ?, ?, NULL, 1, ?)
+                """,
+                (
+                    "dependency-review-evidence",
+                    "composite-plan",
+                    tasks[1]["id"],
+                    self.store.relative_data_path(dependency_path),
+                    "d" * 64,
+                    len(dependency_body),
+                    time.time(),
+                ),
+            )
+            repair_task = connection.execute(
+                "SELECT * FROM tasks WHERE id = ?", (tasks[2]["id"],)
+            ).fetchone()
+            capsule = json.loads(
+                compile_hot_context(
+                    self.store, connection, repair_task, "fullstack"
+                )
+            )
+        self.assertEqual(
+            capsule["dependency_results"][0]["task_id"],
+            tasks[1]["id"],
+        )
+        self.assertEqual(
+            capsule["dependency_results"][0]["acceptances"][0][
+                "recheck_command"
+            ],
+            "read bounded Cursor transcript",
         )
         with self.store.transaction() as connection:
             legacy_spec = json.loads(tasks[1]["spec_json"])

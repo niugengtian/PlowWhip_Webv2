@@ -108,13 +108,14 @@ not invoke a model. Keep the environment file outside the repository; it may
 contain only the Bridge token and supported Provider variables and must remain
 mode `0600`. Job state never stores prompts, argv, or credentials.
 The same active-process restart/cancel contract is tested on macOS and in a
-minimal Linux container. Cursor read-only Planner/Checker work uses CLI plan
+minimal Linux container. Cursor read-only Planner/Checker work uses CLI ask
 mode without `--force`; write Tasks enable `--force` only inside the configured
 workspace sandbox. Adapter executables resolve from the host service `PATH`
 instead of a macOS-only path; Cursor also accepts the `cursor-agent` binary
 name used by its standalone installer. A first Cursor job creates one chat
 session before invoking `--resume`; later retries of the same Task reuse that
-physical session.
+physical session. Codex read-only work runs in a disposable private workspace,
+so tests can use a temporary directory without granting writes to the source.
 
 The global Butler accepts a selected Project or an `@项目名称` prefix. Safe
 internal IDs remain accepted for existing API clients. An
