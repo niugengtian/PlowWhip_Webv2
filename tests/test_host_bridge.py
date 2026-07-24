@@ -319,7 +319,7 @@ else:
             "read",
             context,
         )
-        self.assertEqual(read_argv[-3:], ["--mode", "plan", "review only"])
+        self.assertEqual(read_argv[-3:], ["--mode", "ask", "review only"])
         self.assertNotIn("--force", read_argv)
         write_argv = _execution_argv(
             "cursor",

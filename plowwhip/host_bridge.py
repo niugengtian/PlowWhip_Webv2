@@ -776,7 +776,7 @@ def _execution_argv(
             session_id,
         ]
         if access == "read":
-            argv.extend(["--mode", "plan"])
+            argv.extend(["--mode", "ask"])
         else:
             argv.append("--force")
         argv.append(prompt)
