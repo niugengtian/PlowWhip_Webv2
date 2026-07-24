@@ -52,6 +52,8 @@ class ProviderStep:
     access: str
     context_policy: dict[str, object]
     source_job_id: str | None = None
+    source_before: dict | None = None
+    source_after: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -609,6 +611,17 @@ def _prepare_provider_task(
             """,
             (task["id"], task["spec_revision"], generation["provider_key"]),
         ).fetchone()
+        reusable_execution = (
+            _provider_execution_for_job(
+                store, connection, task["id"], task["spec_revision"], reusable["id"]
+            )
+            if reusable
+            else None
+        )
+        if not reusable_execution:
+            reusable = None
+    else:
+        reusable_execution = None
     job_id = str(uuid4())
     connection.execute(
         """
@@ -632,6 +645,12 @@ def _prepare_provider_task(
                     "context_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
                     "access": access,
                     "reuse_from_host_job_id": reusable["id"] if reusable else None,
+                    "reuse_before": (
+                        reusable_execution["before"] if reusable_execution else None
+                    ),
+                    "reuse_after": (
+                        reusable_execution["after"] if reusable_execution else None
+                    ),
                 }
             ),
         ),
@@ -670,7 +689,40 @@ def _prepare_provider_task(
         access,
         _context_policy(settings),
         reusable["id"] if reusable else None,
+        reusable_execution["before"] if reusable_execution else None,
+        reusable_execution["after"] if reusable_execution else None,
     )
+
+
+def _provider_execution_for_job(
+    store: Store,
+    connection: sqlite3.Connection,
+    task_id: str,
+    spec_revision: int,
+    job_id: str,
+) -> dict | None:
+    rows = connection.execute(
+        """
+        SELECT path FROM artifacts
+        WHERE task_id = ? AND kind = 'output' AND revision = ?
+          AND path LIKE '%/provider-execution.json'
+        ORDER BY created_at DESC, rowid DESC LIMIT 20
+        """,
+        (task_id, spec_revision),
+    ).fetchall()
+    for row in rows:
+        try:
+            manifest = json.loads(store.resolve_data_path(row["path"]).read_text())
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(manifest, dict)
+            and manifest.get("host_job_id") == job_id
+            and isinstance(manifest.get("before"), dict)
+            and isinstance(manifest.get("after"), dict)
+        ):
+            return manifest
+    return None
 
 
 def pending_provider_step(
@@ -731,6 +783,8 @@ def pending_provider_step(
         str(dispatch.get("access") or "write"),
         _context_policy(settings),
         str(dispatch.get("reuse_from_host_job_id") or "") or None,
+        dispatch.get("reuse_before"),
+        dispatch.get("reuse_after"),
     )
 
 
@@ -738,7 +792,14 @@ def perform_provider_step(step: ProviderStep) -> dict[str, object]:
     stage = step.kind
     try:
         if step.kind == "snapshot":
-            return {"ok": True, "before": workspace_snapshot(step.project_path)}
+            return {
+                "ok": True,
+                "before": (
+                    {"git": step.source_before}
+                    if step.source_job_id
+                    else workspace_snapshot(step.project_path)
+                ),
+            }
         if step.kind == "recover":
             state = provider_job_status(str(step.source_job_id))
             stage = "output"
@@ -768,7 +829,11 @@ def perform_provider_step(step: ProviderStep) -> dict[str, object]:
         facts: dict[str, object] = {"ok": True, "state": state, "output": output}
         if str(state.get("status")) not in ACTIVE_HOST_JOB_STATUSES:
             stage = "snapshot_after"
-            facts["after"] = workspace_snapshot(step.project_path)
+            facts["after"] = (
+                {"git": step.source_after}
+                if step.kind == "recover"
+                else workspace_snapshot(step.project_path)
+            )
         return facts
     except HostBridgeError as error:
         return {

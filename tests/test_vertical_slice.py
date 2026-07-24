@@ -3044,8 +3044,9 @@ class VerticalSliceTest(unittest.TestCase):
         self.assertEqual(tick(self.store)[0]["action"], "rerun")
         with patch(
             "plowwhip.execution.workspace_snapshot", return_value=unchanged
-        ):
+        ) as unexpected_recovery_snapshot:
             self.assertEqual(tick(self.store)[0]["action"], "snapshot")
+        unexpected_recovery_snapshot.assert_not_called()
         with (
             patch(
                 "plowwhip.execution.provider_job_status",
@@ -3058,12 +3059,13 @@ class VerticalSliceTest(unittest.TestCase):
             patch(
                 "plowwhip.execution.workspace_snapshot",
                 return_value=unchanged,
-            ),
+            ) as unexpected_recovery_after,
             patch("plowwhip.execution.start_provider_job") as unexpected_start,
         ):
             self.assertEqual(tick(self.store)[0]["action"], "execute")
         recovered_status.assert_called_once_with(source_job_id)
         recovered_output.assert_called_once_with(source_job_id)
+        unexpected_recovery_after.assert_not_called()
         unexpected_start.assert_not_called()
         connection = self.store.connect_readonly()
         try:
@@ -3093,6 +3095,8 @@ class VerticalSliceTest(unittest.TestCase):
         self.assertEqual(
             recovered_manifest["reused_from_host_job_id"], source_job_id
         )
+        self.assertEqual(recovered_manifest["before"], unchanged["git"])
+        self.assertEqual(recovered_manifest["after"], unchanged["git"])
         self.assertIn(
             "F-001",
             self.store.resolve_data_path(
