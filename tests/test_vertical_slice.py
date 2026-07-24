@@ -24,6 +24,7 @@ from plowwhip.cronner import (
 from plowwhip.execution import (
     ProviderStep,
     _fallback_provider_generation,
+    _root_provider_execution,
     perform_provider_step,
 )
 from plowwhip.intake import (
@@ -3085,6 +3086,21 @@ class VerticalSliceTest(unittest.TestCase):
                 """,
                 (task["id"],),
             ).fetchone()["path"]
+            recovered_job_id = connection.execute(
+                """
+                SELECT id FROM host_jobs
+                WHERE task_id = ? AND purpose = 'execute' AND status = 'succeeded'
+                ORDER BY sequence DESC LIMIT 1
+                """,
+                (task["id"],),
+            ).fetchone()["id"]
+            root_job = _root_provider_execution(
+                self.store,
+                connection,
+                task["id"],
+                task["spec_revision"],
+                recovered_job_id,
+            )
         finally:
             connection.close()
         recovered_manifest = json.loads(
@@ -3095,6 +3111,7 @@ class VerticalSliceTest(unittest.TestCase):
         self.assertEqual(
             recovered_manifest["reused_from_host_job_id"], source_job_id
         )
+        self.assertEqual(root_job[0], source_job_id)
         self.assertEqual(recovered_manifest["before"], unchanged["git"])
         self.assertEqual(recovered_manifest["after"], unchanged["git"])
         self.assertIn(

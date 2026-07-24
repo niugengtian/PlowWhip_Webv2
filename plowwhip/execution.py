@@ -611,15 +611,19 @@ def _prepare_provider_task(
             """,
             (task["id"], task["spec_revision"], generation["provider_key"]),
         ).fetchone()
-        reusable_execution = (
-            _provider_execution_for_job(
+        reusable_root = (
+            _root_provider_execution(
                 store, connection, task["id"], task["spec_revision"], reusable["id"]
             )
             if reusable
             else None
         )
-        if not reusable_execution:
+        if reusable_root:
+            reusable = {"id": reusable_root[0]}
+            reusable_execution = reusable_root[1]
+        else:
             reusable = None
+            reusable_execution = None
     else:
         reusable_execution = None
     job_id = str(uuid4())
@@ -722,6 +726,28 @@ def _provider_execution_for_job(
             and isinstance(manifest.get("after"), dict)
         ):
             return manifest
+    return None
+
+
+def _root_provider_execution(
+    store: Store,
+    connection: sqlite3.Connection,
+    task_id: str,
+    spec_revision: int,
+    job_id: str,
+) -> tuple[str, dict] | None:
+    seen = set()
+    while job_id not in seen and len(seen) < 20:
+        seen.add(job_id)
+        manifest = _provider_execution_for_job(
+            store, connection, task_id, spec_revision, job_id
+        )
+        if not manifest:
+            return None
+        source_job_id = str(manifest.get("reused_from_host_job_id") or "")
+        if not source_job_id:
+            return job_id, manifest
+        job_id = source_job_id
     return None
 
 
