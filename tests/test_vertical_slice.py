@@ -1414,6 +1414,52 @@ class VerticalSliceTest(unittest.TestCase):
             authorization["spec_revision"],
             tasks[0]["spec_revision"],
         )
+        with self.store.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE tasks SET public_status = 'done', outcome = 'done',
+                    phase = 'done', next_action_at = NULL, next_action_kind = NULL
+                WHERE id = ?
+                """,
+                (tasks[0]["id"],),
+            )
+            connection.execute(
+                """
+                UPDATE tasks SET public_status = 'done', outcome = 'cancelled',
+                    phase = 'done', next_action_at = NULL, next_action_kind = NULL
+                WHERE id = ?
+                """,
+                (tasks[1]["id"],),
+            )
+        self.assertEqual(tick(self.store)[0]["action"], "dependency_blocked")
+        submit_action(
+            self.store,
+            "composite-plan",
+            tasks[1]["id"],
+            "rerun",
+            "",
+            "rerun-cancelled-plan-child",
+        )
+        self.assertEqual(tick(self.store)[0]["action"], "rerun")
+        connection = self.store.connect_readonly()
+        try:
+            rerun_rows = connection.execute(
+                """
+                SELECT id, public_status, phase, outcome
+                FROM tasks WHERE id IN (?, ?)
+                ORDER BY CASE id WHEN ? THEN 0 ELSE 1 END
+                """,
+                (tasks[1]["id"], tasks[2]["id"], tasks[1]["id"]),
+            ).fetchall()
+        finally:
+            connection.close()
+        self.assertEqual(
+            [tuple(row) for row in rerun_rows],
+            [
+                (tasks[1]["id"], "pending", "execute", None),
+                (tasks[2]["id"], "pending", "queued", None),
+            ],
+        )
 
     def test_running_planner_host_job_reconciles_after_store_restart(self):
         self._create_project(

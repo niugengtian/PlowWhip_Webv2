@@ -670,6 +670,23 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
                 )
             else:
                 rotate_task_sessions(connection, task["id"], now)
+            connection.execute(
+                """
+                UPDATE tasks SET public_status = 'pending', phase = 'queued',
+                    wait_reason = NULL, fault_code = NULL,
+                    next_action_at = NULL, next_action_kind = 'dependency',
+                    updated_at = ?
+                WHERE project_id = ? AND outcome IS NULL
+                  AND public_status = 'needs_decision' AND phase = 'plan'
+                  AND wait_reason = 'a required dependency was cancelled'
+                  AND EXISTS (
+                      SELECT 1 FROM task_dependencies edge
+                      WHERE edge.task_id = tasks.id
+                        AND edge.depends_on_task_id = ?
+                  )
+                """,
+                (now, task["project_id"], task["id"]),
+            )
         connection.execute(
             """
             UPDATE tasks SET public_status = ?, phase = ?, outcome = NULL,
