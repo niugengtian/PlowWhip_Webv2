@@ -301,8 +301,10 @@ class HostJobManager:
         access = str(payload.get("access") or "write")
         if access not in {"read", "write"}:
             raise ValueError("unsupported access mode")
-        if access == "read" and adapter not in {"codex", "cursor"}:
-            raise ValueError("read-only execution requires Codex or Cursor")
+        if access == "read" and adapter not in {"codex", "cursor", "git-publish"}:
+            raise ValueError(
+                "read-only execution requires Codex, Cursor, or Git inspection"
+            )
         timeout_seconds = min(
             max(int(payload.get("timeout_seconds") or 600), 10),
             MAX_JOB_SECONDS,

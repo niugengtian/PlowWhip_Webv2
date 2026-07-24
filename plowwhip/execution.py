@@ -957,18 +957,24 @@ def _previous_git_publish_failure(
     task_id: str,
     sequence: int,
 ) -> dict[str, object] | None:
-    row = connection.execute(
+    rows = connection.execute(
         """
         SELECT id, returncode, output_ref FROM host_jobs
         WHERE task_id = ? AND sequence < ? AND status = 'failed'
-        ORDER BY sequence DESC LIMIT 1
+        ORDER BY sequence DESC LIMIT 20
         """,
         (task_id, sequence),
-    ).fetchone()
-    if not row:
+    ).fetchall()
+    if not rows:
         return None
-    reason = "failed_publish"
-    if row["output_ref"]:
+    fallback = {
+        "host_job_id": rows[0]["id"],
+        "returncode": rows[0]["returncode"],
+        "reason": "failed_publish",
+    }
+    for row in rows:
+        if not row["output_ref"]:
+            continue
         try:
             path = store.resolve_data_path(row["output_ref"])
             with path.open("rb") as handle:
@@ -984,14 +990,14 @@ def _previous_git_publish_failure(
                     "一个仓库已向该引用进行了推送",
                 )
             ):
-                reason = "remote_history_conflict"
+                return {
+                    "host_job_id": row["id"],
+                    "returncode": row["returncode"],
+                    "reason": "remote_history_conflict",
+                }
         except (OSError, ValueError):
             pass
-    return {
-        "host_job_id": row["id"],
-        "returncode": row["returncode"],
-        "reason": reason,
-    }
+    return fallback
 
 
 def _git_publish_decision_context(

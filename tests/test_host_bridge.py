@@ -437,6 +437,30 @@ else:
                 "read",
                 {},
             )
+        job_id = uuid4().hex
+        status, _started = self._post(
+            "/v1/jobs/start",
+            {
+                "job_id": job_id,
+                "adapter": "git-publish",
+                "executable": "git-publish",
+                "project_path": str(self.project),
+                "prompt": json.dumps(
+                    {
+                        "kind": "git_publish",
+                        "operation": "inspect",
+                        "remote_ssh": "git@github.com:owner/repository.git",
+                        "branch": "blue",
+                        "expected_head": "a" * 40,
+                    }
+                ),
+                "timeout_seconds": 10,
+                "access": "read",
+                "context_policy": {},
+            },
+        )
+        self.assertEqual(status, 202)
+        self.assertEqual(self._wait_terminal(job_id)["returncode"], 1)
 
     def test_host_jobs_inherit_only_the_ssh_agent_socket_not_key_material(self):
         with patch.dict(

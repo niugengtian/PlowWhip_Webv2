@@ -3031,6 +3031,32 @@ class VerticalSliceTest(unittest.TestCase):
                 )
                 legacy = snapshot(self.db, self.data, "legacy-git")
                 self.assertIsNone(legacy["decision_context"])
+                with self.store.transaction() as connection:
+                    previous = connection.execute(
+                        """
+                        SELECT task_session_id, session_generation FROM host_jobs
+                        WHERE task_id = ? ORDER BY sequence DESC LIMIT 1
+                        """,
+                        (legacy["task"]["id"],),
+                    ).fetchone()
+                    connection.execute(
+                        """
+                        INSERT INTO host_jobs(
+                            id, task_id, task_session_id, session_generation,
+                            spec_revision, sequence, purpose, status, started_at,
+                            ended_at, returncode, failure_code
+                        ) VALUES (?, ?, ?, ?, 1, 2, 'execute', 'failed', ?, ?, 125,
+                                  'rejected')
+                        """,
+                        (
+                            "rejected-before-inspection",
+                            legacy["task"]["id"],
+                            previous["task_session_id"],
+                            previous["session_generation"],
+                            time.time(),
+                            time.time(),
+                        ),
+                    )
                 with self.assertRaisesRegex(ValueError, "refresh Git publish"):
                     submit_action(
                         self.store,
