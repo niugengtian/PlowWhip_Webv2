@@ -11,7 +11,7 @@ from .store import Store, write_atomic as _write_atomic
 
 
 GLOBAL_ROUTE_PREFIX = re.compile(
-    r"^\s*@([A-Za-z0-9][A-Za-z0-9._-]{0,63})\s+([\s\S]+)$"
+    r"^\s*@(\S{1,128})\s+([\s\S]+)$"
 )
 GLOBAL_SEARCH = re.compile(r"^\s*(?:找|查找|定位)\s*(.+?)(?:任务)?\s*$")
 
@@ -59,7 +59,8 @@ def conversation(
     connection = store.connect_readonly()
     try:
         project = connection.execute(
-            "SELECT id, created_at FROM projects WHERE id = ?", (project_id,)
+            "SELECT id, display_name, created_at FROM projects WHERE id = ?",
+            (project_id,),
         ).fetchone()
         if not project:
             return {"project": None, "messages": []}
@@ -67,6 +68,7 @@ def conversation(
             """
             SELECT id, role, content, action_json, created_at, processed_at
             FROM messages WHERE project_id = ?
+              AND entry_kind = 'message'
             ORDER BY created_at DESC, rowid DESC LIMIT 50
             """,
             (project_id,),
@@ -98,12 +100,13 @@ def route_global_message(
             """,
             (idempotency_key,),
         ).fetchone()
-        projects = [
-            row["id"]
-            for row in connection.execute(
-                "SELECT id FROM projects WHERE archived_at IS NULL ORDER BY id"
-            )
-        ]
+        project_rows = connection.execute(
+            """
+            SELECT id, display_name FROM projects
+            WHERE archived_at IS NULL ORDER BY created_at, rowid
+            """
+        ).fetchall()
+        projects = [row["id"] for row in project_rows]
     finally:
         connection.close()
     if duplicate:
@@ -122,24 +125,26 @@ def route_global_message(
     )
     explicit_route = bool(explicit_project_id)
     if explicit_project_id:
-        if not PROJECT_ID.fullmatch(explicit_project_id):
-            raise ValueError("invalid project_id")
-        project_id = explicit_project_id
+        project_id = _resolve_project_reference(
+            project_rows, explicit_project_id
+        )
     else:
         prefixed = GLOBAL_ROUTE_PREFIX.fullmatch(content)
         if prefixed:
-            project_id, routed_content = prefixed.groups()
+            reference, routed_content = prefixed.groups()
+            project_id = _resolve_project_reference(project_rows, reference)
             explicit_route = True
         else:
-            named = [
-                project_id
-                for project_id in projects
-                if re.search(
-                    rf"(?<![A-Za-z0-9._-]){re.escape(project_id)}(?![A-Za-z0-9._-])",
+            named = {
+                row["id"]
+                for row in project_rows
+                if row["display_name"] in content
+                or re.search(
+                    rf"(?<![A-Za-z0-9._-]){re.escape(row['id'])}(?![A-Za-z0-9._-])",
                     content,
                 )
-            ]
-            project_id = named[0] if len(named) == 1 else ""
+            }
+            project_id = next(iter(named)) if len(named) == 1 else ""
         if not project_id and search_result:
             matched_projects = {
                 item["project_id"] for item in search_result["results"]
@@ -150,7 +155,7 @@ def route_global_message(
             project_id = projects[0]
         if not project_id:
             raise ValueError(
-                "无法唯一确定项目；请在指令开头写 @project_id，或先明确创建项目"
+                "无法唯一确定项目；请在指令开头写 @项目名称，或先明确创建项目"
             )
     if project_id not in projects and not explicit_route:
         raise ValueError("global Butler can route only to an active project")
@@ -187,6 +192,19 @@ def route_global_message(
     }
 
 
+def _resolve_project_reference(projects, reference: str) -> str:
+    matches = [
+        row["id"]
+        for row in projects
+        if reference in {row["id"], row["display_name"]}
+    ]
+    if not matches and PROJECT_ID.fullmatch(reference):
+        return reference
+    if len(matches) != 1:
+        raise ValueError("project name does not identify one active project")
+    return str(matches[0])
+
+
 def _submit_global_route_reference(
     store: Store, project_id: str, content: str, idempotency_key: str
 ) -> str:
@@ -218,7 +236,8 @@ def sync_conversation_files(store: Store, project_id: str) -> None:
     try:
         rows = connection.execute(
             """
-            SELECT id, project_id, role, content, action_json, created_at, processed_at
+            SELECT id, project_id, role, entry_kind, content, action_json,
+                   created_at, processed_at
             FROM messages WHERE project_id = ?
             ORDER BY created_at DESC, rowid DESC LIMIT 50
             """,
@@ -236,7 +255,7 @@ def sync_conversation_files(store: Store, project_id: str) -> None:
         project_path = project_root / f"{row['id']}.json"
         if not project_path.exists():
             _write_atomic(project_path, body)
-        if row["role"] == "owner":
+        if row["role"] == "owner" and row["entry_kind"] == "message":
             global_body = json.dumps(
                 {
                     "message_id": row["id"],

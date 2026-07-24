@@ -367,7 +367,7 @@ class VerticalSliceTest(unittest.TestCase):
             {item["item_key"] for item in role_snapshot["library"]},
         )
 
-    def test_schema_v5_preserves_terminal_jobs_and_adds_task_schedule(self):
+    def test_schema_v6_preserves_history_and_adds_project_identity(self):
         submit_message(self.store, "migration", "写入 migrated.txt: ok", "migration")
         run_until_idle(self.store)
         connection = self.store.connect()
@@ -415,7 +415,23 @@ class VerticalSliceTest(unittest.TestCase):
         self.store.initialize()
         connection = self.store.connect()
         try:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 5)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 6)
+            project_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(projects)")
+            }
+            self.assertIn("display_name", project_columns)
+            self.assertEqual(
+                connection.execute(
+                    "SELECT display_name FROM projects WHERE id = 'migration'"
+                ).fetchone()["display_name"],
+                "migration",
+            )
+            message_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(messages)")
+            }
+            self.assertIn("entry_kind", message_columns)
             task_columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(tasks)")
             }
@@ -586,7 +602,10 @@ class VerticalSliceTest(unittest.TestCase):
     def test_failed_evidence_converges_to_needs_decision(self):
         with self.store.transaction() as connection:
             connection.execute(
-                "INSERT INTO projects(id, created_at) VALUES ('project-b', ?)",
+                """
+                INSERT INTO projects(id, display_name, created_at)
+                VALUES ('project-b', 'project-b', ?)
+                """,
                 (time.time(),),
             )
             connection.execute(
@@ -1451,7 +1470,7 @@ class VerticalSliceTest(unittest.TestCase):
         self._create_project("archive-me", "archive-create")
         history = conversation(self.db, self.data, "archive-me")
         self.assertEqual(history["project"]["id"], "archive-me")
-        self.assertEqual(history["messages"][0]["content"], "create_project")
+        self.assertEqual(history["messages"], [])
 
         before = self._row_counts()
         state = monitor_snapshot(self.db, self.data)
@@ -1460,7 +1479,7 @@ class VerticalSliceTest(unittest.TestCase):
         self.assertTrue(state["read_only"])
         self.assertEqual(state["database"]["journal_mode"], "wal")
         self.assertEqual(state["database"]["quick_check"], ["ok"])
-        self.assertEqual(state["database"]["schema_version"], 5)
+        self.assertEqual(state["database"]["schema_version"], 6)
 
         archive_project(
             self.store, "archive-me", "archive-me", "archive-confirmed"
@@ -1468,10 +1487,7 @@ class VerticalSliceTest(unittest.TestCase):
         self.assertEqual(tick(self.store)[0]["action"], "archive_project")
         self.assertEqual(projects_snapshot(self.db, self.data)["projects"], [])
         archived_history = conversation(self.db, self.data, "archive-me")
-        self.assertEqual(
-            [item["content"] for item in archived_history["messages"]],
-            ["create_project", "archive_project"],
-        )
+        self.assertEqual(archived_history["messages"], [])
         state = monitor_snapshot(self.db, self.data)
         self.assertEqual(state["summary"]["projects"], 0)
         self.assertEqual(state["summary"]["archived_projects"], 1)
@@ -1490,6 +1506,64 @@ class VerticalSliceTest(unittest.TestCase):
             archive_project(
                 self.store, "archive-me", "archive-me", "archive-rejected"
             )
+
+    def test_chinese_project_name_and_semantic_create_deduplication(self):
+        created = create_project(
+            self.store,
+            None,
+            "chinese-create",
+            "/workspace/review",
+            "审查代码",
+        )
+        self.assertEqual(created["result"], "created")
+        self.assertRegex(created["project_id"], r"^project-[0-9a-f]{32}$")
+        self.assertEqual(tick(self.store)[0]["action"], "create_project")
+
+        project_id = str(created["project_id"])
+        state = projects_snapshot(self.db, self.data)["projects"][0]
+        self.assertEqual(
+            (state["project_id"], state["display_name"], state["host_path"]),
+            (project_id, "审查代码", "/workspace/review"),
+        )
+        connection = self.store.connect_readonly()
+        try:
+            before = connection.execute(
+                "SELECT COUNT(*) FROM messages WHERE project_id = ?", (project_id,)
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        unchanged = create_project(
+            self.store,
+            None,
+            "chinese-repeat",
+            "/workspace/review",
+            "审查代码",
+        )
+        self.assertEqual(
+            unchanged,
+            {
+                "message_id": None,
+                "project_id": project_id,
+                "result": "unchanged",
+            },
+        )
+        connection = self.store.connect_readonly()
+        try:
+            after = connection.execute(
+                "SELECT COUNT(*) FROM messages WHERE project_id = ?", (project_id,)
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        self.assertEqual(after, before)
+        self.assertEqual(conversation(self.db, self.data, project_id)["messages"], [])
+
+        routed = route_global_message(
+            self.store,
+            "@审查代码 写入 review.txt: ok",
+            "chinese-route",
+        )
+        self.assertEqual(routed["project_id"], project_id)
+        self.assertEqual(tick(self.store)[0]["action"], "intake")
 
     def test_global_butler_routes_search_without_creating_a_task(self):
         self._create_project("alpha", "alpha-create")
@@ -3101,7 +3175,8 @@ class VerticalSliceTest(unittest.TestCase):
         starts = [payload for path, payload in requests if path == "/v1/jobs/start"]
         self.assertEqual(starts[-1]["access"], "read")
         self.assertEqual(json.loads(starts[-1]["prompt"])["operation"], "inspect")
-        with self.store.connect_readonly() as connection:
+        connection = self.store.connect_readonly()
+        try:
             self.assertEqual(
                 connection.execute(
                     "SELECT COUNT(*) AS count FROM model_calls WHERE task_id = ?",
@@ -3109,6 +3184,8 @@ class VerticalSliceTest(unittest.TestCase):
                 ).fetchone()["count"],
                 0,
             )
+        finally:
+            connection.close()
 
     def test_rejected_start_is_terminal_not_unknown(self):
         class Bridge(BaseHTTPRequestHandler):
@@ -3298,10 +3375,27 @@ class WebApiTest(unittest.TestCase):
             self.assertIn("[hidden]{display:none!important}", html)
             self.assertIn("项目管家", html)
             self.assertIn("设置与资源库", html)
+            self.assertIn("项目名称", html)
+            self.assertIn("内部稳定 ID 由系统维护", html)
+            self.assertIn("未变化，未重复写入历史", html)
+            self.assertNotIn('id="new-project-id"', html)
             self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
         with urlopen(self.base + "/api/settings-library", timeout=2) as response:
             settings_library = json.load(response)
         self.assertEqual(len(settings_library["library"]), 12)
+
+        status, chinese = self._post(
+            "/api/actions",
+            {
+                "kind": "create_project",
+                "display_name": "审查代码",
+                "host_path": "/workspace/http-review",
+                "idempotency_key": "http-chinese-create",
+            },
+        )
+        self.assertEqual(status, 202)
+        self.assertEqual(chinese["result"], "created")
+        self.assertRegex(chinese["project_id"], r"^project-[0-9a-f]{32}$")
 
         status, _ = self._post(
             "/api/actions",
@@ -3367,7 +3461,12 @@ class WebApiTest(unittest.TestCase):
 
         with urlopen(f"{self.base}/api/projects", timeout=2) as response:
             projects = json.load(response)
-        self.assertEqual(projects["projects"][0]["task_id"], done["task"]["id"])
+        web_project = next(
+            project
+            for project in projects["projects"]
+            if project["project_id"] == "web"
+        )
+        self.assertEqual(web_project["task_id"], done["task"]["id"])
         self.assertNotIn(
             "empty-web", {project["project_id"] for project in projects["projects"]}
         )

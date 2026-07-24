@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS host_jobs (
 SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS projects (
     id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
     host_path TEXT,
     lease_token TEXT,
     lease_fence INTEGER NOT NULL DEFAULT 0,
@@ -54,6 +55,8 @@ CREATE TABLE IF NOT EXISTS messages (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL REFERENCES projects(id),
     role TEXT NOT NULL CHECK (role IN ('owner', 'butler')),
+    entry_kind TEXT NOT NULL DEFAULT 'message'
+        CHECK (entry_kind IN ('message', 'action')),
     content TEXT NOT NULL,
     action_json TEXT,
     idempotency_key TEXT NOT NULL,
@@ -447,6 +450,7 @@ class Store:
             connection.executescript(SCHEMA)
             self._ensure_host_job_schema(connection)
             self._ensure_project_columns(connection)
+            self._ensure_message_columns(connection)
             self._ensure_task_columns(connection)
             self._ensure_model_call_columns(connection)
             connection.execute(
@@ -476,7 +480,7 @@ class Store:
                     (value_json, now, key, value_json),
                 )
             self._sync_default_library(connection, now)
-            connection.execute("PRAGMA user_version = 5")
+            connection.execute("PRAGMA user_version = 6")
             connection.commit()
         finally:
             connection.close()
@@ -557,6 +561,17 @@ class Store:
             connection.execute("ALTER TABLE projects ADD COLUMN archived_at REAL")
         if "host_path" not in columns:
             connection.execute("ALTER TABLE projects ADD COLUMN host_path TEXT")
+        if "display_name" not in columns:
+            connection.execute("ALTER TABLE projects ADD COLUMN display_name TEXT")
+        connection.execute(
+            "UPDATE projects SET display_name = id WHERE display_name IS NULL"
+        )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS projects_display_name_unique
+            ON projects(display_name)
+            """
+        )
 
     @staticmethod
     def _ensure_task_columns(connection: sqlite3.Connection) -> None:
@@ -572,6 +587,33 @@ class Store:
         for name, declaration in additions.items():
             if name not in columns:
                 connection.execute(f"ALTER TABLE tasks ADD COLUMN {name} {declaration}")
+
+    @staticmethod
+    def _ensure_message_columns(connection: sqlite3.Connection) -> None:
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(messages)")
+        }
+        if "entry_kind" not in columns:
+            connection.execute(
+                """
+                ALTER TABLE messages ADD COLUMN entry_kind TEXT NOT NULL
+                DEFAULT 'message' CHECK (entry_kind IN ('message', 'action'))
+                """
+            )
+        connection.execute(
+            """
+            UPDATE messages SET entry_kind = 'action'
+            WHERE role = 'owner' AND action_json IS NOT NULL
+              AND (
+                json_extract(action_json, '$.task_id') IS NOT NULL
+                OR json_extract(action_json, '$.kind') IN (
+                    'create_project', 'restore_project',
+                    'bind_project_workspace', 'archive_project',
+                    'set_project_setting', 'set_project_rule'
+                )
+              )
+            """
+        )
 
     @staticmethod
     def _ensure_model_call_columns(connection: sqlite3.Connection) -> None:

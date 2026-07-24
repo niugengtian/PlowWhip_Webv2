@@ -19,7 +19,8 @@ def snapshot(db_path: str | Path, data_root: str | Path, project_id: str) -> dic
     connection = store.connect_readonly()
     try:
         project = connection.execute(
-            "SELECT host_path FROM projects WHERE id = ?", (project_id,)
+            "SELECT display_name, host_path FROM projects WHERE id = ?",
+            (project_id,),
         ).fetchone()
         tasks = _task_summaries(connection, project_id)
         goals = _goal_summaries(connection, project_id)
@@ -39,6 +40,7 @@ def snapshot(db_path: str | Path, data_root: str | Path, project_id: str) -> dic
         if not task:
             return {
                 "project_id": project_id,
+                "project_name": project["display_name"] if project else project_id,
                 "host_path": project["host_path"] if project else None,
                 "task": None,
                 "events": [],
@@ -48,6 +50,7 @@ def snapshot(db_path: str | Path, data_root: str | Path, project_id: str) -> dic
                 "goals": goals,
             }
         view = _task_view(connection, store, task)
+        view["project_name"] = project["display_name"] if project else project_id
         view["host_path"] = project["host_path"] if project else None
         view["tasks"] = tasks
         view["goals"] = goals
@@ -62,7 +65,7 @@ def projects_snapshot(db_path: str | Path, data_root: str | Path) -> dict:
     try:
         rows = connection.execute(
             """
-            SELECT p.id AS project_id, p.host_path, p.created_at,
+            SELECT p.id AS project_id, p.display_name, p.host_path, p.created_at,
                    t.id AS task_id, t.public_status, t.phase,
                    t.spec_revision, t.outcome, t.updated_at
             FROM projects p
@@ -168,9 +171,11 @@ def token_snapshot(db_path: str | Path, data_root: str | Path) -> dict:
                    COALESCE(call.model, call.provider_key) AS model,
                    call.usage_kind, call.input_tokens,
                    call.cached_input_tokens, call.output_tokens, call.created_at,
-                   task.project_id, session.worker_id, worker.role_key AS worker_role
+                   task.project_id, project.display_name,
+                   session.worker_id, worker.role_key AS worker_role
             FROM model_calls call
             JOIN tasks task ON task.id = call.task_id
+            JOIN projects project ON project.id = task.project_id
             JOIN task_sessions session ON session.id = call.task_session_id
             JOIN workers worker ON worker.id = session.worker_id
             ORDER BY call.created_at, call.rowid
@@ -199,8 +204,10 @@ def token_snapshot(db_path: str | Path, data_root: str | Path) -> dict:
         "all_history": _usage_totals(calls),
         "today": {"date": today.isoformat(), **_usage_totals(today_calls)},
         "trend": trend,
-        "projects": _group_calls(calls, ("project_id",)),
-        "today_projects": _group_calls(today_calls, ("project_id",)),
+        "projects": _group_calls(calls, ("project_id", "display_name")),
+        "today_projects": _group_calls(
+            today_calls, ("project_id", "display_name")
+        ),
         "tasks": _group_calls(calls, ("task_id", "project_id")),
         "models": _group_calls(calls, ("model", "provider_key")),
         "sessions": _group_calls(
@@ -223,7 +230,8 @@ def monitor_snapshot(db_path: str | Path, data_root: str | Path) -> dict:
             statuses[row["public_status"]] = row["count"]
         projects = connection.execute(
             """
-            SELECT project.id AS project_id, project.host_path, project.archived_at,
+            SELECT project.id AS project_id, project.display_name,
+                   project.host_path, project.archived_at,
                    task.id AS task_id, task.public_status,
                    task.phase, task.updated_at
             FROM projects project
@@ -397,7 +405,8 @@ def _task_view(connection, store: Store, task) -> dict:
         "SELECT objective FROM goals WHERE id = ?", (task["goal_id"],)
     ).fetchone()
     project = connection.execute(
-        "SELECT host_path FROM projects WHERE id = ?", (task["project_id"],)
+        "SELECT display_name, host_path FROM projects WHERE id = ?",
+        (task["project_id"],),
     ).fetchone()
     events = connection.execute(
         """
@@ -488,6 +497,9 @@ def _task_view(connection, store: Store, task) -> dict:
             break
     return {
         "project_id": task["project_id"],
+        "project_name": (
+            project["display_name"] if project else task["project_id"]
+        ),
         "host_path": project["host_path"] if project else None,
         "objective": goal["objective"] if goal else None,
         "task": dict(task),

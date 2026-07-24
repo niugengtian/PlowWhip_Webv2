@@ -1094,9 +1094,14 @@ def _apply_project_action(
         connection.execute(
             """
             UPDATE projects SET archived_at = NULL,
+                display_name = COALESCE(?, display_name),
                 host_path = COALESCE(?, host_path) WHERE id = ?
             """,
-            (action.get("host_path"), message["project_id"]),
+            (
+                action.get("display_name"),
+                action.get("host_path"),
+                message["project_id"],
+            ),
         )
     elif kind == "archive_project":
         if action.get("confirmation") != message["project_id"]:

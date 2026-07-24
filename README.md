@@ -76,8 +76,9 @@ append-only Cold Session segment manifests. Native compact policy/events and
 non-native generation rotation use the same frozen thresholds. Project numeric
 settings, Provider order and Project rules are validated, queued as actions,
 applied only by `advance_project`, and frozen with their source into newly-created
-TaskSessions. Visible project creation, restore, workspace binding and archive
-also pass through the same action queue.
+TaskSessions. Human-visible Unicode project names are separate from safe internal
+IDs. Creation, restore, workspace/name binding and archive pass through the same
+action queue; an unchanged create request returns without adding history.
 
 Executor, Planner and Checker calls use stable HostJob IDs with
 start/status/output reconciliation outside SQLite write transactions. A restart
@@ -115,7 +116,8 @@ name used by its standalone installer. A first Cursor job creates one chat
 session before invoking `--resume`; later retries of the same Task reuse that
 physical session.
 
-The global Butler accepts an optional Project ID or an `@project-id` prefix. An
+The global Butler accepts a selected Project or an `@项目名称` prefix. Safe
+internal IDs remain accepted for existing API clients. An
 exact search such as `找 result.txt 任务` routes to a unique Project without
 creating a Task. Project conversation files are bounded projections; global
 conversation files contain only transfer references, while SQLite remains the
@@ -140,7 +142,7 @@ selection, one Butler question, scoped authorization and serial DAG
 materialization. Durable HostJob tests also prove that Executor, Planner and
 Checker waits release SQLite, different projects advance concurrently, all three
 model roles recover across restart and fall back by generation, and terminal
-jobs migrate to schema v5 without loss. A real loopback HTTP test also runs the
+jobs migrate to schema v6 without loss. A real loopback HTTP test also runs the
 restricted Host Bridge against a local fake executable to prove authentication,
 root/executable guards, durable idempotent start, bounded output, cancellation,
 restart reconciliation, and zero-secret state. The suite also covers deadline stopping,

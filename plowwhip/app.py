@@ -134,6 +134,7 @@ class Handler(BaseHTTPRequestHandler):
             body = self._body()
             store = self.server.store  # type: ignore[attr-defined]
             path = urlsplit(self.path).path
+            action_result = None
             if path == "/api/messages":
                 routed = route_global_message(
                     store,
@@ -144,12 +145,14 @@ class Handler(BaseHTTPRequestHandler):
                 identifier = routed["message_id"]
             elif path == "/api/actions":
                 if body.get("kind") == "create_project":
-                    identifier = create_project(
+                    action_result = create_project(
                         store,
-                        body["project_id"],
+                        body.get("project_id"),
                         body["idempotency_key"],
                         body.get("host_path"),
+                        body.get("display_name"),
                     )
+                    identifier = action_result["message_id"]
                 elif body.get("kind") == "archive_project":
                     identifier = archive_project(
                         store,
@@ -193,6 +196,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send(500, {"error": "store_error"})
             return
         response = {"message_id": identifier}
+        if action_result:
+            response.update(
+                {
+                    "project_id": action_result["project_id"],
+                    "result": action_result["result"],
+                }
+            )
         if path == "/api/messages":
             response.update(
                 {

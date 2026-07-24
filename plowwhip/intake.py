@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import time
+import unicodedata
 from pathlib import PurePosixPath
 from uuid import uuid4
 
@@ -86,10 +87,10 @@ def submit_message(
         if not project:
             connection.execute(
                 """
-                INSERT INTO projects(id, archived_at, created_at)
-                VALUES (?, ?, ?)
+                INSERT INTO projects(id, display_name, archived_at, created_at)
+                VALUES (?, ?, ?, ?)
                 """,
-                (project_id, now, now),
+                (project_id, project_id, now, now),
             )
         elif project["archived_at"] is not None:
             pending_intake = connection.execute(
@@ -119,28 +120,56 @@ def submit_message(
 
 def create_project(
     store: Store,
-    project_id: str,
+    project_id: str | None,
     idempotency_key: str,
     host_path: str | None = None,
-) -> str:
-    _validate_project_action(project_id, idempotency_key)
+    display_name: str | None = None,
+) -> dict[str, object]:
+    _validate_idempotency_key(idempotency_key)
+    if project_id is not None and not PROJECT_ID.fullmatch(project_id):
+        raise ValueError("project_id must be 1-64 safe identifier characters")
+    name = _normalize_project_name(display_name or project_id)
     workspace = _normalize_host_path(host_path)
     now = time.time()
     action_id = uuid4().hex
     with store.transaction() as connection:
         duplicate = connection.execute(
-            "SELECT id FROM messages WHERE project_id = ? AND idempotency_key = ?",
-            (project_id, idempotency_key),
+            """
+            SELECT id, project_id, action_json FROM messages
+            WHERE idempotency_key = ?
+              AND json_extract(action_json, '$.kind') IN (
+                  'create_project', 'restore_project', 'bind_project_workspace'
+              )
+            ORDER BY created_at LIMIT 1
+            """,
+            (idempotency_key,),
         ).fetchone()
         if duplicate:
-            return str(duplicate["id"])
+            kind = json.loads(duplicate["action_json"])["kind"]
+            return {
+                "message_id": str(duplicate["id"]),
+                "project_id": str(duplicate["project_id"]),
+                "result": _project_action_result(kind),
+            }
         existing = connection.execute(
-            "SELECT id, host_path, archived_at FROM projects WHERE id = ?", (project_id,)
+            """
+            SELECT id, display_name, host_path, archived_at FROM projects
+            WHERE (? IS NOT NULL AND id = ?) OR display_name = ?
+            ORDER BY CASE WHEN id = ? THEN 0 ELSE 1 END LIMIT 1
+            """,
+            (project_id, project_id, name, project_id),
         ).fetchone()
+        project_id = str(existing["id"]) if existing else project_id or f"project-{uuid4().hex}"
+        name_owner = connection.execute(
+            "SELECT id FROM projects WHERE display_name = ? AND id != ?",
+            (name, project_id),
+        ).fetchone()
+        if name_owner:
+            raise ValueError("project name is already in use")
         pending = (
             connection.execute(
                 """
-                SELECT id FROM messages
+                SELECT id, action_json FROM messages
                 WHERE project_id = ? AND processed_at IS NULL
                   AND json_extract(action_json, '$.kind') IN (
                       'create_project', 'restore_project',
@@ -154,46 +183,77 @@ def create_project(
             else None
         )
         if pending:
-            return str(pending["id"])
+            kind = json.loads(pending["action_json"])["kind"]
+            if kind == "archive_project":
+                raise ValueError("project archive is still pending")
+            return {
+                "message_id": str(pending["id"]),
+                "project_id": project_id,
+                "result": _project_action_result(kind),
+            }
         if existing and existing["archived_at"] is None:
-            kind = (
-                "bind_project_workspace"
-                if workspace and workspace != existing["host_path"]
-                else "create_project"
+            changed = (
+                name != existing["display_name"]
+                or (workspace is not None and workspace != existing["host_path"])
             )
-            if kind == "bind_project_workspace" and connection.execute(
-                "SELECT 1 FROM tasks WHERE project_id = ? AND outcome IS NULL LIMIT 1",
-                (project_id,),
-            ).fetchone():
+            if not changed:
+                return {
+                    "message_id": None,
+                    "project_id": project_id,
+                    "result": "unchanged",
+                }
+            kind = "bind_project_workspace"
+            if (
+                workspace is not None
+                and workspace != existing["host_path"]
+                and connection.execute(
+                    """
+                    SELECT 1 FROM tasks
+                    WHERE project_id = ? AND outcome IS NULL LIMIT 1
+                    """,
+                    (project_id,),
+                ).fetchone()
+            ):
                 raise ValueError("active project workspace cannot be changed")
         elif existing:
             kind = "restore_project"
         else:
             connection.execute(
                 """
-                INSERT INTO projects(id, host_path, archived_at, created_at)
-                VALUES (?, NULL, ?, ?)
+                INSERT INTO projects(
+                    id, display_name, host_path, archived_at, created_at
+                ) VALUES (?, ?, NULL, ?, ?)
                 """,
-                (project_id, now, now),
+                (project_id, name, now, now),
             )
             kind = "create_project"
         connection.execute(
             """
             INSERT INTO messages(
-                id, project_id, role, content, action_json,
+                id, project_id, role, entry_kind, content, action_json,
                 idempotency_key, created_at
-            ) VALUES (?, ?, 'owner', ?, ?, ?, ?)
+            ) VALUES (?, ?, 'owner', 'action', ?, ?, ?, ?)
             """,
             (
                 action_id,
                 project_id,
                 kind,
-                canonical_json({"kind": kind, "host_path": workspace}),
+                canonical_json(
+                    {
+                        "kind": kind,
+                        "display_name": name,
+                        "host_path": workspace,
+                    }
+                ),
                 idempotency_key,
                 now,
             ),
         )
-    return action_id
+    return {
+        "message_id": action_id,
+        "project_id": project_id,
+        "result": _project_action_result(kind),
+    }
 
 
 def archive_project(
@@ -237,9 +297,9 @@ def archive_project(
         connection.execute(
             """
             INSERT INTO messages(
-                id, project_id, role, content, action_json,
+                id, project_id, role, entry_kind, content, action_json,
                 idempotency_key, created_at
-            ) VALUES (?, ?, 'owner', 'archive_project', ?, ?, ?)
+            ) VALUES (?, ?, 'owner', 'action', 'archive_project', ?, ?, ?)
             """,
             (
                 action_id,
@@ -286,9 +346,9 @@ def set_project_setting(
         connection.execute(
             """
             INSERT OR IGNORE INTO messages(
-                id, project_id, role, content, action_json,
+                id, project_id, role, entry_kind, content, action_json,
                 idempotency_key, created_at
-            ) VALUES (?, ?, 'owner', ?, ?, ?, ?)
+            ) VALUES (?, ?, 'owner', 'action', ?, ?, ?, ?)
             """,
             (
                 message_id,
@@ -335,9 +395,9 @@ def set_project_rule(
         connection.execute(
             """
             INSERT OR IGNORE INTO messages(
-                id, project_id, role, content, action_json,
+                id, project_id, role, entry_kind, content, action_json,
                 idempotency_key, created_at
-            ) VALUES (?, ?, 'owner', ?, ?, ?, ?)
+            ) VALUES (?, ?, 'owner', 'action', ?, ?, ?, ?)
             """,
             (
                 message_id,
@@ -382,8 +442,34 @@ def _validate_provider_order(value: object) -> None:
 def _validate_project_action(project_id: str, idempotency_key: str) -> None:
     if not PROJECT_ID.fullmatch(project_id):
         raise ValueError("project_id must be 1-64 safe identifier characters")
+    _validate_idempotency_key(idempotency_key)
+
+
+def _validate_idempotency_key(idempotency_key: str) -> None:
     if not idempotency_key or len(idempotency_key) > 128:
         raise ValueError("idempotency_key must contain 1-128 characters")
+
+
+def _normalize_project_name(value: str | None) -> str:
+    if not isinstance(value, str):
+        raise ValueError("project name is required")
+    name = unicodedata.normalize("NFKC", value).strip()
+    if (
+        not name
+        or len(name) > 128
+        or len(name.encode()) > 256
+        or any(character in "\0\r\n" for character in name)
+    ):
+        raise ValueError("project name must contain 1-128 safe display characters")
+    return name
+
+
+def _project_action_result(kind: str) -> str:
+    return {
+        "create_project": "created",
+        "restore_project": "restored",
+        "bind_project_workspace": "bound",
+    }[kind]
 
 
 def _normalize_host_path(value: str | None) -> str | None:
@@ -651,9 +737,9 @@ def submit_action(
         connection.execute(
             """
             INSERT INTO messages(
-                id, project_id, role, content, action_json,
+                id, project_id, role, entry_kind, content, action_json,
                 idempotency_key, created_at
-            ) VALUES (?, ?, 'owner', ?, ?, ?, ?)
+            ) VALUES (?, ?, 'owner', 'action', ?, ?, ?, ?)
             """,
             (
                 message_id,
