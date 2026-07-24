@@ -12,6 +12,7 @@ from plowwhip.git_publish_worker import (
     _safe_tracked_tree,
     _ssh_command,
     _validated_spec,
+    inspect as inspect_publish,
     publish,
 )
 
@@ -82,6 +83,18 @@ class GitPublishWorkerTest(unittest.TestCase):
         spec["authorization"]["expected_remote_head"] = "c" * 40
         with self.assertRaisesRegex(PublishError, "remote SHA"):
             _validated_spec(json.dumps(spec).encode())
+        inspected = _validated_spec(
+            json.dumps(
+                {
+                    "kind": "git_publish",
+                    "operation": "inspect",
+                    "remote_ssh": remote,
+                    "branch": "blue",
+                    "expected_head": self.head,
+                }
+            ).encode()
+        )
+        self.assertEqual(inspected["operation"], "inspect")
 
         (self.project / ".env").write_text("SECRET=value\n", encoding="utf-8")
         self._git("add", ".env")
@@ -108,6 +121,47 @@ class GitPublishWorkerTest(unittest.TestCase):
         self.assertTrue(result["secret_scan_passed"])
         self.assertTrue(result["pushed"])
         self.assertEqual(result["local_head"], self.head)
+        self.assertEqual(result["remote_head"], self.head)
+        remote_head = subprocess.run(
+            ["git", "--git-dir", str(bare), "rev-parse", "refs/heads/blue"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        self.assertEqual(remote_head, self.head)
+
+    def test_inspection_reads_heads_without_pushing(self):
+        bare = self.root / "remote.git"
+        subprocess.run(
+            ["git", "init", "--bare", str(bare)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        publish(
+            self.project,
+            {
+                "remote_ssh": str(bare),
+                "branch": "blue",
+                "expected_head": self.head,
+            },
+        )
+        (self.project / "LOCAL.md").write_text("local\n", encoding="utf-8")
+        self._git("add", "LOCAL.md")
+        self._git("commit", "-m", "local only")
+        local_head = self._git("rev-parse", "HEAD").stdout.strip()
+        result = inspect_publish(
+            self.project,
+            {
+                "remote_ssh": str(bare),
+                "branch": "blue",
+                "expected_head": local_head,
+            },
+        )
+        self.assertEqual(result["kind"], "git_publish_inspection")
+        self.assertEqual(result["relationship"], "different")
+        self.assertFalse(result["external_write"])
+        self.assertEqual(result["local_head"], local_head)
         self.assertEqual(result["remote_head"], self.head)
         remote_head = subprocess.run(
             ["git", "--git-dir", str(bare), "rev-parse", "refs/heads/blue"],

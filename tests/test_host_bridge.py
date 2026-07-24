@@ -407,6 +407,36 @@ else:
         self.assertEqual(status, 200)
         self.assertTrue(result["available"])
         self.assertIn("plowwhip-git-publish", result["detail"])
+        inspect_argv = _execution_argv(
+            "git-publish",
+            "python",
+            self.project,
+            None,
+            json.dumps({"kind": "git_publish", "operation": "inspect"}),
+            "read",
+            {},
+        )
+        self.assertTrue(inspect_argv[-1].endswith("git_publish_worker.py"))
+        with self.assertRaisesRegex(ValueError, "requires read access"):
+            _execution_argv(
+                "git-publish",
+                "python",
+                self.project,
+                None,
+                json.dumps({"kind": "git_publish", "operation": "inspect"}),
+                "write",
+                {},
+            )
+        with self.assertRaisesRegex(ValueError, "requires write access"):
+            _execution_argv(
+                "git-publish",
+                "python",
+                self.project,
+                None,
+                json.dumps({"kind": "git_publish", "operation": "publish"}),
+                "read",
+                {},
+            )
 
     def test_host_jobs_inherit_only_the_ssh_agent_socket_not_key_material(self):
         with patch.dict(

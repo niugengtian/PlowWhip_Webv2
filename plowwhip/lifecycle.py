@@ -659,6 +659,88 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
         )
         event, detail = "rerun", {"message_id": message["id"]}
     elif (
+        kind == "refresh_git_publish_context"
+        and task["public_status"] == "needs_decision"
+        and task["outcome"] is None
+    ):
+        spec = json.loads(task["spec_json"])
+        revision = int(action.get("next_spec_revision") or 0)
+        active_job = connection.execute(
+            """
+            SELECT 1 FROM host_jobs
+            WHERE task_id = ? AND status IN ('dispatching', 'running', 'cancelling')
+            LIMIT 1
+            """,
+            (task["id"],),
+        ).fetchone()
+        valid = bool(
+            spec.get("kind") == "git_publish"
+            and not active_job
+            and action.get("previous_spec_revision") == task["spec_revision"]
+            and revision == task["spec_revision"] + 1
+        )
+        revised = {
+            **spec,
+            "operation": "inspect",
+            "workspace_change_required": False,
+        }
+        revised.pop("authorization", None)
+        revised.pop("expected_remote_head", None)
+        revised.pop("publish_mode", None)
+        (
+            supported,
+            revised,
+            role_key,
+            provider_key,
+            checker_role,
+            checker_provider,
+            reason,
+        ) = _runtime_contract(connection, task["project_id"], revised)
+        if valid and supported:
+            ensure_task_sessions(
+                connection,
+                task["project_id"],
+                task["id"],
+                now,
+                executor_role=role_key,
+                checker_role=checker_role,
+                executor_provider=provider_key,
+                checker_provider=checker_provider,
+                settings_overrides={role_key: {"retry_count": 0}},
+            )
+            connection.execute(
+                """
+                UPDATE tasks SET spec_revision = ?, spec_json = ?,
+                    public_status = 'pending', phase = 'execute',
+                    wait_reason = NULL, fault_code = NULL, retry_count = 0,
+                    next_retry_at = NULL, next_action_at = ?,
+                    next_action_kind = 'execute', role_key = ?,
+                    checker_role_key = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    revision,
+                    canonical_json(revised),
+                    now,
+                    role_key,
+                    checker_role,
+                    now,
+                    task["id"],
+                ),
+            )
+            event = "git_publish_context_refresh_requested"
+            detail = {
+                "message_id": message["id"],
+                "spec_revision": revision,
+                "external_write": False,
+            }
+        else:
+            event = "decision_rejected"
+            detail = {
+                "message_id": message["id"],
+                "reason": reason or "stale_git_publish_context_refresh",
+            }
+    elif (
         kind in {"publish_new_branch", "force_publish_with_lease"}
         and task["public_status"] == "needs_decision"
         and task["outcome"] is None
@@ -667,6 +749,8 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
         authorization = action.get("authorization")
         revised = {
             **spec,
+            "operation": "publish",
+            "workspace_change_required": True,
             "branch": action.get("branch"),
             "publish_mode": action.get("publish_mode"),
             "authorization": authorization,
@@ -685,12 +769,30 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
             reason,
         ) = _runtime_contract(connection, task["project_id"], revised)
         revision = int(action.get("next_spec_revision") or 0)
+        context_row = connection.execute(
+            """
+            SELECT detail_json FROM task_events
+            WHERE id = ? AND task_id = ? AND kind = 'git_publish_needs_decision'
+            """,
+            (action.get("decision_context_event_id"), task["id"]),
+        ).fetchone()
+        context = json.loads(context_row["detail_json"]) if context_row else {}
         valid = bool(
             spec.get("kind") == "git_publish"
             and action.get("previous_spec_revision") == task["spec_revision"]
             and revision == task["spec_revision"] + 1
             and isinstance(authorization, dict)
             and authorization.get("spec_revision") == revision
+            and authorization.get("source_decision_event_id")
+            == action.get("decision_context_event_id")
+            and authorization.get("expected_head") == context.get("local_head")
+            and context.get("complete") is True
+            and context.get("spec_revision") == task["spec_revision"]
+            and kind in context.get("allowed_decisions", [])
+            and (
+                kind != "force_publish_with_lease"
+                or action.get("expected_remote_head") == context.get("remote_head")
+            )
         )
         if supported and valid:
             ensure_task_sessions(
@@ -1958,6 +2060,20 @@ def _runtime_contract(
             or (project["host_path"] if project else "")
             or ""
         )
+        if spec.get("operation") == "inspect":
+            return (
+                bool(project_path),
+                {**spec, "project_path": project_path},
+                "git_publisher",
+                "git_publish",
+                "deterministic_checker",
+                "local",
+                (
+                    None
+                    if project_path
+                    else "project workspace is not bound; set an absolute Host Bridge path"
+                ),
+            )
         authorization = spec.get("authorization")
         publish_mode = str(spec.get("publish_mode") or "fast_forward")
         expected_scope = (
@@ -1984,6 +2100,13 @@ def _runtime_contract(
                 )
             )
             and float(authorization.get("expires_at") or 0) >= time.time()
+            and (
+                int(authorization.get("spec_revision") or 0) <= 1
+                or (
+                    isinstance(authorization.get("expected_head"), str)
+                    and len(authorization["expected_head"]) == 40
+                )
+            )
         )
         if project_path and authorized:
             return (

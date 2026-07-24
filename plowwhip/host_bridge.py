@@ -700,8 +700,15 @@ def _execution_argv(
     context: dict[str, object],
 ) -> list[str]:
     if adapter == "git-publish":
-        if access != "write":
-            raise ValueError("Git publish requires external-write access")
+        try:
+            operation = json.loads(prompt).get("operation", "publish")
+        except (AttributeError, json.JSONDecodeError) as error:
+            raise ValueError("Git publish prompt is invalid") from error
+        expected_access = "read" if operation == "inspect" else "write"
+        if access != expected_access:
+            raise ValueError(
+                f"Git {operation} requires {expected_access} access"
+            )
         return [executable, str(_git_publish_script())]
     if adapter == "codex":
         sandbox = "read-only" if access == "read" else "workspace-write"

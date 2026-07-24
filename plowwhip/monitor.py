@@ -475,11 +475,23 @@ def _task_view(connection, store: Store, task) -> dict:
         if job and job["output_ref"]
         else []
     )
+    decision_context = None
+    for event in events:
+        if event["kind"] != "git_publish_needs_decision":
+            continue
+        try:
+            candidate = json.loads(event["detail_json"])
+        except json.JSONDecodeError:
+            continue
+        if candidate.get("spec_revision") == task["spec_revision"]:
+            decision_context = candidate
+            break
     return {
         "project_id": task["project_id"],
         "host_path": project["host_path"] if project else None,
         "objective": goal["objective"] if goal else None,
         "task": dict(task),
+        "decision_context": decision_context,
         "events": [dict(event) for event in events],
         "artifacts": [
             {

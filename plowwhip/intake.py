@@ -417,6 +417,7 @@ def submit_action(
         "authorize",
         "cancel",
         "confirm_not_executed",
+        "refresh_git_publish_context",
         "publish_new_branch",
         "force_publish_with_lease",
         "rerun",
@@ -424,7 +425,7 @@ def submit_action(
     }:
         raise ValueError(
             "supported actions: provide_decision, provide_plan, authorize, cancel, "
-            "confirm_not_executed, publish_new_branch, "
+            "confirm_not_executed, refresh_git_publish_context, publish_new_branch, "
             "force_publish_with_lease, rerun, wake"
         )
     if kind == "provide_decision" and not instruction:
@@ -503,7 +504,11 @@ def submit_action(
                 "plan_id": proposal["id"],
                 "plan_revision": proposal["revision"],
             }
-        if kind in {"publish_new_branch", "force_publish_with_lease"}:
+        if kind in {
+            "refresh_git_publish_context",
+            "publish_new_branch",
+            "force_publish_with_lease",
+        }:
             spec = json.loads(task["spec_json"])
             active_job = connection.execute(
                 """
@@ -521,11 +526,44 @@ def submit_action(
                 or active_job
             ):
                 raise ValueError("Git publish recovery is not allowed for current task")
+            if kind == "refresh_git_publish_context":
+                action = {
+                    "kind": kind,
+                    "task_id": task_id,
+                    "previous_spec_revision": task["spec_revision"],
+                    "next_spec_revision": task["spec_revision"] + 1,
+                }
+            else:
+                context_row = connection.execute(
+                    """
+                    SELECT id, detail_json FROM task_events
+                    WHERE task_id = ? AND kind = 'git_publish_needs_decision'
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (task_id,),
+                ).fetchone()
+                context = (
+                    json.loads(context_row["detail_json"]) if context_row else {}
+                )
+                decision = kind
+                if not (
+                    context_row
+                    and context.get("complete") is True
+                    and context.get("spec_revision") == task["spec_revision"]
+                    and decision in context.get("allowed_decisions", [])
+                    and GIT_SHA.fullmatch(str(context.get("local_head") or ""))
+                    and GIT_SHA.fullmatch(str(context.get("remote_head") or ""))
+                ):
+                    raise ValueError(
+                        "refresh Git publish reason and evidence before authorization"
+                    )
             branch = str(spec.get("branch") or "")
             publish_mode = "fast_forward"
             expected_remote_head = None
             action_kind = "git_publish"
-            if kind == "publish_new_branch":
+            if kind == "refresh_git_publish_context":
+                pass
+            elif kind == "publish_new_branch":
                 branch = instruction.strip()
                 if (
                     not GIT_BRANCH.fullmatch(branch)
@@ -544,28 +582,36 @@ def submit_action(
                         "force_publish_with_lease requires the exact "
                         "40-character remote SHA"
                     )
+                if expected_remote_head != context["remote_head"]:
+                    raise ValueError(
+                        "force_publish_with_lease SHA must match the displayed evidence"
+                    )
                 publish_mode = "force_with_lease"
                 action_kind = "git_publish_force_with_lease"
-            target_scope = f"{spec.get('remote_ssh')}#refs/heads/{branch}"
-            action = {
-                "kind": kind,
-                "task_id": task_id,
-                "previous_spec_revision": task["spec_revision"],
-                "next_spec_revision": task["spec_revision"] + 1,
-                "branch": branch,
-                "publish_mode": publish_mode,
-                "expected_remote_head": expected_remote_head,
-                "authorization": {
-                    "source_message_id": message_id,
-                    "project_id": project_id,
+            if kind != "refresh_git_publish_context":
+                target_scope = f"{spec.get('remote_ssh')}#refs/heads/{branch}"
+                action = {
+                    "kind": kind,
                     "task_id": task_id,
-                    "spec_revision": task["spec_revision"] + 1,
-                    "action_kind": action_kind,
-                    "target_scope": target_scope,
+                    "previous_spec_revision": task["spec_revision"],
+                    "next_spec_revision": task["spec_revision"] + 1,
+                    "decision_context_event_id": context_row["id"],
+                    "branch": branch,
+                    "publish_mode": publish_mode,
                     "expected_remote_head": expected_remote_head,
-                    "expires_at": now + 900,
-                },
-            }
+                    "authorization": {
+                        "source_message_id": message_id,
+                        "source_decision_event_id": context_row["id"],
+                        "project_id": project_id,
+                        "task_id": task_id,
+                        "spec_revision": task["spec_revision"] + 1,
+                        "action_kind": action_kind,
+                        "target_scope": target_scope,
+                        "expected_head": context["local_head"],
+                        "expected_remote_head": expected_remote_head,
+                        "expires_at": now + 900,
+                    },
+                }
         allowed = (
             kind == "provide_decision"
             and task["public_status"] == "needs_decision"
@@ -585,7 +631,12 @@ def submit_action(
             and task["fault_code"] == "unsafe_unknown"
             and task["outcome"] is None
         ) or (
-            kind in {"publish_new_branch", "force_publish_with_lease"}
+            kind
+            in {
+                "refresh_git_publish_context",
+                "publish_new_branch",
+                "force_publish_with_lease",
+            }
             and task["public_status"] == "needs_decision"
             and task["outcome"] is None
         ) or (

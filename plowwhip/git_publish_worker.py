@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 
 
-VERSION = "plowwhip-git-publish 2"
+VERSION = "plowwhip-git-publish 3"
 MAX_SPEC_BYTES = 65_536
 MAX_SCAN_BYTES = 64 * 1_048_576
 REMOTE = re.compile(
@@ -93,6 +93,7 @@ def _validated_spec(raw: bytes) -> dict[str, object]:
     remote = str(value.get("remote_ssh") or "")
     branch = str(value.get("branch") or "")
     expected_head = str(value.get("expected_head") or "")
+    operation = str(value.get("operation") or "publish")
     publish_mode = str(value.get("publish_mode") or "fast_forward")
     expected_remote_head = str(value.get("expected_remote_head") or "")
     authorization = value.get("authorization")
@@ -107,6 +108,11 @@ def _validated_spec(raw: bytes) -> dict[str, object]:
         raise PublishError("branch is invalid")
     if not re.fullmatch(r"[0-9a-f]{40}", expected_head):
         raise PublishError("expected_head must be a full Git commit SHA")
+    if operation not in {"inspect", "publish"}:
+        raise PublishError("operation is invalid")
+    value["operation"] = operation
+    if operation == "inspect":
+        return value
     if publish_mode not in {"fast_forward", "force_with_lease"}:
         raise PublishError("publish_mode is invalid")
     scope = f"{remote}#refs/heads/{branch}"
@@ -135,6 +141,34 @@ def _validated_spec(raw: bytes) -> dict[str, object]:
         raise PublishError("force-with-lease authorization is missing the remote SHA")
     value["publish_mode"] = publish_mode
     return value
+
+
+def inspect(cwd: Path, spec: dict[str, object]) -> dict[str, object]:
+    inside = _git(cwd, "rev-parse", "--is-inside-work-tree").stdout.strip()
+    if inside != "true":
+        raise PublishError("workspace is not a Git repository")
+    local_head = _git(cwd, "rev-parse", "HEAD").stdout.strip()
+    if local_head != spec["expected_head"]:
+        raise PublishError(
+            "workspace HEAD changed before inspection",
+            "local_head_changed",
+            expected_head=spec["expected_head"],
+            local_head=local_head,
+        )
+    remote = str(spec["remote_ssh"])
+    branch = str(spec["branch"])
+    lines = _git(cwd, "ls-remote", remote, f"refs/heads/{branch}").stdout.splitlines()
+    remote_head = lines[0].split()[0] if lines else ""
+    return {
+        "kind": "git_publish_inspection",
+        "remote_ssh": remote,
+        "branch": branch,
+        "local_head": local_head,
+        "remote_head": remote_head,
+        "branch_exists": bool(remote_head),
+        "relationship": "match" if remote_head == local_head else "different",
+        "external_write": False,
+    }
 
 
 def _safe_tracked_tree(cwd: Path) -> dict[str, int | bool]:
@@ -201,6 +235,7 @@ def publish(cwd: Path, spec: dict[str, object]) -> dict[str, object]:
                 "remote branch moved after the owner decision",
                 "lease_mismatch",
                 branch=branch,
+                local_head=local_head,
                 expected_remote_head=expected_remote_head,
                 remote_head=previous_remote_head,
             )
@@ -255,7 +290,11 @@ def main() -> int:
         return 0
     try:
         spec = _validated_spec(sys.stdin.buffer.read(MAX_SPEC_BYTES + 1))
-        result = publish(Path.cwd(), spec)
+        result = (
+            inspect(Path.cwd(), spec)
+            if spec["operation"] == "inspect"
+            else publish(Path.cwd(), spec)
+        )
     except (OSError, PublishError, subprocess.TimeoutExpired) as error:
         failure = {
             "kind": "git_publish",

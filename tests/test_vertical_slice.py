@@ -2842,6 +2842,14 @@ class VerticalSliceTest(unittest.TestCase):
         new_view = snapshot(self.db, self.data, "new-branch")
         self.assertEqual(new_view["task"]["fault_code"], "scope")
         self.assertIn(remote_head, new_view["task"]["wait_reason"])
+        self.assertTrue(new_view["decision_context"]["complete"])
+        self.assertEqual(
+            new_view["decision_context"]["reason_code"],
+            "remote_history_conflict",
+        )
+        self.assertEqual(new_view["decision_context"]["local_head"], head)
+        self.assertEqual(new_view["decision_context"]["remote_head"], remote_head)
+        self.assertEqual(len(new_view["decision_context"]["options"]), 2)
         self.assertEqual(
             json.loads(new_view["events"][0]["detail_json"])["remote_head"],
             remote_head,
@@ -2865,6 +2873,10 @@ class VerticalSliceTest(unittest.TestCase):
             recovered_spec["authorization"]["target_scope"],
             "git@github.com:niugengtian/PlowWhip_Webv2.git#refs/heads/blue-v1",
         )
+        self.assertEqual(recovered_spec["authorization"]["expected_head"], head)
+        self.assertIsInstance(
+            recovered_spec["authorization"]["source_decision_event_id"], int
+        )
         with self.store.transaction() as connection:
             connection.execute(
                 "UPDATE tasks SET next_action_at = NULL WHERE id = ?",
@@ -2880,6 +2892,15 @@ class VerticalSliceTest(unittest.TestCase):
                 "force_publish_with_lease",
                 "short",
                 "bad-lease",
+            )
+        with self.assertRaisesRegex(ValueError, "match the displayed evidence"):
+            submit_action(
+                self.store,
+                "force-lease",
+                force_view["task"]["id"],
+                "force_publish_with_lease",
+                "e" * 40,
+                "wrong-valid-lease",
             )
         submit_action(
             self.store,
@@ -2901,6 +2922,164 @@ class VerticalSliceTest(unittest.TestCase):
             forced_spec["authorization"]["action_kind"],
             "git_publish_force_with_lease",
         )
+
+    def test_legacy_git_failure_requires_read_only_context_before_authorization(self):
+        local_head = "a" * 40
+        remote_head = "b" * 40
+        operations = {}
+        requests = []
+
+        class Bridge(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers["Content-Length"])
+                payload = json.loads(self.rfile.read(length))
+                requests.append((self.path, payload))
+                if self.path == "/v1/evidence/snapshot":
+                    body = {
+                        "git": {
+                            "kind": "workspace",
+                            "available": True,
+                            "fingerprint": "fixture",
+                            "head": local_head,
+                            "status": "",
+                        }
+                    }
+                elif self.path == "/v1/jobs/start":
+                    operation = json.loads(payload["prompt"]).get(
+                        "operation", "publish"
+                    )
+                    operations[payload["job_id"]] = operation
+                    body = {
+                        "job_id": payload["job_id"],
+                        "status": "completed",
+                        "returncode": 0 if operation == "inspect" else 1,
+                        "duration_ms": 4,
+                    }
+                elif self.path == "/v1/jobs/output":
+                    operation = operations[payload["job_id"]]
+                    result = (
+                        {
+                            "kind": "git_publish_inspection",
+                            "remote_ssh": (
+                                "git@github.com:niugengtian/PlowWhip_Webv2.git"
+                            ),
+                            "branch": "blue",
+                            "local_head": local_head,
+                            "remote_head": remote_head,
+                            "relationship": "different",
+                            "external_write": False,
+                        }
+                        if operation == "inspect"
+                        else {
+                            "kind": "git_publish",
+                            "status": "failed",
+                            "error": "rejected (non-fast-forward)",
+                        }
+                    )
+                    body = {
+                        "job_id": payload["job_id"],
+                        "status": "completed",
+                        "chunks": [
+                            {
+                                "stream": (
+                                    "stdout" if operation == "inspect" else "stderr"
+                                ),
+                                "text": json.dumps(result),
+                            }
+                        ],
+                    }
+                else:
+                    self.send_error(404)
+                    return
+                data = json.dumps(body).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *_args):
+                return
+
+        bridge = ThreadingHTTPServer(("127.0.0.1", 0), Bridge)
+        thread = threading.Thread(target=bridge.serve_forever, daemon=True)
+        thread.start()
+        try:
+            self._create_project("legacy-git", "legacy-project", str(self.root))
+            with patch.dict(
+                os.environ,
+                {
+                    "PLOW_WHIP_BRIDGE_URL": (
+                        f"http://127.0.0.1:{bridge.server_port}"
+                    ),
+                    "PLOW_WHIP_BRIDGE_TOKEN": "test-token",
+                },
+            ):
+                submit_message(
+                    self.store,
+                    "legacy-git",
+                    "用ssh上传到"
+                    "https://github.com/niugengtian/PlowWhip_Webv2/tree/blue",
+                    "legacy-message",
+                )
+                self.assertEqual(
+                    [item["action"] for item in run_until_idle(self.store)],
+                    ["intake", "snapshot", "execute"],
+                )
+                legacy = snapshot(self.db, self.data, "legacy-git")
+                self.assertIsNone(legacy["decision_context"])
+                with self.assertRaisesRegex(ValueError, "refresh Git publish"):
+                    submit_action(
+                        self.store,
+                        "legacy-git",
+                        legacy["task"]["id"],
+                        "publish_new_branch",
+                        "blue-v1",
+                        "premature-publish",
+                    )
+                submit_action(
+                    self.store,
+                    "legacy-git",
+                    legacy["task"]["id"],
+                    "refresh_git_publish_context",
+                    "",
+                    "refresh-context",
+                )
+                self.assertEqual(
+                    tick(self.store)[0]["action"],
+                    "refresh_git_publish_context",
+                )
+                self.assertEqual(
+                    [item["action"] for item in run_until_idle(self.store)],
+                    ["snapshot", "inspect"],
+                )
+        finally:
+            bridge.shutdown()
+            bridge.server_close()
+            thread.join()
+
+        refreshed = snapshot(self.db, self.data, "legacy-git")
+        self.assertEqual(refreshed["task"]["public_status"], "needs_decision")
+        self.assertEqual(refreshed["task"]["spec_revision"], 2)
+        self.assertTrue(refreshed["decision_context"]["complete"])
+        self.assertEqual(
+            refreshed["decision_context"]["reason_code"],
+            "remote_history_conflict",
+        )
+        self.assertEqual(refreshed["decision_context"]["local_head"], local_head)
+        self.assertEqual(refreshed["decision_context"]["remote_head"], remote_head)
+        self.assertEqual(len(refreshed["decision_context"]["evidence"]), 3)
+        starts = [payload for path, payload in requests if path == "/v1/jobs/start"]
+        self.assertEqual(starts[-1]["access"], "read")
+        self.assertEqual(json.loads(starts[-1]["prompt"])["operation"], "inspect")
+        with self.store.connect_readonly() as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) AS count FROM model_calls WHERE task_id = ?",
+                    (refreshed["task"]["id"],),
+                ).fetchone()["count"],
+                0,
+            )
 
     def test_rejected_start_is_terminal_not_unknown(self):
         class Bridge(BaseHTTPRequestHandler):
@@ -3067,7 +3246,12 @@ class WebApiTest(unittest.TestCase):
             self.assertIn("处理待决定", html)
             self.assertIn("授权发布到新分支", html)
             self.assertIn("明确授权 force-with-lease", html)
+            self.assertIn("Why This Decision", html)
+            self.assertIn("只读刷新原因与证据", html)
+            self.assertIn("没有原因与证据不能授权", html)
+            self.assertIn("contextComplete", html)
             self.assertIn("publish_new_branch", html)
+            self.assertIn("refresh_git_publish_context", html)
             self.assertIn("force_publish_with_lease", html)
             self.assertIn("探测 Provider codex_cli: 0token", html)
             self.assertIn("0 Token 版本探活", html)

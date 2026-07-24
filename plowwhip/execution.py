@@ -778,21 +778,75 @@ def apply_provider_step(
         dispatch["before"] = before_git
         spec = json.loads(task["spec_json"])
         if spec["kind"] == "git_publish":
-            authorization = {
-                **spec["authorization"],
-                "expected_head": before_git.get("head"),
-            }
-            dispatch["prompt"] = canonical_json(
-                {
-                    "kind": "git_publish",
-                    "remote_ssh": spec["remote_ssh"],
-                    "branch": spec["branch"],
-                    "publish_mode": spec.get("publish_mode", "fast_forward"),
-                    "expected_remote_head": spec.get("expected_remote_head"),
-                    "authorization": authorization,
-                    "expected_head": before_git.get("head"),
-                }
+            operation = str(spec.get("operation") or "publish")
+            observed_head = before_git.get("head")
+            authorized_head = (
+                spec.get("authorization", {}).get("expected_head")
+                if operation == "publish"
+                else None
             )
+            if authorized_head and authorized_head != observed_head:
+                connection.execute(
+                    """
+                    UPDATE host_jobs SET status = 'failed', ended_at = ?,
+                        returncode = 1, failure_code = 'scope',
+                        dispatch_json = ? WHERE id = ?
+                    """,
+                    (now, canonical_json(dispatch), job["id"]),
+                )
+                connection.execute(
+                    """
+                    UPDATE tasks SET public_status = 'needs_decision',
+                        phase = 'provider_recovery', wait_reason = ?,
+                        fault_code = 'scope', next_action_at = NULL,
+                        next_action_kind = NULL, updated_at = ? WHERE id = ?
+                    """,
+                    (
+                        "本地 HEAD 已在授权后变化；请刷新 Git 发布原因与证据",
+                        now,
+                        task["id"],
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO task_events(
+                        project_id, task_id, kind, detail_json, created_at
+                    ) VALUES (?, ?, 'git_publish_context_stale', ?, ?)
+                    """,
+                    (
+                        task["project_id"],
+                        task["id"],
+                        canonical_json(
+                            {
+                                "spec_revision": task["spec_revision"],
+                                "authorized_local_head": authorized_head,
+                                "observed_local_head": observed_head,
+                                "host_job_id": job["id"],
+                            }
+                        ),
+                        now,
+                    ),
+                )
+                return "needs_decision"
+            prompt = {
+                "kind": "git_publish",
+                "operation": operation,
+                "remote_ssh": spec["remote_ssh"],
+                "branch": spec["branch"],
+                "expected_head": observed_head,
+            }
+            if operation == "publish":
+                prompt.update(
+                    {
+                        "publish_mode": spec.get("publish_mode", "fast_forward"),
+                        "expected_remote_head": spec.get("expected_remote_head"),
+                        "authorization": {
+                            **spec["authorization"],
+                            "expected_head": observed_head,
+                        },
+                    }
+                )
+            dispatch["prompt"] = canonical_json(prompt)
         connection.execute(
             "UPDATE host_jobs SET dispatch_json = ? WHERE id = ?",
             (canonical_json(dispatch), job["id"]),
@@ -895,6 +949,134 @@ def _provider_log(
         / f"sequence-{job['sequence']:06d}.log"
     )
     return path, body
+
+
+def _previous_git_publish_failure(
+    store: Store,
+    connection: sqlite3.Connection,
+    task_id: str,
+    sequence: int,
+) -> dict[str, object] | None:
+    row = connection.execute(
+        """
+        SELECT id, returncode, output_ref FROM host_jobs
+        WHERE task_id = ? AND sequence < ? AND status = 'failed'
+        ORDER BY sequence DESC LIMIT 1
+        """,
+        (task_id, sequence),
+    ).fetchone()
+    if not row:
+        return None
+    reason = "failed_publish"
+    if row["output_ref"]:
+        try:
+            path = store.resolve_data_path(row["output_ref"])
+            with path.open("rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                handle.seek(max(0, handle.tell() - 16_384))
+                tail = handle.read().decode(errors="replace").lower()
+            if any(
+                marker in tail
+                for marker in (
+                    "non-fast-forward",
+                    "fetch first",
+                    "remote contains work that you do not have locally",
+                )
+            ):
+                reason = "remote_history_conflict"
+        except (OSError, ValueError):
+            pass
+    return {
+        "host_job_id": row["id"],
+        "returncode": row["returncode"],
+        "reason": reason,
+    }
+
+
+def _git_publish_decision_context(
+    task: sqlite3.Row,
+    job: sqlite3.Row,
+    result: dict[str, object],
+    output_ref: str,
+    *,
+    prior_failure: dict[str, object] | None = None,
+) -> dict[str, object]:
+    spec = json.loads(task["spec_json"])
+    local_head = str(result.get("local_head") or "")
+    remote_head = str(result.get("remote_head") or "")
+    reason = str(result.get("code") or "")
+    if result.get("kind") == "git_publish_inspection":
+        reason = str((prior_failure or {}).get("reason") or "failed_publish")
+    complete = bool(
+        reason == "remote_history_conflict"
+        and len(local_head) == 40
+        and len(remote_head) == 40
+        and local_head != remote_head
+    )
+    branch = str(result.get("branch") or "目标分支")
+    summary = (
+        f"普通 push 已被远端以 non-fast-forward 拒绝；只读复核显示"
+        f"本地 {local_head} 与远端 {branch} 的 {remote_head} 不同。"
+        if complete
+        else "尚未取得足够的只读事实，不能安全授权 Git 发布恢复。"
+    )
+    evidence = [
+        {"kind": "host_job", "id": job["id"], "purpose": job["purpose"]},
+        {"kind": "artifact", "path": output_ref},
+    ]
+    if prior_failure:
+        evidence.append(
+            {
+                "kind": "host_job",
+                "id": prior_failure["host_job_id"],
+                "purpose": "failed_publish",
+                "returncode": prior_failure["returncode"],
+            }
+        )
+    return {
+        "complete": complete,
+        "spec_revision": task["spec_revision"],
+        "reason_code": reason,
+        "summary": summary,
+        "question": (
+            f"要保留远端 {branch} 并发布到新分支，还是以当前远端 SHA "
+            f"{remote_head} 为 lease 改写 {branch}？"
+            if complete
+            else "请先刷新原因与证据。"
+        ),
+        "remote_ssh": result.get("remote_ssh") or spec.get("remote_ssh"),
+        "branch": branch,
+        "local_head": local_head,
+        "remote_head": remote_head,
+        "allowed_decisions": (
+            ["publish_new_branch", "force_publish_with_lease"] if complete else []
+        ),
+        "options": (
+            [
+                {
+                    "kind": "publish_new_branch",
+                    "title": "保留远端历史，发布到新分支",
+                    "effect": f"不改写 {branch}；创建一个指向本地 HEAD 的新分支。",
+                    "risk": "低；会新增一个远端分支。",
+                    "required_input": "一个不同且合法的新分支名",
+                },
+                {
+                    "kind": "force_publish_with_lease",
+                    "title": f"以 lease 改写 {branch}",
+                    "effect": (
+                        f"仅当远端仍为 {remote_head} 时，"
+                        f"把 {branch} 改为本地 HEAD。"
+                    ),
+                    "risk": "高；会改写目标分支历史，远端已移动则安全拒绝。",
+                    "required_input": f"完整远端 SHA：{remote_head}",
+                },
+            ]
+            if complete
+            else []
+        ),
+        "evidence": evidence,
+        "external_write_performed": False,
+    }
 
 
 def _finalize_provider_job(
@@ -1033,6 +1215,66 @@ def _finalize_provider_job(
                 now,
             ),
         )
+    inspection = bool(
+        succeeded
+        and isinstance(script_result, dict)
+        and script_result.get("kind") == "git_publish_inspection"
+    )
+    if inspection:
+        output_ref = store.relative_data_path(output_path)
+        context = _git_publish_decision_context(
+            task,
+            job,
+            script_result,
+            output_ref,
+            prior_failure=_previous_git_publish_failure(
+                store, connection, task["id"], job["sequence"]
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE tasks SET public_status = 'needs_decision',
+                phase = 'provider_recovery', next_action_at = NULL,
+                next_action_kind = NULL, wait_reason = ?, fault_code = 'scope',
+                updated_at = ? WHERE id = ?
+            """,
+            (context["summary"], now, task["id"]),
+        )
+        connection.execute(
+            """
+            INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
+            VALUES (?, ?, 'executed', ?, ?)
+            """,
+            (
+                task["project_id"],
+                task["id"],
+                canonical_json(
+                    {
+                        "host_job_id": job["id"],
+                        "host_job_sequence": job["sequence"],
+                        "provider_key": step.provider_key,
+                        "returncode": returncode,
+                        "workspace_changed": workspace_changed,
+                        "normalized_total": 0,
+                        "operation": "inspect",
+                    }
+                ),
+                now,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
+            VALUES (?, ?, 'git_publish_needs_decision', ?, ?)
+            """,
+            (
+                task["project_id"],
+                task["id"],
+                canonical_json(context),
+                now,
+            ),
+        )
+        return "inspect"
     fallback = (
         _fallback_provider_generation(connection, task, job, step.provider_key, now)
         if not succeeded
@@ -1051,8 +1293,15 @@ def _finalize_provider_job(
             remote_head = str(script_result.get("remote_head") or "不存在")
             branch = str(script_result.get("branch") or "目标分支")
             wait_reason = (
-                f"远端 {branch} 当前为 {remote_head}；"
-                "请选择发布到新分支，或用该 SHA 明确授权 force-with-lease"
+                (
+                    f"远端 {branch} 已移动到 {remote_head}；"
+                    "原授权证据失效，请先刷新原因与证据"
+                )
+                if script_result.get("code") == "lease_mismatch"
+                else (
+                    f"远端 {branch} 当前为 {remote_head}；"
+                    "请选择发布到新分支，或用该 SHA 明确授权 force-with-lease"
+                )
             )
         elif fallback:
             wait_reason = f"Provider {step.provider_key} failed; falling back to {fallback}"
@@ -1098,6 +1347,12 @@ def _finalize_provider_job(
         ),
     )
     if conflict:
+        context = _git_publish_decision_context(
+            task,
+            job,
+            script_result,
+            store.relative_data_path(output_path),
+        )
         connection.execute(
             """
             INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
@@ -1106,19 +1361,7 @@ def _finalize_provider_job(
             (
                 task["project_id"],
                 task["id"],
-                canonical_json(
-                    {
-                        "host_job_id": job["id"],
-                        "branch": script_result.get("branch"),
-                        "local_head": script_result.get("local_head"),
-                        "remote_head": script_result.get("remote_head"),
-                        "reason": script_result.get("code"),
-                        "allowed_decisions": [
-                            "publish_new_branch",
-                            "force_publish_with_lease",
-                        ],
-                    }
-                ),
+                canonical_json(context),
                 now,
             ),
         )
@@ -1368,17 +1611,23 @@ def _provider_prompt(
     task: sqlite3.Row, spec: dict, purpose: str, hot_context: str | None = None
 ) -> str:
     if spec["kind"] == "git_publish":
-        return canonical_json(
-            {
-                "kind": "git_publish",
-                "remote_ssh": spec["remote_ssh"],
-                "branch": spec["branch"],
-                "publish_mode": spec.get("publish_mode", "fast_forward"),
-                "expected_remote_head": spec.get("expected_remote_head"),
-                "authorization": spec["authorization"],
-                "expected_head": "",
-            }
-        )
+        operation = str(spec.get("operation") or "publish")
+        prompt = {
+            "kind": "git_publish",
+            "operation": operation,
+            "remote_ssh": spec["remote_ssh"],
+            "branch": spec["branch"],
+            "expected_head": "",
+        }
+        if operation == "publish":
+            prompt.update(
+                {
+                    "publish_mode": spec.get("publish_mode", "fast_forward"),
+                    "expected_remote_head": spec.get("expected_remote_head"),
+                    "authorization": spec["authorization"],
+                }
+            )
+        return canonical_json(prompt)
     repair = (
         f"\nRepair context: {task['wait_reason']}"
         if purpose == "repair" and task["wait_reason"]
