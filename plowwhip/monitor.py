@@ -401,9 +401,7 @@ def _ratio(numerator: int, denominator: int) -> float | None:
 
 
 def _task_view(connection, store: Store, task) -> dict:
-    goal = connection.execute(
-        "SELECT objective FROM goals WHERE id = ?", (task["goal_id"],)
-    ).fetchone()
+    spec = json.loads(task["spec_json"])
     project = connection.execute(
         "SELECT display_name, host_path FROM projects WHERE id = ?",
         (task["project_id"],),
@@ -501,7 +499,11 @@ def _task_view(connection, store: Store, task) -> dict:
             project["display_name"] if project else task["project_id"]
         ),
         "host_path": project["host_path"] if project else None,
-        "objective": goal["objective"] if goal else None,
+        "objective": (
+            spec.get("instruction")
+            or spec.get("content")
+            or f"Task {task['id']}"
+        ),
         "task": dict(task),
         "decision_context": decision_context,
         "events": [dict(event) for event in events],
@@ -542,16 +544,14 @@ def _task_view(connection, store: Store, task) -> dict:
 
 
 def _task_summaries(connection, project_id: str) -> list[dict]:
-    return [
-        dict(row)
-        for row in connection.execute(
+    rows = connection.execute(
             """
             SELECT task.id, task.goal_id, task.spec_revision,
                    task.public_status, task.phase, task.wait_reason,
                    task.fault_code, task.retry_count, task.outcome,
                    task.role_key, task.checker_role_key, task.sprint,
                    task.created_at, task.updated_at,
-                   goal.objective,
+                   task.spec_json, goal.objective AS goal_objective,
                    COALESCE((
                        SELECT generation.provider_key
                        FROM task_sessions session
@@ -575,8 +575,19 @@ def _task_summaries(connection, project_id: str) -> list[dict]:
             ORDER BY task.created_at DESC, task.rowid DESC LIMIT 100
             """,
             (project_id,),
+        ).fetchall()
+    tasks = []
+    for row in rows:
+        item = dict(row)
+        spec = json.loads(item.pop("spec_json"))
+        item["objective"] = (
+            spec.get("instruction")
+            or spec.get("content")
+            or item.pop("goal_objective")
         )
-    ]
+        item.pop("goal_objective", None)
+        tasks.append(item)
+    return tasks
 
 
 def _goal_summaries(connection, project_id: str) -> list[dict]:

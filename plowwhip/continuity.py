@@ -169,11 +169,39 @@ def _dependency_results(
         except (OSError, ValueError, json.JSONDecodeError):
             acceptances = []
             verdict = {}
+        report_row = connection.execute(
+            """
+            SELECT path, sha256, bytes FROM artifacts
+            WHERE task_id = ? AND kind = 'output'
+              AND acceptance_id = 'provider_report'
+            ORDER BY created_at DESC, rowid DESC LIMIT 1
+            """,
+            (row["task_id"],),
+        ).fetchone()
+        report = None
+        if report_row:
+            try:
+                report_body = store.resolve_data_path(report_row["path"]).read_bytes()
+                if (
+                    len(report_body) > 32_768
+                    or len(report_body) != int(report_row["bytes"])
+                    or hashlib.sha256(report_body).hexdigest()
+                    != report_row["sha256"]
+                ):
+                    raise ValueError("dependency report contract failed")
+                report = {
+                    "path": report_row["path"],
+                    "sha256": report_row["sha256"],
+                    "content": report_body.decode(errors="replace"),
+                }
+            except (OSError, ValueError):
+                report = None
         results.append(
             {
                 "task_id": row["task_id"],
                 "verdict": verdict.get("checker_verdict"),
                 "evidence": {"path": row["path"], "sha256": row["sha256"]},
+                "provider_report": report,
                 "acceptances": acceptances,
             }
         )

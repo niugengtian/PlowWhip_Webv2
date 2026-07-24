@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import sqlite3
@@ -1350,6 +1351,15 @@ class VerticalSliceTest(unittest.TestCase):
             ),
         ):
             self.assertEqual(tick(self.store)[0]["action"], "plan_applied")
+        task_view = snapshot(self.db, self.data, "composite-plan")
+        self.assertEqual(task_view["goals"][0]["objective"], instruction)
+        self.assertTrue(
+            all(item["objective"] != instruction for item in task_view["tasks"])
+        )
+        task_objectives = [item["objective"] for item in task_view["tasks"]]
+        self.assertTrue(any("SSH" in item for item in task_objectives))
+        self.assertTrue(any("Cursor" in item for item in task_objectives))
+        self.assertTrue(any("修复" in item for item in task_objectives))
         connection = self.store.connect()
         try:
             tasks = connection.execute(
@@ -1544,6 +1554,9 @@ class VerticalSliceTest(unittest.TestCase):
         dependency_path = self.data / "dependency-review-verdict.json"
         dependency_body = json.dumps(dependency_verdict).encode()
         dependency_path.write_bytes(dependency_body)
+        dependency_report_path = self.data / "dependency-review-report.md"
+        dependency_report_body = b"F-001 High: bounded review finding\n"
+        dependency_report_path.write_bytes(dependency_report_body)
         with self.store.transaction() as connection:
             connection.execute(
                 """
@@ -1559,6 +1572,23 @@ class VerticalSliceTest(unittest.TestCase):
                     self.store.relative_data_path(dependency_path),
                     "d" * 64,
                     len(dependency_body),
+                    time.time(),
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO artifacts(
+                    id, project_id, task_id, kind, path, sha256, bytes,
+                    acceptance_id, revision, created_at
+                ) VALUES (?, ?, ?, 'output', ?, ?, ?, 'provider_report', 1, ?)
+                """,
+                (
+                    "dependency-review-report",
+                    "composite-plan",
+                    tasks[1]["id"],
+                    self.store.relative_data_path(dependency_report_path),
+                    hashlib.sha256(dependency_report_body).hexdigest(),
+                    len(dependency_report_body),
                     time.time(),
                 ),
             )
@@ -1579,6 +1609,10 @@ class VerticalSliceTest(unittest.TestCase):
                 "recheck_command"
             ],
             "read bounded Cursor transcript",
+        )
+        self.assertEqual(
+            capsule["dependency_results"][0]["provider_report"]["content"],
+            dependency_report_body.decode(),
         )
         with self.store.transaction() as connection:
             legacy_spec = json.loads(tasks[1]["spec_json"])
@@ -2889,7 +2923,18 @@ class VerticalSliceTest(unittest.TestCase):
             and item["path"].endswith("provider-execution.json")
         )
         self.assertEqual(execution_manifest["provider_key"], "cursor_cli")
-        self.assertIn("F-001 · High", execution_manifest["provider_report"])
+        report_path = self.store.resolve_data_path(
+            execution_manifest["provider_report_ref"]
+        )
+        report_body = report_path.read_bytes()
+        self.assertIn("F-001 · High", report_body.decode())
+        self.assertEqual(
+            hashlib.sha256(report_body).hexdigest(),
+            execution_manifest["provider_report_sha256"],
+        )
+        self.assertEqual(
+            len(report_body), execution_manifest["provider_report_bytes"]
+        )
         self.assertFalse(execution_manifest["provider_report_truncated"])
         evidence = next(
             json.loads(Path(item["path"]).read_text())
@@ -2900,6 +2945,171 @@ class VerticalSliceTest(unittest.TestCase):
         self.assertFalse(evidence["workspace_changed"])
         self.assertFalse(evidence["workspace_change_required"])
         self.assertTrue(evidence["passed"])
+
+    def test_read_only_rerun_recovers_report_without_reinvoking_provider(self):
+        self._create_project(
+            "report-recovery", "report-recovery-create", "/workspace/recovery"
+        )
+        submit_message(
+            self.store,
+            "report-recovery",
+            "使用 Cursor 只读审查当前代码并输出报告",
+            "report-recovery-message",
+        )
+        self.assertEqual(tick(self.store)[0]["action"], "intake")
+        unchanged = {"git": {"available": True, "head": "abc123", "status": ""}}
+        provider_state = {
+            "status": "completed",
+            "returncode": 0,
+            "session_id": "report-recovery-session",
+            "input_tokens": 10,
+            "cached_input_tokens": 4,
+            "output_tokens": 3,
+            "model": "cursor-test",
+        }
+        provider_output = {
+            "chunks": [
+                {
+                    "stream": "stdout",
+                    "text": json.dumps(
+                        {
+                            "type": "result",
+                            "subtype": "success",
+                            "result": "F-001 High: persisted report finding",
+                        }
+                    ),
+                }
+            ]
+        }
+        with (
+            patch("plowwhip.execution.workspace_snapshot", return_value=unchanged),
+            patch(
+                "plowwhip.execution.start_provider_job",
+                return_value=provider_state,
+            ),
+            patch(
+                "plowwhip.execution.provider_job_output",
+                return_value=provider_output,
+            ),
+            patch(
+                "plowwhip.verification.start_provider_job",
+                return_value={
+                    **provider_state,
+                    "session_id": "report-recovery-checker",
+                },
+            ),
+            patch(
+                "plowwhip.verification.provider_job_output",
+                return_value={
+                    "chunks": [{"stream": "stdout", "text": checker_output()}]
+                },
+            ),
+        ):
+            self.assertEqual(
+                [item["action"] for item in run_until_idle(self.store)],
+                ["snapshot", "execute", "verify"],
+            )
+        with self.store.transaction() as connection:
+            task = connection.execute(
+                "SELECT * FROM tasks WHERE project_id = 'report-recovery'"
+            ).fetchone()
+            source_job_id = connection.execute(
+                """
+                SELECT id FROM host_jobs
+                WHERE task_id = ? AND purpose = 'execute' AND status = 'succeeded'
+                ORDER BY sequence LIMIT 1
+                """,
+                (task["id"],),
+            ).fetchone()["id"]
+            calls_before = connection.execute(
+                "SELECT COUNT(*) AS value FROM model_calls WHERE task_id = ?",
+                (task["id"],),
+            ).fetchone()["value"]
+            connection.execute(
+                """
+                UPDATE tasks SET public_status = 'done', outcome = 'cancelled',
+                    phase = 'done', next_action_at = NULL, next_action_kind = NULL
+                WHERE id = ?
+                """,
+                (task["id"],),
+            )
+        submit_action(
+            self.store,
+            "report-recovery",
+            task["id"],
+            "rerun",
+            "",
+            "report-recovery-rerun",
+        )
+        self.assertEqual(tick(self.store)[0]["action"], "rerun")
+        with patch(
+            "plowwhip.execution.workspace_snapshot", return_value=unchanged
+        ):
+            self.assertEqual(tick(self.store)[0]["action"], "snapshot")
+        with (
+            patch(
+                "plowwhip.execution.provider_job_status",
+                return_value=provider_state,
+            ) as recovered_status,
+            patch(
+                "plowwhip.execution.provider_job_output",
+                return_value=provider_output,
+            ) as recovered_output,
+            patch(
+                "plowwhip.execution.workspace_snapshot",
+                return_value=unchanged,
+            ),
+            patch("plowwhip.execution.start_provider_job") as unexpected_start,
+        ):
+            self.assertEqual(tick(self.store)[0]["action"], "execute")
+        recovered_status.assert_called_once_with(source_job_id)
+        recovered_output.assert_called_once_with(source_job_id)
+        unexpected_start.assert_not_called()
+        connection = self.store.connect_readonly()
+        try:
+            recovered_task = connection.execute(
+                "SELECT phase, public_status FROM tasks WHERE id = ?",
+                (task["id"],),
+            ).fetchone()
+            calls_after = connection.execute(
+                "SELECT COUNT(*) AS value FROM model_calls WHERE task_id = ?",
+                (task["id"],),
+            ).fetchone()["value"]
+            manifest_path = connection.execute(
+                """
+                SELECT path FROM artifacts
+                WHERE task_id = ? AND path LIKE '%/provider-execution.json'
+                ORDER BY created_at DESC, rowid DESC LIMIT 1
+                """,
+                (task["id"],),
+            ).fetchone()["path"]
+        finally:
+            connection.close()
+        recovered_manifest = json.loads(
+            self.store.resolve_data_path(manifest_path).read_text()
+        )
+        self.assertEqual(tuple(recovered_task), ("verify", "in_progress"))
+        self.assertEqual(calls_after, calls_before)
+        self.assertEqual(
+            recovered_manifest["reused_from_host_job_id"], source_job_id
+        )
+        self.assertIn(
+            "F-001",
+            self.store.resolve_data_path(
+                recovered_manifest["provider_report_ref"]
+            ).read_text(),
+        )
+        self.store.resolve_data_path(
+            recovered_manifest["provider_report_ref"]
+        ).write_text("tampered")
+        with patch(
+            "plowwhip.verification.start_provider_job"
+        ) as unexpected_checker:
+            self.assertEqual(tick(self.store)[0]["action"], "needs_decision")
+        unexpected_checker.assert_not_called()
+        tampered = snapshot(self.db, self.data, "report-recovery")
+        self.assertEqual(tampered["task"]["public_status"], "needs_decision")
+        self.assertIn("SHA-256", tampered["task"]["wait_reason"])
 
     def test_terminal_provider_failure_falls_back_with_new_generation(self):
         snapshots = 0

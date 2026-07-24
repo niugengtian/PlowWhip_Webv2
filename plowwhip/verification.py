@@ -409,20 +409,39 @@ def _prepare_checker_step(
     task: sqlite3.Row,
     spec: dict,
     started_at: float,
-) -> CheckerStep:
-    artifact = connection.execute(
-        """
-        SELECT path FROM artifacts
-        WHERE task_id = ? AND kind = 'output' AND revision = ?
-        ORDER BY created_at DESC, rowid DESC LIMIT 1
-        """,
-        (task["id"], task["spec_revision"]),
-    ).fetchone()
-    output_path = store.resolve_data_path(artifact["path"]) if artifact else None
-    try:
-        execution = json.loads(output_path.read_text()) if output_path else {}
-    except (OSError, json.JSONDecodeError):
-        execution = {}
+) -> str | CheckerStep:
+    execution = _execution_manifest(store, connection, task)
+    report, report_error = _provider_report(store, execution)
+    if report_error:
+        now = time.time()
+        connection.execute(
+            """
+            UPDATE tasks SET public_status = 'needs_decision', phase = 'verify',
+                wait_reason = ?, fault_code = 'verification',
+                next_action_at = NULL, next_action_kind = NULL, updated_at = ?
+            WHERE id = ?
+            """,
+            (report_error, now, task["id"]),
+        )
+        connection.execute(
+            """
+            INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
+            VALUES (?, ?, 'provider_report_invalid', ?, ?)
+            """,
+            (
+                task["project_id"],
+                task["id"],
+                canonical_json(
+                    {
+                        "report_ref": execution.get("provider_report_ref"),
+                        "report_sha256": execution.get("provider_report_sha256"),
+                        "reason": report_error,
+                    }
+                ),
+                now,
+            ),
+        )
+        return "needs_decision"
     task_session_id, session_generation = current_session(
         connection, task["id"], task["checker_role_key"] or "independent_checker"
     )
@@ -442,7 +461,7 @@ def _prepare_checker_step(
         (task["id"],),
     ).fetchone()["value"]
     job_id = str(uuid4())
-    prompt = _checker_prompt(task, spec, execution)
+    prompt = _checker_prompt(task, spec, execution, report)
     connection.execute(
         """
         INSERT INTO host_jobs(
@@ -527,7 +546,7 @@ def pending_checker_step(
     execution = _execution_manifest(store, connection, task)
     prompt = str(
         json.loads(job["dispatch_json"]).get("prompt")
-        or _checker_prompt(task, spec, execution)
+        or _checker_prompt(task, spec, execution, _provider_report(store, execution)[0])
     )
     return CheckerStep(
         "start" if job["status"] == "dispatching" else "poll",
@@ -957,6 +976,7 @@ def _execution_manifest(
         """
         SELECT path FROM artifacts
         WHERE task_id = ? AND kind = 'output' AND revision = ?
+          AND path LIKE '%/provider-execution.json'
         ORDER BY created_at DESC, rowid DESC LIMIT 1
         """,
         (task["id"], task["spec_revision"]),
@@ -968,6 +988,31 @@ def _execution_manifest(
     except (OSError, json.JSONDecodeError):
         return {}
     return value if isinstance(value, dict) else {}
+
+
+def _provider_report(
+    store: Store, execution: dict
+) -> tuple[str, str | None]:
+    report_ref = str(execution.get("provider_report_ref") or "")
+    expected_sha256 = str(execution.get("provider_report_sha256") or "")
+    if not report_ref or not expected_sha256:
+        return "", "Provider report artifact is missing; Checker was not started"
+    if execution.get("provider_report_truncated"):
+        return "", "Provider report artifact exceeded its frozen bound"
+    try:
+        body = store.resolve_data_path(report_ref).read_bytes()
+    except (OSError, ValueError):
+        return "", "Provider report artifact cannot be read; Checker was not started"
+    if hashlib.sha256(body).hexdigest() != expected_sha256:
+        return "", "Provider report artifact SHA-256 does not match its manifest"
+    if len(body) != int(execution.get("provider_report_bytes") or -1):
+        return "", "Provider report artifact byte count does not match its manifest"
+    report = body.decode(errors="replace").strip()
+    return (
+        (report, None)
+        if report
+        else ("", "Provider report artifact is empty; Checker was not started")
+    )
 
 
 def _checker_result(
@@ -999,10 +1044,10 @@ def _checker_result(
     }
 
 
-def _checker_prompt(task: sqlite3.Row, spec: dict, execution: dict) -> str:
+def _checker_prompt(
+    task: sqlite3.Row, spec: dict, execution: dict, report: str
+) -> str:
     acceptance = json.loads(task["acceptance_json"])
-    report = str(execution.get("provider_report") or "")
-    report_truncated = bool(execution.get("provider_report_truncated"))
     return (
         "Independently inspect the current workspace read-only. Verify this Task against "
         f"the actual files and smallest relevant checks:\n{spec['instruction']}\n"
@@ -1010,8 +1055,11 @@ def _checker_prompt(task: sqlite3.Row, spec: dict, execution: dict) -> str:
         f"Frozen acceptance contract: {canonical_json(acceptance)}\n"
         f"Control-plane workspace delta recorded: {bool(execution.get('workspace_changed'))}.\n"
         f"Control-plane executor provider: {execution.get('provider_key')}.\n"
-        f"Complete bounded executor report (truncated={report_truncated}):\n"
-        f"{report if report else str(execution.get('stdout_tail') or '')[-4000:]}\n"
+        "Persisted Provider report artifact "
+        f"{execution.get('provider_report_ref')} "
+        f"(sha256={execution.get('provider_report_sha256')}, "
+        f"bytes={execution.get('provider_report_bytes')}):\n"
+        f"{report}\n"
         f"Finish with one line beginning {CHECKER_RESULT_PREFIX!r} followed by one JSON object. "
         'Use {"verdict":"PASS|CHANGES_REQUIRED|NEEDS_DECISION",'
         '"acceptances":[{"acceptance_id":"...","passed":true,'

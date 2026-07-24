@@ -51,6 +51,7 @@ class ProviderStep:
     timeout_seconds: int
     access: str
     context_policy: dict[str, object]
+    source_job_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -589,6 +590,25 @@ def _prepare_provider_task(
         )
         return "needs_decision"
     access = "write" if spec.get("workspace_change_required", True) else "read"
+    reusable = None
+    if (
+        purpose == "execute"
+        and spec.get("kind") == "provider_task"
+        and access == "read"
+    ):
+        reusable = connection.execute(
+            """
+            SELECT job.id FROM host_jobs job
+            JOIN session_generations generation
+              ON generation.task_session_id = job.task_session_id
+             AND generation.generation = job.session_generation
+            WHERE job.task_id = ? AND job.spec_revision = ?
+              AND job.purpose = 'execute' AND job.status = 'succeeded'
+              AND job.returncode = 0 AND generation.provider_key = ?
+            ORDER BY job.sequence DESC LIMIT 1
+            """,
+            (task["id"], task["spec_revision"], generation["provider_key"]),
+        ).fetchone()
     job_id = str(uuid4())
     connection.execute(
         """
@@ -611,6 +631,7 @@ def _prepare_provider_task(
                     "prompt": prompt,
                     "context_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
                     "access": access,
+                    "reuse_from_host_job_id": reusable["id"] if reusable else None,
                 }
             ),
         ),
@@ -648,6 +669,7 @@ def _prepare_provider_task(
         int(settings.get("max_runtime_seconds", 600)),
         access,
         _context_policy(settings),
+        reusable["id"] if reusable else None,
     )
 
 
@@ -679,7 +701,9 @@ def pending_provider_step(
     dispatch = json.loads(job["dispatch_json"])
     kind = {
         "execute_snapshot": "snapshot",
-        "execute_dispatch": "start",
+        "execute_dispatch": (
+            "recover" if dispatch.get("reuse_from_host_job_id") else "start"
+        ),
         "execute_wait": "poll",
         "stopping": "cancel",
     }.get(task["phase"])
@@ -706,6 +730,7 @@ def pending_provider_step(
         int(settings.get("max_runtime_seconds", 600)),
         str(dispatch.get("access") or "write"),
         _context_policy(settings),
+        str(dispatch.get("reuse_from_host_job_id") or "") or None,
     )
 
 
@@ -714,7 +739,10 @@ def perform_provider_step(step: ProviderStep) -> dict[str, object]:
     try:
         if step.kind == "snapshot":
             return {"ok": True, "before": workspace_snapshot(step.project_path)}
-        if step.kind == "start":
+        if step.kind == "recover":
+            state = provider_job_status(str(step.source_job_id))
+            stage = "output"
+        elif step.kind == "start":
             state = start_provider_job(
                 step.job_id,
                 step.provider_key,
@@ -734,7 +762,9 @@ def perform_provider_step(step: ProviderStep) -> dict[str, object]:
             stage = "output"
         else:
             raise ValueError("unknown Provider step")
-        output = provider_job_output(step.job_id)
+        output = provider_job_output(
+            str(step.source_job_id) if step.kind == "recover" else step.job_id
+        )
         facts: dict[str, object] = {"ok": True, "state": state, "output": output}
         if str(state.get("status")) not in ACTIVE_HOST_JOB_STATUSES:
             stage = "snapshot_after"
@@ -787,7 +817,8 @@ def apply_provider_step(
         values = json.loads(settings["settings_json"]).get("values", {})
         max_retries = int(values.get("retry_count", 0))
         exhausted = failures > max_retries
-        if exhausted and step.kind == "snapshot":
+        safe_reconcile = step.kind in {"snapshot", "recover"}
+        if exhausted and safe_reconcile:
             connection.execute(
                 """
                 UPDATE host_jobs SET status = 'failed', ended_at = ?, returncode = 1,
@@ -811,14 +842,19 @@ def apply_provider_step(
                 "provider_recovery" if exhausted else task["phase"],
                 (
                     f"HostJob {job['id']} outcome is unknown after {failures} reconcile failures"
-                    if exhausted and step.kind != "snapshot"
+                    if exhausted and not safe_reconcile
                     else (
-                        f"Host Bridge snapshot unavailable after {failures} attempts"
+                        (
+                            "previous successful Provider report is unavailable "
+                            f"after {failures} attempts"
+                        )
+                        if exhausted and step.kind == "recover"
+                        else f"Host Bridge snapshot unavailable after {failures} attempts"
                         if exhausted
                         else f"Host Bridge {step.kind} unavailable; idempotent reconcile scheduled"
                     )
                 ),
-                "unsafe_unknown" if exhausted and step.kind != "snapshot" else "transport",
+                "unsafe_unknown" if exhausted and not safe_reconcile else "transport",
                 (
                     None
                     if exhausted
@@ -1180,7 +1216,28 @@ def _finalize_provider_job(
     succeeded = str(state.get("status")) == "completed" and returncode == 0
     stdout, stderr = _provider_output_streams(facts.get("output"))
     context_events = parse_context_events(stdout)
-    report, report_truncated = _bounded_report(provider_agent_text(stdout))
+    report, report_truncated = (
+        _bounded_report(
+            _PERSISTED_SECRET.sub("[REDACTED]", provider_agent_text(stdout))
+        )
+        if step.provider_key != "git_publish"
+        else ("", False)
+    )
+    report_body = report.encode()
+    report_path = (
+        store.data_root
+        / "projects"
+        / task["project_id"]
+        / "tasks"
+        / task["id"]
+        / "artifacts"
+        / f"revision-{task['spec_revision']:06d}"
+        / f"execution-{job['sequence']:06d}"
+        / "output"
+        / "provider-report.md"
+    )
+    report_ref = store.relative_data_path(report_path) if report else None
+    report_sha256 = hashlib.sha256(report_body).hexdigest() if report else None
     manifest = {
         "provider_key": step.provider_key,
         "project_path": step.project_path,
@@ -1193,8 +1250,11 @@ def _finalize_provider_job(
         "after": after_git,
         "stdout_tail": _bounded_tail(stdout),
         "stderr_tail": _bounded_tail(stderr),
-        "provider_report": report,
+        "provider_report_ref": report_ref,
+        "provider_report_sha256": report_sha256,
+        "provider_report_bytes": len(report_body),
         "provider_report_truncated": report_truncated,
+        "reused_from_host_job_id": step.source_job_id,
     }
     script_result = None
     if step.provider_key == "git_publish":
@@ -1219,6 +1279,8 @@ def _finalize_provider_job(
             f"workspace_changed={str(workspace_changed).lower()}\n"
         ).encode()
     _write_atomic(output_path, body)
+    if report:
+        _write_atomic(report_path, report_body)
     _write_atomic(log_path, log_body)
     log_path.chmod(0o600)
     connection.execute(
@@ -1246,7 +1308,7 @@ def _finalize_provider_job(
     input_tokens = max(0, int(state.get("input_tokens") or 0))
     cached_tokens = min(input_tokens, max(0, int(state.get("cached_input_tokens") or 0)))
     output_tokens = max(0, int(state.get("output_tokens") or 0))
-    if step.provider_key != "git_publish":
+    if step.provider_key != "git_publish" and not step.source_job_id:
         record_model_call(
             connection,
             task["id"],
@@ -1280,13 +1342,19 @@ def _finalize_provider_job(
                 now,
             ),
         )
-    for kind, path, data in (("output", output_path, body), ("log", log_path, log_body)):
+    artifacts = [
+        ("output", output_path, body, None),
+        ("log", log_path, log_body, None),
+    ]
+    if report:
+        artifacts.append(("output", report_path, report_body, "provider_report"))
+    for kind, path, data, acceptance_id in artifacts:
         connection.execute(
             """
             INSERT INTO artifacts(
                 id, project_id, task_id, kind, path, sha256, bytes,
                 acceptance_id, revision, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 uuid4().hex,
@@ -1296,6 +1364,7 @@ def _finalize_provider_job(
                 store.relative_data_path(path),
                 hashlib.sha256(data).hexdigest(),
                 len(data),
+                acceptance_id,
                 task["spec_revision"],
                 now,
             ),
@@ -1473,7 +1542,10 @@ def _finalize_provider_job(
                     "provider_key": step.provider_key,
                     "returncode": returncode,
                     "workspace_changed": workspace_changed,
-                    "normalized_total": input_tokens + output_tokens,
+                    "normalized_total": (
+                        0 if step.source_job_id else input_tokens + output_tokens
+                    ),
+                    "reused_from_host_job_id": step.source_job_id,
                 }
             ),
             now,
