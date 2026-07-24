@@ -1152,6 +1152,12 @@ class VerticalSliceTest(unittest.TestCase):
             classify_instruction("前端和后端增加刷新能力", "provider_task")["size"],
             "large",
         )
+        self.assertFalse(
+            classify_instruction(
+                "不要部署、不要发布，也不要接触生产环境",
+                "provider_task",
+            )["authorization_required"]
+        )
         self.assertEqual(parse_planner_result(PLANNER_RESULT_PREFIX + json.dumps(planned))["confidence"], 0.97)
         codex_jsonl = json.dumps(
             {
@@ -1173,6 +1179,9 @@ class VerticalSliceTest(unittest.TestCase):
             )["confidence"],
             0.97,
         )
+        numeric_sprint = json.loads(json.dumps(planned["plan"]))
+        numeric_sprint["tasks"][0]["sprint"] = "2"
+        self.assertEqual(normalize_plan(numeric_sprint)["tasks"][0]["sprint"], 2)
 
     def test_composite_git_cursor_codex_goal_uses_planner_and_keeps_all_steps(self):
         self._create_project(
@@ -1190,6 +1199,11 @@ class VerticalSliceTest(unittest.TestCase):
         )
         spec, _ = normalize_instruction(instruction)
         self.assertEqual(spec["kind"], "provider_task")
+        codex_spec, _ = normalize_instruction("仅使用 Codex 修复当前代码")
+        cursor_spec, _ = normalize_instruction("使用 Cursor 只读审查当前代码")
+        self.assertEqual(codex_spec["provider_key"], "codex_cli")
+        self.assertEqual(cursor_spec["provider_key"], "cursor_cli")
+        self.assertFalse(cursor_spec["workspace_change_required"])
         planned_publish, _ = normalize_instruction(
             "使用 SSH 认证，将本地代码发布到 "
             "https://github.com/niugengtian/PlowWhip_Webv2/tree/blue"
@@ -2140,7 +2154,15 @@ class VerticalSliceTest(unittest.TestCase):
 
     def test_settings_and_library_are_indexed_and_read_only(self):
         state = settings_library_snapshot(self.db, self.data)
-        self.assertEqual(len(state["settings"]), 13)
+        self.assertEqual(len(state["settings"]), 15)
+        self.assertEqual(
+            next(
+                item["value"]
+                for item in state["settings"]
+                if item["setting_key"] == "max_total_tokens"
+            ),
+            10_000_000,
+        )
         self.assertEqual(len(state["library"]), 12)
         self.assertEqual(
             {item["kind"] for item in state["library"]},

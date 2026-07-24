@@ -23,6 +23,8 @@ from .store import write_atomic
 MAX_BODY_BYTES = 1_048_576
 MAX_OUTPUT_BYTES = 32_768
 MAX_JOB_SECONDS = 86_400
+RECOVERY_HOLD_SECONDS = 30
+ORPHAN_WATCH_INTERVAL_SECONDS = 0.1
 SUPPORTED_EXECUTABLES = {
     "codex": {"codex"},
     "cursor": {"cursor", "cursor-agent"},
@@ -345,6 +347,9 @@ class HostJobManager:
         )
         stdout_path = directory / "stdout.segment-000001.log"
         stderr_path = directory / "stderr.segment-000001.log"
+        for stream_path in (stdout_path, stderr_path):
+            stream_path.touch(mode=0o600, exist_ok=True)
+            stream_path.chmod(0o600)
         now = time.time()
         record: dict[str, Any] = {
             "job_id": job_id,
@@ -536,7 +541,9 @@ class HostJobManager:
             self._finish(record)
 
     def _recover(self) -> None:
+        now = time.time()
         for path in self.root.glob("*.json"):
+            watch_orphan = False
             try:
                 record = json.loads(path.read_text(encoding="utf-8"))
                 _job_id(record.get("job_id"))
@@ -544,14 +551,18 @@ class HostJobManager:
                 continue
             if record.get("status") in ACTIVE_STATUSES:
                 if not record.get("pid"):
-                    record.update(
-                        {
-                            "status": "recovery_hold",
-                            "failure_class": "dispatch_outcome_unknown",
-                        }
+                    hold_until = min(
+                        float(record.get("recovery_hold_until") or now + RECOVERY_HOLD_SECONDS),
+                        now + RECOVERY_HOLD_SECONDS,
                     )
+                    record.update({
+                        "status": "recovery_hold",
+                        "failure_class": "dispatch_outcome_unknown",
+                        "recovery_hold_until": hold_until,
+                    })
                 elif _same_process(record):
                     record["status"] = "orphan_running"
+                    watch_orphan = True
                 else:
                     record.update(
                         {
@@ -562,6 +573,13 @@ class HostJobManager:
                     )
                     self._finish(record)
                 self._write(record)
+                if watch_orphan:
+                    threading.Thread(
+                        target=self._watch_orphan,
+                        args=(record["job_id"],),
+                        name=f"plowwhip-orphan-{record['job_id'][:8]}",
+                        daemon=True,
+                    ).start()
 
     def _refresh(self, record: dict[str, Any]) -> dict[str, Any]:
         job_id = record["job_id"]
@@ -587,6 +605,18 @@ class HostJobManager:
                 )
             self._finish(record)
         elif (
+            record.get("status") == "recovery_hold"
+            and time.time() >= float(record.get("recovery_hold_until") or 0)
+        ):
+            record.update(
+                {
+                    "status": "interrupted",
+                    "returncode": 125,
+                    "failure_class": "dispatch_outcome_unknown",
+                }
+            )
+            self._finish(record)
+        elif (
             record.get("status") in ACTIVE_STATUSES
             and process is None
             and record.get("pid")
@@ -598,18 +628,27 @@ class HostJobManager:
                     else "orphan_running"
                 )
             else:
+                watchdog_reason = record.get("watchdog_reason")
                 record.update(
                     {
                         "status": (
                             "cancelled"
                             if record.get("cancel_requested")
-                            else "interrupted"
+                            else ("completed" if watchdog_reason == "timeout" else "interrupted")
                         ),
-                        "returncode": 130 if record.get("cancel_requested") else 125,
+                        "returncode": (
+                            130
+                            if record.get("cancel_requested")
+                            else (124 if watchdog_reason == "timeout" else 125)
+                        ),
                         "failure_class": (
                             "cancelled"
                             if record.get("cancel_requested")
-                            else "external_interruption"
+                            else (
+                                "timeout"
+                                if watchdog_reason == "timeout"
+                                else "external_interruption"
+                            )
                         ),
                     }
                 )
@@ -617,11 +656,59 @@ class HostJobManager:
         self._write(record)
         return dict(record)
 
+    def _watch_orphan(self, job_id: str) -> None:
+        """Continue persisted timeout/cancel enforcement without owning the child."""
+        while True:
+            with self._lock:
+                record = self._read(job_id, required=False)
+                if not record or record.get("status") not in ACTIVE_STATUSES:
+                    return
+                pid = int(record.get("pid") or 0)
+                alive = bool(pid and _same_process(record))
+                timed_out = time.time() >= (
+                    float(record.get("started_at") or 0)
+                    + int(record.get("timeout_seconds") or 600)
+                )
+                cancel_requested = bool(record.get("cancel_requested"))
+            if not alive:
+                with self._lock:
+                    current = self._read(job_id, required=False)
+                    if current:
+                        self._refresh(current)
+                return
+            if timed_out or cancel_requested:
+                with self._lock:
+                    current = self._read(job_id, required=False)
+                    if current:
+                        current["watchdog_reason"] = (
+                            "cancelled" if cancel_requested else "timeout"
+                        )
+                        self._write(current)
+                _signal_process(None, pid, signal.SIGTERM)
+                deadline = time.time() + 5
+                while time.time() < deadline and _same_process(record):
+                    time.sleep(ORPHAN_WATCH_INTERVAL_SECONDS)
+                if _same_process(record):
+                    _signal_process(None, pid, signal.SIGKILL)
+                with self._lock:
+                    current = self._read(job_id, required=False)
+                    if not current:
+                        return
+                    current.update(
+                        {
+                            "status": "cancelled" if cancel_requested else "completed",
+                            "returncode": 130 if cancel_requested else 124,
+                            "failure_class": "cancelled" if cancel_requested else "timeout",
+                        }
+                    )
+                    self._finish(current)
+                return
+            time.sleep(ORPHAN_WATCH_INTERVAL_SECONDS)
+
     def _finish(self, record: dict[str, Any]) -> None:
-        stdout = _read_all(
-            self._output_directory(record["job_id"])
-            / "stdout.segment-000001.log"
-        )
+        directory = self._output_directory(record["job_id"])
+        stdout_path = directory / "stdout.segment-000001.log"
+        stdout = _read_all(stdout_path)
         usage = _parse_usage(stdout)
         record.update(usage)
         record["ended_at"] = record.get("ended_at") or time.time()
@@ -637,6 +724,14 @@ class HostJobManager:
                 self._output_directory(record["job_id"]) / "tmp",
                 ignore_errors=True,
             )
+        for stream_path in (
+            stdout_path,
+            directory / "stderr.segment-000001.log",
+        ):
+            if stream_path.is_file():
+                minimized = _redact(_read_all(stream_path))[-262_144:].encode()
+                write_atomic(stream_path, minimized)
+                stream_path.chmod(0o600)
         self._write(record)
 
     def _project(self, value: object) -> Path:

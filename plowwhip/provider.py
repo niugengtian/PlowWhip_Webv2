@@ -509,4 +509,82 @@ def record_model_call(
             time.time(),
         ),
     )
+    session = connection.execute(
+        "SELECT settings_json FROM task_sessions WHERE id = ?",
+        (task_session_id,),
+    ).fetchone()
+    if session:
+        values = json.loads(session["settings_json"]).get("values", {})
+        totals = connection.execute(
+            """
+            SELECT COUNT(*) AS calls, COALESCE(SUM(normalized_total), 0) AS tokens
+            FROM model_calls WHERE task_id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+        max_calls = int(values.get("max_model_calls", 100))
+        max_tokens = int(values.get("max_total_tokens", 10_000_000))
+        exceeded = (
+            totals["calls"] >= max_calls or totals["tokens"] >= max_tokens
+        )
+        if exceeded:
+            detail = (
+                "Model budget reached: "
+                f"{totals['calls']}/{max_calls} calls, "
+                f"{totals['tokens']}/{max_tokens} normalized tokens"
+            )
+            connection.execute(
+                """
+                UPDATE tasks SET public_status = 'needs_decision',
+                    phase = 'provider_recovery', wait_reason = ?,
+                    fault_code = 'scope', next_action_at = NULL,
+                    next_action_kind = NULL, updated_at = ?
+                WHERE id = ? AND outcome IS NULL
+                """,
+                (detail, time.time(), task_id),
+            )
+            task = connection.execute(
+                "SELECT project_id FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if task:
+                connection.execute(
+                    """
+                    INSERT INTO task_events(
+                        project_id, task_id, kind, detail_json, created_at
+                    ) VALUES (?, ?, 'model_budget_reached', ?, ?)
+                    """,
+                    (
+                        task["project_id"],
+                        task_id,
+                        json.dumps(
+                            {
+                                "calls": totals["calls"],
+                                "max_model_calls": max_calls,
+                                "normalized_tokens": totals["tokens"],
+                                "max_total_tokens": max_tokens,
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        time.time(),
+                    ),
+                )
     return normalized
+
+
+def model_budget_reached(
+    connection: sqlite3.Connection, task_id: str
+) -> bool:
+    row = connection.execute(
+        """
+        SELECT public_status, fault_code, wait_reason
+        FROM tasks WHERE id = ?
+        """,
+        (task_id,),
+    ).fetchone()
+    return bool(
+        row
+        and row["public_status"] == "needs_decision"
+        and row["fault_code"] == "scope"
+        and str(row["wait_reason"] or "").startswith("Model budget reached:")
+    )

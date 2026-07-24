@@ -34,6 +34,10 @@ EXPLICIT_READ_ONLY = re.compile(
     r"(?:只读(?:分析|审查|检查|查询)|不修改(?:任何)?(?:代码|文件)|read[- ]only)",
     re.IGNORECASE,
 )
+EXPLICIT_PROVIDER = re.compile(
+    r"(?:仅|只|指定)?\s*(?:使用|用)\s*(codex|cursor|deepseek|kimi)\b",
+    re.IGNORECASE,
+)
 GITHUB_TREE_URL = re.compile(
     r"https://github\.com/"
     r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/tree/"
@@ -53,6 +57,8 @@ PROJECT_SETTING_LIMITS = {
     "session_segment_max_bytes": (1_024, 1_048_576),
     "native_compact_input_tokens": (1_000, 100_000_000),
     "rotation_input_tokens": (1_000, 100_000_000),
+    "max_model_calls": (1, 100_000),
+    "max_total_tokens": (1_000, 1_000_000_000),
     "monitor_tail_lines": (1, 1_000),
     "monitor_tail_bytes": (256, 1_048_576),
     "retry_count": (0, 10),
@@ -839,11 +845,23 @@ def normalize_instruction(content: str) -> tuple[dict[str, object], list[dict[st
         workspace_change_required = not bool(
             READ_ONLY_INSTRUCTION.match(content) or EXPLICIT_READ_ONLY.search(content)
         )
+        requested = EXPLICIT_PROVIDER.search(content)
+        provider_key = (
+            {
+                "codex": "codex_cli",
+                "cursor": "cursor_cli",
+                "deepseek": "deepseek",
+                "kimi": "kimi",
+            }[requested.group(1).lower()]
+            if requested
+            else None
+        )
         return (
             {
                 "kind": "provider_task",
                 "instruction": content,
                 "workspace_change_required": workspace_change_required,
+                **({"provider_key": provider_key} if provider_key else {}),
             },
             [
                 {

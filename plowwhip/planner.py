@@ -48,11 +48,16 @@ TASK_SETTING_LIMITS = {
     "session_segment_max_bytes": (1_024, 1_048_576),
     "native_compact_input_tokens": (1_000, 100_000_000),
     "rotation_input_tokens": (1_000, 100_000_000),
+    "max_model_calls": (1, 100_000),
+    "max_total_tokens": (1_000, 1_000_000_000),
     "monitor_tail_lines": (1, 1_000),
     "monitor_tail_bytes": (256, 1_048_576),
     "retry_count": (0, 10),
     "retry_backoff_seconds": (0, 86_400),
 }
+NEGATED_RISK = re.compile(
+    r"(?:不要|禁止|不得|严禁|无需|不允许|避免)[^，。；;.!?\n]{0,24}$"
+)
 
 
 @dataclass(frozen=True)
@@ -81,8 +86,10 @@ def classify_instruction(content: str, kind: str) -> dict[str, object]:
         }
     lowered = content.lower()
     numbered_steps = declared_step_count(content)
-    high_risk = [term for term in HIGH_RISK_TERMS if term in lowered]
-    reasons = [term for term in LARGE_TERMS if term in lowered]
+    high_risk = [
+        term for term in HIGH_RISK_TERMS if _has_positive_term(lowered, term)
+    ]
+    reasons = [term for term in LARGE_TERMS if _has_positive_term(lowered, term)]
     if numbered_steps >= 3:
         reasons.append(f"{numbered_steps}_declared_steps")
     if reasons:
@@ -96,6 +103,13 @@ def classify_instruction(content: str, kind: str) -> dict[str, object]:
         "reasons": ["one_worker_owns_scope"],
         "authorization_required": False,
     }
+
+
+def _has_positive_term(content: str, term: str) -> bool:
+    return any(
+        not NEGATED_RISK.search(content[max(0, match.start() - 32) : match.start()])
+        for match in re.finditer(re.escape(term), content)
+    )
 
 
 def planner_prompt(instruction: str, project_id: str, classification: dict) -> str:
@@ -252,6 +266,8 @@ def normalize_plan(plan: object) -> dict:
         if len(dependencies) != len(set(dependencies)):
             raise ValueError(f"task {key} has duplicate dependencies")
         sprint = item.get("sprint", 1)
+        if isinstance(sprint, str) and sprint.isdigit():
+            sprint = int(sprint)
         if isinstance(sprint, bool) or not isinstance(sprint, int) or not 1 <= sprint <= 10_000:
             raise ValueError(f"task {key} has invalid sprint")
         role_key = str(item.get("role_key", default_role))

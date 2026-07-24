@@ -21,6 +21,7 @@ from .provider import (
     provider_agent_text,
     provider_job_output,
     provider_job_status,
+    model_budget_reached,
     record_model_call,
     start_provider_job,
 )
@@ -693,6 +694,15 @@ def apply_checker_step(
             int(checker["output_tokens"]),
             str(checker["model"]),
         )
+        if model_budget_reached(connection, task["id"]):
+            connection.execute(
+                """
+                UPDATE host_jobs SET status = 'succeeded', ended_at = ?,
+                    returncode = ? WHERE id = ?
+                """,
+                (time.time(), checker["returncode"], job["id"]),
+            )
+            return "needs_decision"
     checker_completed = bool(
         str(facts["state"].get("status")) == "completed"
         and checker["returncode"] == 0

@@ -22,7 +22,12 @@ SECRET = re.compile(
     rb"\bsk-[A-Za-z0-9_-]{20,}\b|"
     rb"\bghp_[A-Za-z0-9]{20,}\b|"
     rb"\bgithub_pat_[A-Za-z0-9_]{20,}\b|"
-    rb"\bAKIA[0-9A-Z]{16}\b)"
+    rb"\bAKIA[0-9A-Z]{16}\b|"
+    rb"\bASIA[0-9A-Z]{16}\b|"
+    rb"\bAIza[0-9A-Za-z_-]{35}\b|"
+    rb"\bxox[baprs]-[0-9A-Za-z-]{10,}\b|"
+    rb"\bglpat-[0-9A-Za-z_-]{20,}\b|"
+    rb"\b(?:npm_[0-9A-Za-z]{30,}|pypi-[0-9A-Za-z_-]{50,})\b)"
 )
 
 

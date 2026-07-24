@@ -43,7 +43,11 @@ from .planner import (
     perform_planner_step,
     planner_prompt,
 )
-from .provider import ACTIVE_HOST_JOB_STATUSES, record_model_call
+from .provider import (
+    ACTIVE_HOST_JOB_STATUSES,
+    model_budget_reached,
+    record_model_call,
+)
 from .store import Store, write_atomic as _write_atomic
 from .verification import (
     CheckerStep,
@@ -1650,6 +1654,15 @@ def _apply_planner_step(
             max(0, int(result.get("output_tokens") or 0)),
             str(result.get("model") or step.provider_key),
         )
+        if model_budget_reached(connection, task["id"]):
+            connection.execute(
+                """
+                UPDATE host_jobs SET status = 'succeeded', ended_at = ?,
+                    returncode = ? WHERE id = ?
+                """,
+                (now, int(result.get("returncode") or 0), job["id"]),
+            )
+            return "needs_decision"
     returncode = int(result.get("returncode") or 0) if isinstance(result, dict) else 1
     stdout = str(result.get("stdout") or "") if isinstance(result, dict) else ""
     if str(state.get("status")) != "completed" or returncode != 0:

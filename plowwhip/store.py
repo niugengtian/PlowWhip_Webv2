@@ -245,6 +245,8 @@ DEFAULT_SETTINGS = {
     "session_segment_max_bytes": 65_536,
     "native_compact_input_tokens": 120_000,
     "rotation_input_tokens": 180_000,
+    "max_model_calls": 100,
+    "max_total_tokens": 10_000_000,
     "monitor_tail_lines": 20,
     "monitor_tail_bytes": 8192,
     "retry_count": 1,

@@ -102,6 +102,24 @@ class GitPublishWorkerTest(unittest.TestCase):
         with self.assertRaisesRegex(PublishError, "sensitive filename"):
             _safe_tracked_tree(self.project)
 
+    def test_common_high_confidence_secret_patterns_are_rejected(self):
+        patterns = {
+            "aws.txt": "ASIAABCDEFGHIJKLMNOP",
+            "google.txt": "AIza" + "A" * 35,
+            "slack.txt": "xoxb-" + "A" * 20,
+            "gitlab.txt": "glpat-" + "A" * 20,
+        }
+        for name, secret in patterns.items():
+            with self.subTest(name=name):
+                path = self.project / name
+                path.write_text(secret + "\n", encoding="utf-8")
+                self._git("add", name)
+                self._git("commit", "-m", name)
+                with self.assertRaisesRegex(PublishError, "possible credential"):
+                    _safe_tracked_tree(self.project)
+                self._git("rm", name)
+                self._git("commit", "-m", f"remove {name}")
+
     def test_clean_head_is_pushed_and_remote_sha_is_verified(self):
         bare = self.root / "remote.git"
         subprocess.run(

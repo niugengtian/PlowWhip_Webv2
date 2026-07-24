@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import time
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
@@ -20,12 +21,20 @@ from .provider import (
     parse_context_events,
     provider_job_output,
     provider_job_status,
+    model_budget_reached,
     record_model_call,
     run_provider_probe,
     start_provider_job,
     workspace_snapshot,
 )
 from .store import Store, write_atomic as _write_atomic
+
+
+_PERSISTED_SECRET = re.compile(
+    r"(?i)(?:bearer\s+|(?:api[_-]?key|token|secret|password)\s*[=:]\s*)"
+    r"[A-Za-z0-9._~+/=-]{12,}|"
+    r"\b(?:sk-|ghp_|github_pat_|glpat-|xox[baprs]-)[A-Za-z0-9_-]{10,}\b"
+)
 
 
 @dataclass(frozen=True)
@@ -927,6 +936,7 @@ def apply_provider_step(
     log_path, log_body = _provider_log(store, task, job, facts.get("output"))
     if log_body:
         _write_atomic(log_path, log_body)
+        log_path.chmod(0o600)
     if bridge_status in ACTIVE_HOST_JOB_STATUSES:
         stopping = bool(
             task["phase"] == "stopping"
@@ -993,11 +1003,12 @@ def _provider_log(
         for chunk in output.get("chunks", []):
             if isinstance(chunk, dict) and chunk.get("stream") in streams:
                 streams[str(chunk["stream"])].append(str(chunk.get("text") or ""))
-    body = (
+    text = (
         "".join(streams["stdout"])
         + ("\n" if streams["stdout"] and streams["stderr"] else "")
         + "".join(streams["stderr"])
-    ).encode()
+    )
+    body = _PERSISTED_SECRET.sub("[REDACTED]", text).encode()
     path = (
         store.data_root
         / "projects"
@@ -1205,6 +1216,7 @@ def _finalize_provider_job(
         ).encode()
     _write_atomic(output_path, body)
     _write_atomic(log_path, log_body)
+    log_path.chmod(0o600)
     connection.execute(
         """
         UPDATE host_jobs SET status = ?, ended_at = ?, returncode = ?,
@@ -1243,6 +1255,7 @@ def _finalize_provider_job(
             output_tokens,
             str(state.get("model") or step.provider_key),
         )
+    budget_reached = model_budget_reached(connection, task["id"])
     for event in context_events:
         connection.execute(
             """
@@ -1343,6 +1356,7 @@ def _finalize_provider_job(
             ),
         )
         return "inspect"
+    unsafe_interruption = _write_interruption_is_unsafe(step.access, state)
     fallback = (
         _fallback_provider_generation(
             connection,
@@ -1356,7 +1370,7 @@ def _finalize_provider_job(
                 in {"process", "provider_unavailable", "transport"}
             ),
         )
-        if not succeeded
+        if not succeeded and not unsafe_interruption and not budget_reached
         else None
     )
     if succeeded and step.provider_key not in {"codex_cli", "git_publish"}:
@@ -1388,6 +1402,12 @@ def _finalize_provider_job(
                 if fallback == step.provider_key
                 else f"Provider {step.provider_key} failed; falling back to {fallback}"
             )
+        elif unsafe_interruption:
+            wait_reason = (
+                "Provider process was externally interrupted after a write-capable "
+                "dispatch; workspace side effects are unknown and automatic fallback "
+                "is fail-closed"
+            )
         else:
             wait_reason = "Provider execution did not exit successfully"
     connection.execute(
@@ -1397,12 +1417,38 @@ def _finalize_provider_job(
             updated_at = ? WHERE id = ?
         """,
         (
-            "in_progress" if succeeded or fallback else "needs_decision",
-            "verify" if succeeded else ("execute" if fallback else "provider_recovery"),
-            now if succeeded or fallback else None,
-            "check" if succeeded else ("execute" if fallback else None),
-            wait_reason,
-            None if succeeded else ("scope" if conflict else "provider"),
+            (
+                "needs_decision"
+                if budget_reached
+                else ("in_progress" if succeeded or fallback else "needs_decision")
+            ),
+            (
+                "provider_recovery"
+                if budget_reached
+                else ("verify" if succeeded else ("execute" if fallback else "provider_recovery"))
+            ),
+            None if budget_reached else (now if succeeded or fallback else None),
+            None if budget_reached else ("check" if succeeded else ("execute" if fallback else None)),
+            (
+                connection.execute(
+                    "SELECT wait_reason FROM tasks WHERE id = ?", (task["id"],)
+                ).fetchone()["wait_reason"]
+                if budget_reached
+                else wait_reason
+            ),
+            (
+                None
+                if succeeded and not budget_reached
+                else (
+                    "scope"
+                    if budget_reached
+                    else (
+                    "scope"
+                    if conflict
+                    else ("unsafe_unknown" if unsafe_interruption else "provider")
+                    )
+                )
+            ),
             now,
             task["id"],
         ),
@@ -1449,6 +1495,13 @@ def _finalize_provider_job(
             ),
         )
     return "provider_fallback" if fallback else job["purpose"]
+
+
+def _write_interruption_is_unsafe(access: str, state: dict[str, object]) -> bool:
+    return bool(
+        access == "write"
+        and str(state.get("failure_class") or "") == "external_interruption"
+    )
 
 
 def _rotate_context_generation(
@@ -2261,10 +2314,11 @@ def _persist_probe_result(
     body = canonical_json(result).encode()
     log_body = (
         f"provider={result['provider_key']} mode={result['mode']} "
-        f"available={result['available']} detail={result['detail']}\n"
+        f"available={result['available']}\n"
     ).encode()
     _write_atomic(output_path, body)
     _write_atomic(log_path, log_body)
+    log_path.chmod(0o600)
     if result["model_invoked"]:
         record_model_call(
             connection,
@@ -2278,6 +2332,7 @@ def _persist_probe_result(
             int(result["output_tokens"]),
             str(result["model"] or result["provider_key"]),
         )
+    budget_reached = model_budget_reached(connection, task["id"])
     returncode = result.get("returncode")
     returncode = int(returncode) if isinstance(returncode, int) else 0
     connection.execute(
@@ -2322,14 +2377,15 @@ def _persist_probe_result(
                 now,
             ),
         )
-    connection.execute(
-        """
-        UPDATE tasks SET public_status = 'in_progress', phase = 'verify',
-            next_action_at = ?, next_action_kind = 'check', updated_at = ?
-        WHERE id = ?
-        """,
-        (now, now, task["id"]),
-    )
+    if not budget_reached:
+        connection.execute(
+            """
+            UPDATE tasks SET public_status = 'in_progress', phase = 'verify',
+                next_action_at = ?, next_action_kind = 'check', updated_at = ?
+            WHERE id = ?
+            """,
+            (now, now, task["id"]),
+        )
     connection.execute(
         """
         INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
@@ -2351,4 +2407,4 @@ def _persist_probe_result(
             now,
         ),
     )
-    return job["purpose"]
+    return "needs_decision" if budget_reached else job["purpose"]
