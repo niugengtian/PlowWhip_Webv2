@@ -106,7 +106,8 @@ def planner_prompt(instruction: str, project_id: str, classification: dict) -> s
         "Return at least two genuine alternatives comparing name, scope, cost, risk, "
         "reversible, and acceptance. Select one and emit a serializable Task DAG with "
         "2-50 bounded tasks. Each task needs key, instruction, depends_on, sprint, "
-        "role_key, a 1-20 item acceptance array with stable id and expected result, "
+        'role_key, a 1-20 item acceptance array shaped exactly as '
+        '{"id":"stable-id","expected":"bounded expected result"}, '
         "optional earliest_start_delay_seconds, optional deadline_seconds, and optional "
         "settings. Use role_key fullstack for code work or "
         "deterministic only for exact '写入 relative-path: content' instructions. "
@@ -319,7 +320,9 @@ def _normalize_task_acceptance(
         if not isinstance(item, dict):
             raise ValueError(f"task {task_key} acceptance must contain objects")
         acceptance_id = str(item.get("id") or "")
-        expected = str(item.get("expected") or "").strip()
+        expected = str(
+            item.get("expected") or item.get("expected_result") or ""
+        ).strip()
         if (
             not TASK_KEY.fullmatch(acceptance_id)
             or acceptance_id in seen

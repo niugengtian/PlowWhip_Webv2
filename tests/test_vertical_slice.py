@@ -1052,7 +1052,7 @@ class VerticalSliceTest(unittest.TestCase):
                         "acceptance": [
                             {
                                 "id": "backend_refresh",
-                                "expected": "refresh endpoint passes its bounded check",
+                                "expected_result": "refresh endpoint passes its bounded check",
                             }
                         ],
                     },
@@ -1133,6 +1133,10 @@ class VerticalSliceTest(unittest.TestCase):
         self.assertEqual(
             json.loads(tasks[0]["acceptance_json"])[0]["id"],
             "backend_refresh",
+        )
+        self.assertEqual(
+            json.loads(tasks[0]["acceptance_json"])[0]["expected"],
+            "refresh endpoint passes its bounded check",
         )
         self.assertEqual(
             [row["role_key"] for row in roles],
