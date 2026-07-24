@@ -804,6 +804,67 @@ class VerticalSliceTest(unittest.TestCase):
             [(1, 1, "execute"), (2, 2, "execute"), (3, 2, "check")],
         )
 
+    def test_cancelled_planner_rerun_returns_to_plan_without_executor_bypass(self):
+        self._create_project(
+            "planner-rerun",
+            "planner-rerun-create",
+            "/workspace/planner-rerun",
+        )
+        submit_message(
+            self.store,
+            "planner-rerun",
+            "1、使用 SSH 上传到 "
+            "https://github.com/niugengtian/PlowWhip_Webv2/tree/blue；"
+            "2、指定 Cursor 审查稳健性、安全与 Token；"
+            "3、指定 Codex 根据审查结果修复并验证",
+            "planner-rerun-message",
+        )
+        self.assertEqual(tick(self.store)[0]["action"], "intake")
+        task = snapshot(self.db, self.data, "planner-rerun")["task"]
+        self.assertEqual((task["role_key"], task["phase"]), ("planner", "plan"))
+
+        submit_action(
+            self.store,
+            "planner-rerun",
+            task["id"],
+            "cancel",
+            "",
+            "planner-rerun-cancel",
+        )
+        self.assertEqual(tick(self.store)[0]["action"], "cancel")
+        submit_action(
+            self.store,
+            "planner-rerun",
+            task["id"],
+            "rerun",
+            "",
+            "planner-rerun-retry",
+        )
+        self.assertEqual(tick(self.store)[0]["action"], "rerun")
+
+        rerun = snapshot(self.db, self.data, "planner-rerun")
+        self.assertEqual(rerun["task"]["phase"], "plan")
+        self.assertEqual(rerun["task"]["next_action_kind"], "plan")
+        self.assertEqual(rerun["task"]["role_key"], "planner")
+        self.assertNotIn(
+            "fullstack",
+            {item["role_key"] for item in rerun["sessions"]},
+        )
+        with (
+            patch(
+                "plowwhip.planner.start_provider_job",
+                return_value={
+                    "status": "running",
+                    "session_id": "planner-rerun-session",
+                },
+            ),
+            patch(
+                "plowwhip.planner.provider_job_output",
+                return_value={"chunks": []},
+            ),
+        ):
+            self.assertEqual(tick(self.store)[0]["action"], "plan_wait")
+
     def test_versioned_plan_runs_serial_dag(self):
         submit_message(self.store, "plan", "build two files", "plan-1")
         run_until_idle(self.store)

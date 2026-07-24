@@ -620,15 +620,30 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
             event, detail = "cancelled", {"message_id": message["id"]}
     elif kind == "rerun" and task["outcome"] == "cancelled":
         spec = json.loads(task["spec_json"])
-        (
-            supported,
-            spec,
-            role_key,
-            provider_key,
-            checker_role,
-            checker_provider,
-            _reason,
-        ) = _runtime_contract(connection, task["project_id"], spec)
+        planner_rerun = bool(
+            task["role_key"] == "planner"
+            and dict(spec.get("classification") or {}).get("size") == "large"
+        )
+        if planner_rerun:
+            supported = bool(spec.get("project_path"))
+            role_key = "planner"
+            provider_key = _first_provider(
+                connection, task["project_id"], role_key
+            )
+            checker_role = task["checker_role_key"] or "independent_checker"
+            checker_provider = _first_provider(
+                connection, task["project_id"], checker_role
+            )
+        else:
+            (
+                supported,
+                spec,
+                role_key,
+                provider_key,
+                checker_role,
+                checker_provider,
+                _reason,
+            ) = _runtime_contract(connection, task["project_id"], spec)
         if supported:
             ensure_task_sessions(
                 connection,
@@ -646,13 +661,26 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
             UPDATE tasks SET public_status = ?, phase = ?, outcome = NULL,
                 retry_count = 0, next_retry_at = NULL,
                 next_action_at = ?, next_action_kind = ?,
+                wait_reason = NULL, fault_code = NULL,
                 updated_at = ? WHERE id = ?
             """,
             (
                 "pending" if supported else "needs_decision",
-                "execute" if supported else "intake",
+                (
+                    "plan"
+                    if supported and planner_rerun
+                    else "execute"
+                    if supported
+                    else "intake"
+                ),
                 now if supported else None,
-                "execute" if supported else None,
+                (
+                    "plan"
+                    if supported and planner_rerun
+                    else "execute"
+                    if supported
+                    else None
+                ),
                 now,
                 task["id"],
             ),

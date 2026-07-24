@@ -2,3 +2,16 @@
 __pycache__/
 *.py[cod]
 data/
+
+# Local configuration and credentials must never enter a commit.
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+id_rsa
+id_ed25519
