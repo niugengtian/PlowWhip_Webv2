@@ -626,6 +626,19 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
             event, detail = "cancelled", {"message_id": message["id"]}
     elif kind == "rerun" and task["outcome"] == "cancelled":
         spec = json.loads(task["spec_json"])
+        normalized_spec, _normalized_acceptance = normalize_instruction(
+            str(spec.get("instruction") or "")
+        )
+        if (
+            spec.get("kind") == "provider_task"
+            and normalized_spec.get("kind") == "provider_task"
+            and spec.get("workspace_change_required", True)
+            and not normalized_spec.get("workspace_change_required", True)
+        ):
+            spec = {**spec, "workspace_change_required": False}
+            spec_revision = task["spec_revision"] + 1
+        else:
+            spec_revision = task["spec_revision"]
         planner_rerun = bool(
             task["role_key"] == "planner"
             and dict(spec.get("classification") or {}).get("size") == "large"
@@ -690,6 +703,7 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
         connection.execute(
             """
             UPDATE tasks SET public_status = ?, phase = ?, outcome = NULL,
+                spec_json = ?, spec_revision = ?,
                 retry_count = 0, next_retry_at = NULL,
                 next_action_at = ?, next_action_kind = ?,
                 wait_reason = NULL, fault_code = NULL,
@@ -704,6 +718,8 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
                     if supported
                     else "intake"
                 ),
+                canonical_json(spec),
+                spec_revision,
                 now if supported else None,
                 (
                     "plan"

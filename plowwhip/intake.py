@@ -30,6 +30,10 @@ READ_ONLY_INSTRUCTION = re.compile(
     r"^\s*(?:分析|审查|检查|查询|只读|audit|review|inspect|analy[sz]e)",
     re.IGNORECASE,
 )
+EXPLICIT_READ_ONLY = re.compile(
+    r"(?:只读(?:分析|审查|检查|查询)|不修改(?:任何)?(?:代码|文件)|read[- ]only)",
+    re.IGNORECASE,
+)
 GITHUB_TREE_URL = re.compile(
     r"https://github\.com/"
     r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/tree/"
@@ -833,7 +837,7 @@ def normalize_instruction(content: str) -> tuple[dict[str, object], list[dict[st
     match = WRITE_INSTRUCTION.fullmatch(content.strip())
     if not match:
         workspace_change_required = not bool(
-            READ_ONLY_INSTRUCTION.match(content)
+            READ_ONLY_INSTRUCTION.match(content) or EXPLICIT_READ_ONLY.search(content)
         )
         return (
             {

@@ -27,6 +27,7 @@ from plowwhip.execution import (
 )
 from plowwhip.intake import (
     archive_project,
+    canonical_json,
     create_project,
     normalize_instruction,
     set_project_rule,
@@ -1242,7 +1243,10 @@ class VerticalSliceTest(unittest.TestCase):
                     },
                     {
                         "key": "cursor-review",
-                        "instruction": "审查当前代码并生成有界多维 Evidence",
+                        "instruction": (
+                            "使用 Cursor 对当前代码进行多维度只读审查并生成有界 "
+                            "Evidence，不修改代码"
+                        ),
                         "depends_on": ["initial-publish"],
                         "role_key": "fullstack",
                         "settings": {
@@ -1415,6 +1419,9 @@ class VerticalSliceTest(unittest.TestCase):
             tasks[0]["spec_revision"],
         )
         with self.store.transaction() as connection:
+            legacy_spec = json.loads(tasks[1]["spec_json"])
+            self.assertFalse(legacy_spec["workspace_change_required"])
+            legacy_spec["workspace_change_required"] = True
             connection.execute(
                 """
                 UPDATE tasks SET public_status = 'done', outcome = 'done',
@@ -1426,10 +1433,11 @@ class VerticalSliceTest(unittest.TestCase):
             connection.execute(
                 """
                 UPDATE tasks SET public_status = 'done', outcome = 'cancelled',
-                    phase = 'done', next_action_at = NULL, next_action_kind = NULL
+                    phase = 'done', spec_json = ?,
+                    next_action_at = NULL, next_action_kind = NULL
                 WHERE id = ?
                 """,
-                (tasks[1]["id"],),
+                (canonical_json(legacy_spec), tasks[1]["id"]),
             )
         self.assertEqual(tick(self.store)[0]["action"], "dependency_blocked")
         submit_action(
@@ -1445,7 +1453,7 @@ class VerticalSliceTest(unittest.TestCase):
         try:
             rerun_rows = connection.execute(
                 """
-                SELECT id, public_status, phase, outcome
+                SELECT id, public_status, phase, outcome, spec_revision, spec_json
                 FROM tasks WHERE id IN (?, ?)
                 ORDER BY CASE id WHEN ? THEN 0 ELSE 1 END
                 """,
@@ -1454,11 +1462,15 @@ class VerticalSliceTest(unittest.TestCase):
         finally:
             connection.close()
         self.assertEqual(
-            [tuple(row) for row in rerun_rows],
-            [
-                (tasks[1]["id"], "pending", "execute", None),
-                (tasks[2]["id"], "pending", "queued", None),
-            ],
+            tuple(rerun_rows[0])[:5],
+            (tasks[1]["id"], "pending", "execute", None, 2),
+        )
+        self.assertFalse(
+            json.loads(rerun_rows[0]["spec_json"])["workspace_change_required"]
+        )
+        self.assertEqual(
+            tuple(rerun_rows[1])[:5],
+            (tasks[2]["id"], "pending", "queued", None, 1),
         )
 
     def test_running_planner_host_job_reconciles_after_store_restart(self):
