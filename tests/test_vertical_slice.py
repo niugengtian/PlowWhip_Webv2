@@ -1451,6 +1451,81 @@ class VerticalSliceTest(unittest.TestCase):
             authorization["spec_revision"],
             tasks[0]["spec_revision"],
         )
+        with self.store.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE tasks SET public_status = 'done', outcome = 'cancelled',
+                    phase = 'done', next_action_at = NULL, next_action_kind = NULL
+                WHERE id = ?
+                """,
+                (tasks[0]["id"],),
+            )
+        self.assertEqual(tick(self.store)[0]["action"], "dependency_blocked")
+        submit_action(
+            self.store,
+            "composite-plan",
+            tasks[0]["id"],
+            "rerun",
+            "",
+            "rerun-cancelled-planned-git",
+        )
+        self.assertEqual(tick(self.store)[0]["action"], "rerun")
+        connection = self.store.connect_readonly()
+        try:
+            git_rerun = connection.execute(
+                """
+                SELECT public_status, phase, outcome, wait_reason
+                FROM tasks WHERE id = ?
+                """,
+                (tasks[0]["id"],),
+            ).fetchone()
+            cursor_after_rerun = connection.execute(
+                "SELECT public_status, phase, outcome FROM tasks WHERE id = ?",
+                (tasks[1]["id"],),
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(
+            tuple(git_rerun)[:3],
+            ("needs_decision", "intake", None),
+        )
+        self.assertIn("authorization", git_rerun["wait_reason"])
+        self.assertEqual(
+            tuple(cursor_after_rerun),
+            ("pending", "queued", None),
+        )
+        submit_action(
+            self.store,
+            "composite-plan",
+            tasks[0]["id"],
+            "authorize",
+            tasks[0]["id"],
+            "reauthorize-cancelled-planned-git",
+        )
+        self.assertEqual(tick(self.store)[0]["action"], "authorize")
+        connection = self.store.connect_readonly()
+        try:
+            reauthorized_git = connection.execute(
+                """
+                SELECT public_status, phase, outcome, spec_revision, spec_json
+                FROM tasks WHERE id = ?
+                """,
+                (tasks[0]["id"],),
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(
+            tuple(reauthorized_git)[:4],
+            ("pending", "execute", None, 3),
+        )
+        refreshed_authorization = json.loads(
+            reauthorized_git["spec_json"]
+        )["authorization"]
+        self.assertEqual(
+            refreshed_authorization["task_id"],
+            tasks[0]["id"],
+        )
+        self.assertEqual(refreshed_authorization["spec_revision"], 3)
         repair_acceptances = json.loads(tasks[2]["acceptance_json"])
         self.assertIn(
             "review-findings-disposition",
@@ -3954,6 +4029,7 @@ class WebApiTest(unittest.TestCase):
             self.assertIn("项目名称", html)
             self.assertIn("内部稳定 ID 由系统维护", html)
             self.assertIn("未变化，未重复写入历史", html)
+            self.assertIn("重新授权发布当前 HEAD", html)
             self.assertNotIn('id="new-project-id"', html)
             self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
         with urlopen(self.base + "/api/settings-library", timeout=2) as response:

@@ -685,6 +685,11 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
         )
         if planner_rerun:
             supported = bool(spec.get("project_path"))
+            reason = (
+                None
+                if supported
+                else "project workspace is not bound; set an absolute Host Bridge path"
+            )
             role_key = "planner"
             provider_key = _first_provider(
                 connection, task["project_id"], role_key
@@ -701,8 +706,25 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
                 provider_key,
                 checker_role,
                 checker_provider,
-                _reason,
+                reason,
             ) = _runtime_contract(connection, task["project_id"], spec)
+        connection.execute(
+            """
+            UPDATE tasks SET public_status = 'pending', phase = 'queued',
+                wait_reason = NULL, fault_code = NULL,
+                next_action_at = NULL, next_action_kind = 'dependency',
+                updated_at = ?
+            WHERE project_id = ? AND outcome IS NULL
+              AND public_status = 'needs_decision' AND phase = 'plan'
+              AND wait_reason = 'a required dependency was cancelled'
+              AND EXISTS (
+                  SELECT 1 FROM task_dependencies edge
+                  WHERE edge.task_id = tasks.id
+                    AND edge.depends_on_task_id = ?
+              )
+            """,
+            (now, task["project_id"], task["id"]),
+        )
         if supported:
             ensure_task_sessions(
                 connection,
@@ -723,30 +745,13 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
                 )
             else:
                 rotate_task_sessions(connection, task["id"], now)
-            connection.execute(
-                """
-                UPDATE tasks SET public_status = 'pending', phase = 'queued',
-                    wait_reason = NULL, fault_code = NULL,
-                    next_action_at = NULL, next_action_kind = 'dependency',
-                    updated_at = ?
-                WHERE project_id = ? AND outcome IS NULL
-                  AND public_status = 'needs_decision' AND phase = 'plan'
-                  AND wait_reason = 'a required dependency was cancelled'
-                  AND EXISTS (
-                      SELECT 1 FROM task_dependencies edge
-                      WHERE edge.task_id = tasks.id
-                        AND edge.depends_on_task_id = ?
-                  )
-                """,
-                (now, task["project_id"], task["id"]),
-            )
         connection.execute(
             """
             UPDATE tasks SET public_status = ?, phase = ?, outcome = NULL,
                 spec_json = ?, acceptance_json = ?, spec_revision = ?,
                 retry_count = 0, next_retry_at = NULL,
                 next_action_at = ?, next_action_kind = ?,
-                wait_reason = NULL, fault_code = NULL,
+                wait_reason = ?, fault_code = ?,
                 updated_at = ? WHERE id = ?
             """,
             (
@@ -769,6 +774,8 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
                     if supported
                     else None
                 ),
+                None if supported else reason,
+                None if supported else "scope",
                 now,
                 task["id"],
             ),
@@ -1158,6 +1165,84 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
             (now, now, task["id"]),
         )
         event, detail = "wake_requested", {"message_id": message["id"]}
+    elif (
+        kind == "authorize"
+        and task["public_status"] == "needs_decision"
+        and action.get("action_kind") == "git_publish"
+    ):
+        spec = json.loads(task["spec_json"])
+        project = connection.execute(
+            "SELECT host_path FROM projects WHERE id = ?", (task["project_id"],)
+        ).fetchone()
+        target_scope = (
+            f"{spec.get('remote_ssh')}#refs/heads/{spec.get('branch')}"
+        )
+        valid = bool(
+            spec.get("kind") == "git_publish"
+            and project
+            and project["host_path"]
+            and action.get("spec_revision") == task["spec_revision"]
+            and action.get("target_scope") == target_scope
+            and float(action.get("expires_at") or 0) >= now
+        )
+        if valid:
+            revision = task["spec_revision"] + 1
+            authorization = {
+                **action,
+                "source_message_id": message["id"],
+                "project_id": task["project_id"],
+                "spec_revision": revision,
+            }
+            revised = {
+                **spec,
+                "operation": "publish",
+                "workspace_change_required": True,
+                "authorization": authorization,
+            }
+            revised.pop("expected_remote_head", None)
+            revised.pop("publish_mode", None)
+            ensure_task_sessions(
+                connection,
+                task["project_id"],
+                task["id"],
+                now,
+                executor_role="git_publisher",
+                checker_role="deterministic_checker",
+                executor_provider="git_publish",
+                checker_provider="local",
+                settings_overrides={"git_publisher": {"retry_count": 0}},
+            )
+            rotate_task_sessions(connection, task["id"], now)
+            connection.execute(
+                """
+                UPDATE tasks SET spec_revision = ?, spec_json = ?,
+                    public_status = 'pending', phase = 'execute', outcome = NULL,
+                    wait_reason = NULL, fault_code = NULL, retry_count = 0,
+                    next_retry_at = NULL, next_action_at = ?,
+                    next_action_kind = 'execute', role_key = 'git_publisher',
+                    checker_role_key = 'deterministic_checker', updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    revision,
+                    canonical_json(revised),
+                    now,
+                    now,
+                    task["id"],
+                ),
+            )
+            event = "authorization_granted"
+            detail = authorization
+        else:
+            connection.execute(
+                """
+                UPDATE tasks SET wait_reason = ?, fault_code = 'scope',
+                    updated_at = ? WHERE id = ?
+                """,
+                ("Git publish authorization is stale or out of scope", now, task["id"]),
+            )
+            event = "authorization_rejected"
+            detail = {"message_id": message["id"]}
     elif kind == "authorize" and task["public_status"] == "needs_decision":
         project = connection.execute(
             "SELECT host_path FROM projects WHERE id = ?", (task["project_id"],)

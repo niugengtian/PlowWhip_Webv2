@@ -582,28 +582,45 @@ def submit_action(
         if kind == "authorize":
             if instruction != task_id:
                 raise ValueError("authorize requires exact Task ID confirmation")
-            proposal = connection.execute(
-                """
-                SELECT id, revision FROM plans
-                WHERE goal_id = (
-                    SELECT goal_id FROM tasks WHERE id = ?
-                ) AND selected = 0 AND revision > 1
-                ORDER BY revision DESC LIMIT 1
-                """,
-                (task_id,),
-            ).fetchone()
-            if not proposal:
-                raise ValueError("no Planner proposal is awaiting authorization")
-            action = {
-                "kind": "authorize",
-                "task_id": task_id,
-                "spec_revision": task["spec_revision"],
-                "action_kind": "select_plan",
-                "target_scope": task["host_path"] or f"project:{project_id}",
-                "expires_at": now + 900,
-                "plan_id": proposal["id"],
-                "plan_revision": proposal["revision"],
-            }
+            spec = json.loads(task["spec_json"])
+            if (
+                spec.get("kind") == "git_publish"
+                and task["public_status"] == "needs_decision"
+                and task["outcome"] is None
+            ):
+                action = {
+                    "kind": "authorize",
+                    "task_id": task_id,
+                    "spec_revision": task["spec_revision"],
+                    "action_kind": "git_publish",
+                    "target_scope": (
+                        f"{spec.get('remote_ssh')}#refs/heads/{spec.get('branch')}"
+                    ),
+                    "expires_at": now + 900,
+                }
+            else:
+                proposal = connection.execute(
+                    """
+                    SELECT id, revision FROM plans
+                    WHERE goal_id = (
+                        SELECT goal_id FROM tasks WHERE id = ?
+                    ) AND selected = 0 AND revision > 1
+                    ORDER BY revision DESC LIMIT 1
+                    """,
+                    (task_id,),
+                ).fetchone()
+                if not proposal:
+                    raise ValueError("no Planner proposal is awaiting authorization")
+                action = {
+                    "kind": "authorize",
+                    "task_id": task_id,
+                    "spec_revision": task["spec_revision"],
+                    "action_kind": "select_plan",
+                    "target_scope": task["host_path"] or f"project:{project_id}",
+                    "expires_at": now + 900,
+                    "plan_id": proposal["id"],
+                    "plan_revision": proposal["revision"],
+                }
         if kind in {
             "refresh_git_publish_context",
             "publish_new_branch",
@@ -723,8 +740,11 @@ def submit_action(
         ) or (
             kind == "authorize"
             and task["public_status"] == "needs_decision"
-            and task["phase"] == "plan"
             and task["outcome"] is None
+            and (
+                task["phase"] == "plan"
+                or json.loads(task["spec_json"]).get("kind") == "git_publish"
+            )
         ) or (kind == "cancel" and task["outcome"] is None) or (
             kind == "confirm_not_executed"
             and task["public_status"] == "needs_decision"
