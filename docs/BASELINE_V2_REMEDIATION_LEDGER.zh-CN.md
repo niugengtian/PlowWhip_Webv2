@@ -38,7 +38,7 @@
 |---|---|---|---|
 | Wave1 | `1393c35` | A-16a 禁章节覆盖语义拒；废止 A/B+0.95；`decision_options`/`select_option`；failure-signature 分桶 | 定向 unittest；**非**付费 E2E |
 | Wave2 | `2b23060` | T-14 增量续命；checkpoint 事实化；Bridge 分类+/health；force-cancel 收敛；exploration turn advisory；`script_library_search` | 定向 unittest；**非**付费 E2E |
-| Wave3 | 见本推送 tip | Provider×条款矩阵回归 + 台账重标；禁把单厂商 Done 当全厂闭环 | `tests/test_v3_provider_matrix.py` + `docs/runtime-audits/V3_WAVE3_PROVIDER_MATRIX_20260726.md`；现场 cursor/deepseek/kimi E2E **仍待主人密钥环境** |
+| Wave3 | `d1a8b6b` | Provider×条款矩阵回归 + 台账重标；禁把单厂商 Done 当全厂闭环 | `tests/test_v3_provider_matrix.py` + `docs/runtime-audits/V3_WAVE3_PROVIDER_MATRIX_20260726.md`；现场 cursor/deepseek/kimi E2E **仍待主人密钥环境** |
 
 ## 2. 根因修复顺序
 
