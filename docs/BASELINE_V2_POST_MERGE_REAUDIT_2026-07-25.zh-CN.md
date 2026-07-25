@@ -36,7 +36,7 @@
 | L-01 / D-09 / C-04 | 与基线冲突 | `cronner.py:117-122` → `lifecycle.py:146-175` `record_checkpoint_failure` |
 | L-03 / C-02 | 与基线冲突 | `execution.py` 21×、`verification.py` 12× `write_task_fields` |
 | B-15 | 与基线冲突 | `app.py:168-183` `POST /api/semantic-search` |
-| A-07 | 部分实现 | 代码有 fcntl/lease；Docker 8750 运行证据未闭合 |
+| A-07 | 已实现（本机 Docker） | 见 `docs/BASELINE_V2_DOCKER_8750_RUNTIME_EVIDENCE.zh-CN.md`：`v2-baseline` 容器 healthy、`.cronner.lock`、in-process Cronner |
 | D-30 | 部分实现 | `secret_policy.py` 已知形态启发式拒收 |
 
 ## 4. 已实现主线抽检（无变化）
