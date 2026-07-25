@@ -141,6 +141,38 @@ def register_indexed_artifact(
         "scope": scope,
         "source_task_id": source_task_id,
     }
+    # LIVE-P1-02 / LIVE-DS-20: verify→continue re-executes at the same
+    # spec_revision and re-indexes the same workspace Artifact path. A hard
+    # INSERT crash rolled back finalize, left HostJob "running", and surfaced
+    # as endless "Host Bridge poll unavailable".
+    existing = connection.execute(
+        """
+        SELECT id FROM artifacts
+        WHERE task_id = ? AND kind = ? AND path = ? AND revision = ?
+        ORDER BY rowid DESC LIMIT 1
+        """,
+        (task_id, kind, stored_path, int(revision)),
+    ).fetchone()
+    if existing:
+        connection.execute(
+            """
+            UPDATE artifacts
+            SET project_id = ?, sha256 = ?, bytes = ?, acceptance_id = ?,
+                scope_json = ?, source_task_id = ?, created_at = ?
+            WHERE id = ?
+            """,
+            (
+                project_id,
+                sha256,
+                bytes_count,
+                acceptance_id,
+                canonical_json(scope),
+                source_task_id,
+                created_at,
+                existing["id"],
+            ),
+        )
+        return entry
     connection.execute(
         """
         INSERT INTO artifacts(

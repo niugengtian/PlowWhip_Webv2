@@ -6,8 +6,10 @@ from pathlib import Path
 
 from plowwhip.artifact_contract import (
     register_artifact,
+    register_indexed_artifact,
     task_data_scope,
     verified_artifact,
+    workspace_scope,
 )
 from plowwhip.continuity import _dependency_results
 from plowwhip.store import Store
@@ -181,6 +183,54 @@ class ArtifactContractTest(unittest.TestCase):
                 )
         finally:
             connection.close()
+
+    def test_register_indexed_artifact_upserts_same_revision(self):
+        """LIVE-DS-20: same path@revision re-execute must not crash Cronner."""
+        scope = workspace_scope(str(Path(self.temporary.name) / "ws"), ["report.md"])
+        (Path(self.temporary.name) / "ws").mkdir(parents=True, exist_ok=True)
+        first_sha = "a" * 64
+        second_sha = "b" * 64
+        with self.store.transaction() as connection:
+            first = register_indexed_artifact(
+                connection,
+                project_id="artifact-project",
+                task_id="artifact-task-0",
+                kind="output",
+                stored_path="docs/runtime-audits/REPORT.md",
+                sha256=first_sha,
+                bytes_count=11,
+                acceptance_id="task_result_artifact",
+                revision=2,
+                scope=scope,
+                source_task_id="artifact-task-0",
+                created_at=self.now,
+            )
+            second = register_indexed_artifact(
+                connection,
+                project_id="artifact-project",
+                task_id="artifact-task-0",
+                kind="output",
+                stored_path="docs/runtime-audits/REPORT.md",
+                sha256=second_sha,
+                bytes_count=22,
+                acceptance_id="task_result_artifact",
+                revision=2,
+                scope=scope,
+                source_task_id="artifact-task-0",
+                created_at=self.now + 1,
+            )
+            rows = connection.execute(
+                """
+                SELECT sha256, bytes FROM artifacts
+                WHERE task_id = 'artifact-task-0'
+                  AND path = 'docs/runtime-audits/REPORT.md'
+                  AND revision = 2
+                """
+            ).fetchall()
+        self.assertEqual(first["path"], second["path"])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["sha256"], second_sha)
+        self.assertEqual(rows[0]["bytes"], 22)
 
 
 if __name__ == "__main__":

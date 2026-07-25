@@ -23,6 +23,7 @@ from .lifecycle_state import (
     increment_task_retry,
     write_task_fields,
 )
+from .planner import audit_delivery_intent
 from .provider import (
     ACTIVE_HOST_JOB_STATUSES,
     HostBridgeError,
@@ -40,6 +41,13 @@ from .provider import (
     selected_model,
     start_provider_job,
     workspace_snapshot,
+)
+from .recovery_policy import (
+    MAX_SAME_PROBLEM_RETRIES,
+    clamp_retry_count,
+    count_recovery_attempts,
+    recovery_cap_reached,
+    recovery_cap_wait_reason,
 )
 from .secret_policy import redact_secret
 from .store import Store, write_atomic as _write_atomic
@@ -315,6 +323,7 @@ def _role_snapshot(
         "planner": "code_change",
         "independent_checker": "code_change",
         "git_publisher": "git_publish",
+        "local_script_runner": "local_script",
     }.get(role_key, "deterministic_write")
     keys = [role_key, "v1_hard_boundaries", template_key]
     rows = connection.execute(
@@ -497,7 +506,7 @@ def execute_task(
     spec = json.loads(task["spec_json"])
     if spec["kind"] == "provider_probe":
         return _prepare_provider_probe(connection, task, spec, purpose)
-    if spec["kind"] in {"provider_task", "git_publish"}:
+    if spec["kind"] in {"provider_task", "git_publish", "local_script"}:
         return _prepare_provider_task(store, connection, task, spec, purpose)
     sequence = connection.execute(
         "SELECT COALESCE(MAX(sequence), 0) + 1 AS value FROM host_jobs WHERE task_id = ?",
@@ -669,11 +678,21 @@ def _prepare_provider_task(
     from .continuity import compile_hot_context
 
     try:
+        hot_context = None
+        if spec["kind"] not in {"git_publish", "local_script"}:
+            hot_context = compile_hot_context(
+                store,
+                connection,
+                task,
+                task["role_key"] or "fullstack",
+            )
         prompt = _provider_prompt(
             task,
             spec,
             purpose,
-            compile_hot_context(store, connection, task, task["role_key"] or "fullstack"),
+            hot_context,
+            store=store,
+            connection=connection,
         )
     except ValueError as error:
         write_task_fields(
@@ -803,7 +822,7 @@ def _prepare_provider_task(
         generation["external_session_id"],
         int(settings.get("max_runtime_seconds", 600)),
         access,
-        _context_policy(settings),
+        _execution_context_policy(settings, spec),
         reusable["id"] if reusable else None,
         reusable_execution["before"] if reusable_execution else None,
         reusable_execution["after"] if reusable_execution else None,
@@ -938,7 +957,7 @@ def pending_provider_step(
         generation["external_session_id"],
         int(settings.get("max_runtime_seconds", 600)),
         str(dispatch.get("access") or "write"),
-        _context_policy(settings),
+        _execution_context_policy(settings, spec),
         str(dispatch.get("reuse_from_host_job_id") or "") or None,
         dispatch.get("reuse_before"),
         dispatch.get("reuse_after"),
@@ -1340,6 +1359,51 @@ def apply_provider_step(
             or step.kind == "cancel"
         )
         dispatch = json.loads(job["dispatch_json"])
+        if (
+            not stopping
+            and state.get("deadline_reached_at") is not None
+            and task["phase"] in {"execute_wait", "execute_dispatch", "plan_wait", "check_wait"}
+        ):
+            from .soft_timeout import try_soft_timeout_extension
+
+            soft_outcome = try_soft_timeout_extension(
+                connection, task, job, state, now=now
+            )
+            if soft_outcome == "extended":
+                return "wait"
+            if soft_outcome in {"hard_idle", "soft_cap_reached"}:
+                dispatch.setdefault("deadline_detected_at", now)
+                dispatch["timeout_stage"] = "reconcile"
+                dispatch["timeout_class"] = (
+                    "hard" if soft_outcome == "hard_idle" else "soft_cap"
+                )
+                connection.execute(
+                    """
+                    UPDATE host_jobs SET status = 'running',
+                        output_ref = COALESCE(?, output_ref), dispatch_json = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        store.relative_data_path(log_path) if log_body else None,
+                        canonical_json(dispatch),
+                        job["id"],
+                    ),
+                )
+                write_task_fields(
+                    connection,
+                    task["id"],
+                    {
+                        "phase": "timeout_reconcile",
+                        "wait_reason": (
+                            "[deadline] reconcile and checkpoint required before stop"
+                        ),
+                        "fault_code": "process",
+                        "next_action_at": now,
+                        "next_action_kind": "reconcile_stop",
+                        "updated_at": now,
+                    },
+                )
+                return "deadline_reconcile"
         if stopping:
             dispatch.setdefault("stop_requested_at", now)
             if step.kind == "cancel":
@@ -1367,19 +1431,49 @@ def apply_provider_step(
                 """,
                 (state["session_id"], job["task_session_id"], job["session_generation"]),
             )
+        # Bind Task deadline to HostJob wall budget when missing (LIVE-DS-22).
+        deadline_fields: dict[str, object] = {
+            "phase": "stopping" if stopping else "execute_wait",
+            "wait_reason": task["wait_reason"] if stopping else None,
+            "fault_code": task["fault_code"] if stopping else None,
+            "next_action_at": now + 1,
+            "next_action_kind": (
+                "reconcile_stop" if stopping else "poll"
+            ),
+            "updated_at": now,
+        }
+        if (
+            not stopping
+            and task["deadline_at"] is None
+            and step.kind == "start"
+        ):
+            session_row = connection.execute(
+                """
+                SELECT settings_json FROM task_sessions WHERE id = ?
+                """,
+                (job["task_session_id"],),
+            ).fetchone()
+            session_values = (
+                json.loads(session_row["settings_json"]).get("values", {})
+                if session_row
+                else {}
+            )
+            budget = int(
+                state.get("timeout_seconds")
+                or dispatch.get("timeout_seconds")
+                or session_values.get("max_runtime_seconds")
+                or 600
+            )
+            deadline_fields["deadline_at"] = now + budget
+            dispatch["timeout_seconds"] = budget
+            connection.execute(
+                "UPDATE host_jobs SET dispatch_json = ? WHERE id = ?",
+                (canonical_json(dispatch), job["id"]),
+            )
         write_task_fields(
             connection,
             task["id"],
-            {
-                "phase": "stopping" if stopping else "execute_wait",
-                "wait_reason": task["wait_reason"] if stopping else None,
-                "fault_code": task["fault_code"] if stopping else None,
-                "next_action_at": now + 1,
-                "next_action_kind": (
-                    "reconcile_stop" if stopping else "poll"
-                ),
-                "updated_at": now,
-            },
+            deadline_fields,
         )
         return "cancel" if stopping else (
             "dispatch" if step.kind == "start" else "wait"
@@ -1740,12 +1834,26 @@ def _finalize_provider_job(
     workspace_changed = canonical_json(before_git) != canonical_json(after_git)
     returncode = state.get("returncode")
     returncode = int(returncode) if isinstance(returncode, int) else 1
-    succeeded = str(state.get("status")) == "completed" and returncode == 0
+    workspace_apply = state.get("workspace_apply")
+    applied_delta = (
+        isinstance(workspace_apply, dict)
+        and bool(workspace_apply.get("applied"))
+        and (
+            int(workspace_apply.get("created") or 0)
+            + int(workspace_apply.get("modified") or 0)
+        )
+        > 0
+    )
+    # LIVE-DS-26: nonzero exit with applied workspace payload still counts as
+    # HostJob success so formal Artifact finalize is not skipped.
+    succeeded = str(state.get("status")) == "completed" and (
+        returncode == 0 or applied_delta or workspace_changed
+    )
     stdout, stderr = _provider_output_streams(facts.get("output"))
     context_events = parse_context_events(stdout)
     script_result = (
         _last_json_object(stdout) or _last_json_object(stderr)
-        if step.provider_key == "git_publish"
+        if step.provider_key in {"git_publish", "local_script"}
         else None
     )
     report, report_truncated = (
@@ -1753,7 +1861,7 @@ def _finalize_provider_job(
             redact_secret(provider_agent_text(stdout)),
             False,
         )
-        if step.provider_key != "git_publish"
+        if step.provider_key not in {"git_publish", "local_script"}
         else ("", False)
     )
     report_body = report.encode()
@@ -1942,7 +2050,7 @@ def _finalize_provider_job(
         "formal_result_error": formal_result_error,
         "reused_from_host_job_id": step.source_job_id,
     }
-    if step.provider_key == "git_publish":
+    if step.provider_key in {"git_publish", "local_script"}:
         manifest["script_result"] = script_result
     body = canonical_json(manifest).encode()
     output_path = (
@@ -2135,6 +2243,10 @@ def _finalize_provider_job(
                 step.provider_key != "git_publish"
                 and str(state.get("failure_class") or "")
                 in {"process", "provider_unavailable", "transport"}
+                # LIVE-DS-22: tool-loop / no-progress is not a process blip —
+                # do not burn same-provider retries on identical shape.
+                and str(state.get("failure_class") or "")
+                != "internal_tool_no_progress"
             ),
         )
         if not succeeded and not unsafe_interruption and not budget_reached
@@ -2166,6 +2278,11 @@ def _finalize_provider_job(
                 f"Provider {step.provider_key} failed; scheduled bounded retry"
                 if fallback == step.provider_key
                 else f"Provider {step.provider_key} failed; falling back to {fallback}"
+            )
+        elif recovery_cap_reached(connection, task["id"]):
+            wait_reason = recovery_cap_wait_reason(
+                count_recovery_attempts(connection, task["id"]),
+                formal_result_error,
             )
         elif unsafe_interruption:
             wait_reason = (
@@ -2286,6 +2403,42 @@ def _fallback_provider_generation(
     now: float,
     retry_same_provider: bool = False,
 ) -> str | None:
+    from .provider_policy import provider_order_for_role
+
+    attempts = count_recovery_attempts(connection, task["id"])
+    if attempts >= MAX_SAME_PROBLEM_RETRIES:
+        connection.execute(
+            """
+            INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
+            VALUES (?, ?, 'recovery_cap_reached', ?, ?)
+            """,
+            (
+                task["project_id"],
+                task["id"],
+                canonical_json(
+                    {
+                        "attempts": attempts,
+                        "max": MAX_SAME_PROBLEM_RETRIES,
+                        "from": provider_key,
+                        "host_job_id": job["id"],
+                    }
+                ),
+                now,
+            ),
+        )
+        write_task_fields(
+            connection,
+            task["id"],
+            {
+                "wait_reason": recovery_cap_wait_reason(
+                    attempts, task["wait_reason"]
+                ),
+                "fault_code": "scope",
+                "updated_at": now,
+            },
+        )
+        return None
+
     session = connection.execute(
         """
         SELECT role_key, settings_json FROM task_sessions WHERE id = ?
@@ -2293,12 +2446,7 @@ def _fallback_provider_generation(
         (job["task_session_id"],),
     ).fetchone()
     values = json.loads(session["settings_json"]).get("values", {})
-    configured = values.get("provider_order", {})
-    order = (
-        configured
-        if isinstance(configured, list)
-        else configured.get(session["role_key"], [])
-    )
+    order = provider_order_for_role(values, session["role_key"])
     try:
         candidates = order[order.index(provider_key) + 1 :]
     except ValueError:
@@ -2311,11 +2459,12 @@ def _fallback_provider_generation(
         ),
         None,
     )
+    allowed_retries = clamp_retry_count(values.get("retry_count", 0))
     retrying = bool(
         not next_provider
         and retry_same_provider
         and provider_key in PROVIDERS
-        and task["retry_count"] < int(values.get("retry_count", 0))
+        and task["retry_count"] < allowed_retries
     )
     if retrying:
         next_provider = provider_key
@@ -2490,7 +2639,13 @@ def _provider_output_streams(output: object) -> tuple[str, str]:
 
 
 def _provider_prompt(
-    task: sqlite3.Row, spec: dict, purpose: str, hot_context: str | None = None
+    task: sqlite3.Row,
+    spec: dict,
+    purpose: str,
+    hot_context: str | None = None,
+    *,
+    store: Store | None = None,
+    connection: sqlite3.Connection | None = None,
 ) -> str:
     if spec["kind"] == "git_publish":
         operation = str(spec.get("operation") or "publish")
@@ -2510,6 +2665,35 @@ def _provider_prompt(
                 }
             )
         return canonical_json(prompt)
+    if spec["kind"] == "local_script":
+        script = dict(spec.get("script") or {})
+        if script.get("origin") == "library":
+            if store is None or connection is None:
+                raise ValueError("local_script library resolution requires store")
+            from .script_library import resolve_library_script
+
+            resolved = resolve_library_script(
+                connection,
+                store,
+                task["project_id"],
+                str(script["item_key"]),
+                int(script["revision"]) if script.get("revision") is not None else None,
+            )
+            script = {
+                "origin": "library",
+                "item_key": resolved["item_key"],
+                "revision": resolved["revision"],
+                "sha256": resolved["sha256"],
+                "body": resolved["body"],
+            }
+        return canonical_json(
+            {
+                "kind": "local_script",
+                "script": script,
+                "argv": list(spec.get("argv") or []),
+                "timeout_seconds": int(spec.get("timeout_seconds") or 120),
+            }
+        )
     repair = (
         f"\nRepair context: {task['wait_reason']}"
         if purpose == "repair" and task["wait_reason"]
@@ -2675,6 +2859,17 @@ def _context_policy(settings: dict) -> dict[str, object]:
             )
         },
     }
+
+
+def _execution_context_policy(
+    settings: dict, spec: dict[str, object]
+) -> dict[str, object]:
+    policy = _context_policy(settings)
+    if audit_delivery_intent(spec):
+        # Write access may still be required for the report Artifact; progress
+        # stays exploration so multi-file reads are not treated as stall.
+        return {**policy, "progress_delivery": "audit_report"}
+    return policy
 
 
 def _prepare_provider_probe(

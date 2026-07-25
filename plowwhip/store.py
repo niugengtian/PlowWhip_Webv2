@@ -241,13 +241,25 @@ CREATE TABLE IF NOT EXISTS settings (
 
 DEFAULT_SETTINGS = {
     "provider_order": {
-        "planner": ["codex_cli", "cursor_cli", "deepseek", "kimi"],
-        "fullstack": ["cursor_cli", "codex_cli", "deepseek", "kimi"],
-        "independent_checker": ["codex_cli", "cursor_cli", "deepseek", "kimi"],
-        "simple": ["deepseek", "kimi", "codex_cli"],
-        "provider_probe": ["codex_cli", "cursor_cli", "deepseek", "kimi"],
+        "planner": ["cursor_cli", "deepseek"],
+        "fullstack": ["cursor_cli", "deepseek"],
+        "independent_checker": ["cursor_cli", "deepseek"],
+        "simple": ["cursor_cli", "deepseek"],
+        "provider_probe": ["cursor_cli", "deepseek"],
         "deterministic": ["local"],
         "deterministic_checker": ["local"],
+        "local_script_runner": ["local_script"],
+    },
+    # Per-role providers that stay registered but are skipped by dispatch/fallback.
+    "provider_disabled": {
+        "planner": [],
+        "fullstack": [],
+        "independent_checker": [],
+        "simple": [],
+        "provider_probe": [],
+        "deterministic": [],
+        "deterministic_checker": [],
+        "local_script_runner": [],
     },
     "provider_models": {
         "codex_cli": "default",
@@ -291,7 +303,25 @@ DEFAULT_LIBRARY = {
     ),
     ("role", "planner"): (
         "roles/planner.md",
-        "# Planner\n\nRead the frozen Goal and produce the smallest bounded alternatives and Task DAG without modifying the workspace.\n",
+        (
+            "# Planner\n\n"
+            "Read the frozen Goal and produce the smallest bounded alternatives and "
+            "Task DAG without modifying the workspace.\n\n"
+            "## Product discipline (bounded)\n\n"
+            "1. Pin problem, boundary, and Non-Goals before splitting Tasks. Do not "
+            "invent deployment, GTM, research, or extra preflight absent from the Goal.\n"
+            "2. Every Task must carry verifiable acceptance (stable id + expected). "
+            "Vague later / improve / polish is not a Task.\n"
+            "3. Say no to scope creep in structured reasons: accept, defer, or refuse "
+            "— never silently absorb.\n"
+            "4. Put trade-offs in classification.reasons and selection.basis; never "
+            "hide them.\n"
+            "5. Completion means Artifact/Evidence contracts, not narrative success. "
+            "Prefer reuse (script library / existing paths) over regenerating "
+            "equivalents.\n\n"
+            "Never ask the owner directly. If information is insufficient, return "
+            "information_sufficient=false with one bounded blocking_reason.\n"
+        ),
     ),
     ("role", "independent_checker"): (
         "roles/independent-checker.md",
@@ -300,6 +330,10 @@ DEFAULT_LIBRARY = {
     ("role", "git_publisher"): (
         "roles/git-publisher.md",
         "# Git publisher\n\nExecute only the frozen Git remote and branch authorization with deterministic secret and SHA checks.\n",
+    ),
+    ("role", "local_script_runner"): (
+        "roles/local-script-runner.md",
+        "# Local script runner\n\nExecute only a frozen workspace compose entry or a project library script revision through the Host Bridge local-script adapter.\n",
     ),
     ("rule", "v1_hard_boundaries"): (
         "rules/v1-hard-boundaries.md",
@@ -320,6 +354,10 @@ DEFAULT_LIBRARY = {
     ("worker_template", "git_publish"): (
         "worker-templates/git-publish.md",
         "# Git publish\n\nRequire a clean tree and unexpired exact authorization, reject tracked secrets, push the frozen HEAD, then verify the remote SHA.\n",
+    ),
+    ("worker_template", "local_script"): (
+        "worker-templates/local-script.md",
+        "# Local script\n\nRun the frozen script reference with bounded argv; capture stdout/stderr and return a structured local_script result.\n",
     ),
 }
 
@@ -711,11 +749,23 @@ class Store:
                 )
 
     def _sync_default_library(self, connection: sqlite3.Connection, now: float) -> None:
+        legacy_default_bodies = {
+            ("role", "planner"): (
+                "# Planner\n\n"
+                "Read the frozen Goal and produce the smallest bounded alternatives "
+                "and Task DAG without modifying the workspace.\n"
+            ),
+        }
         for (kind, item_key), (relative, default_body) in DEFAULT_LIBRARY.items():
             path = self.data_root / "library" / relative
             path.resolve().relative_to(self.data_root)
             path.parent.mkdir(parents=True, exist_ok=True)
             if not path.exists():
+                path.write_text(default_body)
+            elif path.read_text(encoding="utf-8") == legacy_default_bodies.get(
+                (kind, item_key)
+            ):
+                # Upgrade shipped defaults only; never clobber owner-edited role files.
                 path.write_text(default_body)
             body = path.read_bytes()
             digest = hashlib.sha256(body).hexdigest()

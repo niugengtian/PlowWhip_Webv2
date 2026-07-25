@@ -9,7 +9,44 @@ from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 from uuid import uuid4
 
+from .progress_policy import merge_context_policy
 from .store import DEFAULT_SETTINGS
+
+
+# Per-executable capabilities under shared adapters (MECH-06). DeepSeek/Kimi
+# share json-worker but must not be treated as interchangeable stdout/model CLIs.
+PROVIDER_CAPABILITIES = {
+    "codex_cli": {
+        "accepts_model_flag": True,
+        "result_shape": "stdout_jsonl",
+        "model_transport": "flag",
+    },
+    "cursor_cli": {
+        "accepts_model_flag": True,
+        "result_shape": "stdout_jsonl",
+        "model_transport": "flag",
+    },
+    "deepseek": {
+        "accepts_model_flag": False,
+        "result_shape": "session_markers",
+        "model_transport": "env",
+    },
+    "kimi": {
+        "accepts_model_flag": False,
+        "result_shape": "session_markers",
+        "model_transport": "env",
+    },
+    "git_publish": {
+        "accepts_model_flag": False,
+        "result_shape": "deterministic",
+        "model_transport": "none",
+    },
+    "local_script": {
+        "accepts_model_flag": False,
+        "result_shape": "deterministic",
+        "model_transport": "none",
+    },
+}
 
 
 PROVIDERS = {
@@ -43,6 +80,12 @@ PROVIDERS = {
         "executable": "git-publish",
         "minimal_probe": False,
     },
+    "local_script": {
+        "display_name": "Local script runner",
+        "adapter": "local-script",
+        "executable": "local-script",
+        "minimal_probe": False,
+    },
 }
 PROBE_MARKER = "PLOWWHIP_PROBE_OK"
 PROBE_TOKEN_CAP = 4096
@@ -58,27 +101,69 @@ ACTIVE_HOST_JOB_STATUSES = {
 
 def provider_agent_text(output: str) -> str:
     """Return final agent messages from JSONL Providers, or the original text."""
-    messages = []
+    assistant_messages = []
+    result_messages = []
     for line in output.splitlines():
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        item = event.get("item") if isinstance(event, dict) else None
+        if not isinstance(event, dict):
+            continue
+        item = event.get("item")
         if (
             isinstance(item, dict)
             and item.get("type") == "agent_message"
             and isinstance(item.get("text"), str)
         ):
-            messages.append(item["text"])
+            assistant_messages.append(item["text"])
+        if event.get("type") == "assistant":
+            message = event.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            if isinstance(content, list):
+                for part in content:
+                    if (
+                        isinstance(part, dict)
+                        and part.get("type") == "text"
+                        and isinstance(part.get("text"), str)
+                    ):
+                        assistant_messages.append(part["text"])
+        # simple-worker / kimi-worker session and harvested stdout lines
+        if event.get("type") == "message":
+            message = event.get("message")
+            if isinstance(message, dict) and isinstance(message.get("content"), str):
+                content = message["content"]
+                role = message.get("role")
+                if role == "assistant" and content.strip():
+                    assistant_messages.append(content)
+                elif role == "tool" and content.strip():
+                    text = content
+                    try:
+                        nested = json.loads(content)
+                    except json.JSONDecodeError:
+                        nested = None
+                    if isinstance(nested, dict):
+                        for key in ("content", "text", "body"):
+                            value = nested.get(key)
+                            if isinstance(value, str) and value.strip():
+                                text = value
+                                break
+                    if (
+                        "PLOWWHIP_PLANNER_RESULT " in text
+                        or "PLOWWHIP_CHECKER_RESULT " in text
+                    ):
+                        assistant_messages.append(text)
         if (
-            isinstance(event, dict)
-            and event.get("type") == "result"
+            event.get("type") == "result"
             and event.get("subtype") == "success"
             and isinstance(event.get("result"), str)
         ):
-            messages.append(event["result"])
-    return "\n".join(messages) if messages else output
+            result_messages.append(event["result"])
+    if assistant_messages:
+        return "\n".join(assistant_messages)
+    if result_messages:
+        return "\n".join(result_messages)
+    return output
 
 
 class HostBridgeError(RuntimeError):
@@ -199,14 +284,23 @@ def run_provider_probe(provider_key: str, mode: str) -> dict[str, object]:
 
 
 def workspace_snapshot(
-    project_path: str, paths: list[str] | None = None
+    project_path: str,
+    paths: list[str] | None = None,
+    *,
+    include_text_max_bytes: int = 0,
 ) -> dict[str, object]:
     base_url, token = _bridge_configuration()
+    payload: dict[str, object] = {
+        "project_path": project_path,
+        "paths": list(paths or []),
+    }
+    if include_text_max_bytes:
+        payload["include_text_max_bytes"] = int(include_text_max_bytes)
     return _bridge_post(
         base_url,
         token,
         "/v1/evidence/snapshot",
-        {"project_path": project_path, "paths": list(paths or [])},
+        payload,
         30,
     )
 
@@ -252,6 +346,21 @@ def start_provider_job(
             "task_id": "",
             "spec_revision": 0,
         }
+    resolved_model = model or "default"
+    if (
+        resolved_model != "default"
+        and not provider_accepts_model_flag(provider_key)
+    ):
+        # MECH-06 / LIVE-DS-03: env-transported json-workers cannot take --model.
+        # Reject before dispatch so lifecycle can fall back instead of CLI death.
+        raise HostBridgeError(
+            f"provider {provider_key} does not accept HostJob model flag",
+            status=400,
+            detail=(
+                "model_transport=env; set provider_models to default "
+                "or configure DEEPSEEK_MODEL/KIMI_MODEL in Bridge env"
+            ),
+        )
     base_url, token = _bridge_configuration()
     return _bridge_post(
         base_url,
@@ -268,13 +377,13 @@ def start_provider_job(
             "session_id": session_id,
             "timeout_seconds": min(max(int(timeout_seconds), 10), 86_400),
             "access": access,
-            "context_policy": {
-                "max_turns": 24,
-                "tool_no_progress_limit": 6,
-                **(context_policy or {}),
-            },
+            "context_policy": merge_context_policy(
+                context_policy,
+                access=access,
+                workspace_kind=workspace_kind,
+            ),
             "capability": capability,
-            "model": model,
+            "model": resolved_model,
         },
         20,
         max_bytes=1_048_576,
@@ -299,6 +408,14 @@ def selected_model(settings: dict[str, object], provider_key: str) -> str | None
     return value
 
 
+def provider_capability(provider_key: str) -> dict[str, object]:
+    return dict(PROVIDER_CAPABILITIES.get(provider_key) or {})
+
+
+def provider_accepts_model_flag(provider_key: str) -> bool:
+    return bool(provider_capability(provider_key).get("accepts_model_flag"))
+
+
 def provider_job_status(job_id: str) -> dict[str, object]:
     base_url, token = _bridge_configuration()
     return _bridge_post(
@@ -306,6 +423,24 @@ def provider_job_status(job_id: str) -> dict[str, object]:
         token,
         "/v1/jobs/status",
         {"job_id": job_id},
+        10,
+        max_bytes=1_048_576,
+    )
+
+
+def extend_provider_job_timeout(
+    job_id: str, timeout_seconds: int
+) -> dict[str, object]:
+    """Ask Host Bridge to raise an active job's wall-clock budget (soft timeout)."""
+    base_url, token = _bridge_configuration()
+    return _bridge_post(
+        base_url,
+        token,
+        "/v1/jobs/extend_timeout",
+        {
+            "job_id": job_id,
+            "timeout_seconds": min(max(int(timeout_seconds), 10), 86_400),
+        },
         10,
         max_bytes=1_048_576,
     )
@@ -377,12 +512,15 @@ def provider_job_output(
             if isinstance(result.get("stream_refs"), dict)
             else {}
         )
-        if not result.get("has_more"):
-            break
+        # Prefer offset progress over has_more: some Bridge builds incorrectly
+        # report has_more=false after the first page while stdout still remains.
+        # Keep paging while offsets advance; stop on a no-progress page.
         if not advanced:
-            raise RuntimeError(
-                "Host Bridge complete output made no offset progress"
-            )
+            if result.get("has_more"):
+                raise RuntimeError(
+                    "Host Bridge complete output made no offset progress"
+                )
+            break
     return {
         "job_id": job_id,
         "status": status,
@@ -608,20 +746,28 @@ def record_model_call(
             (physical_session_id, provider_key),
         ).fetchone()
         if previous:
-            if (
+            decreased = (
                 input_tokens < previous["input_tokens"]
                 or cached_input_tokens < previous["cached_input_tokens"]
                 or output_tokens < previous["output_tokens"]
                 or input_tokens - cached_input_tokens
                 < previous["input_tokens"] - previous["cached_input_tokens"]
-            ):
-                raise ValueError("cumulative usage cannot decrease within one generation")
-            normalized = (
-                input_tokens
-                - previous["input_tokens"]
-                + output_tokens
-                - previous["output_tokens"]
             )
+            if decreased:
+                # Cursor cumulative counters can jitter/reset across HostJobs that
+                # reuse one external session id. Clamp to the prior sample and
+                # charge zero instead of failing the whole Cronner tick.
+                input_tokens = int(previous["input_tokens"])
+                cached_input_tokens = int(previous["cached_input_tokens"])
+                output_tokens = int(previous["output_tokens"])
+                normalized = 0
+            else:
+                normalized = (
+                    input_tokens
+                    - previous["input_tokens"]
+                    + output_tokens
+                    - previous["output_tokens"]
+                )
     connection.execute(
         """
         INSERT INTO model_calls(

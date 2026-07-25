@@ -1,9 +1,14 @@
-# PlowWhip Web V2 基线修复台账
+# PlowWhip Web 基线修复台账（对照已冻结 V3）
 
 ## 1. 权威输入与边界
 
-- 唯一基线：`/Users/niugengtian/work/plow-whip-web-v2/docs/MINIMAL_REDESIGN_BASELINE_V2.zh-CN.md`
-- 基线 SHA-256：`4ae79ba906997640304a202ba0d453e2437e77e36468c29eb4a185ad970f6098`
+- **唯一基线（V3，已冻结 2026-07-26）**：`docs/MINIMAL_REDESIGN_BASELINE_V3.zh-CN.md`
+- V3 冻结 SHA-256：`0ffd3f63fbe181696043fb52512e33abc0c6981523c90043d9d3bd2cfe835292`
+- 历史基线（V2，仅对照/废止溯源，不作符合性依据）：`/Users/niugengtian/work/plow-whip-web-v2/docs/MINIMAL_REDESIGN_BASELINE_V2.zh-CN.md`
+- 基线 SHA-256（V2）：`4ae79ba906997640304a202ba0d453e2437e77e36468c29eb4a185ad970f6098`
+- V3 相对 V2 已裁定：去 Plan A/B；Planner 权威分层（R1）；Checker 分层（R2）；NeedsDecision 收窄且结构化点选（R3/ND-*）；目标序 G-01>G-02>G-03；禁止章节 PASS / 自由文本改写 TaskSpec 等降质旁路。
+- V3 2026-07-26 整链反审补齐（对齐三目标，禁「提醒一条补一条」）：脚本模块管线 D-32～D-34；Provider 默认 `cursor_cli→deepseek`（B-04'）+ 管理面 B-27；废止双基线「沿用 V2」；A-16/完成门槛对齐合同 Checker；废止 LIVE-DS-21 章节覆盖字面；RC-P2-01/03 与实现冲突项改待复核。
+- V3 已升格台账机制（防进行中误杀与同构重烧）：LIVE-DS-22/23、MECH-01/02/04/05/06/07 → A-27～A-33、T-11～T-16、R-18～R-20（见 V3 正文；改后须重算 V3 SHA）。
 - 差距报告：`docs/BASELINE_V2_CONFORMANCE_AUDIT.zh-CN.md`
 - 差距报告 SHA-256：`9b553d741728dc1c5e843148ac28e76efc4a461ac6d74a05d060e77038c72cd8`
 - 修复起点：`main@942f246d7b82dcfdcb74452c654646185a27067f`
@@ -15,15 +20,27 @@
 
 状态枚举：`待复核 / 进行中 / 已实现待回归 / 已闭环 / 受外部环境限制`。
 
+### 台账状态刷新规则（2026-07-26 · 对齐 V3）
+
+| 状态 | 含义 |
+|---|---|
+| 已闭环 | 实现 + 反例测试 +（若适用）现场证据均满足**当时条款**；若 V3 改写了条款，必须改回「待复核」按 V3 重验 |
+| 已实现待回归 | 代码与定向测试已有；缺干净现场 E2E 或未按 V3 条款重跑 |
+| 进行中 | 实现未完成或关键路径仍缺口 |
+| 待复核 | 曾标闭环/完成，但与 V3 或独立审计冲突，禁止继续当完成证据 |
+| 受外部环境限制 | 仓库外依赖（PATH/LaunchAgent/密钥）阻塞 |
+
+**本次纠偏要点**：`RC-P0-03` 不得再标已闭环（仍有第二写入口）；V3 已升格的进行中判断/超时/同构重试等，实现侧多数为「已实现待回归」，不等于 DeepSeek 无人值守 E2E 已证明。
+
 ## 2. 根因修复顺序
 
 | ID | 优先级 | 合并根因 | 条款 | 当前生产路径 | 预计修改文件 | 最小验证 | 状态 |
 |---|---|---|---|---|---|---|---|
 | RC-P0-01 | P0 | 所有正式指令统一进入模型 Planner，启发式仅为输入事实；角色阻塞只经 Butler 串行呈现 | P-01/P-02/P-05/P-06/P-14/P-15/C-01 | `POST /api/messages → intake/butler → lifecycle._create_task → planner` | `plowwhip/planner.py`、`plowwhip/lifecycle.py`、`plowwhip/execution.py`、`plowwhip/verification.py`、`plowwhip/provider.py`、`plowwhip/host_bridge.py`、`tests/test_vertical_slice.py`、`tests/test_host_bridge.py` | simple/medium/large 三类都先形成 Planner HostJob 与结构化 PlannerResult；静态断言 regex/kind 不决定最终 size；跨项目仅一个 `waiting=true` Butler question | 已闭环 |
-| RC-P0-02 | P0 | large 方案客观选择、语义原子 TaskSpec 与有依据升级 | P-09/P-10/P-11/P-12/O-05/A-03/T-02 | `planner_prompt/parse/normalize_plan → lifecycle._materialize_plan/_install_plan` | `plowwhip/planner.py`、`plowwhip/lifecycle.py`、`tests/test_vertical_slice.py` | 拒绝无结果合同、无 runtime、非原子、无覆盖映射和自报 0.95 的 Plan | 已闭环 |
-| RC-P0-03 | P0 | lifecycle 成为 Goal/Task 生命周期字段唯一写入者 | L-01/L-03/D-09/B-04/B-05/C-02/C-04 | `advance_project` 调用 execution/verification/provider/cronner | `plowwhip/lifecycle.py`、`plowwhip/execution.py`、`plowwhip/verification.py`、`plowwhip/provider.py`、`plowwhip/cronner.py`、`plowwhip/store.py`、测试 | SQL authorizer/AST 边界测试禁止 lifecycle 外更新 Goal/Task 生命周期列 | 已闭环 |
+| RC-P0-02 | P0 | large 方案客观选择、语义原子 TaskSpec 与有依据升级 | V3:P-09'/P-10/P-11'/…（**废止强制 A/B**） | `planner_prompt/parse/normalize_plan → lifecycle._materialize_plan/_install_plan` | `plowwhip/planner.py`、`plowwhip/lifecycle.py`、`tests/test_vertical_slice.py` | 按 V3：单一 Plan + 原子合同；不再要求 Plan A/B / 0.95 自动选 | 待复核 |
+| RC-P0-03 | P0 | lifecycle 成为 Goal/Task 生命周期字段唯一写入者 | V3:L-01/L-03' | `advance_project` 调用 execution/verification/provider/cronner | `plowwhip/lifecycle.py`、`plowwhip/execution.py`、`plowwhip/verification.py`、`plowwhip/provider.py`、`plowwhip/cronner.py`、`plowwhip/store.py`、测试 | 禁止 lifecycle 外写；`record_checkpoint_failure` / execution·verification 直接写必须归并 | 待复核 |
 | RC-P0-04 | P0 | 完整结果、Artifact manifest 与完整下游输入 | A-23/R-01～R-08/R-12/R-14～R-16/D-06/D-11/D-13 | `execution finalize → artifacts → continuity dependencies → verification manifest` | `plowwhip/execution.py`、`plowwhip/continuity.py`、`plowwhip/verification.py`、`plowwhip/store.py`、测试 | 超过 1 MiB 的交付物完整读取；任一 path/hash/revision/scope/source 篡改均 fail closed；tail 不进入输入 | 已闭环 |
-| RC-P0-05 | P0 | 所有模型产出统一由独立 Checker 验收 | A-16/A-17/A-18/R-08/R-13 | Planner/Worker/probe 模型 HostJob → 正式结果 → Checker | `plowwhip/lifecycle.py`、`plowwhip/execution.py`、`plowwhip/verification.py`、测试 | Planner、Worker、minimal probe 均走独立 TaskSession Checker；Prompt 不含 Worker 自由聊天 | 已闭环 |
+| RC-P0-05 | P0 | 所有模型产出统一由独立 Checker 验收 | V3:A-16'/A-16a（合同/语义分层） | Planner/Worker/probe 模型 HostJob → 正式结果 → Checker | `plowwhip/lifecycle.py`、`plowwhip/execution.py`、`plowwhip/verification.py`、测试 | 按 V3 分层验收；禁章节覆盖结构化否决；salvage 必经合同 Checker | 待复核 |
 | RC-P0-06 | P0 | Task 终态前收敛 HostJob、授权和 Secret 引用 | B-21/S-05 | `cancel/complete action → active HostJob → terminal outcome` | `plowwhip/lifecycle.py`、`plowwhip/execution.py`、`plowwhip/verification.py`、测试 | provider_probe/git_publish 取消时先 stop/reconcile，随后撤销引用，最后写 cancelled/done | 已闭环 |
 | RC-P1-01 | P1 | timeout 顺序与冻结 grace | T-02/T-06/T-07/T-09 | Host Bridge deadline → lifecycle reconcile/checkpoint/stop | `plowwhip/host_bridge.py`、`plowwhip/lifecycle.py`、`plowwhip/execution.py`、测试 | deadline、grace、SIGTERM/SIGKILL、晚到结果逐步断言 | 已闭环 |
 | RC-P1-02 | P1 | Generation、Warm handoff 与 append-only Cold 无损恢复 | A-14/M-03/M-06/M-09/D-11 | Provider failure/compact → continuity checkpoint → generation replacement | `plowwhip/execution.py`、`plowwhip/continuity.py`、`plowwhip/host_bridge.py`、测试 | 健康 Session 不轮换；替换前校验最新 Warm；Cold segment 不覆盖 | 已闭环 |
@@ -31,13 +48,81 @@
 | RC-P1-04 | P1 | Secret 不进入 SQLite/Prompt/模板/日志并在终态失效 | D-30/B-21 | message/action/library/provider env → persistence/prompt/log | `plowwhip/intake.py`、`plowwhip/butler.py`、`plowwhip/lifecycle.py`、`plowwhip/host_bridge.py`、`plowwhip/store.py`、测试 | 注入测试 Secret，扫描 SQLite、Artifact、Prompt、模板和日志均无明文 | 已闭环 |
 | RC-P1-05 | P1 | 三档 capability、scope、expiry 运行时硬校验 | D-20/B-17/B-18/B-19 | TaskSpec authorization → execution/Host Bridge | `plowwhip/planner.py`、`plowwhip/execution.py`、`plowwhip/host_bridge.py`、测试 | 未授权不可逆/外部动作 fail closed；删除改为时间戳 `.rm.*` | 已闭环 |
 | RC-P1-06 | P1 | 禁止 PASS 自动污染 WorkerTemplate | D-21/D-22 | `verification PASS → project worker_template` | `plowwhip/verification.py`、`plowwhip/lifecycle.py`、测试 | 普通 PASS 不创建模板 revision；显式长期 owner decision 才更新 | 已闭环 |
-| RC-P2-01 | P2 | 四类页面、Task-ID 完整文件入口与观察标签 | B-13/B-14/D-15 | UI navigation → GET task/file → monitor references | `plowwhip/app.py`、`plowwhip/monitor.py`、`plowwhip/ui.py`、测试 | 仅四类产品页；ID 解析、边界和 hash 校验；tail 明示非 Evidence | 已闭环 |
+| RC-P2-01 | P2 | 主导航含独立 Token/Monitor + Task-ID 完整文件入口与观察标签 | V3:B-25/B-26/B-13/B-14/D-15 | UI navigation → GET task/file → monitor references | `plowwhip/app.py`、`plowwhip/monitor.py`、`plowwhip/ui.py`、测试 | **六导航**（全局/项目/Task/Token/Monitor/设置）；禁把 Token/Monitor 埋设置；ID/hash/tail 合同仍成立 | 待复核 |
 | RC-P2-02 | P2 | Provider/model 业务选择移出环境变量 | D-28/D-29 | SQLite settings snapshot → Host Bridge dispatch | `plowwhip/store.py`、`plowwhip/execution.py`、`plowwhip/provider.py`、`plowwhip/host_bridge.py`、测试 | env 不接受业务模型选择；冻结 settings 决定 model | 已闭环 |
-| RC-P2-03 | P2 | 当前 Task 验收后的显式脚本入库合同 | D-24/D-25 | done Task Artifact → owner promotion action → library_items | `plowwhip/intake.py`、`plowwhip/lifecycle.py`、`plowwhip/store.py`、测试 | 未完成/未 PASS/非单文件 CLI 拒绝；显式 action 登记 revision/hash | 已闭环 |
+| RC-P2-03 | P2 | 脚本验收后门禁入库（显式或 auto enqueue 同门） | V3:D-24'/D-32～D-34 | done/PASS → promote_script（owner 或 auto）→ library_items | `script_library.py`、`verification.py`、`lifecycle.py`、测试 | 未 PASS/缺合同/非单文件 CLI 拒绝；auto 与显式走同一 AST/Evidence/SHA；已复用模块不重复晋升 | 待复核 |
 | RC-P2-04 | P2 | Butler 精确检索不足时的受控语义归纳 | B-12 | global message → exact SQLite/file search → read-only semantic summary → route | `plowwhip/butler.py`、`plowwhip/lifecycle.py`、`plowwhip/verification.py`、测试 | 精确查询零模型；模糊查询有来源引用、独立验收且不创建业务 Task | 已闭环 |
 | RC-P3-01 | P3 | Host Bridge macOS/Linux 契约证据 | B-02 | start/read/stop/resume/segment | `plowwhip/host_bridge.py`、`tests/test_host_bridge.py`、验收 Artifact | 本机 macOS 确定性契约；Linux 通过本地 Docker 隔离契约，不调用 Provider | 已闭环 |
 | RC-P3-02 | P3 | Task 详情字段与完整文件呈现 | B-13/Task 详情合同 | monitor snapshot → task detail UI | `plowwhip/monitor.py`、`plowwhip/ui.py`、`plowwhip/app.py`、测试 | role/model/generation/Checker/Evidence/handoff/session segment 可见可验 hash | 已闭环 |
-| RC-P3-03 | P3 | Docker 8750 本地运行链验收 | B-03/A-07/E18 | image → single Cronner lease → 8750 → Host Bridge boundary | Docker/Compose 配置、只读验收 Artifact | 本地重建并重启 8750；health、进程、端口、卷、lease、20 行日志；不调用模型 | 待复核 |
+| RC-P3-03 | P3 | Docker 8750 本地运行链验收 | B-03/A-07/E18 | image → single Cronner lease → 8750 → Host Bridge boundary | Docker/Compose 配置、只读验收 Artifact | 本地重建并重启 8750；health、进程、端口、卷、lease、20 行日志；不调用模型 | 已闭环 |
+| LIVE-P0-01 | P0 | Cursor Planner 常不返回可解析结构化 JSON，主线卡在 needs_decision | P-01/P-07/A-16 | Planner HostJob(cursor_cli) → parse_planner_result | `plowwhip/planner.py`、`plowwhip/lifecycle.py`、`plowwhip/provider.py` | 真实 cursor_cli Planner 产出可解析 JSON；失败不得把主人决定当 TaskSpec | 已闭环 |
+| LIVE-P0-02 | P0 | Planner 失败后 `provide_decision` 把主人决定正文装成执行 TaskSpec/objective 并跳过正式 Plan（含 RETRY_PLANNER 文案） | P-11/L-01/R-01/C-04 | needs_decision(plan) → provide_decision → execute_dispatch | `plowwhip/lifecycle.py`、`plowwhip/intake.py` | 决定只恢复/重试 Planner 或授权 Plan；禁止决定文本成为 provider_task instruction；Planner 失败应 cancel+重提 Goal | 已闭环 |
+| LIVE-P1-01 | P1 | formal result manifest 为空仍进入 verify/needs_decision 循环；错误代决会反复 execute | V3:A-31/R-01 | execute finalize → verification manifest | `plowwhip/execution.py`、`plowwhip/verification.py`、`continue_policy.py` | 缺 manifest 时 fail-closed；禁同构继续；选项须 cancel/缩 Goal/换策略 | 已实现待回归 |
+| LIVE-P1-02 | P1 | Host Bridge poll unavailable 时 Task 停在 execute_wait；GET /health 对 Bridge 返回 501 | V3:A-34 | HostJob poll → reconcile | `plowwhip/host_bridge.py`、`plowwhip/execution.py` | Bridge 探活/轮询合同明确；不可用时有界重试并呈现可读阻塞事实 | 进行中 |
+| LIVE-P2-01 | P2 | 语义查询取消长时间停在 stopping；取消路径与 lease 抖动 | V3:A-35/B-21 | cancel → HostJob stop | `plowwhip/lifecycle.py`、`plowwhip/execution.py` | 取消在 stop_grace 内收敛到 cancelled，不长期占 active Task | 进行中 |
+| LIVE-P0-03 | P0 | 项目管家对话里的「主人决定…」owner message 被当成正式指令，再次创建 planner_intake Goal | P-01/B-11/C-01 | POST /api/messages(owner) → _create_task | `plowwhip/lifecycle.py`、`plowwhip/butler.py`、`plowwhip/intake.py` | 决策/取消答复不得创建业务 Task；仅 action 或结构化 decision 推进 | 已闭环 |
+| LIVE-P0-04 | P0 | Checker HostJob 已在 Bridge 成功，但 Cronner 因 cumulative token 回落崩溃，表现为 HostJob unavailable | A-05/A-10 | check_poll → record_model_call | `plowwhip/provider.py`、`plowwhip/lifecycle.py` | cumulative 回落钳制为 0 增量；「继续」可强制 reconcile 再 poll | 已闭环 |
+| LIVE-DS-01 | P0 | Host Bridge 曾拒绝 `json-worker` 只读 Planner（DeepSeek 无法开跑） | B-02/A-05 | host_bridge read allowlist → Planner HostJob | `plowwhip/host_bridge.py` | deepseek/json-worker 只读 Planner 可 start | 已实现待回归 |
+| LIVE-DS-02 | P1 | Host Bridge PATH 默认无 `simple-worker`，DeepSeek 探测/执行不可用 | B-02 | LaunchAgent PATH → simple-worker | 运行环境/`bridge` LaunchAgent | `simple-worker --probe` 经 Bridge 成功 | 受外部环境限制 |
+| LIVE-DS-03 | P0 | `provider_models.deepseek≠default` 时 Bridge 向 `simple-worker` 传 `--model`，CLI 直接失败 | D-28/B-02 | selected_model → `_execution_argv` | `plowwhip/host_bridge.py`、`simple-worker` | 非 default 模型可派发或明确拒绝并递补 | 已实现待回归 |
+| LIVE-DS-04 | P0 | DeepSeek/Kimi 被同化到同一 `json-worker` 合同（CLI/stdout/session），跨厂商「任意步骤递补」合同层易失效 | D-28/A-05/M-03 | PROVIDERS adapter=json-worker → fallback | `plowwhip/provider.py`、`host_bridge.py`、`provider_policy.py` | 递补按 executable 能力矩阵；stdout/模型传参分厂商 | 已实现待回归 |
+| LIVE-DS-05 | P0 | Planner **verification（结构化解析）失败不触发** `_fallback_provider_generation`，仅进程失败才递补 | P-07/A-16 | plan_poll parse ValueError → needs_decision | `plowwhip/lifecycle.py` | 解析失败有界递补或 session 结果回灌后再判 | 已实现待回归 |
+| LIVE-DS-06 | P0 | `simple-worker` 将 `PLOWWHIP_PLANNER_RESULT` 写在 session jsonl，Bridge stdout 仅有 progress/completed；`provider_agent_text` 不识别 `type=message` | P-07/A-05 | HostJob stdout → parse_planner_result | `host_bridge.py`、`provider.py`、`result_ingest.py` | DeepSeek Planner 成功完成且 stdout/回灌可被 parse | 已实现待回归 |
+| LIVE-DS-07 | P1 | DeepSeek 已产出近合法 Plan，但 `upgrade_path=["simple→medium"]`（应为 `["simple","medium"]`）且 coverage 用文件路径而非 `TASK_KEY` 安全 id，导致 parse/normalize 失败 | P-09/P-11 | Planner JSON → normalize | `planner.py`（别名）/Prompt 约束 | 真实 DeepSeek Plan 可被 normalize；别名兼容箭头路径 | 已实现待回归 |
+| LIVE-DS-08 | P0 | DeepSeek fullstack 反复 `internal_tool_no_progress`（limit=6），只读多文件后未 `write_file` 即失败；声明 Artifact 缺失；「继续」同构重试烧 Token | A-05/T-02 | simple-worker execute → snapshot | `host_bridge` context/`simple-worker` | 有界多文件审查能写出 Artifact 或提高/区分 progress 语义 | 已实现待回归 |
+| LIVE-DS-09 | P0 | DeepSeek audit_delivery 在 `exploration`+limit=96 下仍 `bounded tool loop exceeded 48 turns`，读文件/compact 耗尽回合未写报告 Artifact | V3:A-29/MECH-05 | execute HostJob max_turns | `progress_policy.py`（audit_report max_turns=96）、`simple-worker` | audit_report 交付回合预算与 Cursor 可互换完成；缺干净 DeepSeek E2E | 已实现待回归 |
+| LIVE-DS-10 | P1 | `simple-worker` `search_text`/`grep` 缺 `query` 键时 `KeyError` 直接进程失败（非合同失败） | B-02/MECH-06 | tool_result search_text | v2 `simple_worker.py` | 缺参返回结构化 error，不崩进程 | 已实现待回归 |
+| LIVE-DS-13 | P0 | 代决文案 `继续：…` 不在 `CONTINUE_DECISIONS` 精确集合中，被 `provide_decision` 当成新 TaskSpec 重写并重跑 execute（rev+1），Checker 重试路径被绕过 | C-04/LIVE-P0-02 | provide_decision 分支 | `lifecycle.py` `_is_continue_decision` | 前缀 `继续`/`RETRY_PLANNER` 识别为 continue；verify 空 manifest 可 continue 重试 execute | 已实现待回归 |
+| LIVE-DS-12 | P0 | DeepSeek Checker 把验收当成重做 Worker 审计：通读 plowwhip/*.py、反复 compact，未产出 `PLOWWHIP_CHECKER_RESULT`；stderr=`DEEPSEEK_API_KEY: TimeoutError`，exit 78，表现为 Checker exhausted | A-16/A-18/LIVE-DS-11 | check HostJob prompt / progress | `verification.py` `_checker_prompt` | **验收标准=报告已生成且有内容（含章节）**；Prompt 不粘贴 Worker 审查指令；max_turns≤16；禁止重审源码 | 已实现待回归 |
+| LIVE-DS-11 | P0 | DeepSeek Planner 把 `PLOWWHIP_PLANNER_RESULT` **write_file 到隔离工作区**（如 `PLOWWHIP_PLANNER_RESULT.md`），stdout 仅有 “written to temp file” 散文；控制面判 `missing_structured_result`。UI 在 `phase=plan` 的任何 needs_decision 都提示「需要明确授权（15 分钟）」造成误导 | P-07/A-05/B-13 | HostJob finish harvest / parse / UI help | `host_bridge.py`、`planner.py`、`ui.py` | 工作区落盘结果在 rmtree 前回灌 stdout；中文 acceptance id / `provider_key` 可 coerce；仅在真正 awaiting authorization 时显示授权按钮文案 | 已实现待回归 |
+| LIVE-DS-14 | P0 | `independent Checker rejected the planner result`（phase=`plan`）时，`provide_decision`+「继续」被通用分支拒绝为 `continue does not rewrite TaskSpec; retry Planner/Checker instead`，需二次「继续」才 `planner_retry`；烧代决预算 | C-04/LIVE-DS-13 | planner_intake continue 分支误排除 Checker rejected | `lifecycle.py` | phase=plan + Checker rejected → 一次「继续」即 `planner_retry_requested`；exhaustion 仍走 checker_retry | 已实现待回归 |
+| LIVE-DS-15 | P0 | DeepSeek Plan `inputs` 常为文件路径字符串列表（如 `["plowwhip/a.py",…]`），normalize 抛 `unsupported input kind`；同签名恢复触 MECH-07 硬顶 | P-07/MECH-03 | `_normalize_task_inputs` | `planner.py` | 描述性 path list/map 强制 coerce 为 `owner_instruction`(+deps) | 已实现待回归 |
+| LIVE-DS-18 | P0 | Checker 已输出 `PLOWWHIP_CHECKER_RESULT` PASS，但 json-worker exit≠0 → 控制面判 Checker exhausted，烧 MECH-07 | A-16/LIVE-DS-12 | apply_checker_step returncode 门闩 | `verification.py` | 有结构化 Checker 结果时以 verdict 为准，不唯 exit code | 已实现待回归 |
+| LIVE-DS-20 | P0 | 同 spec_revision 重跑 execute 时 `register_indexed_artifact` 撞 UNIQUE，Cronner 崩事务回滚，HostJob 假 running，表象为 Host Bridge poll unavailable 空转 45 分钟 | LIVE-P1-01/A-05 | execute finalize → artifacts index | `artifact_contract.py` `register_indexed_artifact` | 同 path@revision 幂等 upsert；finalize 不再崩 | 已实现待回归 |
+| LIVE-DS-21 | P0 | 审计报告四章已齐全，LLM Checker 仍 `did not prove every acceptance`，烧满 MECH-07 | **与 V3:A-16a 冲突** | check finalize | `verification.py` | **禁止**「章节齐全⇒覆盖语义拒」；合同 Checker 仅补充；假拒应修语义 Checker/Prompt/合同，不得标题短路 | 待复核 |
+| LIVE-DS-22 | P0 | 失败标准错误：工具空转计数杀仍在回复的模型；Task 无体量超时；超时直接停；同构重试烧 Token | V3:T-11～T-16/A-27～A-30 | HostJob budget / Cronner / butler | `timeout_policy.py`、`soft_timeout.py`、`io_phase.py`、`simple_worker`、`host_bridge`、`lifecycle`、`execution` | I/O 显式态；soft≤3×2；hard idle 不翻倍；已升格入 V3；T-14 有效增量续命仍待对照 | 已闭环 |
+| LIVE-DS-23 | P0 | 缺声明 Artifact + `internal_tool_no_progress`（或同类）时，「继续」/同构 `decision_retry` 仍重开同等大 HostJob 烧 Token | V3:A-31 | provide_decision continue / provider_recovery | `continue_policy.py`、`lifecycle.py`、测试 | 禁同构继续；已升格入 V3；ND 结构化选项尚未替换自由文本「继续」 | 已闭环 |
+| LIVE-DS-25 | P0 | Planner `returncode!=0` 先于结构化解析即失败，Cursor/json-worker 已写 `PLOWWHIP_PLANNER_RESULT` 仍判失败 | V3:R-19 | plan_poll | `lifecycle.py` | completed + 可解析结果优先；已升格入 V3 | 已闭环 |
+| LIVE-DS-26 | P0 | Execute/Bridge 仅 `returncode==0` 才 succeeded/apply，已写 Artifact 也可能不落地 | V3:R-19 | host_bridge `_finish` / execution finalize | `host_bridge.py`、`execution.py` | staged payload/落地优先；已升格入 V3 | 已闭环 |
+| LIVE-DS-27 | P0 | Checker 强制 acceptance 集合全等 + 非空 `recheck_command` → 漏字段假拒 | V3:A-16'/LIVE-DS-24 | `_parse_checker_verdict` | `verification.py`、测试 | 覆盖 frozen id 即可；recheck 可选 | 已闭环 |
+| LIVE-DS-28 | P1 | Prompt 仍写「整行开头 marker」，与 LIVE-DS-24 解析兼容不一致 | LIVE-DS-24 | checker/planner-checker prompt | `verification.py`、`lifecycle.py` | Prompt 允许 mid-line marker；recheck 标注 optional | 已闭环 |
+| LIVE-DS-24 | P0 | Cursor Checker 已输出 `PLOWWHIP_CHECKER_RESULT PASS`，但解析要求整行以 marker 开头且从后往前命中转义脏行 → `missing checker evidence` 伪拒，MECH-07 | V3:R-18/MECH-02 | `_parse_checker_verdict` / result_ingest | `result_ingest.py`、`verification.py`、测试 | 嵌套/转义/脏行可解析；缺更多真实 stdout 回归 | 已实现待回归 |
+
+## LIVE-DS-22 超时续命现场记录
+
+（soft 超时自动追加：原预算→翻倍后预算；结论含「Task 超时阈值判断有误」。）
+
+- 2026-07-25 闭环证据：`docs/runtime-audits/LIVE_DS_22_REGRESSION_EVIDENCE_20260725.md`（pytest `tests/test_timeout_policy.py` 7 passed；Task `ec7f134d…` Done）
+
+## LIVE-DS-23 缺 Artifact 同构重试跟跑
+
+- 2026-07-25 22:24:19 LIVE-DS-23 Cursor 验收：Task `c7e70e030c4f499ea7425bd322066ffe` outcome=done; 证据 `docs/runtime-audits/LIVE_DS_23_CURSOR_REGRESSION_EVIDENCE_20260725.md`
+
+
+（Cursor CLI / 8750 实现禁同构「继续」；卡点追加于此。）
+
+| MECH-08 | P0 | 审计类 Goal 仍逼任意 Provider 吐完美线缆 Plan JSON；字段漂移反复 needs_decision / MECH-07；且易误写成厂商绑定 | V3:P-01'/R1 | parse_planner_result salvage | `planner.py` `build_audit_delivery_plan`、`lifecycle.py` | 控制面模板合法但**必须合同 Checker**；禁跳过验收的 salvage | 已实现待回归 |
+| LIVE-DS-16 | P0 | Planner Checker 在空 sandbox 中因「plowwhip/*.py 不存在」判 invented scope，拒绝合法 Goal 派生 Plan | V3:P-17/MECH-03 | `_prepare_planner_checker` prompt | `lifecycle.py` | 空 sandbox≠发明范围；按 Goal 文本验收 Artifact | 已实现待回归 |
+| MECH-01 | P0 | **角色感知 ProgressPolicy**：进度不能等同于 workspace 写；Planner/审计/Checker 用 exploration，Implement 用 mutation | V3:A-27～A-30 | `start_provider_job` / Bridge `context_policy` | `progress_policy.py`、`provider.py`、`host_bridge.py`、测试 | 已升格入 V3；定向测试有；DeepSeek 现场互换未证 | 已实现待回归 |
+| MECH-02 | P0 | **统一结果摄入**：stdout ∪ session/message ∪ tool 嵌套 → Evidence；Planner/Checker 不依赖 Cursor 形 stdout | V3:R-18 | HostJob finish → parse | `result_ingest.py`、`planner.py`、`verification.py`、`host_bridge.py` | 已升格入 V3；单测有 | 已实现待回归 |
+| MECH-03 | P0 | **Planner 沙箱认识论**：空 sandbox ≠ 资料不足；失败返回可递补错误码 | V3:P-17 | parse/normalize → needs_decision | `planner.py`、`planner_errors.py`、`lifecycle.py` | 已升格入 V3 | 已实现待回归 |
+| MECH-04 | P0 | **验证失败有界递补**：解析/合同失败触发 fallback 或结构化重试，禁止无差别「继续」 | V3:A-33 | plan_poll/verify → fallback | `lifecycle.py`、`verification.py` | 已升格入 V3；ND 点选尚未完全替换自由文本继续 | 已实现待回归 |
+| MECH-05 | P1 | **审计 TaskSpec 合同**：审查交付 Evidence/Report，中间允许只读；不套实现类写盘验收 | V3:A-29 | TaskSpec → verification | `planner.py`、`execution.py`、`progress_policy.py` | 已升格入 V3 | 已实现待回归 |
+| MECH-06 | P0 | **json-worker 能力矩阵**：模型标志/结果形状/progress 按 executable 区分，禁止 DeepSeek/Kimi 合同同质化 | V3:A-11' | PROVIDERS → argv/fallback | `provider.py`、`host_bridge.py` | 已升格入 V3；派发前过滤仍需对照 | 已实现待回归 |
+| MECH-07 | P0 | **同问题恢复硬顶 5**：`provider_retry/fallback`、`decision_retry`、`planner/checker_retry` 累计 ≥5 后 fail-closed；禁止再「继续」；暴露卡点 | V3:A-32 | fallback / provide_decision | `recovery_policy.py`、`execution.py`、`lifecycle.py`、`intake.py` | 已升格入 V3；实现仍偏事件总数，**signature 作用域待对齐 A-32** | 已实现待回归 |
+| V3-ND | P0 | NeedsDecision 必须结构化选项点选（理由/依据/利弊），禁止自由文本改写 TaskSpec | V3:ND-01～05/B-22 | needs_decision → UI/actions | `lifecycle.py`、`ui.py`、`intake.py` | decision_options 生成与点选 action；通用决定框禁用 | 进行中 |
+| V3-AB | P0 | 废止强制 Plan A/B；大型单一 Plan + DAG | V3:P-07废止/P-09' | planner normalize / UI | `planner.py`、`lifecycle.py`、测试 | 删除 A/B 强制与 0.95 打断；更新回归 | 进行中 |
+| V3-SCRIPT | P0 | 简单/本地脚本：库检索→复用→生成缺件→拼接→Local Runner→门禁入库 | V3:P-04'/D-32～D-34 | planner facts → local_script → promote | `script_library.py`、`local_script_worker.py`、`planner.py`、`verification.py`、测试 | 有检索证据；禁模型 shell；auto promote 同门禁；完整 DAG 可复现 | 已实现待回归 |
+| V3-PROVIDER | P1 | 默认 cursor→deepseek；项目 Provider 管理面；派发前过滤 | V3:B-04'/B-27/A-11' | settings → dispatch/fallback | `store.py`、`intake.py`、`provider_policy.py`、`ui.py` | DEFAULT 无 Codex-first；disabled/unavailable 跳过；管理页只冻新 Session | 已实现待回归 |
+| V3-NAV | P1 | Token/Monitor 独立主导航 | V3:B-25/B-26 | `ui.py` HTML nav | `plowwhip/ui.py`、测试 | 顶栏含 Token/Monitor；设置页不再吞并 | 已实现待回归 |
+
+### 机制修复原则（2026-07-26 对齐 V3）
+
+- **优先级（与 V3 G-01～G-03 一致）**：**正确证据完成 → 无人值守可达 → 极致省 Token**。互换是无人值守的手段，不能压过证据硬度。
+- **同失败签名 ≤5 次重试**：满 5 次 = 机制卡点，停止递补/同构「继续」，修机制后再开跑。
+- 不以盲目抬阈值/「继续」烧 Token 当主修复；缺口记入 **能力矩阵差**，禁止合同同质化。
+- 目标态：DeepSeek/Kimi 与 Cursor **可互换但非同一 stdout/写盘假设**。
+- **LIVE-DS-11**：解析失败时 UI 不得显示授权文案——已升格为 V3 **B-23**。
 
 ## 3. 通用验收门槛
 
@@ -168,11 +253,11 @@
 
 ### RC-P2-01 / RC-P3-02
 
-- 四类产品页：主导航和实际顶层 view 都收敛为全局首页、项目详情、Task 详情、设置与资源库；项目管家并入项目详情，Token/Monitor 作为设置页中的只读观察面，不保留额外产品页。
+- **V3 纠偏（2026-07-26）**：原「四类产品页、Token/Monitor 塞设置」与 V3:B-25/B-26 **冲突**，状态改回**待复核**。验收改为六导航（全局/项目/Task/Token/Monitor/设置），Token/Monitor 独立页。
 - 安全完整文件入口：Task snapshot 为 Artifact、Evidence、Handoff、Session segment 生成 `Task ID + opaque file_id` URL；后端从 Task 权威索引重新解析受控路径，并在返回完整 bytes 前复核 SHA-256 和 revision。浏览器不能提交本地 path；伪造 file_id 返回 404。
 - 详情字段：Task 页同时展示 role/Checker、Provider/model、Worker、TaskSession、物理 Session、generation、Token、HostJob、Artifact/Evidence/Handoff 的 path/SHA/revision 和完整 Session segment 入口。模型名来自最新 ModelCall 事实，不再对非本地 Session 显示空占位。
 - 观察标签：API 字段改为 `observation_tail` 并返回不可作为 Artifact/Evidence/完成依据的声明；UI 同样把默认 20 行标为有界观察。
-- 反例验证：四页数量、完整文件 200、伪造 ID 404、响应 SHA header、相对路径边界和观察标签均由 `test_http_intake_decision_and_automatic_completion`、`test_message_to_verified_done` 覆盖。
+- 反例验证：完整文件 200、伪造 ID 404、响应 SHA header、相对路径边界和观察标签仍有效；**导航页数断言须按 V3 重写**（旧「仅四页」测试若仍存在则与基线冲突）。
 
 ### RC-P2-02
 
@@ -182,10 +267,10 @@
 
 ### RC-P2-03
 
-- 显式入口：普通 PASS 不自动登记脚本。只有主人对当前 done Task 的明确 `promote_script` action，才能选择该 Task 当前 revision 的正式 output Artifact 和资源键。
+- **V3 纠偏（2026-07-26）**：原「普通 PASS 永不自动登记」与主人锁定的脚本模块管线 B1 / V3:D-34 **冲突**（代码已有 `enqueue_auto_promote_script`）。状态改回**待复核**。新合同：Checker PASS + 脚本门禁后允许控制面 auto enqueue `promote_script`；与主人显式 promote 走**同一** AST/Evidence/SHA 校验；已复用模块不重复晋升；非脚本 PASS 仍不得晋升。
 - 双重门禁：intake 与 lifecycle 都复核 Task 终态、TaskSpec `script_contract`、Artifact ID/path/SHA/revision/source、当前完整 Checker Evidence。Python 文件还必须是 UTF-8 单文件、含独立 public callable、`main` CLI 和 `SystemExit(main())`；TaskSpec 必须声明包含 0/非 0 的 exit codes、stdout/stderr 合同及三项不同 acceptance。
 - additive lineage：schema v10 只增 `library_items.source_task_id/source_artifact_id/source_revision`，脚本正文复制为版本化 library 文件，SQLite 仍只保存索引、revision、SHA 与来源。
-- 反例验证：无合同、Evidence 不完整、缺 CLI guard 均拒绝；通过后脚本 bytes/SHA 与源 Artifact 一致且 lineage 完整。
+- 反例验证：无合同、Evidence 不完整、缺 CLI guard 均拒绝；通过后脚本 bytes/SHA 与源 Artifact 一致且 lineage 完整；须补 auto-enqueue 与「已复用不重复晋升」定向测试后才能再标闭环。
 
 ### RC-P2-04
 
@@ -201,3 +286,133 @@
 - Linux 契约：`docker run --rm --network none -v /Users/niugengtian/work/plow-whip-web_blue-1:/src:ro -w /src python:3.13-slim python -m unittest -v tests.test_host_bridge`，`Ran 12 tests ... OK`；Linux 下同一套契约 12/12 通过，包括 macOS 沙箱跳过的 Bridge restart 后进程 reconcile/cancel。
 - 隔离边界：Linux 验证使用只读源码挂载、`--network none` 和本地已缓存 `python:3.13-slim`；没有启动真实 Provider、没有读取生产 Secret，也没有修改 8750 数据卷。
 - 完整回归与格式：`/opt/homebrew/bin/python3.13 -m unittest discover -s tests`，`Ran 89 tests ... OK (skipped=1)`；`git diff --check` 通过。
+
+
+### RC-P3-03
+
+- 镜像：`plowwhip-web:v2-baseline`（`--network none` 构建自 `blue@5c0dcda` 工作树）。
+- 容器：`plowwhip-web-v1-8750` 监听 `127.0.0.1:8750`，`healthy`，user `65534:65534`，卷 `plowwhip-web-v1-8750-data`，保留 `.cronner.lock`。
+- 证据文件：`docs/BASELINE_V2_DOCKER_8750_RUNTIME_EVIDENCE.zh-CN.md`。
+- 状态：本机 Docker 单实例验收闭环。
+
+### LIVE-2026-07-25 Cursor-only Planner→Done
+
+现场目标：`check-code` 强制 `provider_order=cursor_cli`，提交只读审查指令，验证 Planner→Done。
+
+已复现并记入台账：
+
+1. **LIVE-P0-01**：Cursor Planner 多次 `Planner output is invalid: Planner did not return a structured result` / candidates exhausted。
+2. **LIVE-P0-02**：对 plan 阶段 `provide_decision` 后，objective/spec 变为「主人决定…」并进入 `execute_dispatch`，跳过正式 Plan 安装；`formal result manifest is empty`。
+3. **LIVE-P0-03**：`POST /api/messages` 发送「主人决定：取消…」也会新建 `planner_intake` Task，形成取消风暴。
+4. **LIVE-P1-02**：执行中出现 `Host Bridge poll unavailable; idempotent reconcile scheduled`；Bridge HTTP GET `/health` 返回 501。
+
+代决记录：`docs/runtime-audits/OWNER_DECISIONS_2026-07-25.md`
+运行日志：`/tmp/plowwhip_owner_proxy_e2e.jsonl`
+
+#### 2026-07-25 闭环证据（Cursor-only Planner→Done）
+
+- Goal 标记：`E2E_CURSOR_ONLY_20260725_113901`
+- Task：`bd0753e5fe4f4209bc019d93195dfa25` → `outcome=done` / `phase=done` / `spec_revision=2`
+- Provider：`check-code.provider_order` 全角色 `cursor_cli` only
+- 交付：`docs/runtime-audits/CURSOR_UNATTENDED_PLANNER_TO_DONE.md`（四章非空；主机约 16709 bytes；含路径/SHA256 登记）
+- 主线 HostJob：Planner command ✓ → Planner Checker ✓ → authorize/select_plan → Execute ✓ → Independent Checker ✓
+- 关键修复（本轮）：
+  1. Cursor Planner 字段别名（inputs/checker role/`md` format 等）
+  2. Bridge 完整 stdout 分页不盲信 `has_more`
+  3. `provide_decision`/`继续` 不污染 TaskSpec；Checker 耗尽重试 Checker
+  4. Plan 授权必须 `instruction=task_id`
+  5. 「outcome is unknown」时「继续」强制 reconcile poll
+  6. `record_model_call` 对 cumulative 回落钳制，避免 Cronner tick 崩溃
+- 运行日志：`/tmp/plowwhip_owner_proxy_e2e.jsonl`
+- 当前结论：**Cursor-only 主线已在 8750 跑通 Planner→Done（含独立 Checker PASS）。**
+
+### LIVE-2026-07-25 DeepSeek-only Planner→Done（观察轮，本轮不修代码）
+
+现场目标：`check-code` 全角色 `provider_order=["deepseek"]`，`provider_models.deepseek=default`（规避 LIVE-DS-03），验证能否自动跑通审查交付。
+
+已复现并记入上表：LIVE-DS-01～LIVE-DS-08。
+
+关键证据（Task `2e34684223a04b9b9a738e70d2a8c09c` / Goal `E2E_DEEPSEEK_ONLY_20260725_135422`）：
+
+1. HostJob `7c6904be…`：`--model deepseek-v4-flash` → `simple-worker: unrecognized arguments`（LIVE-DS-03）。
+2. HostJob `39aaf080…`：worker.completed，session 含 `PLOWWHIP_PLANNER_RESULT`，但 lifecycle `planner_rejected`：stdout 无可解析结构化结果；根因含 LIVE-DS-06 + LIVE-DS-07（`upgrade_path`/`coverage` 合同）。
+3. 验证失败路径走 `needs_decision`，**未**触发 Provider 递补（LIVE-DS-05）；且本 Goal 冻结唯一 deepseek，候选本就耗尽。
+4. 本轮约定：**只记录不修复**。为省 Token 且继续「用 DeepSeek 完成审查」，主人代决对已产出意图执行 `provide_plan`（coverage id 改为安全 token，settings 锁定 deepseek），再监视 fullstack/Checker；**不**循环 `继续` 重跑 Planner。
+5. fullstack HostJob 多次 `worker.completed`/`failure_class=internal_tool_no_progress`（例 session `352d39a5…`），交付物未出现；代决 `cancel` 停止烧 Token（LIVE-DS-08）。
+6. **本轮结论：DeepSeek-only 未能自动跑通 Planner→Done**；阻塞为 LIVE-DS-03/05/06/07/08（下轮再修）。
+
+代决记录：`docs/runtime-audits/OWNER_DECISIONS_2026-07-25.md`
+问题旁路：`/tmp/plowwhip_deepseek_live_issues.jsonl`
+运行日志：`/tmp/plowwhip_owner_proxy_deepseek.jsonl`（若存在）
+
+### MECH-2026-07-25 机制修复开干
+
+- 台账新增 MECH-01～MECH-06；LIVE-DS-08 → 进行中（由 MECH-01/05 吸收）。
+- **MECH-01 已实现待回归**：
+  - 新增 `plowwhip/progress_policy.py`：`exploration`（read/planner）vs `mutation`（write）。
+  - `provider.start_provider_job` / `host_bridge._context_policy` 合并角色进度；Bridge 子进程注入 `PLOWWHIP_PROGRESS_MODE`。
+  - 外部 `simple-worker`（v2）按 `PLOWWHIP_PROGRESS_MODE=exploration` 将唯一只读探查计为进度。
+  - 验证：`tests.test_progress_policy` + 相关 Bridge 合同测试 OK。
+- **MECH-02 已实现待回归**：
+  - 新增 `plowwhip/result_ingest.py`；`parse_planner_result` / Checker 解析走 `ingest_provider_result`。
+  - 裸标记行与 JSONL message/tool 均并入 `agent_text`。
+  - 验证：`tests.test_result_ingest` OK。
+- **MECH-04 已实现待回归**：
+  - Planner 结构化解析 `ValueError` 调用 `_fallback_provider_generation(..., retry_same_provider=True)`，有候选则 `provider_fallback`，耗尽才 `needs_decision`。
+  - 验证：`test_planner_parse_failure_falls_back_instead_of_immediate_decision` OK。
+- **MECH-03 已实现待回归**：
+  - `plowwhip/planner_errors.py`：`PlannerContractError` + 稳定 `error_code`（含 `planner.sandbox_false_insufficient`）。
+  - lifecycle `planner_rejected` 事件携带 `error_code`；`fallback_eligible` 控制是否递补。
+- **MECH-05 已实现待回归**：
+  - 审查/报告 Artifact 打 `audit_delivery`；execution 注入 `progress_delivery=audit_report` → exploration（允许先多文件读再写报告）。
+  - 纯只读 analysis 仍走 `evidence` + `workspace_change_required=false`（既有单测保持）。
+- **MECH-06 已实现待回归**：
+  - `PROVIDER_CAPABILITIES`：deepseek/kimi `model_transport=env` / `result_shape=session_markers`。
+  - 非 default 模型对 deepseek/kimi 在 `start_provider_job` 明确 400 拒绝以便递补（LIVE-DS-03）。
+- 验证：`tests.test_mech_planner_audit` + 相关 MECH/vertical 用例 OK。
+- 下一动作：重建/重启 8750 + Host Bridge（含 v2 simple-worker）后跑 DeepSeek-only E2E。
+
+### LIVE-2026-07-25 DeepSeek MECH E2E（主轨，未 Done）
+
+- Marker：`E2E_DEEPSEEK_MECH_20260725_153014`
+- Task：`dbd9b24f144945e58a4f9ec329c03a6e` → **cancelled**（执行失败耗尽后有界取消；报告未落盘）
+- **已打通（互换进展）**：
+  1. Planner HostJob：`progress_mode=exploration` / limit=96
+  2. 结构化解析失败 → typed `error_code` + 同 Provider retry（MECH-03/04）
+  3. Planner Checker PASS → 授权 → fullstack `execute` 启动
+  4. Execute 携带 `progress_delivery=audit_report` + exploration（MECH-05 生效）
+- **能力矩阵缺口（阻挡 Done）**：
+  1. **LIVE-DS-09**：多次 execute `failure_class=internal_tool_no_progress` / `bounded tool loop exceeded 48 turns`；读+compact 烧尽回合，未 `write_file` 报告（单次输入 Token 可达 70万级）
+  2. **LIVE-DS-10**：`simple-worker` grep/`search_text` 缺 `query` → `KeyError` 进程失败
+  3. Bridge poll unavailable 仍偶发（LIVE-P1-02），需 wake/reconcile
+- **补丁（本轮继续）**：`audit_report.max_turns=96`；simple-worker search 缺参容错；不切 Codex 交差。
+
+- **E2E watch5 (2026-07-25 16:28:04)**：DeepSeek E2E `E2E_DEEPSEEK_MECH_20260725_160201` 硬顶/卡点停跑：same problem recovered 5 times (cap=5); blocking mechanism gap must be fixed before continue; prior=formal result manifest is empty
+
+- **E2E (2026-07-25 16:28:38)**：旧 Task `d7a29ad315ed4eef987c8273e0f44035` 因 LIVE-DS-13 TaskSpec 被毁掉 + MECH-07 硬顶取消；重提 `E2E_DEEPSEEK_MECH_20260725_162832`。Checker 合同已改为**只验报告生成与内容**。
+
+- **E2E watch5 (2026-07-25 16:41:49)**：DeepSeek E2E `E2E_DEEPSEEK_MECH_20260725_162832` 硬顶/卡点停跑：same problem recovered 5 times (cap=5); blocking mechanism gap must be fixed before continue; prior=Planner output is invalid: task audit_and_report has unsuppo
+
+- **E2E watch5 (2026-07-25 16:44:42)**：DeepSeek E2E `E2E_DEEPSEEK_MECH_20260725_162832` 终态失败 outcome=cancelled；wait=
+
+- **E2E (2026-07-25 16:46:48)**：旧 `E2E_DEEPSEEK_MECH_20…` 前一轮 `f14898…` 触 MECH-07（prior=unsupported input kind）。已修 LIVE-DS-15/16 并重建 8750；重提 `E2E_DEEPSEEK_MECH_20260725_164645` Task `55d5e77abe3c40e6a75c0e72f3c276cf`。
+
+- **E2E watch5 (2026-07-25 16:49:43)**：DeepSeek E2E `E2E_DEEPSEEK_MECH_20260725_164645` 终态失败 outcome=cancelled；wait=
+
+- **E2E watch5 (2026-07-25 17:10:22)**：DeepSeek E2E `E2E_AUDIT_TMPL_20260725_170602` 硬顶/卡点停跑：same problem recovered 5 times (cap=5); blocking mechanism gap must be fixed before continue; prior=independent Checker rejected the planner result
+
+- **E2E MECH-08 (2026-07-25 17:10:26)**：`E2E_AUDIT_TMPL_20260725_170602` 失败 wait=
+
+- **E2E LIVE-DS-19 (2026-07-25 19:48:58)**：`E2E_AUDIT_TMPL_20260725_194454` **Done** ok=True bytes=5554
+
+- **MECH-07 cap**：`E2E_FIX_PLAN_20260725_200353` prior=same problem recovered 5 times (cap=5); blocking mechanism gap must be fixed before continue; prior=declared workspace Artifact is missing from the complete post-execution snapshot
+- LIVE-DS-22 / soft-timeout: Task `068087f25568410a88e44a2ed2b8d616` project `deadline` class=hard attempt=1/3 budget 1800s（不再翻倍）; io_phase=idle; 结论：Task 超时阈值判断有误（hard idle — 无近期模型/工具 I/O）。
+- LIVE-DS-22 / soft-timeout: Task `5624b046f71e403ca70a78a6c484903a` project `deadline-late` class=hard attempt=1/3 budget 1800s（不再翻倍）; io_phase=idle; 结论：Task 超时阈值判断有误（hard idle — 无近期模型/工具 I/O）。
+
+## LIVE-DS-22 回归证据跟跑记录
+- 2026-07-25 21:05:25 E2E_REG_EVIDENCE_20260725_210045 task=`ec7f134d…` outcome=done；交付 `docs/runtime-audits/LIVE_DS_22_REGRESSION_EVIDENCE_20260725.md`；中途 Planner exhausted 代决「继续」一次后恢复。
+- 2026-07-25 21:23:03 E2E_LIVE_DS23_CURSOR_20260725_211903 task=`3cd936954a4e4b68b6f119d90cc45833` decision=cancel api=202 wait=same problem recovered 5 times (cap=5); blocking mechanism gap must be fixed before continue; prior=Planner output is invalid: task implemen
+- 2026-07-25 21:23:07 E2E_LIVE_DS23_CURSOR_20260725_211903 TERMINAL outcome=cancelled task=`3cd936954a4e4b68b6f119d90cc45833`
+- 2026-07-25 21:23:38 LIVE-DS-23 首跑失败：项目 settings 禁用 cursor_cli 且 planner=deepseek；Task `3cd93695…` MECH-07 cancelled。已切 Cursor 对照轨后重提。
+- 2026-07-25 21:46:16 LIVE-DS-23 cancel task=`d35a601600eb4dd7a44135d3dc0660c7` wait=same problem recovered 5 times (cap=5); blocking mechanism gap must be fixed before continue; prior=independent Checker
+- 2026-07-25 21:46:20 LIVE-DS-23 TERMINAL outcome=cancelled task=`d35a601600eb4dd7a44135d3dc0660c7`

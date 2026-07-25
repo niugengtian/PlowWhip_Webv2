@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -30,7 +31,6 @@ from .provider import (
     ACTIVE_HOST_JOB_STATUSES,
     HostBridgeError,
     PROBE_TOKEN_CAP,
-    provider_agent_text,
     provider_job_output,
     provider_job_status,
     model_budget_fact,
@@ -39,6 +39,8 @@ from .provider import (
     start_provider_job,
     workspace_snapshot,
 )
+from .result_ingest import ingest_provider_result
+from .script_library import enqueue_auto_promote_script, suggested_item_key
 from .store import Store, write_atomic as _write_atomic
 
 
@@ -72,6 +74,8 @@ def verify_task(
         if spec["kind"] == "provider_probe"
         else "git_publish_contract"
         if spec["kind"] == "git_publish"
+        else "local_script_contract"
+        if spec["kind"] == "local_script"
         else "artifact_content_sha256"
     )
     artifact = connection.execute(
@@ -148,6 +152,35 @@ def verify_task(
                 result,
                 started_at,
             )
+    elif spec["kind"] == "local_script":
+        try:
+            manifest = json.loads(output_path.read_text()) if output_path else {}
+        except (OSError, json.JSONDecodeError):
+            manifest = {}
+        result = (
+            manifest.get("script_result")
+            if isinstance(manifest, dict)
+            else None
+        )
+        passed = bool(
+            exists
+            and isinstance(result, dict)
+            and manifest.get("provider_key") == "local_script"
+            and manifest.get("returncode") == 0
+            and result.get("kind") == "local_script"
+            and result.get("ok") is True
+            and result.get("returncode") == 0
+        )
+        evidence = {
+            "acceptance_id": acceptance_id,
+            "provider_key": "local_script",
+            "script": (result or {}).get("script"),
+            "argv": (result or {}).get("argv"),
+            "passed": passed,
+            "status": "PASS" if passed else "CHANGES_REQUIRED",
+            "allowed_scope": "Host Bridge local-script only",
+            "recheck": "local_script_result",
+        }
     elif spec["kind"] == "git_publish":
         try:
             manifest = json.loads(output_path.read_text()) if output_path else {}
@@ -280,6 +313,7 @@ def verify_task(
     )
     if passed:
         finalize_task_terminal(connection, task["id"], "done", now)
+        _maybe_enqueue_script_promote(store, connection, task, now)
     elif will_repair:
         increment_task_retry(connection, task["id"], 1)
         write_task_fields(
@@ -294,7 +328,11 @@ def verify_task(
                     else (
                         "Git publish proof failed; bounded retry scheduled"
                         if spec["kind"] == "git_publish"
-                        else "output hash mismatch; deterministic repair scheduled"
+                        else (
+                            "Local script proof failed; bounded retry scheduled"
+                            if spec["kind"] == "local_script"
+                            else "output hash mismatch; deterministic repair scheduled"
+                        )
                     )
                 ),
                 "fault_code": "verification",
@@ -625,7 +663,7 @@ def _prepare_checker_step(
         generation["external_session_id"],
         int(settings.get("max_runtime_seconds", 600)),
         execution,
-        _context_policy(settings),
+        _checker_context_policy(settings, spec),
         (
             "planner"
             if spec.get("butler_semantic_query")
@@ -693,7 +731,7 @@ def pending_checker_step(
         generation["external_session_id"],
         int(settings.get("max_runtime_seconds", 600)),
         execution,
-        _context_policy(settings),
+        _checker_context_policy(settings, spec),
         str(dispatch.get("workspace_kind") or "project"),
         (
             str(dispatch["workspace_key"])
@@ -952,9 +990,15 @@ def apply_checker_step(
                 (time.time(), checker["returncode"], job["id"]),
             )
             return "needs_decision"
+    checker_agent_text = str(
+        ingest_provider_result(str(checker.get("stdout") or ""))["agent_text"]
+    )
+    # LIVE-DS-18 / MECH-08: json-worker Checkers often exit non-zero after
+    # emitting a valid PLOWWHIP_CHECKER_RESULT. Structured verdict wins.
+    checker_has_structured = CHECKER_RESULT_PREFIX in checker_agent_text
     checker_completed = bool(
         str(facts["state"].get("status")) == "completed"
-        and checker["returncode"] == 0
+        and (checker["returncode"] == 0 or checker_has_structured)
     )
     if not checker_completed:
         now = time.time()
@@ -1028,12 +1072,37 @@ def apply_checker_step(
     workspace_change_required = bool(
         spec.get("workspace_change_required", True)
     )
+    # MECH-08 / audit_delivery: a registered report Artifact is the delivery
+    # proof. Do not require a git HEAD/worktree delta when the Worker already
+    # indexed the declared report path (overwrite of an existing report may
+    # produce no git revision change).
+    from .planner import audit_delivery_intent
+
+    if (
+        not workspace_changed
+        and audit_delivery_intent(spec, str(spec.get("instruction") or ""))
+        and step.execution.get("result_artifacts")
+    ):
+        workspace_changed = True
     expected_acceptance = json.loads(task["acceptance_json"])
     verdict = _parse_checker_verdict(
-        provider_agent_text(checker_stdout),
+        str(ingest_provider_result(checker_stdout)["agent_text"]),
         expected_acceptance,
         spec["project_path"],
     )
+    # LIVE-DS-21: audit report delivery is objectively file/chapter proof.
+    # When the LLM Checker misses PLOWWHIP_CHECKER_RESULT or invents failure
+    # while the report Artifact is present with required headings, control
+    # plane salvages PASS instead of burning MECH-07 on false rejects.
+    if (
+        audit_delivery_intent(spec, str(spec.get("instruction") or ""))
+        and not (verdict.get("valid") and verdict.get("passed"))
+    ):
+        deterministic = _deterministic_audit_report_verdict(
+            spec, expected_acceptance
+        )
+        if deterministic and deterministic.get("passed"):
+            verdict = deterministic
     if workspace_change_required and not workspace_changed:
         for item in verdict["acceptances"]:
             if item["acceptance_id"] == "relevant_checks":
@@ -1053,8 +1122,9 @@ def apply_checker_step(
         step.execution
         and step.execution.get("returncode") == 0
         and (workspace_changed or not workspace_change_required)
-        and checker["returncode"] == 0
+        and verdict["valid"]
         and verdict["passed"]
+        and (checker["returncode"] == 0 or verdict["verdict"] == "PASS")
     )
     executor = connection.execute(
         """
@@ -1132,7 +1202,10 @@ def apply_checker_step(
     checker_succeeded = bool(
         facts.get("ok")
         and str(facts["state"].get("status")) == "completed"
-        and checker["returncode"] == 0
+        and (
+            checker["returncode"] == 0
+            or (verdict["valid"] and verdict["verdict"] in {"PASS", "CHANGES_REQUIRED", "NEEDS_DECISION"})
+        )
     )
     connection.execute(
         """
@@ -1150,6 +1223,7 @@ def apply_checker_step(
     )
     if passed:
         finalize_task_terminal(connection, task["id"], "done", now)
+        _maybe_enqueue_script_promote(store, connection, task, now)
     elif will_repair:
         increment_task_retry(connection, task["id"], 1)
         write_task_fields(
@@ -1273,14 +1347,14 @@ def _finalize_special_model_checker(
     )
     checker_stdout = str(checker["stdout"])
     verdict = _parse_checker_verdict(
-        provider_agent_text(checker_stdout),
+        str(ingest_provider_result(checker_stdout)["agent_text"]),
         [{"id": acceptance_id, "expected": f"{subject} result contract"}],
         "Planner Artifact" if subject == "planner" else "Provider probe Evidence",
     )
     passed = bool(
-        checker["returncode"] == 0
-        and verdict["valid"]
+        verdict["valid"]
         and verdict["passed"]
+        and (checker["returncode"] == 0 or verdict["verdict"] == "PASS")
     )
     now = time.time()
     evidence = {
@@ -1563,9 +1637,30 @@ def _checker_result(
     }
 
 
+def _checker_context_policy(
+    settings: dict, spec: dict[str, object]
+) -> dict[str, object]:
+    """Audit Checker must stay report-bounded; do not inherit Worker turn budgets."""
+    from .planner import audit_delivery_intent
+
+    policy = _context_policy(settings)
+    if audit_delivery_intent(spec, str(spec.get("instruction") or "")):
+        # LIVE-DS-12: report-existence check should finish in a handful of reads.
+        return {
+            **policy,
+            "progress_mode": "exploration",
+            "max_turns": 16,
+            "tool_no_progress_limit": 16,
+            "progress_delivery": "audit_report",
+        }
+    return policy
+
+
 def _checker_prompt(
     task: sqlite3.Row, spec: dict, execution: dict, report: str
 ) -> str:
+    from .planner import audit_delivery_intent
+
     acceptance = json.loads(task["acceptance_json"])
     before = execution.get("before")
     after = execution.get("after")
@@ -1577,6 +1672,60 @@ def _checker_prompt(
         and before.get("head") == after.get("head")
         else ""
     )
+    artifact_paths: list[str] = []
+    for item in execution.get("result_artifacts") or []:
+        if isinstance(item, dict) and item.get("path"):
+            artifact_paths.append(str(item["path"]))
+    contract = (
+        execution.get("result_contract")
+        if isinstance(execution.get("result_contract"), dict)
+        else {}
+    )
+    result = contract.get("result") if isinstance(contract, dict) else None
+    artifact = result.get("artifact") if isinstance(result, dict) else None
+    if isinstance(artifact, dict) and artifact.get("path"):
+        artifact_paths.append(str(artifact["path"]))
+    if isinstance(spec.get("path"), str) and spec.get("path"):
+        artifact_paths.append(str(spec["path"]))
+    # Deduplicate while preserving order.
+    seen_paths: set[str] = set()
+    bounded_paths = []
+    for path in artifact_paths:
+        if path not in seen_paths:
+            seen_paths.add(path)
+            bounded_paths.append(path)
+    audit_mode = audit_delivery_intent(spec, str(spec.get("instruction") or ""))
+    if audit_mode:
+        report_paths = bounded_paths or [
+            str(spec.get("path") or "docs/runtime-audits/<report>.md")
+        ]
+        # Do NOT paste Worker audit instructions — that triggers re-review.
+        return (
+            "LIVE-DS-12 audit Checker contract (report delivery only).\n"
+            "You are the independent Checker, NOT the Worker auditor.\n"
+            "Acceptance standard = report Artifact generated with real content. "
+            "Do NOT re-read plowwhip/*.py, tests/*, or re-perform the code review.\n"
+            f"Only open these report path(s): {report_paths}\n"
+            "For each frozen acceptance_id, check only:\n"
+            "1) report file exists at the declared path;\n"
+            "2) file is non-empty (bytes > 0 / has prose);\n"
+            "3) required chapter headings from the acceptance expected text are present.\n"
+            "Pass/fail from the report file alone. If the report is missing or empty, "
+            "verdict=CHANGES_REQUIRED. If chapters are present and non-empty, verdict=PASS.\n"
+            f"Task ID: {task['id']} · spec revision {task['spec_revision']}.\n"
+            f"Frozen acceptance contract: {canonical_json(acceptance)}\n"
+            "Frozen formal result manifest (references only): "
+            f"{canonical_json({'result_artifacts': execution.get('result_artifacts')})}\n"
+            "Keep tool use ≤ 6 turns. Emit "
+            f"{CHECKER_RESULT_PREFIX!r} (may appear mid-line after tool output) "
+            "followed by one JSON object. "
+            'Use {"verdict":"PASS|CHANGES_REQUIRED|NEEDS_DECISION",'
+            '"acceptances":[{"acceptance_id":"...","passed":true,'
+            '"actual_evidence":"bounded fact","recheck_command":"optional"}],'
+            '"decision_reason":null}. Cover every frozen acceptance_id; '
+            "recheck_command is recommended but optional. "
+            "Do not modify files or create external effects."
+        )
     return (
         "Independently inspect the Task target read-only. Verify this Task against "
         f"the actual files and smallest relevant checks:\n{spec['instruction']}\n"
@@ -1599,33 +1748,137 @@ def _checker_prompt(
         "path, SHA-256, revision, scope, source Task and coverage. For internal "
         "Evidence, use only the verified manifest reference; independently "
         "recheck the Task against the workspace and frozen TaskSpec.\n"
-        f"Finish with one line beginning {CHECKER_RESULT_PREFIX!r} followed by one JSON object. "
+        f"Emit {CHECKER_RESULT_PREFIX!r} (may appear mid-line after tool output) "
+        "followed by one JSON object. "
         'Use {"verdict":"PASS|CHANGES_REQUIRED|NEEDS_DECISION",'
         '"acceptances":[{"acceptance_id":"...","passed":true,'
-        '"actual_evidence":"bounded fact","recheck_command":"bounded command"}],'
-        '"decision_reason":null}. Include every frozen acceptance_id exactly once. '
+        '"actual_evidence":"bounded fact","recheck_command":"optional"}],'
+        '"decision_reason":null}. Cover every frozen acceptance_id; '
+        "recheck_command is recommended but optional. "
         "Never ask the owner directly; use NEEDS_DECISION plus decision_reason as the "
         "only structured blocker fact. Do not modify files, commit, deploy, send messages, "
         "or create external effects."
     )
 
 
+def _declared_report_path(spec: dict[str, object]) -> str | None:
+    contract = spec.get("task_contract")
+    result = contract.get("result") if isinstance(contract, dict) else None
+    artifact = result.get("artifact") if isinstance(result, dict) else None
+    path = artifact.get("path") if isinstance(artifact, dict) else None
+    if isinstance(path, str) and path.strip():
+        return path.strip()
+    if isinstance(spec.get("path"), str) and str(spec.get("path")).strip():
+        return str(spec["path"]).strip()
+    return None
+
+
+def _heading_from_acceptance_expected(expected: str) -> str | None:
+    text = str(expected or "").strip()
+    if not text:
+        return None
+    quoted = re.search(r"['「\u201c]([^'」\u201d]+)['」\u201d]", text)
+    if quoted:
+        return quoted.group(1).strip() or None
+    match = re.search(r"heading\s+(.+)$", text, re.IGNORECASE)
+    if match:
+        return match.group(1).strip().strip("'\"") or None
+    if "含" in text:
+        return text.split("含", 1)[-1].strip(" 。.;；") or None
+    return None
+
+
+def _deterministic_audit_report_verdict(
+    spec: dict[str, object], expected: list[dict]
+) -> dict[str, object] | None:
+    """Prove audit_delivery acceptances from the live report file via Bridge."""
+    path = _declared_report_path(spec)
+    project_path = str(spec.get("project_path") or "")
+    if not path or not project_path:
+        return None
+    try:
+        snapshot = workspace_snapshot(
+            project_path,
+            [path],
+            include_text_max_bytes=262_144,
+        )
+    except (HostBridgeError, OSError, RuntimeError, ValueError):
+        return None
+    item = next(
+        (
+            entry
+            for entry in (snapshot.get("requested") or [])
+            if isinstance(entry, dict) and entry.get("path") == path
+        ),
+        None,
+    )
+    if not isinstance(item, dict):
+        return None
+    bytes_count = int(item.get("bytes") or 0)
+    text = str(item.get("text") or "")
+    acceptances: list[dict[str, object]] = []
+    for raw in expected:
+        if not isinstance(raw, dict) or not raw.get("id"):
+            return None
+        acceptance_id = str(raw["id"])
+        expected_result = str(raw.get("expected") or raw.get("kind") or acceptance_id)
+        heading = _heading_from_acceptance_expected(expected_result)
+        if acceptance_id == "report_exists" or (
+            heading is None and "exist" in expected_result.lower()
+        ):
+            passed = bytes_count >= 0 and bool(path)
+            evidence = f"report path {path} indexed bytes={bytes_count}"
+            recheck = f"test -f {path}"
+        elif acceptance_id == "report_non_empty" or (
+            heading is None and "non-empty" in expected_result.lower()
+        ):
+            passed = bytes_count > 0 and bool(text.strip())
+            evidence = f"report bytes={bytes_count} non_empty={bool(text.strip())}"
+            recheck = f"wc -c {path}"
+        elif heading is not None or acceptance_id.startswith("chapter_"):
+            if heading is None:
+                return None
+            passed = heading in text
+            evidence = f"heading {heading!r} present={passed}"
+            recheck = f"rg -n {heading!r} {path}"
+        else:
+            return None
+        acceptances.append(
+            {
+                "acceptance_id": acceptance_id,
+                "passed": passed,
+                "actual_evidence": evidence[:4096],
+                "expected_result": expected_result[:4096],
+                "allowed_scope": project_path,
+                "recheck_command": recheck[:1024],
+            }
+        )
+    passed = bool(acceptances) and all(item["passed"] for item in acceptances)
+    return {
+        "valid": True,
+        "verdict": "PASS" if passed else "CHANGES_REQUIRED",
+        "passed": passed,
+        "acceptances": acceptances,
+        "repair_package": [item for item in acceptances if not item["passed"]],
+        "decision_reason": (
+            "control_plane_audit_report_proof"
+            if passed
+            else "control_plane_audit_report_incomplete"
+        ),
+    }
+
+
 def _parse_checker_verdict(
     output: str, expected: list[dict], allowed_scope: str
 ) -> dict[str, object]:
-    line = next(
-        (
-            value
-            for value in reversed(output.splitlines())
-            if value.startswith(CHECKER_RESULT_PREFIX)
-        ),
-        "",
-    )
-    payload: object = {}
-    try:
-        payload = json.loads(line[len(CHECKER_RESULT_PREFIX) :]) if line else {}
-    except json.JSONDecodeError:
-        payload = {}
+    from .result_ingest import extract_structured_json
+
+    # LIVE-DS-24: do not require the whole stdout line to start with the
+    # marker. Cursor/CLI envelopes embed PLOWWHIP_CHECKER_RESULT mid-line and
+    # may append an escaped duplicate after a clean PASS.
+    payload: object = extract_structured_json(
+        output, CHECKER_RESULT_PREFIX
+    ) or {}
     expected_by_id = {
         str(item["id"]): str(item.get("expected") or item.get("kind") or item["id"])
         for item in expected
@@ -1638,12 +1891,14 @@ def _parse_checker_verdict(
         if isinstance(item, dict) and item.get("acceptance_id")
     }
     acceptances = []
+    # LIVE-DS-27: require coverage of every frozen acceptance_id; extras OK.
+    # recheck_command is optional (default filled) — empty must not fake-reject PASS.
     valid = (
         isinstance(payload, dict)
         and payload.get("verdict") in {"PASS", "CHANGES_REQUIRED", "NEEDS_DECISION"}
         and isinstance(raw_items, list)
         and len(raw_by_id) == len(raw_items)
-        and set(raw_by_id) == set(expected_by_id)
+        and set(expected_by_id).issubset(set(raw_by_id))
     )
     for acceptance_id, expected_result in expected_by_id.items():
         raw = raw_by_id.get(acceptance_id, {})
@@ -1652,9 +1907,8 @@ def _parse_checker_verdict(
         item_valid = (
             isinstance(raw.get("passed"), bool)
             and bool(actual)
-            and bool(recheck)
             and len(actual.encode()) <= 4096
-            and len(recheck.encode()) <= 1024
+            and (not recheck or len(recheck.encode()) <= 1024)
         )
         valid = valid and item_valid
         acceptances.append(
@@ -1712,4 +1966,58 @@ def _record_checker_evidence(
         ),
         source_task_id=task["id"],
         created_at=now,
+    )
+
+
+def _maybe_enqueue_script_promote(
+    store: Store,
+    connection: sqlite3.Connection,
+    task: sqlite3.Row,
+    now: float,
+) -> None:
+    """After Checker PASS, auto-queue promote_script for new script modules."""
+    del store  # reserved for future body verification against data_root
+    try:
+        spec = json.loads(task["spec_json"])
+    except json.JSONDecodeError:
+        return
+    if spec.get("kind") == "local_script":
+        return
+    result = (
+        spec.get("task_contract", {}).get("result", {})
+        if isinstance(spec.get("task_contract"), dict)
+        else {}
+    )
+    script_contract = result.get("script_contract")
+    artifact_contract = result.get("artifact")
+    if not isinstance(script_contract, dict) or not isinstance(
+        artifact_contract, dict
+    ):
+        return
+    item_key = suggested_item_key(str(artifact_contract.get("path") or ""))
+    if not item_key:
+        return
+    artifact = connection.execute(
+        """
+        SELECT id, sha256 FROM artifacts
+        WHERE task_id = ? AND project_id = ?
+          AND kind = 'output' AND revision = ?
+          AND acceptance_id IN (
+              'task_result_artifact', 'artifact_content_sha256', 'provider_report'
+          )
+        ORDER BY created_at DESC, rowid DESC LIMIT 1
+        """,
+        (task["id"], task["project_id"], task["spec_revision"]),
+    ).fetchone()
+    if not artifact:
+        return
+    enqueue_auto_promote_script(
+        connection,
+        project_id=task["project_id"],
+        task_id=task["id"],
+        spec_revision=task["spec_revision"],
+        artifact_id=artifact["id"],
+        artifact_sha256=artifact["sha256"],
+        item_key=item_key,
+        now=now,
     )

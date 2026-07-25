@@ -84,6 +84,19 @@ def tick(store: Store, limit: int = 100) -> list[dict[str, str]]:
                         WHERE m.project_id = p.id AND m.processed_at IS NULL
                     )
                 )
+                OR EXISTS (
+                    SELECT 1 FROM tasks waiting
+                    WHERE waiting.project_id = p.id
+                      AND waiting.outcome IS NULL
+                      AND waiting.public_status = 'needs_decision'
+                      AND EXISTS (
+                          SELECT 1 FROM messages reply
+                          WHERE reply.project_id = p.id
+                            AND reply.processed_at IS NULL
+                            AND reply.action_json IS NULL
+                            AND reply.role = 'owner'
+                      )
+                )
               )
             ORDER BY p.created_at LIMIT ?
             """,

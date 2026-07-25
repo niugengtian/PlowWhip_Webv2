@@ -53,7 +53,13 @@ def search(db_path: str | Path, data_root: str | Path, query: str) -> dict:
             """,
             (pattern, pattern, pattern, pattern, pattern, pattern),
         ).fetchall()
-        return {"query": query, "results": [dict(row) for row in rows]}
+        from .script_library import search_script_library
+
+        results = [dict(row) for row in rows]
+        scripts = search_script_library(connection, store, query, limit=20)
+        # Prefer script hits early; keep total bounded.
+        merged = scripts + results
+        return {"query": query, "results": merged[:50]}
     finally:
         connection.close()
 
@@ -207,6 +213,21 @@ def _semantic_sources(store: Store, project_id: str) -> list[dict[str, str]]:
                     "kind": f"artifact:{row['kind']}",
                     "ref": row["id"],
                     "detail": str(row["path"])[:512],
+                }
+            )
+        from .script_library import list_project_scripts
+
+        for item in list_project_scripts(
+            connection, store, project_id, limit=10
+        ):
+            sources.append(
+                {
+                    "kind": "script",
+                    "ref": str(item["library_item_id"]),
+                    "detail": (
+                        f"{item['item_key']}@r{item['revision']}: "
+                        f"{item['summary'] or item['path']}"
+                    )[:512],
                 }
             )
         return sources[:50]

@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+from .io_phase import derive_io_phase
+from .progress_policy import merge_context_policy
 from .secret_policy import redact_secret, require_secret_safe
 from .store import write_atomic
 
@@ -31,6 +33,7 @@ SUPPORTED_EXECUTABLES = {
     "cursor": {"cursor", "cursor-agent"},
     "json-worker": {"simple-worker", "kimi-worker"},
     "git-publish": {"git-publish"},
+    "local-script": {"local-script"},
 }
 KNOWN_EXECUTABLE_PATHS = {
     "codex": {Path("/Applications/ChatGPT.app/Contents/Resources/codex")},
@@ -39,6 +42,7 @@ KNOWN_EXECUTABLE_PATHS = {
     },
     "json-worker": set(),
     "git-publish": set(),
+    "local-script": set(),
 }
 ACTIVE_STATUSES = {
     "dispatching",
@@ -161,6 +165,11 @@ def _handler(token: str, manager: "HostJobManager") -> type[BaseHTTPRequestHandl
                         payload["job_id"],
                         force=bool(payload.get("force", False)),
                     )
+                elif self.path == "/v1/jobs/extend_timeout":
+                    status, result = 200, manager.extend_timeout(
+                        payload["job_id"],
+                        int(payload["timeout_seconds"]),
+                    )
                 else:
                     self._send(404, {"detail": "not found"})
                     return
@@ -223,6 +232,14 @@ class HostJobManager:
     def snapshot(self, payload: dict[str, Any]) -> dict[str, object]:
         project = self._project(payload["project_path"])
         requested_paths = payload.get("paths", [])
+        include_text_max_bytes = payload.get("include_text_max_bytes", 0)
+        if (
+            isinstance(include_text_max_bytes, bool)
+            or not isinstance(include_text_max_bytes, int)
+            or include_text_max_bytes < 0
+            or include_text_max_bytes > 262_144
+        ):
+            raise ValueError("include_text_max_bytes must be 0-262144")
         if (
             not isinstance(requested_paths, list)
             or len(requested_paths) > 100
@@ -258,6 +275,19 @@ class HostJobManager:
             if len(records) < 20:
                 records.append(item)
             if relative in requested_set:
+                if (
+                    include_text_max_bytes > 0
+                    and 0 < stat.st_size <= include_text_max_bytes
+                ):
+                    try:
+                        item = {
+                            **item,
+                            "text": path.read_text(
+                                encoding="utf-8", errors="replace"
+                            ),
+                        }
+                    except OSError:
+                        pass
                 requested.append(item)
         git: dict[str, object] = {
             "kind": "workspace",
@@ -373,9 +403,16 @@ class HostJobManager:
         access = str(payload.get("access") or "write")
         if access not in {"read", "write"}:
             raise ValueError("unsupported access mode")
-        if access == "read" and adapter not in {"codex", "cursor", "git-publish"}:
+        if access == "read" and adapter not in {
+            "codex",
+            "cursor",
+            "json-worker",
+            "git-publish",
+            "local-script",
+        }:
             raise ValueError(
-                "read-only execution requires Codex, Cursor, or Git inspection"
+                "read-only execution requires Codex, Cursor, JSON Worker, "
+                "Git, or local-script"
             )
         capability = _validated_capability(
             payload.get("capability"), adapter, access
@@ -389,16 +426,23 @@ class HostJobManager:
             session_id = _cursor_session(executable, project)
         if adapter == "json-worker" and session_id is None:
             session_id = uuid4().hex
-        context_policy = _context_policy(payload.get("context_policy"))
+        context_policy = _context_policy(
+            payload.get("context_policy"),
+            access=access,
+            workspace_kind=workspace_kind,
+        )
         model = str(payload.get("model") or "default")
         if not MODEL_NAME.fullmatch(model):
             raise ValueError("model must be a safe bounded setting value")
         directory = self._output_directory(job_id)
         directory.mkdir(parents=True, exist_ok=True)
         directory.chmod(0o700)
-        isolated = adapter != "git-publish"
+        isolated = adapter not in {"git-publish", "local-script"}
         execution_project = project
         environment = _safe_environment()
+        environment["PLOWWHIP_PROGRESS_MODE"] = str(
+            context_policy["progress_mode"]
+        )
         if isolated:
             if _is_within(directory, project):
                 raise ValueError(
@@ -534,7 +578,40 @@ class HostJobManager:
 
     def status(self, value: object) -> dict[str, object]:
         with self._lock:
-            return self._refresh(self._read(_job_id(value)))
+            record = self._refresh(self._read(_job_id(value)))
+        return self._enrich_io_phase(record)
+
+    def extend_timeout(self, value: object, timeout_seconds: int) -> dict[str, object]:
+        """Butler soft-timeout: raise wall budget; do not kill a live HostJob."""
+        job_id = _job_id(value)
+        bounded = min(max(int(timeout_seconds), 10), MAX_JOB_SECONDS)
+        with self._lock:
+            record = self._read(job_id)
+            if record.get("status") not in ACTIVE_STATUSES:
+                raise ValueError("HostJob is not active")
+            record["timeout_seconds"] = bounded
+            record["deadline_reached_at"] = None
+            record["timeout_extended_at"] = time.time()
+            self._write(record)
+            return self._enrich_io_phase(dict(record))
+
+    def _enrich_io_phase(self, record: dict[str, Any]) -> dict[str, Any]:
+        stdout_path = (
+            self._output_directory(record["job_id"]) / "stdout.segment-000001.log"
+        )
+        raw = _read_all(stdout_path) if stdout_path.is_file() else ""
+        derived = derive_io_phase(raw, now=time.time())
+        enriched = dict(record)
+        enriched["io_phase"] = derived["io_phase"]
+        enriched["last_io_at"] = derived["last_io_at"]
+        enriched["last_io_event"] = derived["last_event"]
+        worker_failure = derived.get("failure_class")
+        if (
+            worker_failure
+            and enriched.get("failure_class") in {None, "process"}
+        ):
+            enriched["failure_class"] = worker_failure
+        return enriched
 
     def output(
         self,
@@ -815,11 +892,30 @@ class HostJobManager:
         directory = self._output_directory(record["job_id"])
         stdout_path = directory / "stdout.segment-000001.log"
         staged_workspace = directory / "workspace"
+        if record.get("adapter") == "json-worker" and stdout_path.is_file():
+            session_id = str(record.get("session_id") or "") or None
+            if not session_id:
+                session_id = _session_id_from_stdout(_read_all(stdout_path))
+            if session_id:
+                _append_json_worker_assistant_stdout(stdout_path, session_id)
+                record["session_id"] = session_id
+            # LIVE-DS-11: DeepSeek often write_file's PLOWWHIP_PLANNER_RESULT.md
+            # into the isolated workspace instead of emitting stdout JSON.
+            if staged_workspace.is_dir():
+                _harvest_structured_result_files(staged_workspace, stdout_path)
+        # LIVE-DS-26: apply staged workspace when the HostJob completed with a
+        # payload even if the adapter exit code is nonzero (Cursor/json-worker
+        # often write Artifact then exit≠0). Empty staged trees still require
+        # exit 0 to avoid applying a no-op failure as success.
+        staged_has_payload = (
+            staged_workspace.is_dir()
+            and _staged_workspace_has_payload(staged_workspace)
+        )
         if (
             record.get("apply_workspace_on_success")
             and record.get("status") == "completed"
-            and int(record.get("returncode") or 0) == 0
             and staged_workspace.is_dir()
+            and (int(record.get("returncode") or 0) == 0 or staged_has_payload)
         ):
             try:
                 record["workspace_apply"] = _apply_recoverable_workspace(
@@ -856,6 +952,15 @@ class HostJobManager:
             ),
         )
         record.update(usage)
+        # Preserve json-worker typed failure over generic process exit.
+        derived = derive_io_phase(stdout, now=time.time())
+        record["io_phase"] = derived["io_phase"]
+        record["last_io_at"] = derived["last_io_at"]
+        if derived.get("failure_class") and record.get("failure_class") in {
+            None,
+            "process",
+        }:
+            record["failure_class"] = derived["failure_class"]
         record["ended_at"] = record.get("ended_at") or time.time()
         record["duration_ms"] = max(
             0, int((record["ended_at"] - record["started_at"]) * 1_000)
@@ -923,11 +1028,12 @@ def _resolve_executable(value: object, adapter: str) -> str | None:
         "cursor": "cursor",
         "json-worker": "simple-worker",
         "git-publish": "git-publish",
+        "local-script": "local-script",
     }[adapter]
     candidate = candidate or fallback
     if Path(candidate).name not in SUPPORTED_EXECUTABLES[adapter]:
         raise ValueError("executable is not allowed for this adapter")
-    if adapter == "git-publish":
+    if adapter in {"git-publish", "local-script"}:
         return sys.executable
     if Path(candidate).is_absolute():
         path = Path(candidate).resolve()
@@ -985,6 +1091,8 @@ def _validated_capability(
             else "recoverable_workspace_write"
         )
     )
+    if adapter == "local-script" and access == "read":
+        expected = "read_only"
     if tier != expected:
         raise ValueError(f"{access} HostJob requires capability tier {expected}")
     result = {
@@ -1048,6 +1156,16 @@ def _validated_capability(
             key: authorization[key] for key in sorted(required)
         }
     return result
+
+
+def _staged_workspace_has_payload(staged: Path) -> bool:
+    """True when the staged sandbox contains at least one file or symlink."""
+    if not staged.is_dir():
+        return False
+    for _relative, entry in _workspace_entries(staged).items():
+        if entry[0] in {"file", "symlink"}:
+            return True
+    return False
 
 
 def _apply_recoverable_workspace(staged: Path, source: Path) -> dict[str, object]:
@@ -1190,6 +1308,8 @@ def _version_argv(adapter: str, executable: str) -> list[str]:
         return [executable, "--probe"]
     if adapter == "git-publish":
         return [executable, str(_git_publish_script()), "--version"]
+    if adapter == "local-script":
+        return [executable, str(_local_script_worker()), "--version"]
     return [executable, "--version"]
 
 
@@ -1216,6 +1336,14 @@ def _execution_argv(
                 f"Git {operation} requires {expected_access} access"
             )
         return [executable, str(_git_publish_script())]
+    if adapter == "local-script":
+        try:
+            payload = json.loads(prompt)
+        except json.JSONDecodeError as error:
+            raise ValueError("local_script prompt is invalid") from error
+        if not isinstance(payload, dict) or payload.get("kind") != "local_script":
+            raise ValueError("local_script prompt kind is required")
+        return [executable, str(_local_script_worker())]
     if adapter == "codex":
         sandbox = (
             "workspace-write"
@@ -1304,8 +1432,7 @@ def _execution_argv(
         "--tool-no-progress-limit",
         str(context["tool_no_progress_limit"]),
     ]
-    if model != "default":
-        argv.extend(["--model", model])
+    # MECH-06: json-worker executables use model_transport=env (never --model).
     return argv
 
 
@@ -1313,23 +1440,310 @@ def _git_publish_script() -> Path:
     return Path(__file__).with_name("git_publish_worker.py").resolve()
 
 
-def _context_policy(value: object) -> dict[str, object]:
+def _local_script_worker() -> Path:
+    return Path(__file__).with_name("local_script_worker.py").resolve()
+
+
+def _context_policy(
+    value: object,
+    *,
+    access: str = "write",
+    workspace_kind: str = "project",
+) -> dict[str, object]:
     raw = value if isinstance(value, dict) else {}
+    merged = merge_context_policy(
+        raw, access=access, workspace_kind=workspace_kind
+    )
     return {
-        "hot_max_bytes": min(1_048_576, max(4_096, int(raw.get("hot_max_bytes") or 16_384))),
-        "warm_max_bytes": min(262_144, max(2_048, int(raw.get("warm_max_bytes") or 8_192))),
+        "hot_max_bytes": min(
+            1_048_576, max(4_096, int(merged.get("hot_max_bytes") or 16_384))
+        ),
+        "warm_max_bytes": min(
+            262_144, max(2_048, int(merged.get("warm_max_bytes") or 8_192))
+        ),
         "rotation_max_bytes": min(
-            16_777_216, max(16_384, int(raw.get("rotation_max_bytes") or 65_536))
+            16_777_216,
+            max(16_384, int(merged.get("rotation_max_bytes") or 65_536)),
         ),
         "provider_compaction_token_limit": min(
             2_000_000,
-            max(8_000, int(raw.get("provider_compaction_token_limit") or 120_000)),
+            max(
+                8_000,
+                int(merged.get("provider_compaction_token_limit") or 120_000),
+            ),
         ),
-        "max_turns": min(120, max(1, int(raw.get("max_turns") or 24))),
+        "max_turns": min(120, max(1, int(merged.get("max_turns") or 24))),
         "tool_no_progress_limit": min(
-            20, max(1, int(raw.get("tool_no_progress_limit") or 6))
+            256, max(1, int(merged.get("tool_no_progress_limit") or 12))
+        ),
+        "progress_mode": merged["progress_mode"],
+        **(
+            {"progress_delivery": "audit_report"}
+            if merged.get("progress_delivery") == "audit_report"
+            else {}
         ),
     }
+
+
+def _session_id_from_stdout(stdout: str) -> str | None:
+    for line in reversed(stdout.splitlines()):
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        for key in ("session_id", "sessionId"):
+            value = event.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _find_json_worker_session_file(
+    session_id: str,
+    *,
+    search_roots: list[Path] | None = None,
+) -> Path | None:
+    if not session_id or any(ch in session_id for ch in "/\\"):
+        return None
+    roots = search_roots or [
+        Path.home() / ".plow-whip-web" / "simple-worker",
+        Path.home() / ".plow-whip-web" / "kimi-worker",
+        Path.home() / ".plow-whip" / "simple-worker",
+    ]
+    name = f"{session_id}.jsonl"
+    for root in roots:
+        if not root.is_dir():
+            continue
+        direct = root / name
+        if direct.is_file():
+            return direct
+        try:
+            matches = list(root.glob(f"**/{name}"))
+        except OSError:
+            continue
+        if matches:
+            return max(matches, key=lambda path: path.stat().st_mtime)
+    return None
+
+
+def _structured_marker_texts(text: str) -> list[str]:
+    markers = ("PLOWWHIP_PLANNER_RESULT ", "PLOWWHIP_CHECKER_RESULT ")
+    found: list[str] = []
+    for marker in markers:
+        start = 0
+        while True:
+            index = text.find(marker, start)
+            if index < 0:
+                break
+            rest = text[index + len(marker) :].lstrip()
+            # Ignore prose like "PLOWWHIP_PLANNER_RESULT written to temp file."
+            if not rest.startswith("{"):
+                start = index + len(marker)
+                continue
+            payload = _extract_json_object_text(rest)
+            if payload is not None:
+                found.append(marker + payload)
+            start = index + len(marker)
+    return found
+
+
+def _extract_json_object_text(text: str) -> str | None:
+    text = text.lstrip()
+    if not text.startswith("{"):
+        return None
+    try:
+        payload, end = json.JSONDecoder().raw_decode(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return text[:end]
+
+
+def _harvest_structured_result_files(
+    workspace: Path, stdout_path: Path
+) -> bool:
+    """Pull structured Planner/Checker payloads written into the job workspace."""
+    if not workspace.is_dir():
+        return False
+    try:
+        existing = stdout_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        existing = ""
+    harvested: list[str] = []
+    for path in sorted(workspace.rglob("*")):
+        if not path.is_file():
+            continue
+        name = path.name
+        if not (
+            name.startswith("PLOWWHIP_PLANNER_RESULT")
+            or name.startswith("PLOWWHIP_CHECKER_RESULT")
+        ):
+            continue
+        try:
+            body = path.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            continue
+        if not body:
+            continue
+        if name.startswith("PLOWWHIP_CHECKER_RESULT"):
+            marker = "PLOWWHIP_CHECKER_RESULT "
+        else:
+            marker = "PLOWWHIP_PLANNER_RESULT "
+        if body.startswith(marker):
+            content = body
+        elif body.lstrip().startswith("{"):
+            payload = _extract_json_object_text(body)
+            if payload is None:
+                continue
+            content = marker + payload
+        else:
+            markers = _structured_marker_texts(body)
+            if not markers:
+                continue
+            content = markers[-1]
+        if content in existing or content in harvested:
+            continue
+        harvested.append(
+            json.dumps(
+                {
+                    "type": "message",
+                    "message": {"role": "assistant", "content": content},
+                },
+                ensure_ascii=False,
+            )
+        )
+    if not harvested:
+        return False
+    with stdout_path.open("a", encoding="utf-8") as handle:
+        handle.write("\n".join(harvested))
+        handle.write("\n")
+    try:
+        stdout_path.chmod(0o600)
+    except OSError:
+        pass
+    return True
+
+
+def _tool_message_text(content: str) -> str:
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError:
+        return content
+    if isinstance(payload, dict):
+        for key in ("content", "text", "body"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+    return content
+
+
+def _append_json_worker_assistant_stdout(
+    stdout_path: Path,
+    session_id: str,
+    *,
+    search_roots: list[Path] | None = None,
+) -> bool:
+    """Append session texts so lifecycle can parse structured Provider results."""
+    session_path = None
+    for _attempt in range(8):
+        session_path = _find_json_worker_session_file(
+            session_id, search_roots=search_roots
+        )
+        if session_path is not None and session_path.is_file():
+            break
+        time.sleep(0.05)
+    if session_path is None or not session_path.is_file():
+        return False
+    try:
+        existing = stdout_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        existing = ""
+    # Only skip when a real JSON payload already exists (not prose claims).
+    if _structured_marker_texts(existing):
+        return False
+    harvested: list[str] = []
+    marker_lines: list[str] = []
+    try:
+        lines = session_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return False
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            marker_lines.extend(_structured_marker_texts(line))
+            continue
+        if not isinstance(event, dict) or event.get("type") != "message":
+            continue
+        message = event.get("message")
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        content = message.get("content")
+        if not isinstance(content, str) or not content.strip():
+            continue
+        text = _tool_message_text(content) if role == "tool" else content
+        # Prefer decoded tool payloads; avoid appending escaped JSON duplicates.
+        marker_lines.extend(_structured_marker_texts(text))
+        if role == "assistant":
+            harvested.append(
+                json.dumps(
+                    {
+                        "type": "message",
+                        "message": {
+                            "role": "assistant",
+                            "content": content,
+                        },
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        elif role == "tool" and (
+            "PLOWWHIP_PLANNER_RESULT " in text
+            or "PLOWWHIP_CHECKER_RESULT " in text
+        ):
+            harvested.append(
+                json.dumps(
+                    {
+                        "type": "message",
+                        "message": {
+                            "role": "assistant",
+                            "content": text,
+                        },
+                    },
+                    ensure_ascii=False,
+                )
+            )
+    seen_markers = set()
+    for marker_line in marker_lines:
+        if marker_line in seen_markers:
+            continue
+        seen_markers.add(marker_line)
+        harvested.append(
+            json.dumps(
+                {
+                    "type": "message",
+                    "message": {
+                        "role": "assistant",
+                        "content": marker_line,
+                    },
+                },
+                ensure_ascii=False,
+            )
+        )
+    if not harvested:
+        return False
+    with stdout_path.open("a", encoding="utf-8") as handle:
+        handle.write("\n".join(harvested))
+        handle.write("\n")
+    try:
+        stdout_path.chmod(0o600)
+    except OSError:
+        pass
+    return True
 
 
 def _cursor_session(executable: str, project: Path) -> str:
@@ -1359,7 +1773,9 @@ def _safe_environment() -> dict[str, str]:
         "CODEX_HOME",
         "CURSOR_API_KEY",
         "DEEPSEEK_BASE_URL",
+        "DEEPSEEK_MODEL",
         "KIMI_BASE_URL",
+        "KIMI_MODEL",
         "PLOW_WHIP_SIMPLE_WORKER_STATE_DIR",
         "PLOW_WHIP_KIMI_WORKER_STATE_DIR",
         "PLOW_WHIP_GIT_SSH_IDENTITY_FILE",
@@ -1380,7 +1796,7 @@ def _load_private_env(path: Path) -> None:
         raise SystemExit("private environment file must not be group/world accessible")
     allowed = re.compile(
         r"^(?:PLOW_WHIP_BRIDGE_TOKEN|PLOW_WHIP_GIT_SSH_IDENTITY_FILE|CURSOR_API_KEY|"
-        r"(?:DEEPSEEK|KIMI)_(?:API_KEY(?:_\d+)?|BASE_URL)|"
+        r"(?:DEEPSEEK|KIMI)_(?:API_KEY(?:_\d+)?|BASE_URL|MODEL)|"
         r"PLOW_WHIP_(?:SIMPLE|KIMI)_WORKER_STATE_DIR)$"
     )
     for raw in path.read_text(encoding="utf-8").splitlines():

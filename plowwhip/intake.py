@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import time
 import unicodedata
 from pathlib import PurePosixPath
@@ -63,7 +64,7 @@ PROJECT_SETTING_LIMITS = {
     "max_total_tokens": (1_000, 1_000_000_000),
     "monitor_tail_lines": (1, 1_000),
     "monitor_tail_bytes": (256, 1_048_576),
-    "retry_count": (0, 10),
+    "retry_count": (0, 5),
     "retry_backoff_seconds": (0, 86_400),
 }
 PROJECT_PROVIDER_ROLES = {
@@ -74,10 +75,25 @@ PROJECT_PROVIDER_ROLES = {
     "provider_probe",
     "deterministic",
     "deterministic_checker",
+    "local_script_runner",
 }
-PROJECT_PROVIDERS = {"local", "codex_cli", "cursor_cli", "deepseek", "kimi"}
+PROJECT_PROVIDERS = {
+    "local",
+    "local_script",
+    "codex_cli",
+    "cursor_cli",
+    "deepseek",
+    "kimi",
+}
 MODEL_PROVIDERS = {"codex_cli", "cursor_cli", "deepseek", "kimi"}
 MODEL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+LOCAL_SCRIPT_INSTRUCTION = re.compile(
+    r"^\s*(?:执行本地脚本|run local script)\s+"
+    r"(library:([A-Za-z0-9][A-Za-z0-9._-]{0,63})(?:@(\d+))?|"
+    r"([A-Za-z0-9][A-Za-z0-9._/-]{0,240}\.py))"
+    r"(?:\s+--\s+(.+))?\s*$",
+    re.IGNORECASE,
+)
 BUTLER_SEMANTIC_PREFIX = "PLOWWHIP_BUTLER_SEMANTIC_QUERY "
 
 
@@ -360,6 +376,8 @@ def set_project_setting(
     limits = PROJECT_SETTING_LIMITS.get(setting_key)
     if setting_key == "provider_order":
         _validate_provider_order(value)
+    elif setting_key == "provider_disabled":
+        _validate_provider_disabled(value)
     elif setting_key == "provider_models":
         _validate_provider_models(value)
     elif (
@@ -470,8 +488,49 @@ def _validate_provider_order(value: object) -> None:
             raise ValueError("provider_order contains an invalid role or Provider list")
         if role in {"deterministic", "deterministic_checker"} and providers != ["local"]:
             raise ValueError("deterministic roles require provider_order ['local']")
-        if role not in {"deterministic", "deterministic_checker"} and "local" in providers:
+        if role == "local_script_runner" and providers != ["local_script"]:
+            raise ValueError(
+                "local_script_runner requires provider_order ['local_script']"
+            )
+        if (
+            role
+            not in {
+                "deterministic",
+                "deterministic_checker",
+                "local_script_runner",
+            }
+            and "local" in providers
+        ):
             raise ValueError("model roles cannot use the local deterministic Provider")
+        if role != "local_script_runner" and "local_script" in providers:
+            raise ValueError("only local_script_runner may use local_script Provider")
+
+
+def _validate_provider_disabled(value: object) -> None:
+    if not isinstance(value, dict) or not value:
+        raise ValueError("provider_disabled must contain at least one role")
+    for role, providers in value.items():
+        if (
+            role not in PROJECT_PROVIDER_ROLES
+            or not isinstance(providers, list)
+            or len(providers) != len(set(providers))
+            or any(provider not in PROJECT_PROVIDERS for provider in providers)
+        ):
+            raise ValueError(
+                "provider_disabled contains an invalid role or Provider list"
+            )
+        if role in {"deterministic", "deterministic_checker"} and providers:
+            raise ValueError("deterministic roles cannot disable local Provider")
+        if role == "local_script_runner" and providers:
+            raise ValueError("local_script_runner cannot disable local_script Provider")
+        if "local" in providers and role not in {
+            "deterministic",
+            "deterministic_checker",
+        }:
+            # local is irrelevant for model roles; reject noise.
+            raise ValueError("model roles cannot disable the local Provider")
+        if "local_script" in providers and role != "local_script_runner":
+            raise ValueError("only local_script_runner may disable local_script")
 
 
 def _validate_provider_models(value: object) -> None:
@@ -918,6 +977,39 @@ def declared_step_count(content: str) -> int:
     return numbered + bullets
 
 
+def extract_local_script_spec(content: str) -> dict[str, object] | None:
+    match = LOCAL_SCRIPT_INSTRUCTION.fullmatch(content.strip())
+    if not match:
+        return None
+    item_key = match.group(2)
+    revision = match.group(3)
+    workspace_path = match.group(4)
+    argv_raw = match.group(5) or ""
+    argv: list[str] = []
+    if argv_raw.strip():
+        try:
+            argv = shlex.split(argv_raw)
+        except ValueError:
+            return None
+        if len(argv) > 32 or any(len(item) > 512 for item in argv):
+            return None
+    if item_key:
+        script: dict[str, object] = {
+            "origin": "library",
+            "item_key": item_key,
+        }
+        if revision is not None:
+            script["revision"] = int(revision)
+    else:
+        script = {"origin": "workspace", "path": workspace_path}
+    return {
+        "kind": "local_script",
+        "script": script,
+        "argv": argv,
+        "instruction": content.strip(),
+    }
+
+
 def extract_git_publish_spec(content: str) -> dict[str, object] | None:
     github = GITHUB_TREE_URL.search(content)
     lowered = content.lower()
@@ -1039,6 +1131,19 @@ def normalize_instruction(content: str) -> tuple[dict[str, object], list[dict[st
                 {
                     "id": "git_publish_contract",
                     "kind": "secret_scan_and_remote_sha",
+                },
+            ],
+        )
+
+    local_script = extract_local_script_spec(content)
+    if local_script and declared_step_count(content) <= 1:
+        return (
+            local_script,
+            [
+                {
+                    "id": "local_script_contract",
+                    "kind": "local_script_result",
+                    "expected": "local script returns ok with returncode 0",
                 },
             ],
         )

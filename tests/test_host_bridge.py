@@ -18,6 +18,7 @@ from plowwhip.host_bridge import (
     _parse_usage,
     _resolve_executable,
     _safe_environment,
+    _staged_workspace_has_payload,
     _validated_capability,
     make_server,
 )
@@ -347,6 +348,17 @@ else:
             (self.project / "after-delete.txt").read_text(), "applied"
         )
 
+    def test_staged_workspace_payload_detection(self):
+        empty = self.root / "staged-empty"
+        empty.mkdir()
+        (empty / "subdir").mkdir()
+        self.assertFalse(_staged_workspace_has_payload(empty))
+        filled = self.root / "staged-filled"
+        filled.mkdir()
+        (filled / "docs").mkdir()
+        (filled / "docs" / "out.md").write_text("artifact")
+        self.assertTrue(_staged_workspace_has_payload(filled))
+
     def test_external_effect_capability_requires_scoped_live_authorization(self):
         base = {
             "tier": "authorized_external_effect",
@@ -403,9 +415,18 @@ else:
                 __import__("os").environ["PLOW_WHIP_BRIDGE_TOKEN"],
                 "file-token-is-long-enough-123",
             )
-        private_env.write_text("DEEPSEEK_MODEL=must-not-be-env\n")
+        private_env.write_text("UNRELATED_MODEL=must-not-be-env\n")
         with self.assertRaisesRegex(SystemExit, "unsupported private environment"):
             _load_private_env(private_env)
+        # JSON Worker selects model via private env (no --model CLI flag).
+        private_env.write_text("DEEPSEEK_MODEL=deepseek-v4-flash\n")
+        private_env.chmod(0o600)
+        with patch.dict("os.environ", {}, clear=True):
+            _load_private_env(private_env)
+            self.assertEqual(
+                __import__("os").environ["DEEPSEEK_MODEL"],
+                "deepseek-v4-flash",
+            )
 
         outside = self.root.parent
         status, _ = self._post(
@@ -817,8 +838,8 @@ else:
                 "PLOW_WHIP_GIT_SSH_IDENTITY_FILE": (
                     "/Users/test/.ssh/id_ed25519"
                 ),
-                "DEEPSEEK_MODEL": "must-not-pass",
-                "KIMI_MODEL": "must-not-pass",
+                "DEEPSEEK_MODEL": "deepseek-v4-flash",
+                "KIMI_MODEL": "moonshot-v1",
                 "UNRELATED_SECRET": "must-not-pass",
             },
             clear=True,
@@ -832,8 +853,9 @@ else:
             "/Users/test/.ssh/id_ed25519",
         )
         self.assertNotIn("UNRELATED_SECRET", environment)
-        self.assertNotIn("DEEPSEEK_MODEL", environment)
-        self.assertNotIn("KIMI_MODEL", environment)
+        # Model choice for json-worker is env-backed; API keys stay private-env only.
+        self.assertEqual(environment["DEEPSEEK_MODEL"], "deepseek-v4-flash")
+        self.assertEqual(environment["KIMI_MODEL"], "moonshot-v1")
 
 
 if __name__ == "__main__":

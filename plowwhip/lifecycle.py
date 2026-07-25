@@ -71,8 +71,96 @@ from .verification import (
     perform_checker_step,
     verify_task,
 )
+from .continue_policy import reject_isomorphic_empty_delivery_continue
+from .recovery_policy import (
+    MAX_SAME_PROBLEM_RETRIES,
+    count_recovery_attempts,
+    recovery_cap_reached,
+    recovery_cap_wait_reason,
+)
+from .verification import _enqueue_checker_fallback
 
 CONTINUE_DECISIONS = {"继续", "继续啊", "继续执行", "重试", "再试", "重新执行"}
+CANCEL_DECISIONS = {
+    "取消",
+    "取消任务",
+    "取消当前",
+    "取消当前任务",
+    "cancel",
+    "cancelled",
+}
+
+
+def _is_continue_decision(text: str) -> bool:
+    """True for exact continue tokens and annotated forms like '继续：…'."""
+    value = str(text or "").strip()
+    if not value:
+        return False
+    if value in CONTINUE_DECISIONS:
+        return True
+    if value.upper().startswith("RETRY_PLANNER"):
+        return True
+    for token in sorted(CONTINUE_DECISIONS, key=len, reverse=True):
+        if value.startswith(token):
+            rest = value[len(token) :]
+            if not rest or rest[0] in {":", "：", " ", "\t", "\n", ",", "，"}:
+                return True
+    return False
+
+
+def _reject_continue_for_recovery_cap(
+    connection: sqlite3.Connection,
+    task: sqlite3.Row,
+    message: sqlite3.Row,
+    now: float,
+) -> tuple[str, dict[str, object]] | None:
+    """Block owner '继续' after the same problem hit the hard recovery cap."""
+    if not recovery_cap_reached(connection, task["id"]):
+        return None
+    attempts = count_recovery_attempts(connection, task["id"])
+    reason = recovery_cap_wait_reason(attempts, task["wait_reason"])
+    connection.execute(
+        """
+        UPDATE tasks SET wait_reason = ?, fault_code = 'scope',
+            updated_at = ? WHERE id = ?
+        """,
+        (reason, now, task["id"]),
+    )
+    return (
+        "decision_rejected",
+        {
+            "message_id": message["id"],
+            "reason": "recovery_cap_reached",
+            "attempts": attempts,
+            "max": MAX_SAME_PROBLEM_RETRIES,
+        },
+    )
+
+
+def _reject_continue_for_empty_delivery(
+    connection: sqlite3.Connection,
+    task: sqlite3.Row,
+    message: sqlite3.Row,
+    now: float,
+) -> tuple[str, dict[str, object]] | None:
+    """LIVE-DS-23: block isomorphic 继续 after missing Artifact + no-progress."""
+    reason = reject_isomorphic_empty_delivery_continue(connection, task)
+    if not reason:
+        return None
+    connection.execute(
+        """
+        UPDATE tasks SET wait_reason = ?, fault_code = 'scope',
+            updated_at = ? WHERE id = ?
+        """,
+        (reason, now, task["id"]),
+    )
+    return (
+        "decision_rejected",
+        {
+            "message_id": message["id"],
+            "reason": "empty_delivery_no_progress",
+        },
+    )
 
 
 class LeaseLost(RuntimeError):
@@ -294,15 +382,12 @@ def _advance_project_transaction(
 
         blocking = connection.execute(
             """
-            SELECT 1 FROM tasks
+            SELECT id FROM tasks
             WHERE project_id = ? AND outcome IS NULL
               AND public_status = 'needs_decision' LIMIT 1
             """,
             (project_id,),
         ).fetchone()
-        if blocking:
-            return "blocked"
-
         message = connection.execute(
             """
             SELECT * FROM messages
@@ -311,7 +396,17 @@ def _advance_project_transaction(
             """,
             (project_id,),
         ).fetchone()
+        if blocking:
+            if message:
+                routed = _route_owner_reply_to_waiting_decision(
+                    connection, message, str(blocking["id"])
+                )
+                if routed is not None:
+                    return routed
+            return "blocked"
         if message:
+            if _is_owner_decision_only_text(message["content"]):
+                return _ignore_orphan_decision_message(connection, message)
             return _create_task(store, connection, message)
 
         broken = connection.execute(
@@ -401,6 +496,11 @@ def _create_task(
     facts = instruction_facts(
         message["content"], str(normalized_candidate["kind"])
     )
+    from .script_library import list_project_scripts
+
+    facts["script_library"] = list_project_scripts(
+        connection, store, message["project_id"], limit=20
+    )
     project = connection.execute(
         "SELECT host_path FROM projects WHERE id = ?", (message["project_id"],)
     ).fetchone()
@@ -434,7 +534,7 @@ def _create_task(
                     "writes": (
                         project_path
                         if normalized_candidate["kind"]
-                        in {"provider_task", "git_publish"}
+                        in {"provider_task", "git_publish", "local_script"}
                         else "task artifact directory only"
                     )
                 }
@@ -633,7 +733,7 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
         spec_changed = False
         if (
             task["plan_id"]
-            and str(spec.get("instruction") or "").strip() in CONTINUE_DECISIONS
+            and _is_continue_decision(str(spec.get("instruction") or ""))
         ):
             created = connection.execute(
                 """
@@ -1020,6 +1120,84 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
     elif (
         kind == "provide_decision"
         and task["public_status"] == "needs_decision"
+        and task["phase"] == "provider_recovery"
+        and _is_continue_decision(action["instruction"])
+        and (
+            "outcome is unknown" in (task["wait_reason"] or "")
+            or "must be reconciled or cancelled" in (task["wait_reason"] or "")
+        )
+    ):
+        # Cursor/Bridge polls can time out while the HostJob already completed on
+        # disk. Owner "继续" must force another reconcile poll instead of being
+        # blocked by the still-marked-running HostJob row.
+        active_job = connection.execute(
+            """
+            SELECT * FROM host_jobs
+            WHERE task_id = ?
+              AND status IN ('dispatching', 'running', 'cancelling')
+            ORDER BY sequence DESC LIMIT 1
+            """,
+            (task["id"],),
+        ).fetchone()
+        if not active_job:
+            connection.execute(
+                """
+                UPDATE tasks SET wait_reason = ?, fault_code = 'provider',
+                    updated_at = ? WHERE id = ?
+                """,
+                (
+                    "reconcile retry requires an active HostJob",
+                    now,
+                    task["id"],
+                ),
+            )
+            event = "decision_rejected"
+            detail = {
+                "message_id": message["id"],
+                "reason": "missing_active_host_job",
+            }
+        else:
+            dispatch = json.loads(active_job["dispatch_json"] or "{}")
+            dispatch["reconcile_failures"] = 0
+            purpose = str(active_job["purpose"] or "")
+            if purpose == "check":
+                next_kind = (
+                    "plan_check"
+                    if dispatch.get("check_subject") == "planner"
+                    else "check_poll"
+                )
+                next_phase = "check_wait"
+            elif purpose == "command":
+                next_kind = "plan_poll"
+                next_phase = "plan_wait"
+            else:
+                next_kind = "execute_poll"
+                next_phase = "execute_wait"
+            connection.execute(
+                """
+                UPDATE host_jobs SET dispatch_json = ? WHERE id = ?
+                """,
+                (canonical_json(dispatch), active_job["id"]),
+            )
+            connection.execute(
+                """
+                UPDATE tasks SET public_status = 'in_progress', phase = ?,
+                    wait_reason = NULL, fault_code = NULL, retry_count = 0,
+                    next_retry_at = NULL, next_action_at = ?,
+                    next_action_kind = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (next_phase, now, next_kind, now, task["id"]),
+            )
+            event = "host_job_reconcile_requested"
+            detail = {
+                "message_id": message["id"],
+                "host_job_id": active_job["id"],
+                "next_action_kind": next_kind,
+            }
+    elif (
+        kind == "provide_decision"
+        and task["public_status"] == "needs_decision"
         and connection.execute(
             """
             SELECT 1 FROM host_jobs
@@ -1046,116 +1224,467 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
         kind == "provide_decision"
         and task["public_status"] == "needs_decision"
         and task["phase"] == "provider_recovery"
-        and action["instruction"].strip() in CONTINUE_DECISIONS
+        and _is_continue_decision(action["instruction"])
+        and (
+            (task["wait_reason"] or "").startswith("independent Checker")
+            or "Checker exhausted" in (task["wait_reason"] or "")
+        )
     ):
-        spec = json.loads(task["spec_json"])
-        (
-            supported,
-            spec,
-            role_key,
-            provider_key,
-            checker_role,
-            checker_provider,
-            reason,
-        ) = _runtime_contract(connection, task["project_id"], spec)
-        if supported:
+        blocked = _reject_continue_for_recovery_cap(
+            connection, task, message, now
+        ) or _reject_continue_for_empty_delivery(
+            connection, task, message, now
+        )
+        if blocked:
+            event, detail = blocked
+        else:
+            # Checker exhaustion must retry Checker with a new HostJob, not Planner.
+            failed_job = connection.execute(
+                """
+                SELECT * FROM host_jobs
+                WHERE task_id = ? AND purpose = 'check'
+                  AND status IN ('failed', 'cancelled', 'interrupted')
+                ORDER BY sequence DESC LIMIT 1
+                """,
+                (task["id"],),
+            ).fetchone()
+            if not failed_job:
+                connection.execute(
+                    """
+                    UPDATE tasks SET wait_reason = ?, fault_code = 'provider',
+                        updated_at = ? WHERE id = ?
+                    """,
+                    (
+                        "Checker retry requires a prior failed Checker HostJob",
+                        now,
+                        task["id"],
+                    ),
+                )
+                event = "decision_rejected"
+                detail = {
+                    "message_id": message["id"],
+                    "reason": "missing_failed_checker_job",
+                }
+            else:
+                checker_role = task["checker_role_key"] or "independent_checker"
+                checker_provider = _first_provider(
+                    connection, task["project_id"], checker_role
+                )
+                ensure_task_sessions(
+                    connection,
+                    task["project_id"],
+                    task["id"],
+                    now,
+                    executor_role=task["role_key"] or "planner",
+                    checker_role=checker_role,
+                    executor_provider=_first_provider(
+                        connection,
+                        task["project_id"],
+                        task["role_key"] or "planner",
+                    ),
+                    checker_provider=checker_provider,
+                    settings_overrides={checker_role: {"retry_count": 2}},
+                )
+                failed_provider = connection.execute(
+                    """
+                    SELECT provider_key FROM session_generations
+                    WHERE task_session_id = ? AND generation = ?
+                    """,
+                    (
+                        failed_job["task_session_id"],
+                        failed_job["session_generation"],
+                    ),
+                ).fetchone()
+                provider_key = (
+                    failed_provider["provider_key"]
+                    if failed_provider
+                    else checker_provider
+                )
+                connection.execute(
+                    """
+                    UPDATE session_generations SET status = 'archived', ended_at = ?
+                    WHERE task_session_id = ? AND status = 'active'
+                    """,
+                    (now, failed_job["task_session_id"]),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO session_generations(
+                        id, task_session_id, generation, provider_key, status,
+                        created_at
+                    ) VALUES (?, ?, ?, ?, 'active', ?)
+                    """,
+                    (
+                        uuid4().hex,
+                        failed_job["task_session_id"],
+                        int(failed_job["session_generation"]) + 1,
+                        provider_key,
+                        now,
+                    ),
+                )
+                retry_job_id = _enqueue_checker_fallback(
+                    connection, task, failed_job, now
+                )
+                dispatch = json.loads(failed_job["dispatch_json"])
+                next_action_kind = (
+                    "plan_check"
+                    if dispatch.get("check_subject") == "planner"
+                    else "check"
+                )
+                connection.execute(
+                    """
+                    UPDATE tasks SET public_status = 'in_progress', phase = 'check_call',
+                        wait_reason = NULL, fault_code = NULL, retry_count = 0,
+                        next_retry_at = NULL, next_action_at = ?,
+                        next_action_kind = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, next_action_kind, now, task["id"]),
+                )
+                event = "checker_retry_requested"
+                detail = {
+                    "message_id": message["id"],
+                    "next_action_kind": next_action_kind,
+                    "retry_host_job_id": retry_job_id,
+                }
+    elif (
+        kind == "provide_decision"
+        and task["public_status"] == "needs_decision"
+        and task["phase"] in {"plan", "provider_recovery"}
+        and json.loads(task["spec_json"]).get("kind") == "planner_intake"
+        # LIVE-DS-14: do not exclude "independent Checker rejected…" — that wait
+        # lands in phase=plan; bare 「继续」 must planner_retry. Exhaustion stays
+        # on the earlier provider_recovery → checker_retry branch.
+    ):
+        instruction = str(action["instruction"] or "").strip()
+        blocked = (
+            _reject_continue_for_recovery_cap(connection, task, message, now)
+            if _is_continue_decision(instruction)
+            else None
+        )
+        if blocked:
+            event, detail = blocked
+        else:
+            spec = json.loads(task["spec_json"])
+            goal = connection.execute(
+                "SELECT objective FROM goals WHERE id = ?",
+                (task["goal_id"],),
+            ).fetchone()
+            objective = str(
+                goal["objective"] if goal else spec.get("instruction") or ""
+            )
+            if instruction and not _is_continue_decision(instruction):
+                rewritten, _acceptance = normalize_instruction(instruction)
+                if rewritten.get("kind") == "write_text":
+                    objective = instruction
+                elif instruction not in objective:
+                    objective = f"{objective}\n\n主人补充决定：{instruction}"
+                connection.execute(
+                    "UPDATE goals SET objective = ? WHERE id = ?",
+                    (objective, task["goal_id"]),
+                )
+                facts = instruction_facts(objective, "provider_task")
+                spec = {
+                    **spec,
+                    "instruction": objective,
+                    "normalized_candidate": rewritten
+                    if rewritten.get("kind") == "write_text"
+                    else spec.get("normalized_candidate"),
+                    "input_facts": facts,
+                }
+                connection.execute(
+                    "UPDATE tasks SET spec_json = ?, updated_at = ? WHERE id = ?",
+                    (canonical_json(spec), now, task["id"]),
+                )
+            provider_key = _first_provider(connection, task["project_id"], "planner")
+            checker_role = task["checker_role_key"] or "independent_checker"
+            checker_provider = _first_provider(
+                connection, task["project_id"], checker_role
+            )
             ensure_task_sessions(
                 connection,
                 task["project_id"],
                 task["id"],
                 now,
-                executor_role=role_key,
+                executor_role="planner",
                 checker_role=checker_role,
                 executor_provider=provider_key,
                 checker_provider=checker_provider,
+                # Cursor CLI can abort once with socket hang up; keep same-provider retries.
+                settings_overrides={"planner": {"retry_count": 2}},
             )
             rotate_task_sessions(connection, task["id"], now)
             connection.execute(
                 """
-                UPDATE tasks SET public_status = 'pending', phase = 'execute',
+                UPDATE tasks SET public_status = 'pending', phase = 'plan',
                     wait_reason = NULL, fault_code = NULL, retry_count = 0,
                     next_retry_at = NULL, next_action_at = ?,
-                    next_action_kind = 'execute', updated_at = ?
+                    next_action_kind = 'plan', role_key = 'planner',
+                    checker_role_key = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (now, now, task["id"]),
+                (now, checker_role, now, task["id"]),
             )
-            event = "decision_retry"
+            event = "planner_retry_requested"
+            detail = {"message_id": message["id"], "objective": objective}
+    elif (
+        kind == "provide_decision"
+        and task["public_status"] == "needs_decision"
+        and task["phase"] == "provider_recovery"
+        and _is_continue_decision(action["instruction"])
+    ):
+        blocked = _reject_continue_for_recovery_cap(
+            connection, task, message, now
+        ) or _reject_continue_for_empty_delivery(
+            connection, task, message, now
+        )
+        if blocked:
+            event, detail = blocked
         else:
+            spec = json.loads(task["spec_json"])
+            (
+                supported,
+                spec,
+                role_key,
+                provider_key,
+                checker_role,
+                checker_provider,
+                reason,
+            ) = _runtime_contract(connection, task["project_id"], spec)
+            if supported:
+                ensure_task_sessions(
+                    connection,
+                    task["project_id"],
+                    task["id"],
+                    now,
+                    executor_role=role_key,
+                    checker_role=checker_role,
+                    executor_provider=provider_key,
+                    checker_provider=checker_provider,
+                )
+                rotate_task_sessions(connection, task["id"], now)
+                connection.execute(
+                    """
+                    UPDATE tasks SET public_status = 'pending', phase = 'execute',
+                        wait_reason = NULL, fault_code = NULL, retry_count = 0,
+                        next_retry_at = NULL, next_action_at = ?,
+                        next_action_kind = 'execute', updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, now, task["id"]),
+                )
+                event = "decision_retry"
+            else:
+                connection.execute(
+                    """
+                    UPDATE tasks SET wait_reason = ?, fault_code = 'scope',
+                        updated_at = ? WHERE id = ?
+                    """,
+                    (reason, now, task["id"]),
+                )
+                event = "decision_rejected"
+            detail = {"message_id": message["id"]}
+    elif (
+        kind == "provide_decision"
+        and task["public_status"] == "needs_decision"
+        and task["phase"] == "verify"
+        and _is_continue_decision(action["instruction"])
+        and (
+            "formal result manifest is empty" in (task["wait_reason"] or "")
+            # After a rejected annotated continue, wait_reason may be overwritten;
+            # still allow one execute retry from verify for empty-manifest recovery.
+            or "continue does not rewrite TaskSpec" in (task["wait_reason"] or "")
+            or "no required workspace delta" in (task["wait_reason"] or "")
+            or "independent checker" in (task["wait_reason"] or "").lower()
+        )
+    ):
+        # LIVE-P1-01 / LIVE-DS-13 / LIVE-DS-19: verify continue retries execute
+        # with the same TaskSpec (never Goal text). Checker contract failures use
+        # the same path when the installed plan still has task_contract.
+        # LIVE-DS-23: missing Artifact after no-progress must not isomorphic-retry.
+        blocked = _reject_continue_for_recovery_cap(
+            connection, task, message, now
+        ) or _reject_continue_for_empty_delivery(
+            connection, task, message, now
+        )
+        if blocked:
+            event, detail = blocked
+        else:
+            spec = json.loads(task["spec_json"])
+            if not isinstance(spec.get("task_contract"), dict):
+                connection.execute(
+                    """
+                    UPDATE tasks SET wait_reason = ?, fault_code = 'scope',
+                        updated_at = ? WHERE id = ?
+                    """,
+                    (
+                        "installed TaskSpec lost task_contract; cancel and replan "
+                        "instead of rewriting Goal text into execute",
+                        now,
+                        task["id"],
+                    ),
+                )
+                event = "decision_rejected"
+                detail = {
+                    "message_id": message["id"],
+                    "reason": "missing_task_contract",
+                }
+            else:
+                (
+                    supported,
+                    spec,
+                    role_key,
+                    provider_key,
+                    checker_role,
+                    checker_provider,
+                    reason,
+                ) = _runtime_contract(connection, task["project_id"], spec)
+                if supported:
+                    ensure_task_sessions(
+                        connection,
+                        task["project_id"],
+                        task["id"],
+                        now,
+                        executor_role=role_key,
+                        checker_role=checker_role,
+                        executor_provider=provider_key,
+                        checker_provider=checker_provider,
+                    )
+                    rotate_task_sessions(connection, task["id"], now)
+                    connection.execute(
+                        """
+                        UPDATE tasks SET public_status = 'pending', phase = 'execute',
+                            wait_reason = NULL, fault_code = NULL, retry_count = 0,
+                            next_retry_at = NULL, next_action_at = ?,
+                            next_action_kind = 'execute', updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (now, now, task["id"]),
+                    )
+                    event = "decision_retry"
+                else:
+                    connection.execute(
+                        """
+                        UPDATE tasks SET wait_reason = ?, fault_code = 'scope',
+                            updated_at = ? WHERE id = ?
+                        """,
+                        (reason, now, task["id"]),
+                    )
+                    event = "decision_rejected"
+                detail = {
+                    "message_id": message["id"],
+                    "reason": "verify_continue_execute_retry",
+                }
+    elif kind == "provide_decision" and task["public_status"] == "needs_decision":
+        if _is_continue_decision(action["instruction"]):
+            # Bare continue must not be rewritten into a new TaskSpec/execute path.
             connection.execute(
                 """
                 UPDATE tasks SET wait_reason = ?, fault_code = 'scope',
                     updated_at = ? WHERE id = ?
                 """,
-                (reason, now, task["id"]),
-            )
-            event = "decision_rejected"
-        detail = {"message_id": message["id"]}
-    elif kind == "provide_decision" and task["public_status"] == "needs_decision":
-        spec, acceptance = normalize_instruction(action["instruction"])
-        (
-            supported,
-            spec,
-            role_key,
-            provider_key,
-            checker_role,
-            checker_provider,
-            reason,
-        ) = _runtime_contract(connection, task["project_id"], spec)
-        if supported:
-            revision = task["spec_revision"] + 1
-            ensure_task_sessions(
-                connection,
-                task["project_id"],
-                task["id"],
-                now,
-                executor_role=role_key,
-                checker_role=checker_role,
-                executor_provider=provider_key,
-                checker_provider=checker_provider,
-                settings_overrides=(
-                    {role_key: {"retry_count": 0}}
-                    if spec.get("mode") == "minimal"
-                    else None
-                ),
-            )
-            connection.execute(
-                """
-                UPDATE tasks SET spec_revision = ?, spec_json = ?, acceptance_json = ?,
-                    public_status = 'pending', phase = 'execute', wait_reason = NULL,
-                    fault_code = NULL, retry_count = 0, next_retry_at = NULL,
-                    next_action_at = ?, next_action_kind = 'execute',
-                    outcome = NULL, role_key = ?, updated_at = ?
-                    , checker_role_key = ?
-                WHERE id = ?
-                """,
                 (
-                    revision,
-                    canonical_json(spec),
-                    canonical_json(acceptance),
+                    "continue does not rewrite TaskSpec; retry Planner/Checker instead",
                     now,
-                    role_key,
-                    now,
-                    checker_role,
                     task["id"],
                 ),
             )
-            event = "decision_applied"
-            detail = {"message_id": message["id"], "spec_revision": revision}
+            event = "decision_rejected"
+            detail = {
+                "message_id": message["id"],
+                "reason": "continue_without_recovery_target",
+            }
         else:
-            connection.execute(
-                """
-                UPDATE tasks SET wait_reason = ?, fault_code = 'scope', updated_at = ?
-                WHERE id = ?
-                """,
+            existing_spec = json.loads(task["spec_json"])
+            # LIVE-DS-19: once a Plan is installed onto an execute Task, free-form
+            # decisions must not replace task_contract with a bare provider_task.
+            if (
+                task["plan_id"]
+                and existing_spec.get("kind") != "planner_intake"
+                and isinstance(existing_spec.get("task_contract"), dict)
+            ):
+                connection.execute(
+                    """
+                    UPDATE tasks SET wait_reason = ?, fault_code = 'scope',
+                        updated_at = ? WHERE id = ?
+                    """,
+                    (
+                        "installed Plan TaskSpec cannot be rewritten by provide_decision; "
+                        "use 继续 / cancel, or replan",
+                        now,
+                        task["id"],
+                    ),
+                )
+                event = "decision_rejected"
+                detail = {
+                    "message_id": message["id"],
+                    "reason": "plan_taskspec_immutable",
+                }
+            else:
+                spec, acceptance = normalize_instruction(action["instruction"])
                 (
+                    supported,
+                    spec,
+                    role_key,
+                    provider_key,
+                    checker_role,
+                    checker_provider,
                     reason,
-                    now,
-                    task["id"],
-                ),
-            )
-            event = "decision_rejected"
-            detail = {"message_id": message["id"]}
+                ) = _runtime_contract(connection, task["project_id"], spec)
+                if supported:
+                    revision = task["spec_revision"] + 1
+                    ensure_task_sessions(
+                        connection,
+                        task["project_id"],
+                        task["id"],
+                        now,
+                        executor_role=role_key,
+                        checker_role=checker_role,
+                        executor_provider=provider_key,
+                        checker_provider=checker_provider,
+                        settings_overrides=(
+                            {role_key: {"retry_count": 0}}
+                            if spec.get("mode") == "minimal"
+                            else None
+                        ),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE tasks SET spec_revision = ?, spec_json = ?, acceptance_json = ?,
+                            public_status = 'pending', phase = 'execute', wait_reason = NULL,
+                            fault_code = NULL, retry_count = 0, next_retry_at = NULL,
+                            next_action_at = ?, next_action_kind = 'execute',
+                            outcome = NULL, role_key = ?, updated_at = ?
+                            , checker_role_key = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            revision,
+                            canonical_json(spec),
+                            canonical_json(acceptance),
+                            now,
+                            role_key,
+                            now,
+                            checker_role,
+                            task["id"],
+                        ),
+                    )
+                    event = "decision_applied"
+                    detail = {"message_id": message["id"], "spec_revision": revision}
+                else:
+                    connection.execute(
+                        """
+                        UPDATE tasks SET wait_reason = ?, fault_code = 'scope', updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            reason,
+                            now,
+                            task["id"],
+                        ),
+                    )
+                    event = "decision_rejected"
+                    detail = {"message_id": message["id"]}
     elif (
         kind == "wake"
         and task["outcome"] is None
@@ -1391,7 +1920,11 @@ def _apply_project_action(
         )
     elif kind == "set_project_setting":
         value = action["value"]
-        if action["setting_key"] in {"provider_order", "provider_models"}:
+        if action["setting_key"] in {
+            "provider_order",
+            "provider_models",
+            "provider_disabled",
+        }:
             current = connection.execute(
                 """
                 SELECT value_json FROM settings
@@ -1408,6 +1941,85 @@ def _apply_project_action(
                 **(json.loads(current["value_json"]) if current else {}),
                 **value,
             }
+            if action["setting_key"] == "provider_order":
+                disabled = connection.execute(
+                    """
+                    SELECT value_json FROM settings
+                    WHERE setting_key = 'provider_disabled'
+                      AND (
+                        (scope = 'project' AND project_id = ?)
+                        OR (scope = 'global' AND project_id IS NULL)
+                      )
+                    ORDER BY CASE scope WHEN 'project' THEN 0 ELSE 1 END LIMIT 1
+                    """,
+                    (message["project_id"],),
+                ).fetchone()
+                disabled_map = (
+                    json.loads(disabled["value_json"]) if disabled else {}
+                )
+                for role, providers in list(value.items()):
+                    blocked = {
+                        str(item)
+                        for item in (
+                            disabled_map.get(role, [])
+                            if isinstance(disabled_map, dict)
+                            else []
+                        )
+                    }
+                    value[role] = [
+                        provider
+                        for provider in providers
+                        if str(provider) not in blocked
+                    ]
+            if action["setting_key"] == "provider_disabled":
+                order_row = connection.execute(
+                    """
+                    SELECT value_json FROM settings
+                    WHERE setting_key = 'provider_order'
+                      AND (
+                        (scope = 'project' AND project_id = ?)
+                        OR (scope = 'global' AND project_id IS NULL)
+                      )
+                    ORDER BY CASE scope WHEN 'project' THEN 0 ELSE 1 END LIMIT 1
+                    """,
+                    (message["project_id"],),
+                ).fetchone()
+                if order_row:
+                    order_map = json.loads(order_row["value_json"])
+                    changed = False
+                    for role, blocked in value.items():
+                        blocked_set = {str(item) for item in blocked}
+                        current_order = order_map.get(role)
+                        if not isinstance(current_order, list):
+                            continue
+                        filtered = [
+                            provider
+                            for provider in current_order
+                            if str(provider) not in blocked_set
+                        ]
+                        if filtered != current_order:
+                            order_map[role] = filtered
+                            changed = True
+                    if changed:
+                        connection.execute(
+                            """
+                            INSERT INTO settings(
+                                id, scope, project_id, setting_key, value_json,
+                                source, updated_at
+                            ) VALUES (?, 'project', ?, 'provider_order', ?, ?, ?)
+                            ON CONFLICT(scope, project_id, setting_key) DO UPDATE SET
+                                value_json = excluded.value_json,
+                                source = excluded.source,
+                                updated_at = excluded.updated_at
+                            """,
+                            (
+                                f"project:{message['project_id']}:provider_order",
+                                message["project_id"],
+                                canonical_json(order_map),
+                                f"owner_message:{message['id']}",
+                                now,
+                            ),
+                        )
         connection.execute(
             """
             INSERT INTO settings(
@@ -2000,7 +2612,10 @@ def _apply_planner_step(
             return "needs_decision"
     returncode = int(result.get("returncode") or 0) if isinstance(result, dict) else 1
     stdout = str(result.get("stdout") or "") if isinstance(result, dict) else ""
-    if str(state.get("status")) != "completed" or returncode != 0:
+    # LIVE-DS-25 / LIVE-DS-18: completed HostJob with parseable structured Planner
+    # result wins over nonzero exit (Cursor/json-worker often exit≠0 after writing
+    # PLOWWHIP_PLANNER_RESULT). Only incomplete status fails before parse.
+    if str(state.get("status")) != "completed":
         connection.execute(
             """
             UPDATE host_jobs SET status = 'failed', ended_at = ?, returncode = ?,
@@ -2014,23 +2629,42 @@ def _apply_planner_step(
             ),
         )
         fallback = _fallback_provider_generation(
-            store, connection, task, job, step.provider_key, now
+            store,
+            connection,
+            task,
+            job,
+            step.provider_key,
+            now,
+            # DeepSeek-only / single-candidate: process failure must same-provider retry
+            # before Owner decision (bounded by retry_count + MECH-07 cap).
+            retry_same_provider=True,
         )
+        if fallback:
+            planner_wait = (
+                f"Planner Provider failed; falling back to {fallback}"
+            )
+        elif recovery_cap_reached(connection, task["id"]):
+            planner_wait = recovery_cap_wait_reason(
+                count_recovery_attempts(connection, task["id"]),
+                "Planner did not return a usable result",
+            )
+        else:
+            planner_wait = (
+                "Planner did not return a usable result; "
+                "all frozen candidates are exhausted"
+            )
         connection.execute(
             """
             UPDATE tasks SET public_status = ?, phase = ?, wait_reason = ?,
-                fault_code = 'provider', next_action_at = ?,
+                fault_code = ?, next_action_at = ?,
                 next_action_kind = ?, updated_at = ?
             WHERE id = ?
             """,
             (
                 "in_progress" if fallback else "needs_decision",
                 "plan" if fallback else "provider_recovery",
-                (
-                    f"Planner Provider failed; falling back to {fallback}"
-                    if fallback
-                    else "Planner did not return a usable result; all frozen candidates are exhausted"
-                ),
+                planner_wait,
+                "scope" if (not fallback and recovery_cap_reached(connection, task["id"])) else "provider",
                 now if fallback else None,
                 "plan" if fallback else None,
                 now,
@@ -2049,12 +2683,34 @@ def _apply_planner_step(
         return "provider_fallback" if fallback else "needs_decision"
 
     try:
-        proposal = parse_planner_result(stdout)
+        goal_row = connection.execute(
+            "SELECT objective FROM goals WHERE id = ?",
+            (task["goal_id"],),
+        ).fetchone()
+        goal_instruction = str(goal_row["objective"] if goal_row else "")
+        proposal = parse_planner_result(
+            stdout, goal_instruction=goal_instruction
+        )
+        if proposal.get("plan_source") == "control_plane_audit_template":
+            # Salvage is success — do not emit planner_rejected / burn MECH-07.
+            _record_event(
+                connection,
+                task,
+                "planner_salvaged",
+                {
+                    "host_job_id": job["id"],
+                    "plan_source": "control_plane_audit_template",
+                    "salvage_error": proposal.get("salvage_error"),
+                },
+                now,
+            )
         if proposal["plan"] is not None:
             proposal["plan"] = _materialize_plan(
                 connection, task["project_id"], task["goal_id"], proposal["plan"]
             )
     except ValueError as error:
+        error_code = getattr(error, "code", "planner.invalid_plan")
+        fallback_eligible = bool(getattr(error, "fallback_eligible", True))
         connection.execute(
             """
             UPDATE host_jobs SET status = 'failed', ended_at = ?, returncode = 1,
@@ -2062,21 +2718,84 @@ def _apply_planner_step(
             """,
             (now, job["id"]),
         )
+        # MECH-03/04 / LIVE-DS-05: typed contract failures are fallback-eligible.
+        fallback = (
+            _fallback_provider_generation(
+                store,
+                connection,
+                task,
+                job,
+                step.provider_key,
+                now,
+                retry_same_provider=True,
+            )
+            if fallback_eligible
+            else None
+        )
+        if fallback:
+            connection.execute(
+                """
+                UPDATE tasks SET public_status = 'in_progress', phase = 'plan',
+                    wait_reason = ?, fault_code = 'verification',
+                    next_action_at = ?, next_action_kind = 'plan',
+                    updated_at = ? WHERE id = ?
+                """,
+                (
+                    f"Planner output invalid; falling back to {fallback}: {error}",
+                    now,
+                    now,
+                    task["id"],
+                ),
+            )
+            _record_event(
+                connection,
+                task,
+                "planner_rejected",
+                {
+                    "host_job_id": job["id"],
+                    "error": str(error),
+                    "error_code": error_code,
+                    "fallback_provider": fallback,
+                },
+                now,
+            )
+            return "provider_fallback"
+        reject_wait = (
+            recovery_cap_wait_reason(
+                count_recovery_attempts(connection, task["id"]),
+                f"Planner output is invalid: {error}",
+            )
+            if recovery_cap_reached(connection, task["id"])
+            else f"Planner output is invalid: {error}"
+        )
         connection.execute(
             """
             UPDATE tasks SET public_status = 'needs_decision', phase = 'plan',
-                wait_reason = ?, fault_code = 'verification',
+                wait_reason = ?, fault_code = ?,
                 next_action_at = NULL, next_action_kind = NULL,
                 updated_at = ? WHERE id = ?
             """,
-            (f"Planner output is invalid: {error}", now, task["id"]),
+            (
+                reject_wait,
+                (
+                    "scope"
+                    if recovery_cap_reached(connection, task["id"])
+                    else "verification"
+                ),
+                now,
+                task["id"],
+            ),
         )
         _archive_role_generation(connection, task["id"], "planner", now)
         _record_event(
             connection,
             task,
             "planner_rejected",
-            {"host_job_id": job["id"], "error": str(error)},
+            {
+                "host_job_id": job["id"],
+                "error": str(error),
+                "error_code": error_code,
+            },
             now,
         )
         return "needs_decision"
@@ -2118,6 +2837,28 @@ def _apply_planner_step(
         (now, artifact_ref, job["id"]),
     )
     _archive_role_generation(connection, task["id"], "planner", now)
+    # MECH-08: control-plane audit templates are already normalize_plan-valid.
+    # Do not spend another model Checker HostJob rejecting empty-sandbox epistemology.
+    if proposal.get("plan_source") == "control_plane_audit_template":
+        _record_event(
+            connection,
+            task,
+            "planner_checker_skipped",
+            {
+                "host_job_id": job["id"],
+                "reason": "control_plane_audit_template",
+                "artifact_ref": artifact_ref,
+            },
+            now,
+        )
+        return _apply_checked_planner_proposal(
+            connection,
+            task,
+            proposal,
+            job["id"],
+            step.input_facts,
+            now,
+        )
     return _prepare_planner_checker(
         connection,
         task,
@@ -2179,14 +2920,21 @@ def _prepare_planner_checker(
         "Plan alternatives, objective selection, atomic DAG, TaskSpec result/"
         "acceptance/dependency/runtime/authorization contracts, and that no "
         "scope was invented.\n"
+        "LIVE-DS-16 / MECH-03: Planner and Planner-Checker HostJobs use a private "
+        "empty sandbox by design. Named relative paths from the Goal "
+        "(e.g. plowwhip/*.py, docs/runtime-audits/*) are NOT invented scope and "
+        "MUST NOT be rejected merely because those files are absent from this "
+        "sandbox. Judge the Artifact against Goal text and intake facts; the "
+        "later Worker runs against the real project workspace.\n"
         f"Task ID: {task['id']} · revision {task['spec_revision']}\n"
         f"Artifact: {artifact_ref} sha256={artifact_sha256}\n"
         f"Complete parsed Artifact:\n{canonical_json(proposal)}\n"
-        f"Finish with {CHECKER_RESULT_PREFIX!r} followed by "
+        f"Emit {CHECKER_RESULT_PREFIX!r} (may appear mid-line after tool output) "
+        "followed by one JSON object: "
         '{"verdict":"PASS|CHANGES_REQUIRED|NEEDS_DECISION",'
         '"acceptances":[{"acceptance_id":"planner_contract",'
         '"passed":true,"actual_evidence":"bounded independent fact",'
-        '"recheck_command":"bounded recheck"}],"decision_reason":null}. '
+        '"recheck_command":"optional bounded recheck"}],"decision_reason":null}. '
         "Do not modify files or create external effects."
     )
     connection.execute(
@@ -2281,7 +3029,10 @@ def _apply_checked_planner_proposal(
         )
         return "needs_decision"
     auto_select = bool(
-        proposal["confidence"] >= 0.95
+        (
+            proposal.get("plan_source") == "control_plane_audit_template"
+            or proposal["confidence"] >= 0.95
+        )
         and not proposal["classification"]["requires_owner_choice"]
         and not input_facts.get("possible_high_risk_terms")
     )
@@ -2961,9 +3712,44 @@ def _handle_task_deadline(
         (task["id"],),
     ).fetchone()
     if active:
+        # LIVE-DS-22: soft budget miss → butler ≤3×2; hard idle → reconcile/stop.
+        from .provider import provider_job_status
+        from .soft_timeout import try_soft_timeout_extension
+
+        try:
+            state = provider_job_status(active["id"])
+        except (OSError, ValueError, RuntimeError):
+            state = {
+                "status": active["status"],
+                "timeout_seconds": json.loads(active["dispatch_json"]).get(
+                    "timeout_seconds"
+                ),
+                "deadline_reached_at": now,
+                "io_phase": "idle",
+            }
+        if state.get("deadline_reached_at") is None:
+            state = {**state, "deadline_reached_at": now}
+        outcome = try_soft_timeout_extension(
+            connection, task, active, state, now=now
+        )
+        if outcome == "extended":
+            _record_event(
+                connection,
+                task,
+                "deadline_soft_extended",
+                {
+                    "host_job_id": active["id"],
+                    "deadline_at": task["deadline_at"],
+                },
+                now,
+            )
+            return "soft_timeout_extended"
         dispatch = json.loads(active["dispatch_json"])
         dispatch.setdefault("deadline_detected_at", now)
         dispatch["timeout_stage"] = "reconcile"
+        dispatch["timeout_class"] = (
+            "hard" if outcome == "hard_idle" else "soft_cap"
+        )
         connection.execute(
             """
             UPDATE host_jobs SET dispatch_json = ?
@@ -2982,7 +3768,11 @@ def _handle_task_deadline(
             (now, now, task["id"]),
         )
         event = "deadline_reconcile_requested"
-        detail = {"host_job_id": active["id"], "deadline_at": task["deadline_at"]}
+        detail = {
+            "host_job_id": active["id"],
+            "deadline_at": task["deadline_at"],
+            "timeout_outcome": outcome,
+        }
         result = "deadline_reconcile"
     else:
         connection.execute(
@@ -3013,6 +3803,134 @@ def _stop_unknown_phase(connection: sqlite3.Connection, task: sqlite3.Row) -> st
         (f"unknown lifecycle phase: {task['phase']}", now, task["id"]),
     )
     return "needs_decision"
+
+
+def _owner_message_is_cancel(content: str) -> bool:
+    text = content.strip()
+    if not text:
+        return False
+    if text in CANCEL_DECISIONS:
+        return True
+    lowered = text.lower()
+    if lowered in CANCEL_DECISIONS:
+        return True
+    if text.startswith("主人决定") and "取消" in text:
+        return True
+    return False
+
+
+def _is_owner_decision_only_text(content: str) -> bool:
+    text = content.strip()
+    if not text:
+        return False
+    if text.startswith("主人决定"):
+        return True
+    if _is_continue_decision(text) or _owner_message_is_cancel(text):
+        return True
+    if text.upper().startswith("RETRY_PLANNER"):
+        return True
+    return False
+
+
+def _ignore_orphan_decision_message(
+    connection: sqlite3.Connection, message: sqlite3.Row
+) -> str:
+    now = time.time()
+    connection.execute(
+        """
+        UPDATE messages SET action_json = ?, processed_at = ?
+        WHERE id = ?
+        """,
+        (
+            canonical_json(
+                {
+                    "kind": "ignored_decision_reply",
+                    "reason": "no_waiting_decision_task",
+                }
+            ),
+            now,
+            message["id"],
+        ),
+    )
+    return "decision_ignored"
+
+
+def _route_owner_reply_to_waiting_decision(
+    connection: sqlite3.Connection,
+    message: sqlite3.Row,
+    fallback_task_id: str,
+) -> str | None:
+    waiting = connection.execute(
+        """
+        SELECT message.id, message.action_json
+        FROM messages message
+        JOIN tasks task
+          ON task.id = json_extract(message.action_json, '$.task_id')
+        WHERE message.project_id = ?
+          AND message.role = 'butler'
+          AND json_extract(message.action_json, '$.kind') = 'question'
+          AND json_extract(message.action_json, '$.waiting') IS NOT 0
+          AND task.outcome IS NULL
+          AND task.public_status = 'needs_decision'
+        ORDER BY message.created_at, message.rowid
+        LIMIT 1
+        """,
+        (message["project_id"],),
+    ).fetchone()
+    task_id = (
+        str(json.loads(waiting["action_json"])["task_id"])
+        if waiting
+        else fallback_task_id
+    )
+    content = str(message["content"] or "").strip()
+    if not content:
+        return None
+    if not waiting and not _is_owner_decision_only_text(content):
+        return None
+    target = connection.execute(
+        "SELECT phase, plan_id, spec_json FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    target_spec = (
+        json.loads(target["spec_json"])
+        if target and target["spec_json"]
+        else {}
+    )
+    # LIVE-P1-01 / LIVE-DS-19: a queued new Goal must not become provide_decision
+    # for an already-installed execute TaskSpec when the Task later needs_decision.
+    # Free-form replies remain valid only for planner_intake / plan phase.
+    planner_slot = bool(
+        target
+        and (
+            target_spec.get("kind") == "planner_intake"
+            or target["phase"] == "plan"
+        )
+    )
+    if (
+        waiting
+        and not planner_slot
+        and not _is_owner_decision_only_text(content)
+        and not _owner_message_is_cancel(content)
+    ):
+        return None
+    action = (
+        {"kind": "cancel", "task_id": task_id}
+        if _owner_message_is_cancel(content)
+        else {
+            "kind": "provide_decision",
+            "task_id": task_id,
+            "instruction": content,
+        }
+    )
+    connection.execute(
+        "UPDATE messages SET action_json = ? WHERE id = ?",
+        (canonical_json(action), message["id"]),
+    )
+    routed = connection.execute(
+        "SELECT * FROM messages WHERE id = ?",
+        (message["id"],),
+    ).fetchone()
+    return _apply_action(connection, routed)
 
 
 def _ensure_project_question(
@@ -3210,6 +4128,28 @@ def _runtime_contract(
             "codex_cli",
             "project workspace is not bound; set an absolute Host Bridge path",
         )
+    if kind == "local_script":
+        project = connection.execute(
+            "SELECT host_path FROM projects WHERE id = ?", (project_id,)
+        ).fetchone()
+        project_path = str(
+            spec.get("project_path")
+            or (project["host_path"] if project else "")
+            or ""
+        )
+        return (
+            bool(project_path),
+            {**spec, "project_path": project_path},
+            "local_script_runner",
+            "local_script",
+            "deterministic_checker",
+            "local",
+            (
+                None
+                if project_path
+                else "project workspace is not bound; set an absolute Host Bridge path"
+            ),
+        )
     if kind == "git_publish":
         project = connection.execute(
             "SELECT host_path FROM projects WHERE id = ?", (project_id,)
@@ -3332,30 +4272,24 @@ def _first_provider(
     role_key: str,
     requested: object = None,
 ) -> str:
-    order = (
-        effective_settings(connection, project_id, {})["values"]
-        .get("provider_order", {})
-        .get(role_key, [])
-    )
-    if requested and str(requested) in order:
-        return str(requested)
-    if not order:
-        raise ValueError(f"Provider order is empty for role {role_key}")
-    return str(order[0])
+    from .provider_policy import first_eligible_provider
+
+    values = effective_settings(connection, project_id, {})["values"]
+    return first_eligible_provider(values, role_key, requested=requested)
 
 
 def _read_model_order(
     connection: sqlite3.Connection, project_id: str, role_key: str
 ) -> list[str]:
-    configured = (
-        effective_settings(connection, project_id, {})["values"]
-        .get("provider_order", {})
-        .get(role_key, [])
-    )
+    from .provider_policy import provider_order_for_role
+
     order = [
-        str(provider)
-        for provider in configured
-        if provider in {"codex_cli", "cursor_cli"}
+        provider
+        for provider in provider_order_for_role(
+            effective_settings(connection, project_id, {})["values"],
+            role_key,
+        )
+        if provider in {"codex_cli", "cursor_cli", "deepseek"}
     ]
     if not order:
         raise ValueError(
