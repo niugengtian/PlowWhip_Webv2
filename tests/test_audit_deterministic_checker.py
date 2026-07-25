@@ -8,6 +8,7 @@ from unittest.mock import patch
 from plowwhip.verification import (
     _deterministic_audit_report_verdict,
     _heading_from_acceptance_expected,
+    _merge_contract_and_semantic_verdict,
 )
 
 
@@ -99,6 +100,28 @@ class AuditDeterministicCheckerTest(unittest.TestCase):
         assert verdict is not None
         self.assertFalse(verdict["passed"])
         self.assertEqual(verdict["verdict"], "CHANGES_REQUIRED")
+
+    def test_structured_semantic_rejection_is_not_overridden_by_chapters(self):
+        semantic = {
+            "valid": True,
+            "passed": False,
+            "verdict": "CHANGES_REQUIRED",
+            "decision_reason": "audit lacks grounded evidence",
+            "acceptances": [],
+            "repair_package": [],
+        }
+        contract = {
+            "valid": True,
+            "passed": True,
+            "verdict": "PASS",
+            "decision_reason": "control_plane_audit_report_proof",
+            "acceptances": [],
+            "repair_package": [],
+        }
+        self.assertIs(
+            _merge_contract_and_semantic_verdict(semantic, contract),
+            semantic,
+        )
 
 
 if __name__ == "__main__":

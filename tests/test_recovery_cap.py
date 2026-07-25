@@ -16,6 +16,7 @@ from plowwhip.recovery_policy import (
     MAX_SAME_PROBLEM_RETRIES,
     clamp_retry_count,
     count_recovery_attempts,
+    failure_signature,
     recovery_cap_reached,
     recovery_cap_wait_reason,
 )
@@ -134,9 +135,20 @@ class RecoveryCapStoreTest(unittest.TestCase):
                     """
                     INSERT INTO task_events(
                         project_id, task_id, kind, detail_json, created_at
-                    ) VALUES (?, ?, 'provider_retry', '{}', ?)
+                    ) VALUES (?, ?, 'provider_retry', ?, ?)
                     """,
-                    (self.project_id, self.task_id, now),
+                    (
+                        self.project_id,
+                        self.task_id,
+                        canonical_json(
+                            {
+                                "failure_signature": failure_signature(
+                                    1, "provider_recovery", "provider_recovery"
+                                )
+                            }
+                        ),
+                        now,
+                    ),
                 )
 
     def tearDown(self):
@@ -150,6 +162,19 @@ class RecoveryCapStoreTest(unittest.TestCase):
                 MAX_SAME_PROBLEM_RETRIES,
             )
             self.assertTrue(recovery_cap_reached(connection, self.task_id))
+        finally:
+            connection.close()
+
+    def test_new_spec_revision_opens_a_new_failure_bucket(self):
+        connection = self.store.connect()
+        try:
+            before = failure_signature(1, "provider_recovery", "provider_recovery")
+            self.assertEqual(len(before), 24)
+            connection.execute(
+                "UPDATE tasks SET spec_revision = 2 WHERE id = ?", (self.task_id,)
+            )
+            self.assertEqual(count_recovery_attempts(connection, self.task_id), 0)
+            self.assertFalse(recovery_cap_reached(connection, self.task_id))
         finally:
             connection.close()
 

@@ -46,6 +46,7 @@ from .recovery_policy import (
     MAX_SAME_PROBLEM_RETRIES,
     clamp_retry_count,
     count_recovery_attempts,
+    failure_signature,
     recovery_cap_reached,
     recovery_cap_wait_reason,
 )
@@ -1371,11 +1372,19 @@ def apply_provider_step(
             )
             if soft_outcome == "extended":
                 return "wait"
-            if soft_outcome in {"hard_idle", "soft_cap_reached"}:
+            if soft_outcome in {
+                "hard_idle",
+                "soft_cap_reached",
+                "stall_no_increment",
+            }:
                 dispatch.setdefault("deadline_detected_at", now)
                 dispatch["timeout_stage"] = "reconcile"
                 dispatch["timeout_class"] = (
-                    "hard" if soft_outcome == "hard_idle" else "soft_cap"
+                    "hard"
+                    if soft_outcome == "hard_idle"
+                    else "soft_stall"
+                    if soft_outcome == "stall_no_increment"
+                    else "soft_cap"
                 )
                 connection.execute(
                     """
@@ -2508,6 +2517,14 @@ def _fallback_provider_generation(
             "provider_retry" if retrying else "provider_fallback",
             canonical_json(
                 {
+                    "failure_signature": failure_signature(
+                        task["spec_revision"],
+                        task["phase"],
+                        task["fault_code"] or task["phase"],
+                    ),
+                    "spec_revision": task["spec_revision"],
+                    "phase": task["phase"],
+                    "failure_class": task["fault_code"] or task["phase"],
                     "from": provider_key,
                     "to": next_provider,
                     "generation": job["session_generation"] + 1,

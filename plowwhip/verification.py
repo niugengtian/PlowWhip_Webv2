@@ -1090,19 +1090,18 @@ def apply_checker_step(
         expected_acceptance,
         spec["project_path"],
     )
-    # LIVE-DS-21: audit report delivery is objectively file/chapter proof.
-    # When the LLM Checker misses PLOWWHIP_CHECKER_RESULT or invents failure
-    # while the report Artifact is present with required headings, control
-    # plane salvages PASS instead of burning MECH-07 on false rejects.
+    # A deterministic report contract is a fallback for an absent/unparseable
+    # semantic marker.  Headings prove delivery shape, not semantic quality;
+    # a valid structured Checker rejection must remain authoritative.
     if (
         audit_delivery_intent(spec, str(spec.get("instruction") or ""))
-        and not (verdict.get("valid") and verdict.get("passed"))
+        and not verdict.get("valid")
     ):
         deterministic = _deterministic_audit_report_verdict(
             spec, expected_acceptance
         )
-        if deterministic and deterministic.get("passed"):
-            verdict = deterministic
+        if deterministic:
+            verdict = _merge_contract_and_semantic_verdict(verdict, deterministic)
     if workspace_change_required and not workspace_changed:
         for item in verdict["acceptances"]:
             if item["acceptance_id"] == "relevant_checks":
@@ -1710,8 +1709,9 @@ def _checker_prompt(
             "1) report file exists at the declared path;\n"
             "2) file is non-empty (bytes > 0 / has prose);\n"
             "3) required chapter headings from the acceptance expected text are present.\n"
-            "Pass/fail from the report file alone. If the report is missing or empty, "
-            "verdict=CHANGES_REQUIRED. If chapters are present and non-empty, verdict=PASS.\n"
+            "Missing or empty reports are CHANGES_REQUIRED. Required headings are only "
+            "weak delivery evidence; never force PASS from headings alone. Assess the "
+            "structured acceptance evidence before emitting a verdict.\n"
             f"Task ID: {task['id']} · spec revision {task['spec_revision']}.\n"
             f"Frozen acceptance contract: {canonical_json(acceptance)}\n"
             "Frozen formal result manifest (references only): "
@@ -1786,6 +1786,15 @@ def _heading_from_acceptance_expected(expected: str) -> str | None:
     if "含" in text:
         return text.split("含", 1)[-1].strip(" 。.;；") or None
     return None
+
+
+def _merge_contract_and_semantic_verdict(
+    semantic: dict, contract: dict | None
+) -> dict:
+    """Use contract facts only when semantic Checker emitted no valid verdict."""
+    if semantic.get("valid") or not contract:
+        return semantic
+    return contract
 
 
 def _deterministic_audit_report_verdict(

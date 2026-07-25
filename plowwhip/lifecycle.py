@@ -72,9 +72,11 @@ from .verification import (
     verify_task,
 )
 from .continue_policy import reject_isomorphic_empty_delivery_continue
+from .decision_policy import build_decision_options
 from .recovery_policy import (
     MAX_SAME_PROBLEM_RETRIES,
     count_recovery_attempts,
+    failure_signature,
     recovery_cap_reached,
     recovery_cap_wait_reason,
 )
@@ -125,6 +127,19 @@ def _reject_continue_for_recovery_cap(
             updated_at = ? WHERE id = ?
         """,
         (reason, now, task["id"]),
+    )
+    _record_event(
+        connection,
+        task,
+        "decision_options",
+        {
+            "scenario": "recovery_cap",
+            "spec_revision": task["spec_revision"],
+            "options": build_decision_options(
+                scenario="recovery_cap", reason=reason, basis="same failure signature"
+            ),
+        },
+        now,
     )
     return (
         "decision_rejected",
@@ -651,6 +666,69 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
         return "decision_rejected"
 
     kind = action["kind"]
+    if kind == "select_option":
+        row = connection.execute(
+            """
+            SELECT detail_json FROM task_events
+            WHERE task_id = ? AND kind = 'decision_options'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (task["id"],),
+        ).fetchone()
+        try:
+            options = json.loads(row["detail_json"]).get("options", []) if row else []
+        except (TypeError, json.JSONDecodeError):
+            options = []
+        selected = next(
+            (item for item in options if item.get("option_id") == action.get("option_id")),
+            None,
+        )
+        if not selected:
+            _record_event(
+                connection, task, "decision_rejected",
+                {"message_id": message["id"], "reason": "unknown_decision_option"}, now,
+            )
+            return "decision_rejected"
+        option_id = selected["option_id"]
+        if option_id == "cancel_task":
+            kind = "cancel"
+        elif option_id == "authorize_plan":
+            proposal = connection.execute(
+                """
+                SELECT id, revision FROM plans
+                WHERE goal_id = ? AND selected = 0
+                ORDER BY revision DESC LIMIT 1
+                """,
+                (task["goal_id"],),
+            ).fetchone()
+            project = connection.execute(
+                "SELECT host_path FROM projects WHERE id = ?", (task["project_id"],)
+            ).fetchone()
+            if not proposal:
+                _record_event(
+                    connection, task, "decision_rejected",
+                    {"message_id": message["id"], "reason": "plan_option_is_stale"}, now,
+                )
+                return "decision_rejected"
+            kind = "authorize"
+            action.update(
+                {
+                    "action_kind": "select_plan",
+                    "spec_revision": task["spec_revision"],
+                    "target_scope": (
+                        project["host_path"] if project and project["host_path"]
+                        else f"project:{task['project_id']}"
+                    ),
+                    "expires_at": now + 900,
+                    "plan_id": proposal["id"],
+                    "plan_revision": proposal["revision"],
+                }
+            )
+        else:
+            kind = "provide_decision"
+            action["instruction"] = (
+                "RETRY_PLANNER" if option_id == "retry_planner" else "继续：change strategy"
+            )
     if kind == "confirm_not_executed" and task["outcome"] is None:
         job = connection.execute(
             """
@@ -3029,11 +3107,7 @@ def _apply_checked_planner_proposal(
         )
         return "needs_decision"
     auto_select = bool(
-        (
-            proposal.get("plan_source") == "control_plane_audit_template"
-            or proposal["confidence"] >= 0.95
-        )
-        and not proposal["classification"]["requires_owner_choice"]
+        not proposal["classification"]["requires_owner_choice"]
         and not input_facts.get("possible_high_risk_terms")
     )
     if auto_select:
@@ -3093,6 +3167,19 @@ def _apply_checked_planner_proposal(
             "host_job_id": planner_job_id,
             "plan_revision": revision,
             "confidence": proposal["confidence"],
+        },
+        now,
+    )
+    _record_event(
+        connection,
+        task,
+        "decision_options",
+        {
+            "scenario": "plan",
+            "spec_revision": task["spec_revision"],
+            "options": build_decision_options(
+                scenario="plan", reason=question, basis="planner classification"
+            ),
         },
         now,
     )
@@ -3469,6 +3556,19 @@ def _record_event(
     detail: dict,
     now: float,
 ) -> None:
+    if kind in {
+        "provider_retry", "provider_fallback", "planner_retry_requested",
+        "decision_retry", "checker_retry_requested",
+    }:
+        detail = {
+            **detail,
+            "failure_signature": failure_signature(
+                task["spec_revision"], task["phase"], task["fault_code"] or task["phase"]
+            ),
+            "spec_revision": task["spec_revision"],
+            "phase": task["phase"],
+            "failure_class": task["fault_code"] or task["phase"],
+        }
     connection.execute(
         """
         INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
@@ -3744,6 +3844,19 @@ def _handle_task_deadline(
                 now,
             )
             return "soft_timeout_extended"
+        if outcome == "stall_no_increment":
+            _record_event(
+                connection,
+                task,
+                "deadline_soft_stall",
+                {
+                    "host_job_id": active["id"],
+                    "deadline_at": task["deadline_at"],
+                    "effective_increment": False,
+                },
+                now,
+            )
+            return "soft_timeout_stall"
         dispatch = json.loads(active["dispatch_json"])
         dispatch.setdefault("deadline_detected_at", now)
         dispatch["timeout_stage"] = "reconcile"

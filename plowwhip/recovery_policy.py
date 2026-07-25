@@ -8,6 +8,8 @@ fail-closed. That surfaces a mechanism gap that must be fixed — not more burns
 from __future__ import annotations
 
 import sqlite3
+import hashlib
+import json
 
 # Owner rule: same problem ≤5 retries; the 6th attempt means a blocking gap.
 MAX_SAME_PROBLEM_RETRIES = 5
@@ -29,18 +31,64 @@ def clamp_retry_count(value: object) -> int:
     return max(0, min(count, MAX_SAME_PROBLEM_RETRIES))
 
 
+def failure_signature(
+    spec_revision: object,
+    phase: object,
+    failure_class: object,
+    result_identity: object = None,
+) -> str:
+    """Stable bucket identity for retries of one unchanged failure."""
+    payload = {
+        "spec_revision": int(spec_revision or 0),
+        "phase": str(phase or ""),
+        "failure_class": str(failure_class or ""),
+        "result_identity": result_identity,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode()).hexdigest()[:24]
+
+
 def count_recovery_attempts(
-    connection: sqlite3.Connection, task_id: str
+    connection: sqlite3.Connection,
+    task_id: str,
+    *,
+    phase: str | None = None,
+    failure_class: str | None = None,
+    result_identity: object = None,
 ) -> int:
+    task = connection.execute(
+        "SELECT spec_revision, phase, fault_code FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if not task:
+        return 0
+    expected = failure_signature(
+        task["spec_revision"],
+        phase or task["phase"],
+        failure_class or task["fault_code"] or task["phase"],
+        result_identity,
+    )
     placeholders = ",".join("?" for _ in RECOVERY_EVENT_KINDS)
-    row = connection.execute(
+    rows = connection.execute(
         f"""
-        SELECT COUNT(*) AS n FROM task_events
+        SELECT detail_json FROM task_events
         WHERE task_id = ? AND kind IN ({placeholders})
         """,
         (task_id, *RECOVERY_EVENT_KINDS),
-    ).fetchone()
-    return int(row["n"] if row else 0)
+    ).fetchall()
+    count = 0
+    for row in rows:
+        try:
+            detail = json.loads(row["detail_json"])
+        except (TypeError, json.JSONDecodeError):
+            detail = {}
+        signature = detail.get("failure_signature")
+        if signature is None:
+            # Pre-V3 events lack the immutable failure identity and cannot be
+            # safely assigned to a later revision.
+            continue
+        if signature == expected:
+            count += 1
+    return count
 
 
 def recovery_cap_reached(

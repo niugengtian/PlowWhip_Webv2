@@ -169,9 +169,9 @@ def planner_prompt(instruction: str, project_id: str, input_facts: dict) -> str:
         "independent modules, roles, deliverables, dependencies, Sprints, migration, "
         "deployment, or high risk require large. Explain the semantic evidence; never "
         "copy an intake hint as the sole reason.\n"
-        "For simple or medium return exactly one executable Task and one selected "
-        "alternative. For large return at least two genuine alternatives comparing "
-        "name, scope, cost, risk, reversible, and acceptance, then emit a serializable "
+        "Return one executable Plan with rationale in classification.reasons and "
+        "selection.basis. Return one selected alternative for compatibility with the "
+        "wire format. For large emit a serializable "
         "DAG with 2-50 bounded Tasks. Every Plan needs required_coverage and a selection "
         "object. Each alternative needs objective_metrics with exactly the Plan coverage, "
         "integer estimated_effort, and integer risk_level 0-4. selection.mode may be "
@@ -889,7 +889,7 @@ def normalize_plan(
     selection = _normalize_selection(
         plan.get("selection"), requires_owner_choice
     )
-    minimum_alternatives = 2 if size == "large" else 1
+    minimum_alternatives = 1
     # LIVE-DS-17: DeepSeek sometimes omits alternatives[] for medium, or leaves
     # comparison fields null. Synthesize / fill before the strict gate.
     if size in {"simple", "medium"} and (
@@ -917,9 +917,7 @@ def normalize_plan(
         or len(alternatives) < minimum_alternatives
     ):
         raise ValueError(
-            "large plan requires at least two alternatives"
-            if size == "large"
-            else "simple and medium plans require one selected alternative"
+            "plan requires one selected alternative"
         )
     # DeepSeek/Cursor often invent divergent narrative coverage ids across
     # required_coverage, alternatives, and task.result. For simple/medium the

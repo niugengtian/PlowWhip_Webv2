@@ -499,7 +499,13 @@ def _task_view(connection, store: Store, task) -> dict:
         else []
     )
     decision_context = None
+    decision_options = []
     for event in events:
+        if event["kind"] == "decision_options" and not decision_options:
+            try:
+                decision_options = json.loads(event["detail_json"]).get("options", [])
+            except (TypeError, json.JSONDecodeError):
+                decision_options = []
         if event["kind"] != "git_publish_needs_decision":
             continue
         try:
@@ -522,6 +528,7 @@ def _task_view(connection, store: Store, task) -> dict:
         ),
         "task": dict(task),
         "decision_context": decision_context,
+        "decision_options": decision_options,
         "events": [dict(event) for event in events],
         "artifacts": [_artifact_file_view(store, task, artifact) for artifact in artifacts],
         "handoffs": [_artifact_file_view(store, task, handoff) for handoff in handoffs],

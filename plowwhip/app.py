@@ -224,6 +224,7 @@ class Handler(BaseHTTPRequestHandler):
                         body["idempotency_key"],
                         body.get("plan"),
                         body.get("promotion"),
+                        body.get("option_id"),
                     )
             else:
                 self._send(404, {"error": "not_found"})

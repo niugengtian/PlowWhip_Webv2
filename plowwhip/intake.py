@@ -602,11 +602,13 @@ def submit_action(
     idempotency_key: str,
     plan: dict | None = None,
     promotion: dict | None = None,
+    option_id: str | None = None,
 ) -> str:
     if not PROJECT_ID.fullmatch(project_id) or not TASK_ID.fullmatch(task_id):
         raise ValueError("invalid project_id or task_id")
     if kind not in {
         "provide_decision",
+        "select_option",
         "provide_plan",
         "authorize",
         "cancel",
@@ -619,13 +621,17 @@ def submit_action(
         "promote_script",
     }:
         raise ValueError(
-            "supported actions: provide_decision, provide_plan, authorize, cancel, "
+            "supported actions: provide_decision, select_option, provide_plan, authorize, cancel, "
             "confirm_not_executed, refresh_git_publish_context, publish_new_branch, "
             "force_publish_with_lease, rerun, wake"
             ", promote_script"
         )
     if kind == "provide_decision" and not instruction:
         raise ValueError("provide_decision requires instruction")
+    if kind == "select_option" and (
+        not isinstance(option_id, str) or not option_id or not LIBRARY_KEY.fullmatch(option_id)
+    ):
+        raise ValueError("select_option requires a safe option_id")
     if len(instruction.encode()) > 65_536:
         raise ValueError("instruction must contain at most 65536 UTF-8 bytes")
     if kind == "provide_plan" and not isinstance(plan, dict):
@@ -647,6 +653,8 @@ def submit_action(
     now = time.time()
     message_id = uuid4().hex
     action = {"kind": kind, "task_id": task_id, "instruction": instruction}
+    if option_id is not None:
+        action["option_id"] = option_id
     if plan is not None:
         action["plan"] = plan
     with store.transaction() as connection:
@@ -902,6 +910,10 @@ def submit_action(
             kind == "provide_decision"
             and task["public_status"] == "needs_decision"
             and task["outcome"] != "cancelled"
+        ) or (
+            kind == "select_option"
+            and task["public_status"] == "needs_decision"
+            and task["outcome"] is None
         ) or (
             kind == "provide_plan"
             and task["public_status"] == "needs_decision"
