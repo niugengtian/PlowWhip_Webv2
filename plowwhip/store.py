@@ -12,6 +12,11 @@ from typing import Iterator
 from urllib.parse import quote
 from uuid import uuid4
 
+from .lifecycle_state import (
+    lifecycle_write_scope,
+    migrate_legacy_needs_decision_outcomes,
+)
+
 
 HOST_JOBS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS host_jobs (
@@ -110,6 +115,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     next_action_kind TEXT,
     deadline_at REAL,
     outcome TEXT,
+    terminal_capabilities_revoked_at REAL,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -173,6 +179,8 @@ CREATE TABLE IF NOT EXISTS artifacts (
     bytes INTEGER NOT NULL,
     acceptance_id TEXT,
     revision INTEGER NOT NULL,
+    scope_json TEXT NOT NULL DEFAULT '{{}}',
+    source_task_id TEXT,
     created_at REAL NOT NULL,
     UNIQUE (task_id, kind, path, revision)
 );
@@ -194,6 +202,7 @@ CREATE TABLE IF NOT EXISTS model_calls (
     provider_key TEXT NOT NULL,
     model TEXT NOT NULL,
     usage_kind TEXT NOT NULL CHECK (usage_kind IN ('single', 'cumulative')),
+    physical_session_id TEXT NOT NULL,
     input_tokens INTEGER NOT NULL,
     cached_input_tokens INTEGER NOT NULL,
     output_tokens INTEGER NOT NULL,
@@ -210,6 +219,9 @@ CREATE TABLE IF NOT EXISTS library_items (
     revision INTEGER NOT NULL,
     path TEXT NOT NULL,
     sha256 TEXT NOT NULL,
+    source_task_id TEXT,
+    source_artifact_id TEXT,
+    source_revision INTEGER,
     created_at REAL NOT NULL,
     UNIQUE (scope, project_id, kind, item_key, revision)
 );
@@ -236,6 +248,12 @@ DEFAULT_SETTINGS = {
         "provider_probe": ["codex_cli", "cursor_cli", "deepseek", "kimi"],
         "deterministic": ["local"],
         "deterministic_checker": ["local"],
+    },
+    "provider_models": {
+        "codex_cli": "default",
+        "cursor_cli": "default",
+        "deepseek": "default",
+        "kimi": "default",
     },
     "max_runtime_seconds": 600,
     "stop_grace_seconds": 10,
@@ -455,12 +473,10 @@ class Store:
             self._ensure_message_columns(connection)
             self._ensure_task_columns(connection)
             self._ensure_model_call_columns(connection)
-            connection.execute(
-                """
-                UPDATE tasks SET outcome = NULL
-                WHERE public_status = 'needs_decision' AND outcome = 'needs_decision'
-                """
-            )
+            self._ensure_artifact_columns(connection)
+            self._ensure_library_item_columns(connection)
+            with lifecycle_write_scope("schema_migration"):
+                migrate_legacy_needs_decision_outcomes(connection)
             now = time.time()
             for key, value in DEFAULT_SETTINGS.items():
                 value_json = json.dumps(value, sort_keys=True)
@@ -482,7 +498,7 @@ class Store:
                     (value_json, now, key, value_json),
                 )
             self._sync_default_library(connection, now)
-            connection.execute("PRAGMA user_version = 6")
+            connection.execute("PRAGMA user_version = 10")
             connection.commit()
         finally:
             connection.close()
@@ -585,6 +601,7 @@ class Store:
             "checker_role_key": "TEXT",
             "next_action_kind": "TEXT",
             "deadline_at": "REAL",
+            "terminal_capabilities_revoked_at": "REAL",
         }
         for name, declaration in additions.items():
             if name not in columns:
@@ -625,6 +642,73 @@ class Store:
         if "model" not in columns:
             connection.execute("ALTER TABLE model_calls ADD COLUMN model TEXT")
             connection.execute("UPDATE model_calls SET model = provider_key")
+        if "physical_session_id" not in columns:
+            connection.execute(
+                "ALTER TABLE model_calls ADD COLUMN physical_session_id TEXT"
+            )
+            connection.execute(
+                """
+                UPDATE model_calls
+                SET physical_session_id = provider_key || ':' || COALESCE(
+                    (
+                        SELECT generation.external_session_id
+                        FROM session_generations generation
+                        WHERE generation.task_session_id =
+                              model_calls.task_session_id
+                          AND generation.generation =
+                              model_calls.session_generation
+                    ),
+                    task_session_id || ':generation-' ||
+                    printf('%06d', session_generation)
+                )
+                """
+            )
+
+    @staticmethod
+    def _ensure_artifact_columns(connection: sqlite3.Connection) -> None:
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(artifacts)")
+        }
+        if "scope_json" not in columns:
+            connection.execute(
+                "ALTER TABLE artifacts ADD COLUMN scope_json TEXT NOT NULL DEFAULT '{}'"
+            )
+        if "source_task_id" not in columns:
+            connection.execute(
+                "ALTER TABLE artifacts ADD COLUMN source_task_id TEXT"
+            )
+        connection.execute(
+            """
+            UPDATE artifacts SET source_task_id = task_id
+            WHERE source_task_id IS NULL
+            """
+        )
+        connection.execute(
+            """
+            UPDATE artifacts
+            SET scope_json = json_object(
+                'kind', 'task_data',
+                'root', 'data_root',
+                'coverage', json_array()
+            )
+            WHERE scope_json = '{}'
+            """
+        )
+
+    @staticmethod
+    def _ensure_library_item_columns(connection: sqlite3.Connection) -> None:
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(library_items)")
+        }
+        for name, declaration in (
+            ("source_task_id", "TEXT"),
+            ("source_artifact_id", "TEXT"),
+            ("source_revision", "INTEGER"),
+        ):
+            if name not in columns:
+                connection.execute(
+                    f"ALTER TABLE library_items ADD COLUMN {name} {declaration}"
+                )
 
     def _sync_default_library(self, connection: sqlite3.Connection, now: float) -> None:
         for (kind, item_key), (relative, default_body) in DEFAULT_LIBRARY.items():

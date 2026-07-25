@@ -5,12 +5,24 @@ import json
 import os
 import sqlite3
 import time
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
+from .artifact_contract import (
+    register_artifact,
+    register_indexed_artifact,
+    task_data_scope,
+    workspace_scope,
+)
+from .continuity import checkpoint_task_session
 from .intake import canonical_json
+from .lifecycle_state import (
+    apply_model_budget_fact,
+    finalize_task_terminal,
+    increment_task_retry,
+    write_task_fields,
+)
 from .provider import (
     ACTIVE_HOST_JOB_STATUSES,
     HostBridgeError,
@@ -22,20 +34,15 @@ from .provider import (
     provider_agent_text,
     provider_job_output,
     provider_job_status,
-    model_budget_reached,
+    model_budget_fact,
     record_model_call,
     run_provider_probe,
+    selected_model,
     start_provider_job,
     workspace_snapshot,
 )
+from .secret_policy import redact_secret
 from .store import Store, write_atomic as _write_atomic
-
-
-_PERSISTED_SECRET = re.compile(
-    r"(?i)(?:bearer\s+|(?:api[_-]?key|token|secret|password)\s*[=:]\s*)"
-    r"[A-Za-z0-9._~+/=-]{12,}|"
-    r"\b(?:sk-|ghp_|github_pat_|glpat-|xox[baprs]-)[A-Za-z0-9_-]{10,}\b"
-)
 
 
 @dataclass(frozen=True)
@@ -54,6 +61,11 @@ class ProviderStep:
     source_job_id: str | None = None
     source_before: dict | None = None
     source_after: dict | None = None
+    result_artifact_path: str | None = None
+    capability: dict[str, object] | None = None
+    model: str | None = None
+    workspace_kind: str = "project"
+    workspace_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -69,6 +81,7 @@ class ProbeStep:
     session_id: str | None
     timeout_seconds: int
     context_policy: dict[str, object]
+    model: str | None = None
 
 
 def create_task_sessions(
@@ -115,6 +128,10 @@ def create_task_session(
     settings_override: dict | None = None,
 ) -> None:
     settings = effective_settings(connection, project_id, settings_override or {})
+    budget_contract = _context_budget_contract(
+        connection, task_id, role_key, settings
+    )
+    settings["budget_contract"] = budget_contract
     worker = connection.execute(
         "SELECT id FROM workers WHERE project_id = ? AND role_key = ?",
         (project_id, role_key),
@@ -213,6 +230,77 @@ def effective_settings(
         values[key] = value
         sources[key] = "task_role"
     return {"values": values, "sources": sources}
+
+
+def _context_budget_contract(
+    connection: sqlite3.Connection,
+    task_id: str,
+    role_key: str,
+    settings: dict,
+) -> dict[str, object]:
+    values = settings["values"]
+    sources = settings["sources"]
+    keys = (
+        "context_max_bytes",
+        "handoff_max_bytes",
+        "checkpoint_max_bytes",
+        "session_segment_max_bytes",
+        "monitor_tail_bytes",
+    )
+    effective = {
+        key: {"value": int(values[key]), "source": sources[key]}
+        for key in keys
+    }
+    task = connection.execute(
+        "SELECT spec_json, acceptance_json FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if not task:
+        raise ValueError("Task is missing while freezing context budgets")
+    mandatory_bytes = len(
+        canonical_json(
+            {
+                "task_id": task_id,
+                "role_key": role_key,
+                "task_spec": json.loads(task["spec_json"]),
+                "acceptance": json.loads(task["acceptance_json"]),
+            }
+        ).encode()
+    )
+    if mandatory_bytes > int(values["context_max_bytes"]):
+        raise ValueError(
+            "mandatory TaskSpec and acceptance exceed effective "
+            f"context_max_bytes={values['context_max_bytes']} "
+            f"from {sources['context_max_bytes']}"
+        )
+    warnings = []
+    warm_cap = min(
+        int(values["handoff_max_bytes"]),
+        int(values["checkpoint_max_bytes"]),
+    )
+    if int(values["handoff_max_bytes"]) != int(values["checkpoint_max_bytes"]):
+        warnings.append(
+            "Warm handoff uses the smaller handoff/checkpoint cap "
+            f"({warm_cap} bytes)"
+        )
+    if warm_cap + mandatory_bytes > int(values["context_max_bytes"]):
+        warnings.append(
+            "full Warm handoff plus mandatory Context may not fit; "
+            "the verified handoff reference will be retained instead of truncating "
+            "mandatory TaskSpec content"
+        )
+    if int(values["monitor_tail_bytes"]) > int(
+        values["session_segment_max_bytes"]
+    ):
+        warnings.append(
+            "observation byte cap exceeds one Cold segment; observation remains "
+            "non-evidentiary and segment history remains canonical"
+        )
+    return {
+        "mandatory_context_bytes": mandatory_bytes,
+        "effective": effective,
+        "warnings": warnings,
+    }
 
 
 def _role_snapshot(
@@ -465,35 +553,37 @@ def execute_task(
                 output_ref,
             ),
         )
-        for kind, path, data in (("output", output_path, body), ("log", log_path, log_body)):
-            connection.execute(
-                """
-                INSERT INTO artifacts(
-                    id, project_id, task_id, kind, path, sha256, bytes,
-                    acceptance_id, revision, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    uuid4().hex,
-                    task["project_id"],
-                    task["id"],
-                    kind,
-                    store.relative_data_path(path),
-                    hashlib.sha256(data).hexdigest(),
-                    len(data),
-                    "artifact_content_sha256" if kind == "output" else None,
-                    task["spec_revision"],
-                    ended_at,
+        coverage = _task_result_coverage(spec)
+        for kind, path, _data in (
+            ("output", output_path, body),
+            ("log", log_path, log_body),
+        ):
+            register_artifact(
+                store,
+                connection,
+                project_id=task["project_id"],
+                task_id=task["id"],
+                kind=kind,
+                path=path,
+                stored_path=store.relative_data_path(path),
+                acceptance_id=(
+                    "artifact_content_sha256" if kind == "output" else None
                 ),
+                revision=task["spec_revision"],
+                scope=task_data_scope(coverage if kind == "output" else []),
+                source_task_id=task["id"],
+                created_at=ended_at,
             )
-        connection.execute(
-            """
-            UPDATE tasks
-            SET public_status = 'in_progress', phase = 'verify', next_action_at = ?,
-                next_action_kind = 'check', updated_at = ?
-            WHERE id = ?
-            """,
-            (ended_at, ended_at, task["id"]),
+        write_task_fields(
+            connection,
+            task["id"],
+            {
+                "public_status": "in_progress",
+                "phase": "verify",
+                "next_action_at": ended_at,
+                "next_action_kind": "check",
+                "updated_at": ended_at,
+            },
         )
         connection.execute(
             """
@@ -534,13 +624,18 @@ def execute_task(
                 store.relative_data_path(log_path),
             ),
         )
-        connection.execute(
-            """
-            UPDATE tasks SET public_status = 'needs_decision', phase = 'execute',
-                wait_reason = ?, fault_code = 'process', next_action_at = NULL,
-                outcome = NULL, updated_at = ? WHERE id = ?
-            """,
-            ("deterministic write failed; automatic path exhausted", ended_at, task["id"]),
+        write_task_fields(
+            connection,
+            task["id"],
+            {
+                "public_status": "needs_decision",
+                "phase": "execute",
+                "wait_reason": "deterministic write failed; automatic path exhausted",
+                "fault_code": "process",
+                "next_action_at": None,
+                "outcome": None,
+                "updated_at": ended_at,
+            },
         )
         return purpose
 
@@ -581,14 +676,17 @@ def _prepare_provider_task(
             compile_hot_context(store, connection, task, task["role_key"] or "fullstack"),
         )
     except ValueError as error:
-        connection.execute(
-            """
-            UPDATE tasks SET public_status = 'needs_decision',
-                phase = 'provider_recovery', wait_reason = ?,
-                fault_code = 'scope', next_action_at = NULL, updated_at = ?
-            WHERE id = ?
-            """,
-            (str(error), started_at, task["id"]),
+        write_task_fields(
+            connection,
+            task["id"],
+            {
+                "public_status": "needs_decision",
+                "phase": "provider_recovery",
+                "wait_reason": str(error),
+                "fault_code": "scope",
+                "next_action_at": None,
+                "updated_at": started_at,
+            },
         )
         return "needs_decision"
     access = "write" if spec.get("workspace_change_required", True) else "read"
@@ -648,6 +746,16 @@ def _prepare_provider_task(
                     "prompt": prompt,
                     "context_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
                     "access": access,
+                    "workspace_kind": (
+                        "planner"
+                        if spec.get("butler_semantic_query")
+                        else "project"
+                    ),
+                    "workspace_key": (
+                        spec.get("butler_workspace_key")
+                        if spec.get("butler_semantic_query")
+                        else None
+                    ),
                     "reuse_from_host_job_id": reusable["id"] if reusable else None,
                     "reuse_before": (
                         reusable_execution["before"] if reusable_execution else None
@@ -659,14 +767,18 @@ def _prepare_provider_task(
             ),
         ),
     )
-    connection.execute(
-        """
-        UPDATE tasks SET public_status = 'in_progress', phase = 'execute_snapshot',
-            wait_reason = NULL, fault_code = NULL, next_action_at = ?,
-            next_action_kind = 'snapshot', updated_at = ?
-        WHERE id = ?
-        """,
-        (started_at, started_at, task["id"]),
+    write_task_fields(
+        connection,
+        task["id"],
+        {
+            "public_status": "in_progress",
+            "phase": "execute_snapshot",
+            "wait_reason": None,
+            "fault_code": None,
+            "next_action_at": started_at,
+            "next_action_kind": "snapshot",
+            "updated_at": started_at,
+        },
     )
     connection.execute(
         """
@@ -686,7 +798,7 @@ def _prepare_provider_task(
         task["id"],
         job_id,
         generation["provider_key"],
-        str(spec["project_path"]),
+        str(spec.get("project_path") or ""),
         prompt,
         generation["external_session_id"],
         int(settings.get("max_runtime_seconds", 600)),
@@ -695,6 +807,19 @@ def _prepare_provider_task(
         reusable["id"] if reusable else None,
         reusable_execution["before"] if reusable_execution else None,
         reusable_execution["after"] if reusable_execution else None,
+        _declared_artifact_path(spec),
+        _task_capability(task, spec, access),
+        selected_model(settings, generation["provider_key"]),
+        (
+            "planner"
+            if spec.get("butler_semantic_query")
+            else "project"
+        ),
+        (
+            str(spec["butler_workspace_key"])
+            if spec.get("butler_semantic_query")
+            else None
+        ),
     )
 
 
@@ -783,13 +908,19 @@ def pending_provider_step(
             "recover" if dispatch.get("reuse_from_host_job_id") else "start"
         ),
         "execute_wait": "poll",
+        "timeout_reconcile": "poll",
         "stopping": "cancel",
     }.get(task["phase"])
     settings = json.loads(session["settings_json"])["values"]
-    if task["phase"] == "stopping" and job["status"] == "cancelling":
-        dispatch = json.loads(job["dispatch_json"])
-        requested_at = float(dispatch.get("stop_requested_at") or time.time())
-        if time.time() >= requested_at + int(settings.get("stop_grace_seconds", 10)):
+    if task["phase"] == "stopping":
+        cancel_sent_at = dispatch.get("cancel_sent_at")
+        if cancel_sent_at is None:
+            kind = "cancel"
+        elif time.time() >= float(cancel_sent_at) + int(
+            settings.get("stop_grace_seconds", 10)
+        ):
+            kind = "force_cancel"
+        else:
             kind = "poll"
     if not kind:
         raise RuntimeError(f"Task {task['id']} is not waiting on a Provider")
@@ -799,7 +930,7 @@ def pending_provider_step(
         task["id"],
         job["id"],
         generation["provider_key"],
-        str(spec["project_path"]),
+        str(spec.get("project_path") or ""),
         str(
             dispatch.get("prompt")
             or _provider_prompt(task, spec, job["purpose"])
@@ -811,7 +942,68 @@ def pending_provider_step(
         str(dispatch.get("reuse_from_host_job_id") or "") or None,
         dispatch.get("reuse_before"),
         dispatch.get("reuse_after"),
+        _declared_artifact_path(spec),
+        _task_capability(
+            task, spec, str(dispatch.get("access") or "write")
+        ),
+        selected_model(settings, generation["provider_key"]),
+        str(dispatch.get("workspace_kind") or "project"),
+        (
+            str(dispatch["workspace_key"])
+            if dispatch.get("workspace_key")
+            else None
+        ),
     )
+
+
+def _task_capability(
+    task: sqlite3.Row, spec: dict, access: str
+) -> dict[str, object]:
+    base = {
+        "project_id": task["project_id"],
+        "task_id": task["id"],
+        "spec_revision": task["spec_revision"],
+    }
+    contract = spec.get("task_contract")
+    boundary = (
+        contract.get("authorization_boundary", {})
+        if isinstance(contract, dict)
+        else {}
+    )
+    if access == "read":
+        return {
+            "tier": "read_only",
+            **base,
+            "allowed_actions": list(
+                boundary.get("allowed_actions") or ["read_workspace"]
+            ),
+            "target_scope": str(
+                boundary.get("target_scope") or "project_workspace"
+            ),
+        }
+    if spec.get("kind") != "git_publish":
+        return {
+            "tier": "recoverable_workspace_write",
+            **base,
+            "allowed_actions": list(
+                boundary.get("allowed_actions")
+                or ["write_workspace", "run_checks"]
+            ),
+            "target_scope": str(
+                boundary.get("target_scope") or "project_workspace"
+            ),
+        }
+    authorization = spec.get("authorization")
+    if (
+        not isinstance(authorization, dict)
+        or task["terminal_capabilities_revoked_at"] is not None
+    ):
+        raise ValueError("Git publish capability is missing or revoked")
+    return {
+        "tier": "authorized_external_effect",
+        **base,
+        "authorization": authorization,
+    }
 
 
 def perform_provider_step(step: ProviderStep) -> dict[str, object]:
@@ -823,6 +1015,11 @@ def perform_provider_step(step: ProviderStep) -> dict[str, object]:
                 "before": (
                     {"git": step.source_before}
                     if step.source_job_id
+                    else {
+                        "kind": "butler_canonical_refs",
+                        "sha256": hashlib.sha256(step.prompt.encode()).hexdigest(),
+                    }
+                    if step.workspace_kind == "planner"
                     else workspace_snapshot(step.project_path)
                 ),
             }
@@ -839,26 +1036,48 @@ def perform_provider_step(step: ProviderStep) -> dict[str, object]:
                 timeout_seconds=step.timeout_seconds,
                 context_policy=step.context_policy,
                 access=step.access,
+                capability=step.capability,
+                model=step.model,
+                workspace_kind=step.workspace_kind,
+                workspace_key=step.workspace_key,
             )
             stage = "output"
         elif step.kind == "poll":
             state = provider_job_status(step.job_id)
             stage = "output"
-        elif step.kind == "cancel":
-            state = cancel_provider_job(step.job_id)
+        elif step.kind in {"cancel", "force_cancel"}:
+            state = cancel_provider_job(
+                step.job_id,
+                force=step.kind == "force_cancel",
+            )
             stage = "output"
         else:
             raise ValueError("unknown Provider step")
         output = provider_job_output(
-            str(step.source_job_id) if step.kind == "recover" else step.job_id
+            str(step.source_job_id) if step.kind == "recover" else step.job_id,
+            complete=str(state.get("status"))
+            not in ACTIVE_HOST_JOB_STATUSES,
         )
         facts: dict[str, object] = {"ok": True, "state": state, "output": output}
-        if str(state.get("status")) not in ACTIVE_HOST_JOB_STATUSES:
+        if (
+            str(state.get("status")) not in ACTIVE_HOST_JOB_STATUSES
+            and (step.project_path or step.workspace_kind == "planner")
+        ):
             stage = "snapshot_after"
             facts["after"] = (
                 {"git": step.source_after}
                 if step.kind == "recover"
-                else workspace_snapshot(step.project_path)
+                else {
+                    "kind": "butler_canonical_refs",
+                    "sha256": hashlib.sha256(step.prompt.encode()).hexdigest(),
+                }
+                if step.workspace_kind == "planner"
+                else workspace_snapshot(
+                    step.project_path,
+                    [step.result_artifact_path]
+                    if step.result_artifact_path
+                    else [],
+                )
             )
         return facts
     except HostBridgeError as error:
@@ -897,7 +1116,9 @@ def apply_provider_step(
     now = time.time()
     if not facts.get("ok"):
         if step.kind == "start" and facts.get("failure_kind") == "rejected":
-            return _reject_provider_start(connection, task, job, step, facts, now)
+            return _reject_provider_start(
+                store, connection, task, job, step, facts, now
+            )
         dispatch = json.loads(job["dispatch_json"])
         failures = int(dispatch.get("reconcile_failures") or 0) + 1
         dispatch["reconcile_failures"] = failures
@@ -922,16 +1143,13 @@ def apply_provider_step(
                 "UPDATE host_jobs SET dispatch_json = ? WHERE id = ?",
                 (canonical_json(dispatch), job["id"]),
             )
-        connection.execute(
-            """
-            UPDATE tasks SET public_status = ?, phase = ?, wait_reason = ?,
-                fault_code = ?, next_action_at = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (
-                "needs_decision" if exhausted else "in_progress",
-                "provider_recovery" if exhausted else task["phase"],
-                (
+        write_task_fields(
+            connection,
+            task["id"],
+            {
+                "public_status": "needs_decision" if exhausted else "in_progress",
+                "phase": "provider_recovery" if exhausted else task["phase"],
+                "wait_reason": (
                     f"HostJob {job['id']} outcome is unknown after {failures} reconcile failures"
                     if exhausted and not safe_reconcile
                     else (
@@ -945,16 +1163,19 @@ def apply_provider_step(
                         else f"Host Bridge {step.kind} unavailable; idempotent reconcile scheduled"
                     )
                 ),
-                "unsafe_unknown" if exhausted and not safe_reconcile else "transport",
-                (
+                "fault_code": (
+                    "unsafe_unknown"
+                    if exhausted and not safe_reconcile
+                    else "transport"
+                ),
+                "next_action_at": (
                     None
                     if exhausted
                     else now
                     + max(1, int(values.get("retry_backoff_seconds", 0)))
                 ),
-                now,
-                task["id"],
-            ),
+                "updated_at": now,
+            },
         )
         connection.execute(
             """
@@ -992,18 +1213,18 @@ def apply_provider_step(
                     """,
                     (now, canonical_json(dispatch), job["id"]),
                 )
-                connection.execute(
-                    """
-                    UPDATE tasks SET public_status = 'needs_decision',
-                        phase = 'provider_recovery', wait_reason = ?,
-                        fault_code = 'scope', next_action_at = NULL,
-                        next_action_kind = NULL, updated_at = ? WHERE id = ?
-                    """,
-                    (
-                        "本地 HEAD 已在授权后变化；请刷新 Git 发布原因与证据",
-                        now,
-                        task["id"],
-                    ),
+                write_task_fields(
+                    connection,
+                    task["id"],
+                    {
+                        "public_status": "needs_decision",
+                        "phase": "provider_recovery",
+                        "wait_reason": "本地 HEAD 已在授权后变化；请刷新 Git 发布原因与证据",
+                        "fault_code": "scope",
+                        "next_action_at": None,
+                        "next_action_kind": None,
+                        "updated_at": now,
+                    },
                 )
                 connection.execute(
                     """
@@ -1049,13 +1270,17 @@ def apply_provider_step(
             "UPDATE host_jobs SET dispatch_json = ? WHERE id = ?",
             (canonical_json(dispatch), job["id"]),
         )
-        connection.execute(
-            """
-            UPDATE tasks SET phase = 'execute_dispatch', wait_reason = NULL,
-                fault_code = NULL, next_action_at = ?,
-                next_action_kind = 'dispatch', updated_at = ? WHERE id = ?
-            """,
-            (now, now, task["id"]),
+        write_task_fields(
+            connection,
+            task["id"],
+            {
+                "phase": "execute_dispatch",
+                "wait_reason": None,
+                "fault_code": None,
+                "next_action_at": now,
+                "next_action_kind": "dispatch",
+                "updated_at": now,
+            },
         )
         return "snapshot"
 
@@ -1065,6 +1290,49 @@ def apply_provider_step(
     if log_body:
         _write_atomic(log_path, log_body)
         log_path.chmod(0o600)
+    if task["phase"] == "timeout_reconcile":
+        if bridge_status in ACTIVE_HOST_JOB_STATUSES:
+            return _record_timeout_reconciliation(
+                store,
+                connection,
+                task,
+                job,
+                facts,
+                log_path,
+                log_body,
+                now,
+            )
+        write_task_fields(
+            connection,
+            task["id"],
+            {
+                "deadline_at": None,
+                "wait_reason": (
+                    "[deadline] terminal result arrived during reconcile"
+                ),
+                "updated_at": now,
+            },
+        )
+        connection.execute(
+            """
+            INSERT INTO task_events(
+                project_id, task_id, kind, detail_json, created_at
+            ) VALUES (?, ?, 'deadline_terminal_reconciled', ?, ?)
+            """,
+            (
+                task["project_id"],
+                task["id"],
+                canonical_json(
+                    {
+                        "host_job_id": job["id"],
+                        "status": bridge_status,
+                        "returncode": state.get("returncode"),
+                        "next": "evaluate_real_result",
+                    }
+                ),
+                now,
+            ),
+        )
     if bridge_status in ACTIVE_HOST_JOB_STATUSES:
         stopping = bool(
             task["phase"] == "stopping"
@@ -1074,6 +1342,10 @@ def apply_provider_step(
         dispatch = json.loads(job["dispatch_json"])
         if stopping:
             dispatch.setdefault("stop_requested_at", now)
+            if step.kind == "cancel":
+                dispatch.setdefault("cancel_sent_at", now)
+            elif step.kind == "force_cancel":
+                dispatch["force_cancel_sent_at"] = now
         connection.execute(
             """
             UPDATE host_jobs SET status = ?, output_ref = COALESCE(?, output_ref),
@@ -1095,20 +1367,19 @@ def apply_provider_step(
                 """,
                 (state["session_id"], job["task_session_id"], job["session_generation"]),
             )
-        connection.execute(
-            """
-            UPDATE tasks SET phase = ?, wait_reason = ?, fault_code = ?,
-                next_action_at = ?, next_action_kind = ?, updated_at = ? WHERE id = ?
-            """,
-            (
-                "stopping" if stopping else "execute_wait",
-                task["wait_reason"] if stopping else None,
-                task["fault_code"] if stopping else None,
-                now + 1,
-                "reconcile_stop" if stopping else "poll",
-                now,
-                task["id"],
-            ),
+        write_task_fields(
+            connection,
+            task["id"],
+            {
+                "phase": "stopping" if stopping else "execute_wait",
+                "wait_reason": task["wait_reason"] if stopping else None,
+                "fault_code": task["fault_code"] if stopping else None,
+                "next_action_at": now + 1,
+                "next_action_kind": (
+                    "reconcile_stop" if stopping else "poll"
+                ),
+                "updated_at": now,
+            },
         )
         return "cancel" if stopping else (
             "dispatch" if step.kind == "start" else "wait"
@@ -1118,6 +1389,164 @@ def apply_provider_step(
     return _finalize_provider_job(
         store, connection, task, job, step, state, facts, log_path, log_body
     )
+
+
+def _record_timeout_reconciliation(
+    store: Store,
+    connection: sqlite3.Connection,
+    task: sqlite3.Row,
+    job: sqlite3.Row,
+    facts: dict[str, object],
+    log_path: Path,
+    log_body: bytes,
+    now: float,
+) -> str:
+    output = facts.get("output")
+    stream_refs = (
+        output.get("stream_refs")
+        if isinstance(output, dict)
+        and isinstance(output.get("stream_refs"), dict)
+        else {}
+    )
+    evidence = {
+        "status": "RECONCILED_BEFORE_STOP",
+        "source_task_id": task["id"],
+        "source_revision": task["spec_revision"],
+        "host_job_id": job["id"],
+        "host_job_sequence": job["sequence"],
+        "deadline_at": task["deadline_at"],
+        "provider_state": {
+            key: facts["state"].get(key)
+            for key in (
+                "status",
+                "session_id",
+                "deadline_reached_at",
+                "input_tokens",
+                "cached_input_tokens",
+                "output_tokens",
+                "model",
+            )
+            if isinstance(facts.get("state"), dict)
+        },
+        "stream_refs": stream_refs,
+        "handoff_checkpoint_required": True,
+        "reconciled_at": now,
+    }
+    base = (
+        store.data_root
+        / "projects"
+        / task["project_id"]
+        / "tasks"
+        / task["id"]
+        / "artifacts"
+        / f"revision-{task['spec_revision']:06d}"
+        / f"timeout-{job['sequence']:06d}"
+    )
+    evidence_path = base / "evidence" / "timeout-reconcile.json"
+    evidence_body = canonical_json(evidence).encode()
+    _write_atomic(evidence_path, evidence_body)
+    if log_body:
+        existing_log = connection.execute(
+            """
+            SELECT 1 FROM artifacts
+            WHERE task_id = ? AND kind = 'log' AND path = ?
+              AND revision = ?
+            """,
+            (
+                task["id"],
+                store.relative_data_path(log_path),
+                task["spec_revision"],
+            ),
+        ).fetchone()
+        if not existing_log:
+            register_artifact(
+                store,
+                connection,
+                project_id=task["project_id"],
+                task_id=task["id"],
+                kind="log",
+                path=log_path,
+                stored_path=store.relative_data_path(log_path),
+                acceptance_id="timeout_reconcile_log",
+                revision=task["spec_revision"],
+                scope=task_data_scope([]),
+                source_task_id=task["id"],
+                created_at=now,
+            )
+    evidence_ref = register_artifact(
+        store,
+        connection,
+        project_id=task["project_id"],
+        task_id=task["id"],
+        kind="evidence",
+        path=evidence_path,
+        stored_path=store.relative_data_path(evidence_path),
+        acceptance_id="timeout_reconcile",
+        revision=task["spec_revision"],
+        scope=task_data_scope([]),
+        source_task_id=task["id"],
+        created_at=now,
+    )
+    dispatch = json.loads(job["dispatch_json"])
+    dispatch.update(
+        {
+            "timeout_stage": "graceful_stop",
+            "timeout_reconciled_at": now,
+            "stop_requested_at": now,
+            "stop_reason": "deadline",
+            "timeout_evidence_ref": evidence_ref["path"],
+            "timeout_evidence_sha256": evidence_ref["sha256"],
+        }
+    )
+    connection.execute(
+        """
+        UPDATE host_jobs SET status = 'cancelling',
+            output_ref = COALESCE(?, output_ref), dispatch_json = ?
+        WHERE id = ?
+        """,
+        (
+            store.relative_data_path(log_path) if log_body else None,
+            canonical_json(dispatch),
+            job["id"],
+        ),
+    )
+    write_task_fields(
+        connection,
+        task["id"],
+        {
+            "public_status": "in_progress",
+            "phase": "stopping",
+            "wait_reason": (
+                "[deadline] output Artifact/Evidence reconciled; "
+                "checkpoint then graceful stop"
+            ),
+            "fault_code": "process",
+            "next_action_at": now,
+            "next_action_kind": "cancel",
+            "updated_at": now,
+        },
+    )
+    connection.execute(
+        """
+        INSERT INTO task_events(
+            project_id, task_id, kind, detail_json, created_at
+        ) VALUES (?, ?, 'deadline_reconciled', ?, ?)
+        """,
+        (
+            task["project_id"],
+            task["id"],
+            canonical_json(
+                {
+                    "host_job_id": job["id"],
+                    "evidence_ref": evidence_ref["path"],
+                    "evidence_sha256": evidence_ref["sha256"],
+                    "next": "checkpoint_then_graceful_stop",
+                }
+            ),
+            now,
+        ),
+    )
+    return "deadline_stop"
 
 
 def _provider_log(
@@ -1136,7 +1565,7 @@ def _provider_log(
         + ("\n" if streams["stdout"] and streams["stderr"] else "")
         + "".join(streams["stderr"])
     )
-    body = _PERSISTED_SECRET.sub("[REDACTED]", text).encode()
+    body = redact_secret(text).encode()
     path = (
         store.data_root
         / "projects"
@@ -1298,6 +1727,13 @@ def _finalize_provider_job(
     log_body: bytes,
 ) -> str:
     now = time.time()
+    spec = json.loads(task["spec_json"])
+    result_contract = (
+        spec.get("task_contract", {}).get("result", {})
+        if isinstance(spec.get("task_contract"), dict)
+        else {}
+    )
+    coverage = _task_result_coverage(spec)
     after = facts.get("after")
     after_git = after.get("git") if isinstance(after, dict) else {}
     before_git = json.loads(job["dispatch_json"]).get("before", {})
@@ -1307,9 +1743,15 @@ def _finalize_provider_job(
     succeeded = str(state.get("status")) == "completed" and returncode == 0
     stdout, stderr = _provider_output_streams(facts.get("output"))
     context_events = parse_context_events(stdout)
+    script_result = (
+        _last_json_object(stdout) or _last_json_object(stderr)
+        if step.provider_key == "git_publish"
+        else None
+    )
     report, report_truncated = (
-        _bounded_report(
-            _PERSISTED_SECRET.sub("[REDACTED]", provider_agent_text(stdout))
+        (
+            redact_secret(provider_agent_text(stdout)),
+            False,
         )
         if step.provider_key != "git_publish"
         else ("", False)
@@ -1329,7 +1771,155 @@ def _finalize_provider_job(
     )
     report_ref = store.relative_data_path(report_path) if report else None
     report_sha256 = hashlib.sha256(report_body).hexdigest() if report else None
+    provider_result = (
+        {
+            "kind": "output",
+            "path": report_ref,
+            "sha256": report_sha256,
+            "bytes": len(report_body),
+            "acceptance_id": "provider_report",
+            "revision": task["spec_revision"],
+            "scope": task_data_scope(
+                coverage
+                if result_contract.get("type") == "evidence"
+                else []
+            ),
+            "source_task_id": task["id"],
+        }
+        if report_ref and report_sha256
+        else None
+    )
+    formal_result_error = None
+    result_artifacts: list[dict[str, object]] = []
+    if result_contract.get("type") == "artifact":
+        artifact_path = _declared_artifact_path(spec)
+        requested = (
+            after.get("requested", []) if isinstance(after, dict) else []
+        )
+        indexed = next(
+            (
+                item
+                for item in requested
+                if isinstance(item, dict)
+                and item.get("path") == artifact_path
+            ),
+            None,
+        )
+        if (
+            not artifact_path
+            or not isinstance(indexed, dict)
+            or not isinstance(indexed.get("sha256"), str)
+            or not isinstance(indexed.get("bytes"), int)
+        ):
+            formal_result_error = (
+                "declared workspace Artifact is missing from the complete "
+                "post-execution snapshot"
+            )
+        else:
+            result_artifacts.append(
+                register_indexed_artifact(
+                    connection,
+                    project_id=task["project_id"],
+                    task_id=task["id"],
+                    kind="output",
+                    stored_path=artifact_path,
+                    sha256=str(indexed["sha256"]),
+                    bytes_count=int(indexed["bytes"]),
+                    acceptance_id="task_result_artifact",
+                    revision=task["spec_revision"],
+                    scope=workspace_scope(step.project_path, coverage),
+                    source_task_id=task["id"],
+                    created_at=now,
+                )
+            )
+    elif result_contract.get("type") == "workspace_change":
+        if not workspace_changed:
+            formal_result_error = (
+                "declared workspace-change result produced no workspace revision"
+            )
+        else:
+            revision_path = (
+                store.data_root
+                / "projects"
+                / task["project_id"]
+                / "tasks"
+                / task["id"]
+                / "artifacts"
+                / f"revision-{task['spec_revision']:06d}"
+                / f"execution-{job['sequence']:06d}"
+                / "output"
+                / "workspace-revision.json"
+            )
+            revision_body = canonical_json(
+                {
+                    "version": 1,
+                    "project_path": step.project_path,
+                    "source_task_id": task["id"],
+                    "spec_revision": task["spec_revision"],
+                    "before": before_git,
+                    "after": after_git,
+                    "coverage": coverage,
+                }
+            ).encode()
+            _write_atomic(revision_path, revision_body)
+            result_artifacts.append(
+                register_artifact(
+                    store,
+                    connection,
+                    project_id=task["project_id"],
+                    task_id=task["id"],
+                    kind="output",
+                    path=revision_path,
+                    stored_path=store.relative_data_path(revision_path),
+                    acceptance_id="workspace_revision",
+                    revision=task["spec_revision"],
+                    scope=task_data_scope(coverage),
+                    source_task_id=task["id"],
+                    created_at=now,
+                )
+            )
+    elif result_contract.get("type") == "evidence":
+        if isinstance(script_result, dict):
+            result_path = (
+                store.data_root
+                / "projects"
+                / task["project_id"]
+                / "tasks"
+                / task["id"]
+                / "artifacts"
+                / f"revision-{task['spec_revision']:06d}"
+                / f"execution-{job['sequence']:06d}"
+                / "output"
+                / "structured-result.json"
+            )
+            _write_atomic(
+                result_path, (canonical_json(script_result) + "\n").encode()
+            )
+            result_artifacts.append(
+                register_artifact(
+                    store,
+                    connection,
+                    project_id=task["project_id"],
+                    task_id=task["id"],
+                    kind="output",
+                    path=result_path,
+                    stored_path=store.relative_data_path(result_path),
+                    acceptance_id="structured_result",
+                    revision=task["spec_revision"],
+                    scope=task_data_scope(coverage),
+                    source_task_id=task["id"],
+                    created_at=now,
+                )
+            )
+        elif provider_result:
+            result_artifacts.append(provider_result)
+        else:
+            formal_result_error = (
+                "declared Evidence result produced no complete structured result"
+            )
+    succeeded = succeeded and formal_result_error is None
     manifest = {
+        "manifest_version": 2,
         "provider_key": step.provider_key,
         "project_path": step.project_path,
         "host_job_id": job["id"],
@@ -1341,15 +1931,18 @@ def _finalize_provider_job(
         "after": after_git,
         "stdout_tail": _bounded_tail(stdout),
         "stderr_tail": _bounded_tail(stderr),
+        "tail_observation_only": True,
         "provider_report_ref": report_ref,
         "provider_report_sha256": report_sha256,
         "provider_report_bytes": len(report_body),
         "provider_report_truncated": report_truncated,
+        "provider_statement": provider_result,
+        "result_contract": result_contract,
+        "result_artifacts": result_artifacts,
+        "formal_result_error": formal_result_error,
         "reused_from_host_job_id": step.source_job_id,
     }
-    script_result = None
     if step.provider_key == "git_publish":
-        script_result = _last_json_object(stdout) or _last_json_object(stderr)
         manifest["script_result"] = script_result
     body = canonical_json(manifest).encode()
     output_path = (
@@ -1406,13 +1999,16 @@ def _finalize_provider_job(
             job["task_session_id"],
             job["session_generation"],
             step.provider_key,
-            "single",
+            str(state.get("usage_kind") or "cumulative"),
             input_tokens,
             cached_tokens,
             output_tokens,
             str(state.get("model") or step.provider_key),
         )
-    budget_reached = model_budget_reached(connection, task["id"])
+    budget_fact = model_budget_fact(connection, task["id"])
+    if budget_fact:
+        apply_model_budget_fact(connection, task["id"], budget_fact)
+    budget_reached = budget_fact is not None
     for event in context_events:
         connection.execute(
             """
@@ -1439,26 +2035,28 @@ def _finalize_provider_job(
     ]
     if report:
         artifacts.append(("output", report_path, report_body, "provider_report"))
-    for kind, path, data, acceptance_id in artifacts:
-        connection.execute(
-            """
-            INSERT INTO artifacts(
-                id, project_id, task_id, kind, path, sha256, bytes,
-                acceptance_id, revision, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                uuid4().hex,
-                task["project_id"],
-                task["id"],
-                kind,
-                store.relative_data_path(path),
-                hashlib.sha256(data).hexdigest(),
-                len(data),
-                acceptance_id,
-                task["spec_revision"],
-                now,
+    for kind, path, _data, acceptance_id in artifacts:
+        register_artifact(
+            store,
+            connection,
+            project_id=task["project_id"],
+            task_id=task["id"],
+            kind=kind,
+            path=path,
+            stored_path=store.relative_data_path(path),
+            acceptance_id=acceptance_id,
+            revision=task["spec_revision"],
+            scope=task_data_scope(
+                coverage
+                if (
+                    kind == "output"
+                    and acceptance_id == "provider_report"
+                    and result_contract.get("type") == "evidence"
+                )
+                else []
             ),
+            source_task_id=task["id"],
+            created_at=now,
         )
     inspection = bool(
         succeeded
@@ -1476,14 +2074,18 @@ def _finalize_provider_job(
                 store, connection, task["id"], job["sequence"]
             ),
         )
-        connection.execute(
-            """
-            UPDATE tasks SET public_status = 'needs_decision',
-                phase = 'provider_recovery', next_action_at = NULL,
-                next_action_kind = NULL, wait_reason = ?, fault_code = 'scope',
-                updated_at = ? WHERE id = ?
-            """,
-            (context["summary"], now, task["id"]),
+        write_task_fields(
+            connection,
+            task["id"],
+            {
+                "public_status": "needs_decision",
+                "phase": "provider_recovery",
+                "next_action_at": None,
+                "next_action_kind": None,
+                "wait_reason": context["summary"],
+                "fault_code": "scope",
+                "updated_at": now,
+            },
         )
         connection.execute(
             """
@@ -1523,6 +2125,7 @@ def _finalize_provider_job(
     unsafe_interruption = _write_interruption_is_unsafe(step.access, state)
     fallback = (
         _fallback_provider_generation(
+            store,
             connection,
             task,
             job,
@@ -1537,8 +2140,6 @@ def _finalize_provider_job(
         if not succeeded and not unsafe_interruption and not budget_reached
         else None
     )
-    if succeeded and step.provider_key not in {"codex_cli", "git_publish"}:
-        _rotate_context_generation(connection, task, job, step.provider_key, now)
     conflict = bool(
         isinstance(script_result, dict)
         and script_result.get("code")
@@ -1573,34 +2174,40 @@ def _finalize_provider_job(
                 "is fail-closed"
             )
         else:
-            wait_reason = "Provider execution did not exit successfully"
-    connection.execute(
-        """
-        UPDATE tasks SET public_status = ?, phase = ?, next_action_at = ?,
-            next_action_kind = ?, wait_reason = ?, fault_code = ?,
-            updated_at = ? WHERE id = ?
-        """,
-        (
-            (
+            wait_reason = (
+                formal_result_error
+                or "Provider execution did not exit successfully"
+            )
+    write_task_fields(
+        connection,
+        task["id"],
+        {
+            "public_status": (
                 "needs_decision"
                 if budget_reached
                 else ("in_progress" if succeeded or fallback else "needs_decision")
             ),
-            (
+            "phase": (
                 "provider_recovery"
                 if budget_reached
                 else ("verify" if succeeded else ("execute" if fallback else "provider_recovery"))
             ),
-            None if budget_reached else (now if succeeded or fallback else None),
-            None if budget_reached else ("check" if succeeded else ("execute" if fallback else None)),
-            (
+            "next_action_at": (
+                None if budget_reached else (now if succeeded or fallback else None)
+            ),
+            "next_action_kind": (
+                None
+                if budget_reached
+                else ("check" if succeeded else ("execute" if fallback else None))
+            ),
+            "wait_reason": (
                 connection.execute(
                     "SELECT wait_reason FROM tasks WHERE id = ?", (task["id"],)
                 ).fetchone()["wait_reason"]
                 if budget_reached
                 else wait_reason
             ),
-            (
+            "fault_code": (
                 None
                 if succeeded and not budget_reached
                 else (
@@ -1613,9 +2220,8 @@ def _finalize_provider_job(
                     )
                 )
             ),
-            now,
-            task["id"],
-        ),
+            "updated_at": now,
+        },
     )
     connection.execute(
         """
@@ -1671,86 +2277,8 @@ def _write_interruption_is_unsafe(access: str, state: dict[str, object]) -> bool
     )
 
 
-def _rotate_context_generation(
-    connection: sqlite3.Connection,
-    task: sqlite3.Row,
-    job: sqlite3.Row,
-    provider_key: str,
-    now: float,
-) -> bool:
-    session = connection.execute(
-        "SELECT settings_json FROM task_sessions WHERE id = ?",
-        (job["task_session_id"],),
-    ).fetchone()
-    threshold = int(
-        json.loads(session["settings_json"])["values"].get(
-            "rotation_input_tokens", 180_000
-        )
-    )
-    used = connection.execute(
-        """
-        SELECT COALESCE(SUM(normalized_total), 0) AS value FROM model_calls
-        WHERE task_session_id = ? AND session_generation = ?
-        """,
-        (job["task_session_id"], job["session_generation"]),
-    ).fetchone()["value"]
-    generation = connection.execute(
-        """
-        SELECT handoff_ref FROM session_generations
-        WHERE task_session_id = ? AND generation = ? AND status = 'active'
-        """,
-        (job["task_session_id"], job["session_generation"]),
-    ).fetchone()
-    if used < threshold or not generation or not generation["handoff_ref"]:
-        return False
-    connection.execute(
-        """
-        UPDATE session_generations SET status = 'archived', ended_at = ?
-        WHERE task_session_id = ? AND generation = ?
-        """,
-        (now, job["task_session_id"], job["session_generation"]),
-    )
-    connection.execute(
-        """
-        INSERT INTO session_generations(
-            id, task_session_id, generation, provider_key, status,
-            handoff_ref, created_at
-        ) VALUES (?, ?, ?, ?, 'active', ?, ?)
-        """,
-        (
-            uuid4().hex,
-            job["task_session_id"],
-            job["session_generation"] + 1,
-            provider_key,
-            generation["handoff_ref"],
-            now,
-        ),
-    )
-    connection.execute(
-        """
-        INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
-        VALUES (?, ?, 'context_generation_rotated', ?, ?)
-        """,
-        (
-            task["project_id"],
-            task["id"],
-            canonical_json(
-                {
-                    "from_generation": job["session_generation"],
-                    "to_generation": job["session_generation"] + 1,
-                    "provider_key": provider_key,
-                    "normalized_total": used,
-                    "threshold": threshold,
-                    "handoff_ref": generation["handoff_ref"],
-                }
-            ),
-            now,
-        ),
-    )
-    return True
-
-
 def _fallback_provider_generation(
+    store: Store,
     connection: sqlite3.Connection,
     task: sqlite3.Row,
     job: sqlite3.Row,
@@ -1793,13 +2321,9 @@ def _fallback_provider_generation(
         next_provider = provider_key
     if not next_provider:
         return None
-    current = connection.execute(
-        """
-        SELECT handoff_ref FROM session_generations
-        WHERE task_session_id = ? AND generation = ?
-        """,
-        (job["task_session_id"], job["session_generation"]),
-    ).fetchone()
+    handoff = checkpoint_task_session(
+        store, connection, job["task_session_id"]
+    )
     connection.execute(
         """
         UPDATE session_generations SET status = 'archived', ended_at = ?
@@ -1819,14 +2343,11 @@ def _fallback_provider_generation(
             job["task_session_id"],
             job["session_generation"] + 1,
             next_provider,
-            current["handoff_ref"] if current else None,
+            handoff["path"],
             now,
         ),
     )
-    connection.execute(
-        "UPDATE tasks SET retry_count = retry_count + ? WHERE id = ?",
-        (1 if retrying else 0, task["id"]),
-    )
+    increment_task_retry(connection, task["id"], 1 if retrying else 0)
     connection.execute(
         """
         INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
@@ -1842,6 +2363,9 @@ def _fallback_provider_generation(
                     "to": next_provider,
                     "generation": job["session_generation"] + 1,
                     "host_job_id": job["id"],
+                    "handoff_ref": handoff["path"],
+                    "handoff_sha256": handoff["sha256"],
+                    "handoff_revision": handoff["revision"],
                 }
             ),
             now,
@@ -1876,30 +2400,70 @@ def _finalize_provider_cancel(
             job["id"],
         ),
     )
-    deadline_stop = str(task["wait_reason"] or "").startswith("[deadline]")
-    connection.execute(
+    remaining = connection.execute(
         """
-        UPDATE tasks SET public_status = ?, outcome = ?, phase = ?,
-            next_action_at = NULL, next_action_kind = NULL,
-            wait_reason = ?, fault_code = ?, updated_at = ?
-        WHERE id = ?
+        SELECT id FROM host_jobs
+        WHERE task_id = ?
+          AND status IN ('dispatching', 'running', 'cancelling')
+        ORDER BY sequence DESC
         """,
-        (
-            "needs_decision" if deadline_stop else "done",
-            None if deadline_stop else "cancelled",
-            "provider_recovery" if deadline_stop else "done",
-            (
-                "[deadline] HostJob stopped after reconcile; decide whether to resume, revise, or cancel"
-                if deadline_stop
-                else None
-            ),
-            "process" if deadline_stop else None,
-            now,
+        (task["id"],),
+    ).fetchall()
+    if remaining:
+        write_task_fields(
+            connection,
             task["id"],
-        ),
-    )
-    if not deadline_stop:
-        archive_task_sessions(connection, task["id"], now)
+            {
+                "public_status": "in_progress",
+                "phase": "stopping",
+                "next_action_at": now,
+                "next_action_kind": "cancel",
+                "updated_at": now,
+            },
+        )
+        connection.execute(
+            """
+            INSERT INTO task_events(
+                project_id, task_id, kind, detail_json, created_at
+            ) VALUES (?, ?, 'host_job_stop_reconciled', ?, ?)
+            """,
+            (
+                task["project_id"],
+                task["id"],
+                canonical_json(
+                    {
+                        "host_job_id": job["id"],
+                        "remaining_host_job_ids": [
+                            row["id"] for row in remaining
+                        ],
+                    }
+                ),
+                now,
+            ),
+        )
+        return "cancel"
+    deadline_stop = str(task["wait_reason"] or "").startswith("[deadline]")
+    if deadline_stop:
+        write_task_fields(
+            connection,
+            task["id"],
+            {
+                "public_status": "needs_decision",
+                "outcome": None,
+                "phase": "provider_recovery",
+                "next_action_at": None,
+                "next_action_kind": None,
+                "wait_reason": (
+                    "[deadline] HostJob stopped after reconcile; decide whether to resume, revise, or cancel"
+                ),
+                "fault_code": "process",
+                "updated_at": now,
+            },
+        )
+    else:
+        finalize_task_terminal(
+            connection, task["id"], "cancelled", now
+        )
     connection.execute(
         """
         INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
@@ -1957,16 +2521,32 @@ def _provider_prompt(
         if not spec.get("workspace_change_required", True)
         else ""
     )
+    task_contract = spec.get("task_contract", {})
+    result_contract = (
+        task_contract.get("result", {})
+        if isinstance(task_contract, dict)
+        else {}
+    )
+    formal_result = (
+        "Frozen formal result contract: "
+        f"{canonical_json(result_contract)}\n"
+        "The final chat/stdout is only a model statement. "
+        "If the result type is artifact, write the complete deliverable to the "
+        "exact declared relative workspace path; do not substitute a summary, "
+        "tail, handoff, or chat response.\n"
+    )
     return (
         f"Complete this bounded code Task in the current workspace:\n{spec['instruction']}\n"
         f"Task ID: {task['id']} · spec revision {task['spec_revision']}.{repair}\n"
         + (f"Bounded context capsule:\n{hot_context}\n" if hot_context else "")
         + access
+        + formal_result
         + "Stay inside the workspace. Make only recoverable changes. Do not commit, deploy, "
         "delete permanently, expose secrets, send external messages, make purchases, or "
         "change permissions. A scoped deletion must move the target to "
         "original-name.rm.YYYYMMDDHHMMSS instead of unlinking it. Run the smallest relevant "
-        "checks and leave the workspace ready "
+        "checks. Never ask the owner directly; return only bounded blocker or decision "
+        "facts for the lifecycle and Butler to route. Leave the workspace ready "
         "for an independent read-only checker."
     )
 
@@ -1983,6 +2563,7 @@ def _last_json_object(value: str) -> dict[str, object] | None:
 
 
 def _reject_provider_start(
+    store: Store,
     connection: sqlite3.Connection,
     task: sqlite3.Row,
     job: sqlite3.Row,
@@ -2006,28 +2587,25 @@ def _reject_provider_start(
         None
         if step.provider_key == "git_publish"
         else _fallback_provider_generation(
-            connection, task, job, step.provider_key, now
+            store, connection, task, job, step.provider_key, now
         )
     )
-    connection.execute(
-        """
-        UPDATE tasks SET public_status = ?, phase = ?, wait_reason = ?,
-            fault_code = 'provider', next_action_at = ?, next_action_kind = ?,
-            updated_at = ? WHERE id = ?
-        """,
-        (
-            "in_progress" if fallback else "needs_decision",
-            "execute" if fallback else "provider_recovery",
-            (
+    write_task_fields(
+        connection,
+        task["id"],
+        {
+            "public_status": "in_progress" if fallback else "needs_decision",
+            "phase": "execute" if fallback else "provider_recovery",
+            "wait_reason": (
                 f"Provider start was rejected; falling back to {fallback}"
                 if fallback
                 else "Host Bridge rejected the job before acceptance"
             ),
-            now if fallback else None,
-            "execute" if fallback else None,
-            now,
-            task["id"],
-        ),
+            "fault_code": "provider",
+            "next_action_at": now if fallback else None,
+            "next_action_kind": "execute" if fallback else None,
+            "updated_at": now,
+        },
     )
     connection.execute(
         """
@@ -2056,9 +2634,24 @@ def _bounded_tail(value: str, byte_cap: int = 16_384) -> str:
     return body[-byte_cap:].decode(errors="replace")
 
 
-def _bounded_report(value: str, byte_cap: int = 32_768) -> tuple[str, bool]:
-    body = value.encode()
-    return body[:byte_cap].decode(errors="replace"), len(body) > byte_cap
+def _task_result_coverage(spec: dict[str, object]) -> list[str]:
+    contract = spec.get("task_contract")
+    result = contract.get("result") if isinstance(contract, dict) else None
+    coverage = result.get("coverage") if isinstance(result, dict) else None
+    return (
+        list(coverage)
+        if isinstance(coverage, list)
+        and all(isinstance(value, str) for value in coverage)
+        else []
+    )
+
+
+def _declared_artifact_path(spec: dict[str, object]) -> str | None:
+    contract = spec.get("task_contract")
+    result = contract.get("result") if isinstance(contract, dict) else None
+    artifact = result.get("artifact") if isinstance(result, dict) else None
+    path = artifact.get("path") if isinstance(artifact, dict) else None
+    return str(path) if isinstance(path, str) and path else None
 
 
 def _context_policy(settings: dict) -> dict[str, object]:
@@ -2149,19 +2742,20 @@ def _prepare_provider_probe(
         ),
     )
     phase = "probe_call" if spec["mode"] == "zero" else "probe_dispatch"
-    connection.execute(
-        """
-        UPDATE tasks SET public_status = 'in_progress', phase = ?,
-            wait_reason = NULL, fault_code = NULL, next_action_at = ?,
-            next_action_kind = ?, updated_at = ? WHERE id = ?
-        """,
-        (
-            phase,
-            started_at,
-            "probe" if spec["mode"] == "zero" else "probe_start",
-            started_at,
-            task["id"],
-        ),
+    write_task_fields(
+        connection,
+        task["id"],
+        {
+            "public_status": "in_progress",
+            "phase": phase,
+            "wait_reason": None,
+            "fault_code": None,
+            "next_action_at": started_at,
+            "next_action_kind": (
+                "probe" if spec["mode"] == "zero" else "probe_start"
+            ),
+            "updated_at": started_at,
+        },
     )
     connection.execute(
         """
@@ -2195,6 +2789,7 @@ def _prepare_provider_probe(
         min(int(settings.get("max_runtime_seconds", 600)), 60),
         _context_policy(settings)
         | {"max_turns": 1, "tool_no_progress_limit": 1},
+        selected_model(settings, generation["provider_key"]),
     )
 
 
@@ -2228,9 +2823,18 @@ def pending_probe_step(
         "probe_call": "zero",
         "probe_dispatch": "start",
         "probe_wait": "poll",
+        "timeout_reconcile": "poll",
     }.get(task["phase"])
     if task["phase"] == "stopping":
-        kind = "poll" if job["status"] == "cancelling" else "cancel"
+        cancel_sent_at = dispatch.get("cancel_sent_at")
+        if cancel_sent_at is None:
+            kind = "cancel"
+        elif time.time() >= float(cancel_sent_at) + int(
+            settings.get("stop_grace_seconds", 10)
+        ):
+            kind = "force_cancel"
+        else:
+            kind = "poll"
     if not kind:
         raise RuntimeError(f"Probe Task {task['id']} has no pending action")
     spec = json.loads(task["spec_json"])
@@ -2269,17 +2873,25 @@ def perform_probe_step(step: ProbeStep) -> dict[str, object]:
                 timeout_seconds=step.timeout_seconds,
                 context_policy=step.context_policy,
                 access="read",
+                model=step.model,
             )
         elif step.kind == "poll":
             state = provider_job_status(step.job_id)
-        elif step.kind == "cancel":
-            state = cancel_provider_job(step.job_id)
+        elif step.kind in {"cancel", "force_cancel"}:
+            state = cancel_provider_job(
+                step.job_id,
+                force=step.kind == "force_cancel",
+            )
         else:
             raise ValueError("unknown Probe step")
         return {
             "ok": True,
             "state": state,
-            "output": provider_job_output(step.job_id),
+            "output": provider_job_output(
+                step.job_id,
+                complete=str(state.get("status"))
+                not in ACTIVE_HOST_JOB_STATUSES,
+            ),
         }
     except (OSError, RuntimeError, ValueError) as error:
         return {"ok": False, "error": type(error).__name__}
@@ -2319,8 +2931,67 @@ def apply_probe_step(
             """,
             (state["session_id"], job["task_session_id"], job["session_generation"]),
         )
+    if task["phase"] == "timeout_reconcile":
+        log_path, log_body = _provider_log(
+            store, task, job, facts.get("output")
+        )
+        if log_body:
+            _write_atomic(log_path, log_body)
+            log_path.chmod(0o600)
+        if status in ACTIVE_HOST_JOB_STATUSES:
+            return _record_timeout_reconciliation(
+                store,
+                connection,
+                task,
+                job,
+                facts,
+                log_path,
+                log_body,
+                now,
+            )
+        write_task_fields(
+            connection,
+            task["id"],
+            {
+                "deadline_at": None,
+                "wait_reason": (
+                    "[deadline] terminal probe result arrived during reconcile"
+                ),
+                "updated_at": now,
+            },
+        )
+        connection.execute(
+            """
+            INSERT INTO task_events(
+                project_id, task_id, kind, detail_json, created_at
+            ) VALUES (?, ?, 'deadline_terminal_reconciled', ?, ?)
+            """,
+            (
+                task["project_id"],
+                task["id"],
+                canonical_json(
+                    {
+                        "host_job_id": job["id"],
+                        "status": status,
+                        "returncode": state.get("returncode"),
+                        "next": "evaluate_real_result",
+                    }
+                ),
+                now,
+            ),
+        )
     if status in ACTIVE_HOST_JOB_STATUSES:
         stopping = task["phase"] == "stopping" or step.kind == "cancel"
+        if stopping and step.kind in {"cancel", "force_cancel"}:
+            dispatch = json.loads(job["dispatch_json"])
+            if step.kind == "cancel":
+                dispatch.setdefault("cancel_sent_at", now)
+            else:
+                dispatch["force_cancel_sent_at"] = now
+            connection.execute(
+                "UPDATE host_jobs SET dispatch_json = ? WHERE id = ?",
+                (canonical_json(dispatch), job["id"]),
+            )
         connection.execute(
             "UPDATE host_jobs SET status = ? WHERE id = ?",
             (
@@ -2330,18 +3001,15 @@ def apply_probe_step(
                 job["id"],
             ),
         )
-        connection.execute(
-            """
-            UPDATE tasks SET phase = ?, next_action_at = ?,
-                next_action_kind = ?, updated_at = ? WHERE id = ?
-            """,
-            (
-                "stopping" if stopping else "probe_wait",
-                now + 1,
-                "probe_poll",
-                now,
-                task["id"],
-            ),
+        write_task_fields(
+            connection,
+            task["id"],
+            {
+                "phase": "stopping" if stopping else "probe_wait",
+                "next_action_at": now + 1,
+                "next_action_kind": "probe_poll",
+                "updated_at": now,
+            },
         )
         return "probe_wait"
     if status == "cancelled":
@@ -2352,15 +3020,31 @@ def apply_probe_step(
             """,
             (now, job["id"]),
         )
-        connection.execute(
+        remaining = connection.execute(
             """
-            UPDATE tasks SET public_status = 'done', phase = 'done',
-                outcome = 'cancelled', next_action_at = NULL,
-                next_action_kind = NULL, updated_at = ? WHERE id = ?
+            SELECT id FROM host_jobs
+            WHERE task_id = ?
+              AND status IN ('dispatching', 'running', 'cancelling')
+            ORDER BY sequence DESC
             """,
-            (now, task["id"]),
+            (task["id"],),
+        ).fetchall()
+        if remaining:
+            write_task_fields(
+                connection,
+                task["id"],
+                {
+                    "public_status": "in_progress",
+                    "phase": "stopping",
+                    "next_action_at": now,
+                    "next_action_kind": "cancel",
+                    "updated_at": now,
+                },
+            )
+            return "cancel"
+        finalize_task_terminal(
+            connection, task["id"], "cancelled", now
         )
-        archive_task_sessions(connection, task["id"], now)
         return "cancel"
 
     stdout, stderr = _provider_output_streams(facts.get("output"))
@@ -2400,6 +3084,7 @@ def apply_probe_step(
         "input_tokens": input_tokens,
         "cached_input_tokens": cached_tokens,
         "output_tokens": output_tokens,
+        "usage_kind": str(state.get("usage_kind") or "cumulative"),
         "total_tokens": total_tokens,
         "token_cap": PROBE_TOKEN_CAP,
         "model": str(state.get("model") or step.provider_key),
@@ -2429,32 +3114,31 @@ def _defer_probe_reconcile(
         "UPDATE host_jobs SET dispatch_json = ? WHERE id = ?",
         (canonical_json(dispatch), job["id"]),
     )
-    connection.execute(
-        """
-        UPDATE tasks SET public_status = ?, wait_reason = ?, fault_code = ?,
-            next_action_at = ?, next_action_kind = ?, updated_at = ? WHERE id = ?
-        """,
-        (
-            "needs_decision" if exhausted else "in_progress",
-            (
+    write_task_fields(
+        connection,
+        task["id"],
+        {
+            "public_status": "needs_decision" if exhausted else "in_progress",
+            "wait_reason": (
                 "Provider probe could not produce bounded diagnostic facts"
                 if exhausted
                 else "Host Bridge probe reconcile scheduled"
             ),
-            (
+            "fault_code": (
                 "unsafe_unknown"
                 if exhausted and step.mode == "minimal"
                 else ("provider" if exhausted else "transport")
             ),
-            (
+            "next_action_at": (
                 None
                 if exhausted
                 else now + max(1, int(values.get("retry_backoff_seconds", 0)))
             ),
-            None if exhausted else task["next_action_kind"],
-            now,
-            task["id"],
-        ),
+            "next_action_kind": (
+                None if exhausted else task["next_action_kind"]
+            ),
+            "updated_at": now,
+        },
     )
     return "needs_decision" if exhausted else f"probe_{step.kind}_retry"
 
@@ -2498,13 +3182,16 @@ def _persist_probe_result(
             job["task_session_id"],
             job["session_generation"],
             str(result["provider_key"]),
-            "single",
+            str(result.get("usage_kind") or "cumulative"),
             int(result["input_tokens"]),
             int(result["cached_input_tokens"]),
             int(result["output_tokens"]),
             str(result["model"] or result["provider_key"]),
         )
-    budget_reached = model_budget_reached(connection, task["id"])
+    budget_fact = model_budget_fact(connection, task["id"])
+    if budget_fact:
+        apply_model_budget_fact(connection, task["id"], budget_fact)
+    budget_reached = budget_fact is not None
     returncode = result.get("returncode")
     returncode = int(returncode) if isinstance(returncode, int) else 0
     connection.execute(
@@ -2521,42 +3208,40 @@ def _persist_probe_result(
             job["id"],
         ),
     )
-    for kind, path, data in (
+    coverage = _task_result_coverage(json.loads(task["spec_json"]))
+    for kind, path, _data in (
         ("output", output_path, body),
         ("log", log_path, log_body),
     ):
-        connection.execute(
-            """
-            INSERT INTO artifacts(
-                id, project_id, task_id, kind, path, sha256, bytes,
-                acceptance_id, revision, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                uuid4().hex,
-                task["project_id"],
-                task["id"],
-                kind,
-                store.relative_data_path(path),
-                hashlib.sha256(data).hexdigest(),
-                len(data),
-                (
-                    f"provider_{result['mode']}_probe"
-                    if kind == "output"
-                    else None
-                ),
-                task["spec_revision"],
-                now,
+        register_artifact(
+            store,
+            connection,
+            project_id=task["project_id"],
+            task_id=task["id"],
+            kind=kind,
+            path=path,
+            stored_path=store.relative_data_path(path),
+            acceptance_id=(
+                f"provider_{result['mode']}_probe"
+                if kind == "output"
+                else None
             ),
+            revision=task["spec_revision"],
+            scope=task_data_scope(coverage if kind == "output" else []),
+            source_task_id=task["id"],
+            created_at=now,
         )
     if not budget_reached:
-        connection.execute(
-            """
-            UPDATE tasks SET public_status = 'in_progress', phase = 'verify',
-                next_action_at = ?, next_action_kind = 'check', updated_at = ?
-            WHERE id = ?
-            """,
-            (now, now, task["id"]),
+        write_task_fields(
+            connection,
+            task["id"],
+            {
+                "public_status": "in_progress",
+                "phase": "verify",
+                "next_action_at": now,
+                "next_action_kind": "check",
+                "updated_at": now,
+            },
         )
     connection.execute(
         """

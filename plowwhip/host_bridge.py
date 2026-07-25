@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+from .secret_policy import redact_secret, require_secret_safe
 from .store import write_atomic
 
 
@@ -46,13 +47,8 @@ ACTIVE_STATUSES = {
     "cancelling",
     "recovery_hold",
 }
-_SECRET = re.compile(
-    r"(?i)(?:bearer\s+|(?:api[_-]?key|token|secret|password)\s*[=:]\s*)"
-    r"[A-Za-z0-9._~+/=-]{12,}|"
-    r"\b(?:sk-|ghp_|github_pat_|glpat-|xox[baprs]-)[A-Za-z0-9_-]{10,}\b"
-)
-
-
+WORKSPACE_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+MODEL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run the restricted PlowWhip V1 host CLI bridge"
@@ -161,7 +157,10 @@ def _handler(token: str, manager: "HostJobManager") -> type[BaseHTTPRequestHandl
                         int(payload.get("tail_lines") or 20),
                     )
                 elif self.path == "/v1/jobs/cancel":
-                    status, result = 202, manager.cancel(payload["job_id"])
+                    status, result = 202, manager.cancel(
+                        payload["job_id"],
+                        force=bool(payload.get("force", False)),
+                    )
                 else:
                     self._send(404, {"detail": "not found"})
                     return
@@ -223,6 +222,21 @@ class HostJobManager:
 
     def snapshot(self, payload: dict[str, Any]) -> dict[str, object]:
         project = self._project(payload["project_path"])
+        requested_paths = payload.get("paths", [])
+        if (
+            not isinstance(requested_paths, list)
+            or len(requested_paths) > 100
+            or any(
+                not isinstance(value, str)
+                or not value
+                or Path(value).is_absolute()
+                or ".." in Path(value).parts
+                for value in requested_paths
+            )
+        ):
+            raise ValueError("snapshot paths must be bounded safe relative paths")
+        requested_set = set(requested_paths)
+        requested: list[dict[str, object]] = []
         records: list[dict[str, object]] = []
         digest = hashlib.sha256()
         file_count = 0
@@ -243,6 +257,8 @@ class HostJobManager:
             file_count += 1
             if len(records) < 20:
                 records.append(item)
+            if relative in requested_set:
+                requested.append(item)
         git: dict[str, object] = {
             "kind": "workspace",
             "available": True,
@@ -275,15 +291,52 @@ class HostJobManager:
                 check=False,
                 env=_safe_environment(),
             )
+            diff = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(project),
+                    "diff",
+                    "--no-ext-diff",
+                    "--binary",
+                    "HEAD",
+                    "--",
+                ],
+                capture_output=True,
+                timeout=30,
+                check=False,
+                env=_safe_environment(),
+            )
         except (OSError, subprocess.TimeoutExpired):
             git["available"] = False
         else:
-            if head.returncode == 0 and status.returncode == 0:
+            if (
+                head.returncode == 0
+                and status.returncode == 0
+                and diff.returncode == 0
+            ):
+                status_body = status.stdout.encode()
                 git["head"] = head.stdout.strip()
                 git["status"] = _redact(status.stdout)[:8_192]
+                git["status_bytes"] = len(status_body)
+                git["status_sha256"] = hashlib.sha256(
+                    status_body
+                ).hexdigest()
+                git["status_truncated"] = len(status_body) > 8_192
+                git["diff_bytes"] = len(diff.stdout)
+                git["diff_sha256"] = hashlib.sha256(diff.stdout).hexdigest()
             else:
                 git["available"] = False
-        return {"git": git}
+        return {
+            "git": git,
+            "requested": requested,
+            "requested_complete": {
+                "declared": requested_paths,
+                "found": [item["path"] for item in requested],
+                "complete": {item["path"] for item in requested}
+                == requested_set,
+            },
+        }
 
     def start(self, payload: dict[str, Any]) -> dict[str, object]:
         job_id = _job_id(payload.get("job_id"))
@@ -296,10 +349,27 @@ class HostJobManager:
         executable = _resolve_executable(payload.get("executable"), adapter)
         if executable is None:
             raise ValueError("executable is not available")
-        project = self._project(payload["project_path"])
+        workspace_kind = str(payload.get("workspace_kind") or "project")
+        if workspace_kind == "planner":
+            workspace_key = str(payload.get("workspace_key") or "")
+            if (
+                str(payload.get("access") or "write") != "read"
+                or not WORKSPACE_KEY.fullmatch(workspace_key)
+            ):
+                raise ValueError(
+                    "Planner workspace requires a safe key and read-only access"
+                )
+            project = self.root / "planner-workspaces" / workspace_key
+            project.mkdir(parents=True, exist_ok=True)
+            project.chmod(0o700)
+        elif workspace_kind == "project":
+            project = self._project(payload["project_path"])
+        else:
+            raise ValueError("unsupported workspace kind")
         prompt = str(payload.get("prompt") or "")
         if not prompt.strip() or len(prompt.encode()) > MAX_BODY_BYTES:
             raise ValueError("prompt is empty or too large")
+        require_secret_safe(prompt, "HostJob prompt")
         access = str(payload.get("access") or "write")
         if access not in {"read", "write"}:
             raise ValueError("unsupported access mode")
@@ -307,6 +377,9 @@ class HostJobManager:
             raise ValueError(
                 "read-only execution requires Codex, Cursor, or Git inspection"
             )
+        capability = _validated_capability(
+            payload.get("capability"), adapter, access
+        )
         timeout_seconds = min(
             max(int(payload.get("timeout_seconds") or 600), 10),
             MAX_JOB_SECONDS,
@@ -317,10 +390,13 @@ class HostJobManager:
         if adapter == "json-worker" and session_id is None:
             session_id = uuid4().hex
         context_policy = _context_policy(payload.get("context_policy"))
+        model = str(payload.get("model") or "default")
+        if not MODEL_NAME.fullmatch(model):
+            raise ValueError("model must be a safe bounded setting value")
         directory = self._output_directory(job_id)
         directory.mkdir(parents=True, exist_ok=True)
         directory.chmod(0o700)
-        isolated = adapter == "codex" and access == "read"
+        isolated = adapter != "git-publish"
         execution_project = project
         environment = _safe_environment()
         if isolated:
@@ -335,15 +411,21 @@ class HostJobManager:
             temporary.mkdir(mode=0o700, exist_ok=True)
             temporary.chmod(0o700)
             environment["TMPDIR"] = str(temporary)
+        execution_prompt = (
+            prompt.replace(str(project), str(execution_project))
+            if isolated
+            else prompt
+        )
         argv = _execution_argv(
             adapter,
             executable,
             execution_project,
             session_id,
-            prompt,
+            execution_prompt,
             access,
             context_policy,
             isolated=isolated,
+            model=model,
         )
         stdout_path = directory / "stdout.segment-000001.log"
         stderr_path = directory / "stderr.segment-000001.log"
@@ -368,30 +450,50 @@ class HostJobManager:
             "input_tokens": 0,
             "cached_input_tokens": 0,
             "output_tokens": 0,
-            "model": None,
+            "usage_kind": (
+                "cumulative" if adapter in {"codex", "cursor"} else "single"
+            ),
+            "model": None if model == "default" else model,
+            "requested_model": model,
             "cancel_requested": False,
+            "cancel_signal_sent_at": None,
+            "force_cancel_requested": False,
+            "deadline_reached_at": None,
             "output_ref": f"{job_id}/",
             "context_policy": context_policy,
             "isolated_workspace": isolated,
+            "apply_workspace_on_success": bool(
+                isolated
+                and access == "write"
+                and capability["tier"] == "recoverable_workspace_write"
+            ),
+            "capability": capability,
         }
+        capture_argv = [
+            sys.executable,
+            str(Path(__file__).with_name("stream_capture.py")),
+            "--stdout",
+            str(stdout_path),
+            "--stderr",
+            str(stderr_path),
+            "--",
+            *argv,
+        ]
         with self._lock:
             existing = self._read(job_id, required=False)
             if existing:
                 return self._refresh(existing)
             self._write(record)
         try:
-            with stdout_path.open("ab", buffering=0) as stdout, stderr_path.open(
-                "ab", buffering=0
-            ) as stderr:
-                process = subprocess.Popen(
-                    argv,
-                    cwd=execution_project,
-                    stdin=subprocess.PIPE if adapter != "cursor" else subprocess.DEVNULL,
-                    stdout=stdout,
-                    stderr=stderr,
-                    env=environment,
-                    start_new_session=True,
-                )
+            process = subprocess.Popen(
+                capture_argv,
+                cwd=execution_project,
+                stdin=subprocess.PIPE if adapter != "cursor" else subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=environment,
+                start_new_session=True,
+            )
         except OSError as error:
             record.update(
                 {
@@ -401,13 +503,14 @@ class HostJobManager:
                     "failure_class": "command_unavailable",
                 }
             )
-            stderr_path.write_text(_redact(str(error))[:500], encoding="utf-8")
+            with stderr_path.open("ab", buffering=0) as stderr:
+                stderr.write((_redact(str(error))[:500] + "\n").encode())
             with self._lock:
                 self._finish(record)
             return dict(record)
         if process.stdin is not None:
             try:
-                process.stdin.write(prompt.encode())
+                process.stdin.write(execution_prompt.encode())
                 process.stdin.close()
             except BrokenPipeError:
                 pass
@@ -448,6 +551,8 @@ class HostJobManager:
             record = self._refresh(self._read(job_id))
         chunks = []
         next_offsets: dict[str, int] = {}
+        stream_refs: dict[str, dict[str, object]] = {}
+        has_more = False
         for stream, offset in (
             ("stdout", stdout_offset),
             ("stderr", stderr_offset),
@@ -457,6 +562,14 @@ class HostJobManager:
                 path, offset, bounded_limit // 2, bounded_lines
             )
             next_offsets[stream] = end
+            size = path.stat().st_size if path.is_file() else 0
+            has_more = has_more or end < size
+            stream_refs[stream] = {
+                "path": f"{job_id}/{path.name}",
+                "bytes": size,
+                "sha256": _file_sha256(path) if path.is_file() else None,
+                "complete": end >= size,
+            }
             if text:
                 chunks.append(
                     {
@@ -474,10 +587,13 @@ class HostJobManager:
             "output_ref": record["output_ref"],
             "chunks": chunks,
             "next_offsets": next_offsets,
-            "has_more": False,
+            "has_more": has_more,
+            "stream_refs": stream_refs,
         }
 
-    def cancel(self, value: object) -> dict[str, object]:
+    def cancel(
+        self, value: object, *, force: bool = False
+    ) -> dict[str, object]:
         job_id = _job_id(value)
         with self._lock:
             record = self._refresh(self._read(job_id))
@@ -485,10 +601,16 @@ class HostJobManager:
                 return record
             record["status"] = "cancelling"
             record["cancel_requested"] = True
+            record["force_cancel_requested"] = bool(force)
+            record["cancel_signal_sent_at"] = time.time()
             self._write(record)
             process = self._processes.get(job_id)
             pid = int(record.get("pid") or 0)
-        _signal_process(process, pid, signal.SIGTERM)
+        _signal_process(
+            process,
+            pid,
+            signal.SIGKILL if force else signal.SIGTERM,
+        )
         return dict(record)
 
     def _wait(
@@ -497,31 +619,23 @@ class HostJobManager:
         process: subprocess.Popen[bytes],
         timeout_seconds: int,
     ) -> None:
-        timed_out = False
         try:
             process.wait(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
-            timed_out = True
-            _signal_process(process, process.pid, signal.SIGTERM)
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                _signal_process(process, process.pid, signal.SIGKILL)
-                process.wait()
+            with self._lock:
+                record = self._read(job_id, required=False)
+                if record and record.get("status") in ACTIVE_STATUSES:
+                    record["deadline_reached_at"] = (
+                        record.get("deadline_reached_at") or time.time()
+                    )
+                    self._write(record)
+            process.wait()
         with self._lock:
             record = self._read(job_id, required=False)
             self._processes.pop(job_id, None)
             if not record:
                 return
-            if timed_out:
-                record.update(
-                    {
-                        "status": "completed",
-                        "returncode": 124,
-                        "failure_class": "timeout",
-                    }
-                )
-            elif record.get("cancel_requested"):
+            if record.get("cancel_requested"):
                 record.update(
                     {
                         "status": "cancelled",
@@ -628,27 +742,22 @@ class HostJobManager:
                     else "orphan_running"
                 )
             else:
-                watchdog_reason = record.get("watchdog_reason")
                 record.update(
                     {
                         "status": (
                             "cancelled"
                             if record.get("cancel_requested")
-                            else ("completed" if watchdog_reason == "timeout" else "interrupted")
+                            else "interrupted"
                         ),
                         "returncode": (
                             130
                             if record.get("cancel_requested")
-                            else (124 if watchdog_reason == "timeout" else 125)
+                            else 125
                         ),
                         "failure_class": (
                             "cancelled"
                             if record.get("cancel_requested")
-                            else (
-                                "timeout"
-                                if watchdog_reason == "timeout"
-                                else "external_interruption"
-                            )
+                            else "external_interruption"
                         ),
                     }
                 )
@@ -657,7 +766,7 @@ class HostJobManager:
         return dict(record)
 
     def _watch_orphan(self, job_id: str) -> None:
-        """Continue persisted timeout/cancel enforcement without owning the child."""
+        """Report deadlines and observe explicit lifecycle stop requests."""
         while True:
             with self._lock:
                 record = self._read(job_id, required=False)
@@ -676,40 +785,76 @@ class HostJobManager:
                     if current:
                         self._refresh(current)
                 return
-            if timed_out or cancel_requested:
+            if timed_out:
                 with self._lock:
                     current = self._read(job_id, required=False)
-                    if current:
-                        current["watchdog_reason"] = (
-                            "cancelled" if cancel_requested else "timeout"
-                        )
+                    if current and not current.get("deadline_reached_at"):
+                        current["deadline_reached_at"] = time.time()
                         self._write(current)
-                _signal_process(None, pid, signal.SIGTERM)
-                deadline = time.time() + 5
-                while time.time() < deadline and _same_process(record):
-                    time.sleep(ORPHAN_WATCH_INTERVAL_SECONDS)
-                if _same_process(record):
-                    _signal_process(None, pid, signal.SIGKILL)
+            if cancel_requested:
                 with self._lock:
                     current = self._read(job_id, required=False)
                     if not current:
                         return
-                    current.update(
-                        {
-                            "status": "cancelled" if cancel_requested else "completed",
-                            "returncode": 130 if cancel_requested else 124,
-                            "failure_class": "cancelled" if cancel_requested else "timeout",
-                        }
+                    force = bool(current.get("force_cancel_requested"))
+                    signal_sent = current.get("cancel_signal_sent_at")
+                    if not signal_sent or force:
+                        current["cancel_signal_sent_at"] = time.time()
+                        self._write(current)
+                    else:
+                        force = False
+                if not signal_sent or force:
+                    _signal_process(
+                        None,
+                        pid,
+                        signal.SIGKILL if force else signal.SIGTERM,
                     )
-                    self._finish(current)
-                return
             time.sleep(ORPHAN_WATCH_INTERVAL_SECONDS)
 
     def _finish(self, record: dict[str, Any]) -> None:
         directory = self._output_directory(record["job_id"])
         stdout_path = directory / "stdout.segment-000001.log"
+        staged_workspace = directory / "workspace"
+        if (
+            record.get("apply_workspace_on_success")
+            and record.get("status") == "completed"
+            and int(record.get("returncode") or 0) == 0
+            and staged_workspace.is_dir()
+        ):
+            try:
+                record["workspace_apply"] = _apply_recoverable_workspace(
+                    staged_workspace,
+                    Path(str(record["project_path"])).resolve(),
+                )
+            except (OSError, ValueError) as error:
+                record.update(
+                    {
+                        "returncode": 126,
+                        "failure_class": "scope",
+                        "workspace_apply": {
+                            "applied": False,
+                            "error": type(error).__name__,
+                        },
+                    }
+                )
+                with (
+                    directory / "stderr.segment-000001.log"
+                ).open("ab", buffering=0) as stderr:
+                    stderr.write(
+                        (
+                            "workspace policy rejected staged changes: "
+                            f"{type(error).__name__}\n"
+                        ).encode()
+                    )
         stdout = _read_all(stdout_path)
-        usage = _parse_usage(stdout)
+        usage = _parse_usage(
+            stdout,
+            default_usage_kind=(
+                "cumulative"
+                if record.get("adapter") in {"codex", "cursor"}
+                else "single"
+            ),
+        )
         record.update(usage)
         record["ended_at"] = record.get("ended_at") or time.time()
         record["duration_ms"] = max(
@@ -724,13 +869,8 @@ class HostJobManager:
                 self._output_directory(record["job_id"]) / "tmp",
                 ignore_errors=True,
             )
-        for stream_path in (
-            stdout_path,
-            directory / "stderr.segment-000001.log",
-        ):
+        for stream_path in (stdout_path, directory / "stderr.segment-000001.log"):
             if stream_path.is_file():
-                minimized = _redact(_read_all(stream_path))[-262_144:].encode()
-                write_atomic(stream_path, minimized)
                 stream_path.chmod(0o600)
         self._write(record)
 
@@ -818,12 +958,7 @@ def _isolated_workspace(source: Path, target: Path) -> Path:
         return {
             name
             for name in names
-            if name == "__pycache__"
-            or name == ".env"
-            or (
-                name.startswith(".env.")
-                and name not in {".env.example", ".env.sample", ".env.template"}
-            )
+            if _workspace_ignored(Path(name))
         }
 
     try:
@@ -833,6 +968,219 @@ def _isolated_workspace(source: Path, target: Path) -> Path:
         shutil.rmtree(target, ignore_errors=True)
         raise
     return target
+
+
+def _validated_capability(
+    value: object, adapter: str, access: str
+) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError("HostJob requires a structured capability")
+    tier = str(value.get("tier") or "")
+    expected = (
+        "read_only"
+        if access == "read"
+        else (
+            "authorized_external_effect"
+            if adapter == "git-publish"
+            else "recoverable_workspace_write"
+        )
+    )
+    if tier != expected:
+        raise ValueError(f"{access} HostJob requires capability tier {expected}")
+    result = {
+        "tier": tier,
+        "project_id": str(value.get("project_id") or ""),
+        "task_id": str(value.get("task_id") or ""),
+        "spec_revision": int(value.get("spec_revision") or 0),
+    }
+    if tier == "read_only":
+        actions = value.get("allowed_actions", ["read_workspace"])
+        if actions != ["read_workspace"]:
+            raise ValueError("read-only capability has invalid actions")
+        result.update(
+            {
+                "allowed_actions": actions,
+                "target_scope": str(
+                    value.get("target_scope") or "project_workspace"
+                ),
+            }
+        )
+    elif tier == "recoverable_workspace_write":
+        actions = value.get(
+            "allowed_actions", ["write_workspace", "run_checks"]
+        )
+        if (
+            actions != ["write_workspace", "run_checks"]
+            or value.get("target_scope", "project_workspace")
+            != "project_workspace"
+        ):
+            raise ValueError("recoverable capability has invalid scope or actions")
+        result.update(
+            {
+                "allowed_actions": actions,
+                "target_scope": "project_workspace",
+            }
+        )
+    if tier == "authorized_external_effect":
+        authorization = value.get("authorization")
+        if not isinstance(authorization, dict):
+            raise ValueError("external effect requires authorization facts")
+        required = {
+            "project_id",
+            "task_id",
+            "spec_revision",
+            "action_kind",
+            "target_scope",
+            "expires_at",
+        }
+        if (
+            any(authorization.get(key) in {None, ""} for key in required)
+            or authorization.get("project_id") != result["project_id"]
+            or authorization.get("task_id") != result["task_id"]
+            or int(authorization.get("spec_revision") or 0)
+            != result["spec_revision"]
+            or float(authorization.get("expires_at") or 0) <= time.time()
+            or str(authorization.get("action_kind") or "")
+            not in {"git_publish", "git_publish_force_with_lease"}
+        ):
+            raise ValueError("external authorization is stale or out of scope")
+        result["authorization"] = {
+            key: authorization[key] for key in sorted(required)
+        }
+    return result
+
+
+def _apply_recoverable_workspace(staged: Path, source: Path) -> dict[str, object]:
+    if not staged.is_dir() or not source.is_dir():
+        raise ValueError("recoverable workspace roots must exist")
+    staged_entries = _workspace_entries(staged)
+    source_entries = _workspace_entries(source)
+    removed = []
+    missing = set(source_entries) - set(staged_entries)
+    for relative in sorted(missing, key=lambda value: len(value.parts)):
+        if any(parent in missing for parent in relative.parents):
+            continue
+        target = source / relative
+        if target.exists() or target.is_symlink():
+            removed.append(_move_to_recoverable_name(target).relative_to(source).as_posix())
+
+    created = modified = 0
+    for relative, staged_entry in sorted(
+        staged_entries.items(), key=lambda item: (len(item[0].parts), item[0].as_posix())
+    ):
+        target = source / relative
+        source_entry = source_entries.get(relative)
+        if staged_entry[0] == "directory":
+            if source_entry and source_entry[0] == "directory":
+                continue
+            if target.exists() or target.is_symlink():
+                _move_to_recoverable_name(target)
+                modified += 1
+            else:
+                created += 1
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        if source_entry == staged_entry:
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if source_entry and source_entry[0] != staged_entry[0]:
+            _move_to_recoverable_name(target)
+        if staged_entry[0] == "symlink":
+            link = (staged / relative).readlink()
+            resolved = (
+                link
+                if link.is_absolute()
+                else (target.parent / link).resolve()
+            )
+            if link.is_absolute():
+                raise ValueError("new absolute workspace symlink is forbidden")
+            try:
+                Path(resolved).relative_to(source)
+            except ValueError as error:
+                raise ValueError("workspace symlink escapes authorized scope") from error
+            if target.exists() or target.is_symlink():
+                _move_to_recoverable_name(target)
+            target.symlink_to(link)
+        elif staged_entry[0] == "file":
+            temporary = target.with_name(
+                f".{target.name}.plowwhip-{uuid4().hex}.tmp"
+            )
+            shutil.copy2(staged / relative, temporary, follow_symlinks=False)
+            os.replace(temporary, target)
+        else:
+            raise ValueError("special workspace files are forbidden")
+        if source_entry:
+            modified += 1
+        else:
+            created += 1
+    return {
+        "applied": True,
+        "created": created,
+        "modified": modified,
+        "recoverably_removed": removed,
+    }
+
+
+def _workspace_entries(root: Path) -> dict[Path, tuple[str, object]]:
+    result: dict[Path, tuple[str, object]] = {}
+    for current, directory_names, file_names in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        kept_directories = []
+        for name in directory_names:
+            path = current_path / name
+            relative = path.relative_to(root)
+            if _workspace_ignored(relative):
+                continue
+            if path.is_symlink():
+                result[relative] = ("symlink", path.readlink().as_posix())
+            else:
+                result[relative] = ("directory", None)
+                kept_directories.append(name)
+        directory_names[:] = kept_directories
+        for name in file_names:
+            path = current_path / name
+            relative = path.relative_to(root)
+            if _workspace_ignored(relative):
+                continue
+            if path.is_symlink():
+                result[relative] = ("symlink", path.readlink().as_posix())
+            elif path.is_file():
+                result[relative] = (
+                    "file",
+                    path.stat().st_mode & 0o777,
+                    _file_sha256(path),
+                )
+            else:
+                result[relative] = ("special", None)
+    return result
+
+
+def _workspace_ignored(relative: Path) -> bool:
+    return (
+        "__pycache__" in relative.parts
+        or ".git" in relative.parts
+        or relative.name == ".env"
+        or (
+            relative.name.startswith(".env.")
+            and relative.name
+            not in {".env.example", ".env.sample", ".env.template"}
+        )
+        or relative.name == "credentials.json"
+        or relative.suffix in {".pem", ".key"}
+    )
+
+
+def _move_to_recoverable_name(path: Path) -> Path:
+    now = time.time()
+    for offset in range(86_400):
+        timestamp = time.strftime(
+            "%Y%m%d%H%M%S", time.localtime(now + offset)
+        )
+        target = path.with_name(f"{path.name}.rm.{timestamp}")
+        if not target.exists() and not target.is_symlink():
+            os.replace(path, target)
+            return target
+    raise ValueError("cannot allocate recoverable removal name")
 
 
 def _version_argv(adapter: str, executable: str) -> list[str]:
@@ -855,6 +1203,7 @@ def _execution_argv(
     context: dict[str, object],
     *,
     isolated: bool = False,
+    model: str = "default",
 ) -> list[str]:
     if adapter == "git-publish":
         try:
@@ -887,6 +1236,8 @@ def _execution_argv(
             "-c",
             'model_auto_compact_token_limit_scope="body_after_prefix"',
         ]
+        if model != "default":
+            shared.extend(["--model", model])
         if session_id:
             return [
                 executable,
@@ -929,11 +1280,13 @@ def _execution_argv(
             argv.extend(["--mode", "ask"])
         else:
             argv.append("--force")
+        if model != "default":
+            argv.extend(["--model", model])
         argv.append(prompt)
         return argv
     if not session_id:
         raise ValueError("JSON Worker session is required")
-    return [
+    argv = [
         executable,
         "--project",
         str(project),
@@ -951,6 +1304,9 @@ def _execution_argv(
         "--tool-no-progress-limit",
         str(context["tool_no_progress_limit"]),
     ]
+    if model != "default":
+        argv.extend(["--model", model])
+    return argv
 
 
 def _git_publish_script() -> Path:
@@ -1002,9 +1358,7 @@ def _safe_environment() -> dict[str, str]:
         "SSH_AUTH_SOCK",
         "CODEX_HOME",
         "CURSOR_API_KEY",
-        "DEEPSEEK_MODEL",
         "DEEPSEEK_BASE_URL",
-        "KIMI_MODEL",
         "KIMI_BASE_URL",
         "PLOW_WHIP_SIMPLE_WORKER_STATE_DIR",
         "PLOW_WHIP_KIMI_WORKER_STATE_DIR",
@@ -1026,7 +1380,7 @@ def _load_private_env(path: Path) -> None:
         raise SystemExit("private environment file must not be group/world accessible")
     allowed = re.compile(
         r"^(?:PLOW_WHIP_BRIDGE_TOKEN|PLOW_WHIP_GIT_SSH_IDENTITY_FILE|CURSOR_API_KEY|"
-        r"(?:DEEPSEEK|KIMI)_(?:API_KEY(?:_\d+)?|MODEL|BASE_URL)|"
+        r"(?:DEEPSEEK|KIMI)_(?:API_KEY(?:_\d+)?|BASE_URL)|"
         r"PLOW_WHIP_(?:SIMPLE|KIMI)_WORKER_STATE_DIR)$"
     )
     for raw in path.read_text(encoding="utf-8").splitlines():
@@ -1042,10 +1396,15 @@ def _load_private_env(path: Path) -> None:
         os.environ.setdefault(key, value)
 
 
-def _parse_usage(output: str) -> dict[str, object]:
+def _parse_usage(
+    output: str, *, default_usage_kind: str = "cumulative"
+) -> dict[str, object]:
+    if default_usage_kind not in {"single", "cumulative"}:
+        raise ValueError("invalid default usage kind")
     session_id = None
     input_tokens = cached_tokens = output_tokens = 0
     model = None
+    usage_kind = default_usage_kind
     for line in output.splitlines():
         try:
             value = json.loads(line)
@@ -1053,6 +1412,9 @@ def _parse_usage(output: str) -> dict[str, object]:
             continue
         if not isinstance(value, dict):
             continue
+        explicit_kind = _find_string(value, {"usage_kind", "usageKind"})
+        if explicit_kind in {"single", "cumulative"}:
+            usage_kind = explicit_kind
         session_id = session_id or _find_string(
             value,
             {"thread_id", "threadId", "session_id", "sessionId", "chat_id", "chatId"},
@@ -1077,6 +1439,7 @@ def _parse_usage(output: str) -> dict[str, object]:
         "input_tokens": input_tokens,
         "cached_input_tokens": min(input_tokens, cached_tokens),
         "output_tokens": output_tokens,
+        "usage_kind": usage_kind,
         "model": model,
     }
 
@@ -1116,27 +1479,37 @@ def _read_output(
     if not path.is_file():
         return "", 0, 0
     size = path.stat().st_size
-    if offset < 0:
+    observation = offset < 0
+    if observation:
         start = max(0, size - limit)
     else:
         start = min(max(offset, 0), size)
     with path.open("rb") as handle:
         handle.seek(start)
         body = handle.read(limit)
+    raw_end = min(size, start + len(body))
     text = body.decode(errors="replace")
     lines = text.splitlines(keepends=True)
-    if len(lines) > tail_lines:
+    if observation and len(lines) > tail_lines:
         text = "".join(lines[-tail_lines:])
         start = size - len(text.encode())
-    return text, start, min(size, start + len(text.encode()))
+    return text, start, (
+        min(size, start + len(text.encode())) if observation else raw_end
+    )
 
 
 def _read_all(path: Path) -> str:
     if not path.is_file():
         return ""
+    return path.read_bytes().decode(errors="replace")
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
     with path.open("rb") as handle:
-        handle.seek(max(0, path.stat().st_size - 262_144))
-        return handle.read(262_144).decode(errors="replace")
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _excluded(relative: Path) -> bool:
@@ -1148,7 +1521,7 @@ def _excluded(relative: Path) -> bool:
 
 
 def _redact(value: str) -> str:
-    return _SECRET.sub("[REDACTED]", value)
+    return redact_secret(value)
 
 
 def _sha256(path: Path) -> str:

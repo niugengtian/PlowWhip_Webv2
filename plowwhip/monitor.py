@@ -45,7 +45,10 @@ def snapshot(db_path: str | Path, data_root: str | Path, project_id: str) -> dic
                 "task": None,
                 "events": [],
                 "artifacts": [],
-                "last_output": [],
+                "observation_tail": [],
+                "observation_notice": (
+                    "仅用于有界观察；不是 Artifact、Evidence 或完成依据。"
+                ),
                 "tasks": tasks,
                 "goals": goals,
             }
@@ -95,7 +98,15 @@ def task_snapshot(db_path: str | Path, data_root: str | Path, task_id: str) -> d
     try:
         task = connection.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if not task:
-            return {"task": None, "events": [], "artifacts": [], "last_output": []}
+            return {
+                "task": None,
+                "events": [],
+                "artifacts": [],
+                "observation_tail": [],
+                "observation_notice": (
+                    "仅用于有界观察；不是 Artifact、Evidence 或完成依据。"
+                ),
+            }
         view = _task_view(connection, store, task)
         view["tasks"] = _task_summaries(connection, task["project_id"])
         view["goals"] = _goal_summaries(connection, task["project_id"])
@@ -116,7 +127,8 @@ def settings_library_snapshot(db_path: str | Path, data_root: str | Path) -> dic
         ).fetchall()
         items = connection.execute(
             """
-            SELECT scope, project_id, kind, item_key, revision, path, sha256, created_at
+            SELECT scope, project_id, kind, item_key, revision, path, sha256,
+                   source_task_id, source_artifact_id, source_revision, created_at
             FROM library_items current
             WHERE revision = (
                 SELECT MAX(latest.revision) FROM library_items latest
@@ -169,7 +181,7 @@ def token_snapshot(db_path: str | Path, data_root: str | Path) -> dict:
                    call.task_id, call.task_session_id,
                    call.session_generation, call.provider_key,
                    COALESCE(call.model, call.provider_key) AS model,
-                   call.usage_kind, call.input_tokens,
+                   call.usage_kind, call.physical_session_id, call.input_tokens,
                    call.cached_input_tokens, call.output_tokens, call.created_at,
                    task.project_id, project.display_name,
                    session.worker_id, worker.role_key AS worker_role
@@ -344,8 +356,7 @@ def _normalized_calls(rows) -> list[dict]:
         )
         if item["usage_kind"] == "cumulative":
             key = (
-                item["task_session_id"],
-                item["session_generation"],
+                item["physical_session_id"],
                 item["provider_key"],
             )
             prior = previous.get(key)
@@ -422,7 +433,7 @@ def _task_view(connection, store: Store, task) -> dict:
     ).fetchone()
     artifacts = connection.execute(
         """
-        SELECT kind, path, sha256, acceptance_id, revision FROM artifacts
+        SELECT id, kind, path, sha256, acceptance_id, revision FROM artifacts
         WHERE task_id = ? AND kind IN ('output', 'evidence')
         ORDER BY revision, CASE kind WHEN 'output' THEN 0 ELSE 1 END
         """,
@@ -430,7 +441,7 @@ def _task_view(connection, store: Store, task) -> dict:
     ).fetchall()
     handoffs = connection.execute(
         """
-        SELECT path, sha256, acceptance_id, revision FROM artifacts
+        SELECT id, kind, path, sha256, acceptance_id, revision FROM artifacts
         WHERE task_id = ? AND kind = 'handoff'
         ORDER BY created_at DESC, rowid DESC LIMIT 20
         """,
@@ -443,7 +454,12 @@ def _task_view(connection, store: Store, task) -> dict:
                session.role_snapshot_json, session.settings_json,
                generation.generation, generation.provider_key,
                generation.external_session_id, generation.status,
-               generation.handoff_ref
+               generation.handoff_ref,
+               (
+                   SELECT call.model FROM model_calls call
+                   WHERE call.task_session_id = session.id
+                   ORDER BY call.created_at DESC, call.rowid DESC LIMIT 1
+               ) AS model
         FROM task_sessions session
         JOIN session_generations generation ON generation.task_session_id = session.id
         WHERE session.task_id = ?
@@ -472,7 +488,7 @@ def _task_view(connection, store: Store, task) -> dict:
         if session["role_key"] == (task["role_key"] or "deterministic"):
             tail_values = json.loads(session["settings_json"]).get("values", {})
             break
-    last_output = (
+    observation_tail = (
         _tail(
             store.data_root,
             job["output_ref"],
@@ -507,18 +523,8 @@ def _task_view(connection, store: Store, task) -> dict:
         "task": dict(task),
         "decision_context": decision_context,
         "events": [dict(event) for event in events],
-        "artifacts": [
-            {
-                **dict(artifact),
-                "kind": "artifact" if artifact["kind"] == "output" else "evidence",
-                "path": str(store.resolve_data_path(artifact["path"])),
-            }
-            for artifact in artifacts
-        ],
-        "handoffs": [
-            {**dict(handoff), "path": str(store.resolve_data_path(handoff["path"]))}
-            for handoff in handoffs
-        ],
+        "artifacts": [_artifact_file_view(store, task, artifact) for artifact in artifacts],
+        "handoffs": [_artifact_file_view(store, task, handoff) for handoff in handoffs],
         "sessions": [
             {
                 "task_session_id": session["task_session_id"],
@@ -529,7 +535,11 @@ def _task_view(connection, store: Store, task) -> dict:
                 "status": session["status"],
                 "external_session_id": session["external_session_id"],
                 "handoff_ref": session["handoff_ref"],
-                "model": "deterministic" if session["provider_key"] == "local" else None,
+                "model": (
+                    "deterministic"
+                    if session["provider_key"] == "local"
+                    else session["model"]
+                ),
                 "role_snapshot": json.loads(session["role_snapshot_json"]),
                 "settings": json.loads(session["settings_json"]),
                 "provider_candidates": provider_facts(session["role_key"]),
@@ -539,7 +549,10 @@ def _task_view(connection, store: Store, task) -> dict:
         "model_usage": [dict(row) for row in model_usage],
         "host_jobs": [dict(row) for row in jobs],
         "session_files": _session_files(store, task),
-        "last_output": last_output,
+        "observation_tail": observation_tail,
+        "observation_notice": (
+            "仅用于有界观察；不是 Artifact、Evidence 或完成依据。"
+        ),
     }
 
 
@@ -730,8 +743,113 @@ def _session_files(store: Store, task) -> list[dict]:
             size = path.stat().st_size
         except FileNotFoundError:
             continue
-        result.append({"path": str(path), "bytes": size})
+        relative = store.relative_data_path(path)
+        sha256 = _sha256_file(path)
+        result.append(
+            {
+                "file_id": _task_file_id("session", relative),
+                "path": str(path),
+                "stored_path": relative,
+                "bytes": size,
+                "sha256": sha256,
+                "revision": task["spec_revision"],
+                "open_url": (
+                    f"/api/tasks/{task['id']}/files/"
+                    f"{_task_file_id('session', relative)}"
+                ),
+                "observation_only": False,
+            }
+        )
     return result
+
+
+def task_file(
+    db_path: str | Path,
+    data_root: str | Path,
+    task_id: str,
+    file_id: str,
+) -> tuple[bytes, dict[str, object]]:
+    """Resolve one formal file through Task ID and an opaque, recomputed file ID."""
+    store = Store(db_path, data_root)
+    connection = store.connect_readonly()
+    try:
+        task = connection.execute(
+            "SELECT * FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not task:
+            raise ValueError("Task not found")
+        artifacts = connection.execute(
+            """
+            SELECT id, kind, path, sha256, acceptance_id, revision FROM artifacts
+            WHERE task_id = ? ORDER BY created_at, rowid
+            """,
+            (task_id,),
+        ).fetchall()
+        for artifact in artifacts:
+            view = _artifact_file_view(store, task, artifact)
+            if view["file_id"] != file_id:
+                continue
+            path = store.resolve_data_path(artifact["path"])
+            body = path.read_bytes()
+            actual = hashlib.sha256(body).hexdigest()
+            if actual != artifact["sha256"]:
+                raise ValueError("formal Artifact SHA-256 mismatch")
+            return body, {
+                "sha256": actual,
+                "revision": int(artifact["revision"]),
+                "kind": str(view["kind"]),
+                "path": str(artifact["path"]),
+            }
+        for view in _session_files(store, task):
+            if view["file_id"] != file_id:
+                continue
+            path = store.resolve_data_path(str(view["stored_path"]))
+            body = path.read_bytes()
+            actual = hashlib.sha256(body).hexdigest()
+            if actual != view["sha256"]:
+                raise ValueError("Session file SHA-256 changed during read")
+            return body, {
+                "sha256": actual,
+                "revision": int(view["revision"]),
+                "kind": "session",
+                "path": str(view["stored_path"]),
+            }
+    finally:
+        connection.close()
+    raise ValueError("Task file not found")
+
+
+def _artifact_file_view(store: Store, task, artifact) -> dict[str, object]:
+    path = store.resolve_data_path(artifact["path"])
+    path.relative_to(store.data_root)
+    relative = store.relative_data_path(path)
+    file_id = _task_file_id("artifact", relative)
+    kind = (
+        "artifact"
+        if artifact["kind"] == "output"
+        else str(artifact["kind"])
+    )
+    return {
+        **dict(artifact),
+        "kind": kind,
+        "file_id": file_id,
+        "path": str(path),
+        "stored_path": relative,
+        "bytes": path.stat().st_size if path.is_file() else 0,
+        "open_url": f"/api/tasks/{task['id']}/files/{file_id}",
+    }
+
+
+def _task_file_id(category: str, relative: str) -> str:
+    return hashlib.sha256(f"{category}\0{relative}".encode()).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _tail(data_root: Path, relative: str, lines: int = 20, byte_cap: int = 8192) -> list[str]:

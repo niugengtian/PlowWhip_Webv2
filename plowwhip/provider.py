@@ -198,13 +198,15 @@ def run_provider_probe(provider_key: str, mode: str) -> dict[str, object]:
     )
 
 
-def workspace_snapshot(project_path: str) -> dict[str, object]:
+def workspace_snapshot(
+    project_path: str, paths: list[str] | None = None
+) -> dict[str, object]:
     base_url, token = _bridge_configuration()
     return _bridge_post(
         base_url,
         token,
         "/v1/evidence/snapshot",
-        {"project_path": project_path, "paths": []},
+        {"project_path": project_path, "paths": list(paths or [])},
         30,
     )
 
@@ -219,12 +221,37 @@ def start_provider_job(
     timeout_seconds: int,
     context_policy: dict[str, object] | None = None,
     access: str = "write",
+    workspace_kind: str = "project",
+    workspace_key: str | None = None,
+    capability: dict[str, object] | None = None,
+    model: str | None = None,
 ) -> dict[str, object]:
     provider = PROVIDERS.get(provider_key)
     if not provider:
         raise ValueError("unknown Provider")
     if access not in {"read", "write"}:
         raise ValueError("Provider access must be read or write")
+    if workspace_kind not in {"project", "planner"}:
+        raise ValueError("unsupported Provider workspace kind")
+    if workspace_kind == "planner" and (
+        access != "read" or not workspace_key
+    ):
+        raise ValueError("Planner workspace requires a bounded read-only key")
+    if capability is None:
+        if provider_key == "git_publish" and access == "write":
+            raise ValueError(
+                "Git publish requires explicit external-effect capability"
+            )
+        capability = {
+            "tier": (
+                "read_only"
+                if access == "read"
+                else "recoverable_workspace_write"
+            ),
+            "project_id": "",
+            "task_id": "",
+            "spec_revision": 0,
+        }
     base_url, token = _bridge_configuration()
     return _bridge_post(
         base_url,
@@ -235,6 +262,8 @@ def start_provider_job(
             "adapter": provider["adapter"],
             "executable": provider["executable"],
             "project_path": project_path,
+            "workspace_kind": workspace_kind,
+            "workspace_key": workspace_key,
             "prompt": prompt,
             "session_id": session_id,
             "timeout_seconds": min(max(int(timeout_seconds), 10), 86_400),
@@ -244,10 +273,30 @@ def start_provider_job(
                 "tool_no_progress_limit": 6,
                 **(context_policy or {}),
             },
+            "capability": capability,
+            "model": model,
         },
         20,
         max_bytes=1_048_576,
     )
+
+
+def selected_model(settings: dict[str, object], provider_key: str) -> str | None:
+    """Resolve the frozen SQLite model choice; never consult process env."""
+    mapping = settings.get("provider_models")
+    if not isinstance(mapping, dict):
+        return None
+    value = mapping.get(provider_key)
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or len(value) > 128
+        or not value
+        or any(character.isspace() or ord(character) < 32 for character in value)
+    ):
+        raise ValueError("frozen Provider model is invalid")
+    return value
 
 
 def provider_job_status(job_id: str) -> dict[str, object]:
@@ -262,31 +311,98 @@ def provider_job_status(job_id: str) -> dict[str, object]:
     )
 
 
-def provider_job_output(job_id: str) -> dict[str, object]:
+def provider_job_output(
+    job_id: str, *, complete: bool = False
+) -> dict[str, object]:
     base_url, token = _bridge_configuration()
-    return _bridge_post(
-        base_url,
-        token,
-        "/v1/jobs/output",
-        {
-            "job_id": job_id,
-            "stdout_offset": -1,
-            "stderr_offset": -1,
-            "limit": 65_536,
-            "tail_lines": 100,
-        },
-        10,
-        max_bytes=131_072,
-    )
+    if not complete:
+        return _bridge_post(
+            base_url,
+            token,
+            "/v1/jobs/output",
+            {
+                "job_id": job_id,
+                "stdout_offset": -1,
+                "stderr_offset": -1,
+                "limit": 65_536,
+                "tail_lines": 100,
+            },
+            10,
+            max_bytes=131_072,
+        )
+    offsets = {"stdout": 0, "stderr": 0}
+    chunks: list[dict[str, object]] = []
+    stream_refs: dict[str, object] = {}
+    status = "unknown"
+    while True:
+        result = _bridge_post(
+            base_url,
+            token,
+            "/v1/jobs/output",
+            {
+                "job_id": job_id,
+                "stdout_offset": offsets["stdout"],
+                "stderr_offset": offsets["stderr"],
+                "limit": 65_536,
+                "tail_lines": 100,
+            },
+            10,
+            max_bytes=131_072,
+        )
+        status = str(result.get("status") or status)
+        raw_chunks = result.get("chunks", [])
+        if not isinstance(raw_chunks, list):
+            raise RuntimeError("Host Bridge output chunks are invalid")
+        chunks.extend(
+            chunk for chunk in raw_chunks if isinstance(chunk, dict)
+        )
+        next_offsets = result.get("next_offsets")
+        if not isinstance(next_offsets, dict):
+            # Compatibility with an older/fake Bridge that returns one complete
+            # response without offset metadata.
+            stream_refs = (
+                result.get("stream_refs")
+                if isinstance(result.get("stream_refs"), dict)
+                else {}
+            )
+            break
+        advanced = False
+        for stream in offsets:
+            value = next_offsets.get(stream)
+            if isinstance(value, int) and value >= offsets[stream]:
+                advanced = advanced or value > offsets[stream]
+                offsets[stream] = value
+        stream_refs = (
+            result.get("stream_refs")
+            if isinstance(result.get("stream_refs"), dict)
+            else {}
+        )
+        if not result.get("has_more"):
+            break
+        if not advanced:
+            raise RuntimeError(
+                "Host Bridge complete output made no offset progress"
+            )
+    return {
+        "job_id": job_id,
+        "status": status,
+        "chunks": chunks,
+        "next_offsets": offsets,
+        "has_more": False,
+        "stream_refs": stream_refs,
+        "complete": True,
+    }
 
 
-def cancel_provider_job(job_id: str) -> dict[str, object]:
+def cancel_provider_job(
+    job_id: str, *, force: bool = False
+) -> dict[str, object]:
     base_url, token = _bridge_configuration()
     return _bridge_post(
         base_url,
         token,
         "/v1/jobs/cancel",
-        {"job_id": job_id},
+        {"job_id": job_id, "force": bool(force)},
         10,
         max_bytes=1_048_576,
     )
@@ -466,17 +582,30 @@ def record_model_call(
         raise ValueError("token usage cannot be negative")
     if cached_input_tokens > input_tokens:
         raise ValueError("cached_input_tokens is a subset of input_tokens")
+    generation = connection.execute(
+        """
+        SELECT external_session_id FROM session_generations
+        WHERE task_session_id = ? AND generation = ?
+        """,
+        (task_session_id, session_generation),
+    ).fetchone()
+    external_session_id = (
+        str(generation["external_session_id"])
+        if generation and generation["external_session_id"]
+        else f"{task_session_id}:generation-{session_generation:06d}"
+    )
+    physical_session_id = f"{provider_key}:{external_session_id}"
 
     normalized = input_tokens + output_tokens
     if usage_kind == "cumulative":
         previous = connection.execute(
             """
             SELECT input_tokens, cached_input_tokens, output_tokens FROM model_calls
-            WHERE task_session_id = ? AND session_generation = ?
+            WHERE physical_session_id = ?
               AND provider_key = ? AND usage_kind = 'cumulative'
             ORDER BY created_at DESC, rowid DESC LIMIT 1
             """,
-            (task_session_id, session_generation, provider_key),
+            (physical_session_id, provider_key),
         ).fetchone()
         if previous:
             if (
@@ -497,9 +626,9 @@ def record_model_call(
         """
         INSERT INTO model_calls(
             id, task_id, task_session_id, session_generation, provider_key,
-            model, usage_kind, input_tokens, cached_input_tokens, output_tokens,
-            normalized_total, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            model, usage_kind, physical_session_id, input_tokens,
+            cached_input_tokens, output_tokens, normalized_total, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             uuid4().hex,
@@ -509,6 +638,7 @@ def record_model_call(
             provider_key,
             model or ("deterministic" if provider_key == "local" else provider_key),
             usage_kind,
+            physical_session_id,
             input_tokens,
             cached_input_tokens,
             output_tokens,
@@ -516,82 +646,52 @@ def record_model_call(
             time.time(),
         ),
     )
-    session = connection.execute(
-        "SELECT settings_json FROM task_sessions WHERE id = ?",
-        (task_session_id,),
-    ).fetchone()
-    if session:
-        values = json.loads(session["settings_json"]).get("values", {})
-        totals = connection.execute(
-            """
-            SELECT COUNT(*) AS calls, COALESCE(SUM(normalized_total), 0) AS tokens
-            FROM model_calls WHERE task_id = ?
-            """,
-            (task_id,),
-        ).fetchone()
-        max_calls = int(values.get("max_model_calls", 100))
-        max_tokens = int(values.get("max_total_tokens", 10_000_000))
-        exceeded = (
-            totals["calls"] >= max_calls or totals["tokens"] >= max_tokens
-        )
-        if exceeded:
-            detail = (
-                "Model budget reached: "
-                f"{totals['calls']}/{max_calls} calls, "
-                f"{totals['tokens']}/{max_tokens} normalized tokens"
-            )
-            connection.execute(
-                """
-                UPDATE tasks SET public_status = 'needs_decision',
-                    phase = 'provider_recovery', wait_reason = ?,
-                    fault_code = 'scope', next_action_at = NULL,
-                    next_action_kind = NULL, updated_at = ?
-                WHERE id = ? AND outcome IS NULL
-                """,
-                (detail, time.time(), task_id),
-            )
-            task = connection.execute(
-                "SELECT project_id FROM tasks WHERE id = ?", (task_id,)
-            ).fetchone()
-            if task:
-                connection.execute(
-                    """
-                    INSERT INTO task_events(
-                        project_id, task_id, kind, detail_json, created_at
-                    ) VALUES (?, ?, 'model_budget_reached', ?, ?)
-                    """,
-                    (
-                        task["project_id"],
-                        task_id,
-                        json.dumps(
-                            {
-                                "calls": totals["calls"],
-                                "max_model_calls": max_calls,
-                                "normalized_tokens": totals["tokens"],
-                                "max_total_tokens": max_tokens,
-                            },
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ),
-                        time.time(),
-                    ),
-                )
     return normalized
+
+
+def model_budget_fact(
+    connection: sqlite3.Connection, task_id: str
+) -> dict[str, object] | None:
+    settings_rows = connection.execute(
+        "SELECT settings_json FROM task_sessions WHERE task_id = ?",
+        (task_id,),
+    ).fetchall()
+    if not settings_rows:
+        return None
+    settings = [
+        json.loads(row["settings_json"]).get("values", {})
+        for row in settings_rows
+    ]
+    max_calls = min(
+        int(values.get("max_model_calls", 100)) for values in settings
+    )
+    max_tokens = min(
+        int(values.get("max_total_tokens", 10_000_000))
+        for values in settings
+    )
+    totals = connection.execute(
+        """
+        SELECT COUNT(*) AS calls, COALESCE(SUM(normalized_total), 0) AS tokens
+        FROM model_calls WHERE task_id = ?
+        """,
+        (task_id,),
+    ).fetchone()
+    if totals["calls"] < max_calls and totals["tokens"] < max_tokens:
+        return None
+    return {
+        "calls": int(totals["calls"]),
+        "max_model_calls": max_calls,
+        "normalized_tokens": int(totals["tokens"]),
+        "max_total_tokens": max_tokens,
+        "detail": (
+            "Model budget reached: "
+            f"{totals['calls']}/{max_calls} calls, "
+            f"{totals['tokens']}/{max_tokens} normalized tokens"
+        ),
+    }
 
 
 def model_budget_reached(
     connection: sqlite3.Connection, task_id: str
 ) -> bool:
-    row = connection.execute(
-        """
-        SELECT public_status, fault_code, wait_reason
-        FROM tasks WHERE id = ?
-        """,
-        (task_id,),
-    ).fetchone()
-    return bool(
-        row
-        and row["public_status"] == "needs_decision"
-        and row["fault_code"] == "scope"
-        and str(row["wait_reason"] or "").startswith("Model budget reached:")
-    )
+    return model_budget_fact(connection, task_id) is not None

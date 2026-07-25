@@ -7,12 +7,14 @@ import unicodedata
 from pathlib import PurePosixPath
 from uuid import uuid4
 
+from .secret_policy import require_secret_safe
 from .store import Store
 
 
 PROJECT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 LIBRARY_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 TASK_ID = re.compile(r"^[0-9a-f]{32}$")
+ARTIFACT_ID = re.compile(r"^[0-9a-f]{32}$")
 GIT_BRANCH = re.compile(
     r"^[A-Za-z0-9](?:[A-Za-z0-9._/-]{0,126}[A-Za-z0-9])?$"
 )
@@ -74,6 +76,9 @@ PROJECT_PROVIDER_ROLES = {
     "deterministic_checker",
 }
 PROJECT_PROVIDERS = {"local", "codex_cli", "cursor_cli", "deepseek", "kimi"}
+MODEL_PROVIDERS = {"codex_cli", "cursor_cli", "deepseek", "kimi"}
+MODEL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+BUTLER_SEMANTIC_PREFIX = "PLOWWHIP_BUTLER_SEMANTIC_QUERY "
 
 
 def submit_message(
@@ -85,6 +90,14 @@ def submit_message(
         raise ValueError("message must contain 1-65536 UTF-8 bytes")
     if not idempotency_key or len(idempotency_key) > 128:
         raise ValueError("idempotency_key must contain 1-128 characters")
+    require_secret_safe(
+        {
+            "project_id": project_id,
+            "content": content,
+            "idempotency_key": idempotency_key,
+        },
+        "message",
+    )
 
     now = time.time()
     message_id = uuid4().hex
@@ -144,6 +157,10 @@ def create_project(
         raise ValueError("project_id must be 1-64 safe identifier characters")
     name = _normalize_project_name(display_name or project_id)
     workspace = _normalize_host_path(host_path)
+    require_secret_safe(
+        {"project_id": project_id, "display_name": name, "host_path": workspace},
+        "project metadata",
+    )
     now = time.time()
     action_id = uuid4().hex
     with store.transaction() as connection:
@@ -339,9 +356,12 @@ def set_project_setting(
     idempotency_key: str,
 ) -> str:
     _validate_project_action(project_id, idempotency_key)
+    require_secret_safe(value, "project setting")
     limits = PROJECT_SETTING_LIMITS.get(setting_key)
     if setting_key == "provider_order":
         _validate_provider_order(value)
+    elif setting_key == "provider_models":
+        _validate_provider_models(value)
     elif (
         not limits
         or isinstance(value, bool)
@@ -398,6 +418,7 @@ def set_project_rule(
         raise ValueError("rule_key must be a safe 1-64 character identifier")
     if not content.strip() or len(content.encode()) > 65_536:
         raise ValueError("project rule must contain 1-65536 UTF-8 bytes")
+    require_secret_safe(content, "project rule")
     now = time.time()
     message_id = uuid4().hex
     with store.transaction() as connection:
@@ -453,6 +474,18 @@ def _validate_provider_order(value: object) -> None:
             raise ValueError("model roles cannot use the local deterministic Provider")
 
 
+def _validate_provider_models(value: object) -> None:
+    if not isinstance(value, dict) or not value:
+        raise ValueError("provider_models must contain at least one Provider")
+    if any(
+        provider not in MODEL_PROVIDERS
+        or not isinstance(model, str)
+        or not MODEL_NAME.fullmatch(model)
+        for provider, model in value.items()
+    ):
+        raise ValueError("provider_models contains an invalid Provider or model")
+
+
 def _validate_project_action(project_id: str, idempotency_key: str) -> None:
     if not PROJECT_ID.fullmatch(project_id):
         raise ValueError("project_id must be 1-64 safe identifier characters")
@@ -462,6 +495,7 @@ def _validate_project_action(project_id: str, idempotency_key: str) -> None:
 def _validate_idempotency_key(idempotency_key: str) -> None:
     if not idempotency_key or len(idempotency_key) > 128:
         raise ValueError("idempotency_key must contain 1-128 characters")
+    require_secret_safe(idempotency_key, "idempotency key")
 
 
 def _normalize_project_name(value: str | None) -> str:
@@ -508,6 +542,7 @@ def submit_action(
     instruction: str,
     idempotency_key: str,
     plan: dict | None = None,
+    promotion: dict | None = None,
 ) -> str:
     if not PROJECT_ID.fullmatch(project_id) or not TASK_ID.fullmatch(task_id):
         raise ValueError("invalid project_id or task_id")
@@ -522,11 +557,13 @@ def submit_action(
         "force_publish_with_lease",
         "rerun",
         "wake",
+        "promote_script",
     }:
         raise ValueError(
             "supported actions: provide_decision, provide_plan, authorize, cancel, "
             "confirm_not_executed, refresh_git_publish_context, publish_new_branch, "
             "force_publish_with_lease, rerun, wake"
+            ", promote_script"
         )
     if kind == "provide_decision" and not instruction:
         raise ValueError("provide_decision requires instruction")
@@ -534,8 +571,19 @@ def submit_action(
         raise ValueError("instruction must contain at most 65536 UTF-8 bytes")
     if kind == "provide_plan" and not isinstance(plan, dict):
         raise ValueError("provide_plan requires plan")
+    if kind == "promote_script" and not isinstance(promotion, dict):
+        raise ValueError("promote_script requires a promotion contract")
     if not idempotency_key or len(idempotency_key) > 128:
         raise ValueError("idempotency_key must contain 1-128 characters")
+    require_secret_safe(
+        {
+            "instruction": instruction,
+            "plan": plan,
+            "promotion": promotion,
+            "idempotency_key": idempotency_key,
+        },
+        "owner action",
+    )
 
     now = time.time()
     message_id = uuid4().hex
@@ -561,6 +609,68 @@ def submit_action(
         ).fetchone()
         if not task:
             raise ValueError("task not found")
+        if kind == "promote_script":
+            item_key = promotion.get("item_key") if promotion else None
+            artifact_id = promotion.get("artifact_id") if promotion else None
+            spec = json.loads(task["spec_json"])
+            result = (
+                spec.get("task_contract", {}).get("result", {})
+                if isinstance(spec.get("task_contract"), dict)
+                else {}
+            )
+            script_contract = result.get("script_contract")
+            artifact_contract = result.get("artifact")
+            artifact = connection.execute(
+                """
+                SELECT id, path, sha256, revision FROM artifacts
+                WHERE id = ? AND task_id = ? AND project_id = ?
+                  AND kind = 'output' AND revision = ?
+                """,
+                (artifact_id, task_id, project_id, task["spec_revision"]),
+            ).fetchone()
+            evidence = connection.execute(
+                """
+                SELECT 1 FROM artifacts
+                WHERE task_id = ? AND kind = 'evidence' AND revision = ?
+                LIMIT 1
+                """,
+                (task_id, task["spec_revision"]),
+            ).fetchone()
+            if task["outcome"] != "done" or task["public_status"] != "done":
+                raise ValueError("script promotion requires a verified done Task")
+            if not isinstance(item_key, str) or not LIBRARY_KEY.fullmatch(item_key):
+                raise ValueError("script promotion requires a safe item_key")
+            if not isinstance(artifact_id, str) or not ARTIFACT_ID.fullmatch(
+                artifact_id
+            ):
+                raise ValueError("script promotion requires an exact Artifact ID")
+            if not isinstance(script_contract, dict) or not isinstance(
+                artifact_contract, dict
+            ):
+                raise ValueError(
+                    "script promotion requires a declared single-file script Artifact"
+                )
+            if not artifact or not _artifact_matches_declared_path(
+                artifact["path"] if artifact else None,
+                artifact_contract.get("path"),
+            ):
+                raise ValueError(
+                    "script promotion Artifact does not match the current Task contract: "
+                    f"stored={artifact['path'] if artifact else None!r}, "
+                    f"declared={artifact_contract.get('path')!r}"
+                )
+            if not evidence:
+                raise ValueError(
+                    "script promotion requires current-revision Evidence"
+                )
+            action = {
+                "kind": "promote_script",
+                "task_id": task_id,
+                "spec_revision": task["spec_revision"],
+                "artifact_id": artifact_id,
+                "artifact_sha256": artifact["sha256"],
+                "item_key": item_key,
+            }
         if kind == "confirm_not_executed":
             job = connection.execute(
                 """
@@ -765,6 +875,10 @@ def submit_action(
             kind == "wake"
             and task["outcome"] is None
             and task["public_status"] in {"pending", "in_progress"}
+        ) or (
+            kind == "promote_script"
+            and task["outcome"] == "done"
+            and task["public_status"] == "done"
         )
         if not allowed:
             raise ValueError(f"action {kind} is not allowed for current task")
@@ -785,6 +899,17 @@ def submit_action(
             ),
         )
     return message_id
+
+
+def _artifact_matches_declared_path(
+    stored_path: object, declared_path: object
+) -> bool:
+    if not isinstance(stored_path, str) or not isinstance(declared_path, str):
+        return False
+    return (
+        stored_path == declared_path
+        or stored_path.endswith(f"/output/{declared_path}")
+    )
 
 
 def declared_step_count(content: str) -> int:
@@ -819,6 +944,64 @@ def extract_git_publish_spec(content: str) -> dict[str, object] | None:
 
 
 def normalize_instruction(content: str) -> tuple[dict[str, object], list[dict[str, str]]]:
+    if content.startswith(BUTLER_SEMANTIC_PREFIX):
+        try:
+            request = json.loads(content[len(BUTLER_SEMANTIC_PREFIX) :])
+        except json.JSONDecodeError:
+            request = None
+        query = request.get("query") if isinstance(request, dict) else None
+        sources = request.get("sources") if isinstance(request, dict) else None
+        if (
+            not isinstance(query, str)
+            or not query
+            or len(query) > 128
+            or not isinstance(sources, list)
+            or not 1 <= len(sources) <= 50
+            or any(
+                not isinstance(source, dict)
+                or set(source) != {"kind", "ref", "detail"}
+                or not isinstance(source["kind"], str)
+                or not isinstance(source["ref"], str)
+                or not source["ref"]
+                or not isinstance(source["detail"], str)
+                or len(source["detail"].encode()) > 512
+                for source in sources
+            )
+        ):
+            return (
+                {
+                    "kind": "invalid_butler_query",
+                    "instruction": content,
+                },
+                [],
+            )
+        return (
+            {
+                "kind": "provider_task",
+                "instruction": content,
+                "workspace_change_required": False,
+                "butler_semantic_query": {
+                    "query": query,
+                    "sources": sources,
+                },
+            },
+            [
+                {
+                    "id": "semantic_summary_sources",
+                    "kind": "checker_evidence",
+                    "expected": (
+                        "every summary claim cites only supplied canonical source refs"
+                    ),
+                },
+                {
+                    "id": "semantic_summary_scope",
+                    "kind": "checker_evidence",
+                    "expected": (
+                        "read-only summary answers the query without workspace changes"
+                    ),
+                },
+            ],
+        )
     probe = PROVIDER_PROBE_INSTRUCTION.fullmatch(content.strip())
     if probe:
         provider_key = probe.group(1).lower()

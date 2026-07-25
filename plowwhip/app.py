@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import re
 import sqlite3
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from .butler import conversation, route_global_message, search
+from .butler import conversation, route_global_message, search, semantic_search
 from .cronner import acquire_scheduler_lock, run as run_cronner
 from .intake import (
     PROJECT_ID,
@@ -24,6 +25,7 @@ from .monitor import (
     projects_snapshot,
     settings_library_snapshot,
     snapshot,
+    task_file,
     task_snapshot,
     token_snapshot,
 )
@@ -32,6 +34,9 @@ from .ui import HTML
 
 
 MAX_BODY_BYTES = 65_536
+TASK_FILE_PATH = re.compile(
+    r"^/api/tasks/([A-Za-z0-9][A-Za-z0-9._-]{0,63})/files/([0-9a-f]{64})$"
+)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -116,6 +121,30 @@ class Handler(BaseHTTPRequestHandler):
                 snapshot(store.db_path, store.data_root, project_id),
             )
             return
+        task_file_match = TASK_FILE_PATH.fullmatch(path)
+        if task_file_match:
+            store = self.server.store  # type: ignore[attr-defined]
+            try:
+                body, metadata = task_file(
+                    store.db_path,
+                    store.data_root,
+                    task_file_match.group(1),
+                    task_file_match.group(2),
+                )
+            except (OSError, ValueError):
+                self._send(404, {"error": "task_file_not_found_or_invalid"})
+                return
+            self._send_bytes(
+                200,
+                body,
+                "application/octet-stream",
+                {
+                    "X-Content-SHA256": str(metadata["sha256"]),
+                    "X-Artifact-Revision": str(metadata["revision"]),
+                    "X-Artifact-Kind": str(metadata["kind"]),
+                },
+            )
+            return
         prefix = "/api/tasks/"
         if path.startswith(prefix) and path != prefix:
             store = self.server.store  # type: ignore[attr-defined]
@@ -135,6 +164,7 @@ class Handler(BaseHTTPRequestHandler):
             store = self.server.store  # type: ignore[attr-defined]
             path = urlsplit(self.path).path
             action_result = None
+            semantic_result = None
             if path == "/api/messages":
                 routed = route_global_message(
                     store,
@@ -143,6 +173,14 @@ class Handler(BaseHTTPRequestHandler):
                     body.get("project_id"),
                 )
                 identifier = routed["message_id"]
+            elif path == "/api/semantic-search":
+                semantic_result = semantic_search(
+                    store,
+                    body["query"],
+                    body["project_id"],
+                    body["idempotency_key"],
+                )
+                identifier = semantic_result["message_id"]
             elif path == "/api/actions":
                 if body.get("kind") == "create_project":
                     action_result = create_project(
@@ -185,6 +223,7 @@ class Handler(BaseHTTPRequestHandler):
                         body.get("instruction", ""),
                         body["idempotency_key"],
                         body.get("plan"),
+                        body.get("promotion"),
                     )
             else:
                 self._send(404, {"error": "not_found"})
@@ -203,6 +242,8 @@ class Handler(BaseHTTPRequestHandler):
                     "result": action_result["result"],
                 }
             )
+        if semantic_result:
+            response.update(semantic_result)
         if path == "/api/messages":
             response.update(
                 {
@@ -227,7 +268,13 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()
         self._send_bytes(status, body, "application/json; charset=utf-8")
 
-    def _send_bytes(self, status: int, body: bytes, content_type: str) -> None:
+    def _send_bytes(
+        self,
+        status: int,
+        body: bytes,
+        content_type: str,
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
@@ -235,6 +282,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("X-Content-Type-Options", "nosniff")
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 

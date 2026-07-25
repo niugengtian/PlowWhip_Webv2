@@ -7,13 +7,24 @@ import time
 from dataclasses import dataclass
 from uuid import uuid4
 
+from .artifact_contract import (
+    register_artifact,
+    result_coverage,
+    task_data_scope,
+    verified_artifact,
+)
 from .execution import (
     _context_policy,
     _fallback_provider_generation,
-    archive_task_sessions,
     current_session,
 )
 from .intake import canonical_json
+from .lifecycle_state import (
+    apply_model_budget_fact,
+    finalize_task_terminal,
+    increment_task_retry,
+    write_task_fields,
+)
 from .provider import (
     CHECKER_RESULT_PREFIX,
     ACTIVE_HOST_JOB_STATUSES,
@@ -22,9 +33,11 @@ from .provider import (
     provider_agent_text,
     provider_job_output,
     provider_job_status,
-    model_budget_reached,
+    model_budget_fact,
     record_model_call,
+    selected_model,
     start_provider_job,
+    workspace_snapshot,
 )
 from .store import Store, write_atomic as _write_atomic
 
@@ -42,6 +55,9 @@ class CheckerStep:
     timeout_seconds: int
     execution: dict
     context_policy: dict[str, object]
+    workspace_kind: str = "project"
+    workspace_key: str | None = None
+    model: str | None = None
 
 
 def verify_task(
@@ -60,7 +76,7 @@ def verify_task(
     )
     artifact = connection.execute(
         """
-        SELECT path FROM artifacts
+        SELECT * FROM artifacts
         WHERE task_id = ? AND kind = 'output' AND revision = ?
         ORDER BY created_at DESC, rowid DESC LIMIT 1
         """,
@@ -122,6 +138,16 @@ def verify_task(
             "allowed_scope": "Host Bridge diagnostic only",
             "recheck": "provider_probe_contract",
         }
+        if spec["mode"] == "minimal" and passed and artifact is not None:
+            return _prepare_model_probe_checker_step(
+                store,
+                connection,
+                task,
+                spec,
+                artifact,
+                result,
+                started_at,
+            )
     elif spec["kind"] == "git_publish":
         try:
             manifest = json.loads(output_path.read_text()) if output_path else {}
@@ -216,24 +242,21 @@ def verify_task(
         / f"{acceptance_id}.json"
     )
     _write_atomic(evidence_path, evidence_body)
-    connection.execute(
-        """
-        INSERT INTO artifacts(
-            id, project_id, task_id, kind, path, sha256, bytes,
-            acceptance_id, revision, created_at
-        ) VALUES (?, ?, ?, 'evidence', ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            uuid4().hex,
-            task["project_id"],
-            task["id"],
-            store.relative_data_path(evidence_path),
-            hashlib.sha256(evidence_body).hexdigest(),
-            len(evidence_body),
-            acceptance_id,
-            task["spec_revision"],
-            now,
+    register_artifact(
+        store,
+        connection,
+        project_id=task["project_id"],
+        task_id=task["id"],
+        kind="evidence",
+        path=evidence_path,
+        stored_path=store.relative_data_path(evidence_path),
+        acceptance_id=acceptance_id,
+        revision=task["spec_revision"],
+        scope=task_data_scope(
+            result_coverage(json.loads(task["spec_json"]))
         ),
+        source_task_id=task["id"],
+        created_at=now,
     )
     connection.execute(
         """
@@ -256,31 +279,16 @@ def verify_task(
         ),
     )
     if passed:
-        if spec["kind"] != "git_publish":
-            _promote_verified_worker_template(
-                store, connection, task, evidence_path, now
-            )
-        connection.execute(
-            """
-            UPDATE tasks SET public_status = 'done', phase = 'done', wait_reason = NULL,
-                fault_code = NULL, next_action_at = NULL, next_action_kind = NULL,
-                outcome = 'done', updated_at = ?
-            WHERE id = ?
-            """,
-            (now, task["id"]),
-        )
-        archive_task_sessions(connection, task["id"], now)
+        finalize_task_terminal(connection, task["id"], "done", now)
     elif will_repair:
-        connection.execute(
-            """
-            UPDATE tasks SET public_status = 'in_progress', phase = 'repair',
-                wait_reason = ?,
-                fault_code = 'verification', retry_count = retry_count + 1,
-                next_action_at = ?, next_action_kind = 'repair',
-                updated_at = ? WHERE id = ?
-            """,
-            (
-                (
+        increment_task_retry(connection, task["id"], 1)
+        write_task_fields(
+            connection,
+            task["id"],
+            {
+                "public_status": "in_progress",
+                "phase": "repair",
+                "wait_reason": (
                     "Provider probe contract failed; bounded retry scheduled"
                     if spec["kind"] == "provider_probe"
                     else (
@@ -289,21 +297,20 @@ def verify_task(
                         else "output hash mismatch; deterministic repair scheduled"
                     )
                 ),
-                now,
-                now,
-                task["id"],
-            ),
+                "fault_code": "verification",
+                "next_action_at": now,
+                "next_action_kind": "repair",
+                "updated_at": now,
+            },
         )
     else:
-        connection.execute(
-            """
-            UPDATE tasks SET public_status = 'needs_decision', phase = 'verify',
-                wait_reason = ?,
-                fault_code = 'verification', next_action_at = NULL,
-                next_action_kind = NULL, outcome = NULL, updated_at = ? WHERE id = ?
-            """,
-            (
-                (
+        write_task_fields(
+            connection,
+            task["id"],
+            {
+                "public_status": "needs_decision",
+                "phase": "verify",
+                "wait_reason": (
                     "minimal Token probe did not produce verified terminal evidence"
                     if spec["kind"] == "provider_probe"
                     else (
@@ -312,9 +319,12 @@ def verify_task(
                         else "output hash does not satisfy acceptance"
                     )
                 ),
-                now,
-                task["id"],
-            ),
+                "fault_code": "verification",
+                "next_action_at": None,
+                "next_action_kind": None,
+                "outcome": None,
+                "updated_at": now,
+            },
         )
     connection.execute(
         """
@@ -326,81 +336,158 @@ def verify_task(
     return "verify"
 
 
-def _promote_verified_worker_template(
+def _prepare_model_probe_checker_step(
     store: Store,
     connection: sqlite3.Connection,
     task: sqlite3.Row,
-    evidence_path,
-    now: float,
-) -> None:
-    role_key = task["role_key"] or "fullstack"
-    item_key = "code_change" if role_key == "fullstack" else str(role_key)
-    existing = connection.execute(
+    spec: dict,
+    artifact: sqlite3.Row,
+    result: dict,
+    started_at: float,
+) -> CheckerStep:
+    artifact_ref, artifact_body = verified_artifact(
+        store,
+        artifact,
+        expected_source_task_id=task["id"],
+        expected_revision=task["spec_revision"],
+    )
+    try:
+        complete_result = json.loads(artifact_body)
+    except json.JSONDecodeError as error:
+        raise ValueError("minimal probe Artifact is not valid JSON") from error
+    if complete_result != result:
+        raise ValueError("minimal probe Artifact changed before Checker dispatch")
+    task_session_id, session_generation = current_session(
+        connection,
+        task["id"],
+        task["checker_role_key"] or "independent_checker",
+    )
+    generation = connection.execute(
         """
-        SELECT MAX(revision) AS revision FROM library_items
-        WHERE scope = 'project' AND project_id = ?
-          AND kind = 'worker_template' AND item_key = ?
+        SELECT provider_key, external_session_id FROM session_generations
+        WHERE task_session_id = ? AND generation = ?
         """,
-        (task["project_id"], item_key),
+        (task_session_id, session_generation),
     ).fetchone()
-    revision = int(existing["revision"] or 0) + 1
-    goal = connection.execute(
-        "SELECT objective FROM goals WHERE id = ?", (task["goal_id"],)
+    session = connection.execute(
+        "SELECT settings_json FROM task_sessions WHERE id = ?",
+        (task_session_id,),
     ).fetchone()
-    reuse_requested = bool(
-        goal and "以后都这样" in str(goal["objective"])
+    settings = json.loads(session["settings_json"]).get("values", {})
+    sequence = connection.execute(
+        """
+        SELECT COALESCE(MAX(sequence), 0) + 1 AS value
+        FROM host_jobs WHERE task_id = ?
+        """,
+        (task["id"],),
+    ).fetchone()["value"]
+    job_id = str(uuid4())
+    workspace_key = f"probe-{task['id']}"
+    execution = {
+        "subject": "model_probe",
+        "source_task_id": task["id"],
+        "source_revision": task["spec_revision"],
+        "artifact_ref": artifact_ref,
+        "artifact_sha256": artifact_ref["sha256"],
+        "artifact_bytes": artifact_ref["bytes"],
+        "acceptance_id": "provider_minimal_probe",
+        "probe_result": complete_result,
+    }
+    prompt = canonical_json(
+        {
+            "role": "Independent Checker",
+            "subject": "model_probe",
+            "task_spec": spec,
+            "acceptance": json.loads(task["acceptance_json"]),
+            "source_artifact": execution,
+            "rules": [
+                "Do not trust or consume Worker free chat.",
+                "Check the complete structured probe Artifact independently.",
+                "Confirm provider identity, model invocation, terminal success, marker, and token cap.",
+                "Do not modify files or create external effects.",
+            ],
+            "required_output": (
+                CHECKER_RESULT_PREFIX
+                + '{"verdict":"PASS|CHANGES_REQUIRED",'
+                '"acceptances":[{"acceptance_id":"provider_minimal_probe",'
+                '"passed":true,"actual_evidence":"bounded independent fact",'
+                '"recheck_command":"bounded recheck"}],'
+                '"decision_reason":null}'
+            ),
+        }
     )
-    if revision > 1 and not reuse_requested:
-        return
-    body = (
-        "# Project-verified Worker template\n\n"
-        f"Role: {role_key}\n"
-        "Use the frozen TaskSpec, stay inside the registered workspace, make only "
-        "recoverable changes, run bounded checks, and leave independent Evidence.\n"
-    ).encode()
-    path = (
-        store.data_root
-        / "projects"
-        / task["project_id"]
-        / "library"
-        / "worker-templates"
-        / f"{item_key}.revision-{revision:06d}.md"
-    )
-    _write_atomic(path, body)
+    dispatch = {
+        "prompt": prompt,
+        "access": "read",
+        "workspace_kind": "planner",
+        "workspace_key": workspace_key,
+        "check_subject": "model_probe",
+        "execution": execution,
+    }
     connection.execute(
         """
-        INSERT INTO library_items(
-            id, scope, project_id, kind, item_key, revision,
-            path, sha256, created_at
-        ) VALUES (?, 'project', ?, 'worker_template', ?, ?, ?, ?, ?)
+        INSERT INTO host_jobs(
+            id, task_id, task_session_id, session_generation,
+            spec_revision, sequence, purpose, status, started_at, dispatch_json
+        ) VALUES (?, ?, ?, ?, ?, ?, 'check', 'dispatching', ?, ?)
         """,
         (
-            uuid4().hex,
-            task["project_id"],
-            item_key,
-            revision,
-            store.relative_data_path(path),
-            hashlib.sha256(body).hexdigest(),
-            now,
+            job_id,
+            task["id"],
+            task_session_id,
+            session_generation,
+            task["spec_revision"],
+            sequence,
+            started_at,
+            canonical_json(dispatch),
         ),
+    )
+    write_task_fields(
+        connection,
+        task["id"],
+        {
+            "public_status": "in_progress",
+            "phase": "check_call",
+            "wait_reason": None,
+            "fault_code": None,
+            "next_action_at": started_at,
+            "next_action_kind": "check",
+            "updated_at": started_at,
+        },
     )
     connection.execute(
         """
         INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
-        VALUES (?, ?, 'worker_template_promoted', ?, ?)
+        VALUES (?, ?, 'model_probe_checker_prepared', ?, ?)
         """,
         (
             task["project_id"],
             task["id"],
             canonical_json(
                 {
-                    "item_key": item_key,
-                    "revision": revision,
-                    "evidence_ref": store.relative_data_path(evidence_path),
+                    "host_job_id": job_id,
+                    "artifact_ref": artifact_ref["path"],
+                    "artifact_sha256": artifact_ref["sha256"],
                 }
             ),
-            now,
+            started_at,
         ),
+    )
+    return CheckerStep(
+        "start",
+        task["project_id"],
+        task["id"],
+        job_id,
+        generation["provider_key"],
+        "",
+        prompt,
+        generation["external_session_id"],
+        int(settings.get("max_runtime_seconds", 600)),
+        execution,
+        _context_policy(settings),
+        "planner",
+        workspace_key,
+        selected_model(settings, generation["provider_key"]),
     )
 
 
@@ -412,17 +499,23 @@ def _prepare_checker_step(
     started_at: float,
 ) -> str | CheckerStep:
     execution = _execution_manifest(store, connection, task)
-    report, report_error = _provider_report(store, execution)
+    report, report_error = _provider_report(
+        store, connection, task, execution
+    )
     if report_error:
         now = time.time()
-        connection.execute(
-            """
-            UPDATE tasks SET public_status = 'needs_decision', phase = 'verify',
-                wait_reason = ?, fault_code = 'verification',
-                next_action_at = NULL, next_action_kind = NULL, updated_at = ?
-            WHERE id = ?
-            """,
-            (report_error, now, task["id"]),
+        write_task_fields(
+            connection,
+            task["id"],
+            {
+                "public_status": "needs_decision",
+                "phase": "verify",
+                "wait_reason": report_error,
+                "fault_code": "verification",
+                "next_action_at": None,
+                "next_action_kind": None,
+                "updated_at": now,
+            },
         )
         connection.execute(
             """
@@ -478,17 +571,36 @@ def _prepare_checker_step(
             task["spec_revision"],
             sequence,
             started_at,
-            canonical_json({"prompt": prompt, "access": "read"}),
+            canonical_json(
+                {
+                    "prompt": prompt,
+                    "access": "read",
+                    "workspace_kind": (
+                        "planner"
+                        if spec.get("butler_semantic_query")
+                        else "project"
+                    ),
+                    "workspace_key": (
+                        spec.get("butler_workspace_key")
+                        if spec.get("butler_semantic_query")
+                        else None
+                    ),
+                }
+            ),
         ),
     )
-    connection.execute(
-        """
-        UPDATE tasks SET public_status = 'in_progress', phase = 'check_call',
-            wait_reason = NULL, fault_code = NULL, next_action_at = ?,
-            next_action_kind = 'check', updated_at = ?
-        WHERE id = ?
-        """,
-        (started_at, started_at, task["id"]),
+    write_task_fields(
+        connection,
+        task["id"],
+        {
+            "public_status": "in_progress",
+            "phase": "check_call",
+            "wait_reason": None,
+            "fault_code": None,
+            "next_action_at": started_at,
+            "next_action_kind": "check",
+            "updated_at": started_at,
+        },
     )
     connection.execute(
         """
@@ -514,6 +626,17 @@ def _prepare_checker_step(
         int(settings.get("max_runtime_seconds", 600)),
         execution,
         _context_policy(settings),
+        (
+            "planner"
+            if spec.get("butler_semantic_query")
+            else "project"
+        ),
+        (
+            str(spec["butler_workspace_key"])
+            if spec.get("butler_semantic_query")
+            else None
+        ),
+        model=selected_model(settings, generation["provider_key"]),
     )
 
 
@@ -544,11 +667,21 @@ def pending_checker_step(
     ).fetchone()
     settings = json.loads(session["settings_json"])["values"]
     spec = json.loads(task["spec_json"])
-    execution = _execution_manifest(store, connection, task)
-    prompt = str(
-        json.loads(job["dispatch_json"]).get("prompt")
-        or _checker_prompt(task, spec, execution, _provider_report(store, execution)[0])
-    )
+    dispatch = json.loads(job["dispatch_json"])
+    if dispatch.get("check_subject"):
+        execution = dict(dispatch.get("execution") or {})
+        prompt = str(dispatch["prompt"])
+    else:
+        execution = _execution_manifest(store, connection, task)
+        prompt = str(
+            dispatch.get("prompt")
+            or _checker_prompt(
+                task,
+                spec,
+                execution,
+                _provider_report(store, connection, task, execution)[0],
+            )
+        )
     return CheckerStep(
         "start" if job["status"] == "dispatching" else "poll",
         task["project_id"],
@@ -561,6 +694,13 @@ def pending_checker_step(
         int(settings.get("max_runtime_seconds", 600)),
         execution,
         _context_policy(settings),
+        str(dispatch.get("workspace_kind") or "project"),
+        (
+            str(dispatch["workspace_key"])
+            if dispatch.get("workspace_key")
+            else None
+        ),
+        selected_model(settings, generation["provider_key"]),
     )
 
 
@@ -576,6 +716,9 @@ def perform_checker_step(step: CheckerStep) -> dict[str, object]:
                 timeout_seconds=step.timeout_seconds,
                 context_policy=step.context_policy,
                 access="read",
+                workspace_kind=step.workspace_kind,
+                workspace_key=step.workspace_key,
+                model=step.model,
             )
             if step.kind == "start"
             else provider_job_status(step.job_id)
@@ -583,7 +726,11 @@ def perform_checker_step(step: CheckerStep) -> dict[str, object]:
         return {
             "ok": True,
             "state": state,
-            "output": provider_job_output(step.job_id),
+            "output": provider_job_output(
+                step.job_id,
+                complete=str(state.get("status"))
+                not in ACTIVE_HOST_JOB_STATUSES,
+            ),
         }
     except HostBridgeError as error:
         return {
@@ -634,27 +781,31 @@ def apply_checker_step(
                 (now, canonical_json(dispatch), job["id"]),
             )
             fallback = _fallback_provider_generation(
-                connection, task, job, step.provider_key, now
+                store, connection, task, job, step.provider_key, now
             )
-            connection.execute(
-                """
-                UPDATE tasks SET public_status = ?, phase = ?, wait_reason = ?,
-                    fault_code = 'provider', next_action_at = ?,
-                    next_action_kind = ?, updated_at = ? WHERE id = ?
-                """,
-                (
-                    "in_progress" if fallback else "needs_decision",
-                    "verify" if fallback else "provider_recovery",
-                    (
+            retry_job_id = (
+                _enqueue_checker_fallback(connection, task, job, now)
+                if fallback
+                else None
+            )
+            write_task_fields(
+                connection,
+                task["id"],
+                {
+                    "public_status": (
+                        "in_progress" if fallback else "needs_decision"
+                    ),
+                    "phase": "check_call" if fallback else "provider_recovery",
+                    "wait_reason": (
                         f"Checker start was rejected; falling back to {fallback}"
                         if fallback
                         else "Host Bridge rejected the Checker before acceptance"
                     ),
-                    now if fallback else None,
-                    "check" if fallback else None,
-                    now,
-                    task["id"],
-                ),
+                    "fault_code": "provider",
+                    "next_action_at": now if fallback else None,
+                    "next_action_kind": "check" if fallback else None,
+                    "updated_at": now,
+                },
             )
             connection.execute(
                 """
@@ -671,6 +822,7 @@ def apply_checker_step(
                             "provider_key": step.provider_key,
                             "http_status": facts.get("error_status"),
                             "fallback": fallback,
+                            "retry_host_job_id": retry_job_id,
                         }
                     ),
                     now,
@@ -690,30 +842,32 @@ def apply_checker_step(
             "UPDATE host_jobs SET dispatch_json = ? WHERE id = ?",
             (canonical_json(dispatch), job["id"]),
         )
-        connection.execute(
-            """
-            UPDATE tasks SET public_status = ?, phase = ?,
-                wait_reason = ?, fault_code = ?, next_action_at = ?,
-                next_action_kind = ?, updated_at = ? WHERE id = ?
-            """,
-            (
-                "needs_decision" if exhausted else "in_progress",
-                "provider_recovery" if exhausted else task["phase"],
-                (
+        write_task_fields(
+            connection,
+            task["id"],
+            {
+                "public_status": (
+                    "needs_decision" if exhausted else "in_progress"
+                ),
+                "phase": (
+                    "provider_recovery" if exhausted else task["phase"]
+                ),
+                "wait_reason": (
                     "independent Checker outcome is unknown; reconcile or cancel the HostJob"
                     if exhausted
                     else "Checker HostJob unavailable; idempotent reconcile scheduled"
                 ),
-                "unsafe_unknown" if exhausted else "transport",
-                None if exhausted else now + max(
+                "fault_code": (
+                    "unsafe_unknown" if exhausted else "transport"
+                ),
+                "next_action_at": None if exhausted else now + max(
                     1, int(values.get("retry_backoff_seconds", 0))
                 ),
-                None if exhausted else (
+                "next_action_kind": None if exhausted else (
                     "check" if job["status"] == "dispatching" else "check_poll"
                 ),
-                now,
-                task["id"],
-            ),
+                "updated_at": now,
+            },
         )
         connection.execute(
             """
@@ -749,12 +903,15 @@ def apply_checker_step(
                 """,
                 (state["session_id"], job["task_session_id"], job["session_generation"]),
             )
-        connection.execute(
-            """
-            UPDATE tasks SET phase = 'check_wait', next_action_at = ?,
-                next_action_kind = 'check_poll', updated_at = ? WHERE id = ?
-            """,
-            (now + 1, now, task["id"]),
+        write_task_fields(
+            connection,
+            task["id"],
+            {
+                "phase": "check_wait",
+                "next_action_at": now + 1,
+                "next_action_kind": "check_poll",
+                "updated_at": now,
+            },
         )
         return "check_wait"
     spec = json.loads(task["spec_json"])
@@ -778,13 +935,15 @@ def apply_checker_step(
             job["task_session_id"],
             job["session_generation"],
             step.provider_key,
-            "single",
+            str(checker.get("usage_kind") or "cumulative"),
             int(checker["input_tokens"]),
             int(checker["cached_input_tokens"]),
             int(checker["output_tokens"]),
             str(checker["model"]),
         )
-        if model_budget_reached(connection, task["id"]):
+        budget_fact = model_budget_fact(connection, task["id"])
+        if budget_fact:
+            apply_model_budget_fact(connection, task["id"], budget_fact)
             connection.execute(
                 """
                 UPDATE host_jobs SET status = 'succeeded', ended_at = ?,
@@ -799,9 +958,6 @@ def apply_checker_step(
     )
     if not checker_completed:
         now = time.time()
-        fallback = _fallback_provider_generation(
-            connection, task, job, step.provider_key, now
-        )
         connection.execute(
             """
             UPDATE host_jobs SET status = 'failed', ended_at = ?, returncode = ?,
@@ -809,25 +965,32 @@ def apply_checker_step(
             """,
             (now, checker["returncode"], job["id"]),
         )
-        connection.execute(
-            """
-            UPDATE tasks SET public_status = ?, phase = ?, wait_reason = ?,
-                fault_code = 'provider', next_action_at = ?,
-                next_action_kind = ?, updated_at = ? WHERE id = ?
-            """,
-            (
-                "in_progress" if fallback else "needs_decision",
-                "verify" if fallback else "provider_recovery",
-                (
+        fallback = _fallback_provider_generation(
+            store, connection, task, job, step.provider_key, now
+        )
+        retry_job_id = (
+            _enqueue_checker_fallback(connection, task, job, now)
+            if fallback
+            else None
+        )
+        write_task_fields(
+            connection,
+            task["id"],
+            {
+                "public_status": (
+                    "in_progress" if fallback else "needs_decision"
+                ),
+                "phase": "check_call" if fallback else "provider_recovery",
+                "wait_reason": (
                     f"Checker Provider failed; falling back to {fallback}"
                     if fallback
                     else "independent Checker exhausted all frozen Provider candidates"
                 ),
-                now if fallback else None,
-                "check" if fallback else None,
-                now,
-                task["id"],
-            ),
+                "fault_code": "provider",
+                "next_action_at": now if fallback else None,
+                "next_action_kind": "check" if fallback else None,
+                "updated_at": now,
+            },
         )
         connection.execute(
             """
@@ -842,12 +1005,24 @@ def apply_checker_step(
                         "host_job_id": job["id"],
                         "provider_key": step.provider_key,
                         "fallback": fallback,
+                        "retry_host_job_id": retry_job_id,
                     }
                 ),
                 now,
             ),
         )
         return "checker_fallback" if fallback else "needs_decision"
+    subject = str(step.execution.get("subject") or "")
+    if subject in {"planner", "model_probe"}:
+        return _finalize_special_model_checker(
+            store,
+            connection,
+            task,
+            job,
+            step,
+            checker,
+            subject,
+        )
     checker_stdout = str(checker["stdout"])
     workspace_changed = bool(step.execution.get("workspace_changed"))
     workspace_change_required = bool(
@@ -974,30 +1149,16 @@ def apply_checker_step(
         ),
     )
     if passed:
-        _promote_verified_worker_template(
-            store, connection, task, evidence_path, now
-        )
-        connection.execute(
-            """
-            UPDATE tasks SET public_status = 'done', phase = 'done', wait_reason = NULL,
-                fault_code = NULL, next_action_at = NULL, next_action_kind = NULL,
-                outcome = 'done', updated_at = ?
-            WHERE id = ?
-            """,
-            (now, task["id"]),
-        )
-        archive_task_sessions(connection, task["id"], now)
+        finalize_task_terminal(connection, task["id"], "done", now)
     elif will_repair:
-        connection.execute(
-            """
-            UPDATE tasks SET public_status = 'in_progress', phase = 'repair',
-                wait_reason = ?, fault_code = 'verification',
-                retry_count = retry_count + 1, next_action_at = ?,
-                next_action_kind = 'repair', updated_at = ?
-            WHERE id = ?
-            """,
-            (
-                (
+        increment_task_retry(connection, task["id"], 1)
+        write_task_fields(
+            connection,
+            task["id"],
+            {
+                "public_status": "in_progress",
+                "phase": "repair",
+                "wait_reason": (
                     "No required workspace delta was proven"
                     if workspace_change_required and not workspace_changed
                     else (
@@ -1005,20 +1166,20 @@ def apply_checker_step(
                         + canonical_json(verdict["repair_package"])[:4000]
                     )
                 ),
-                now,
-                now,
-                task["id"],
-            ),
+                "fault_code": "verification",
+                "next_action_at": now,
+                "next_action_kind": "repair",
+                "updated_at": now,
+            },
         )
     else:
-        connection.execute(
-            """
-            UPDATE tasks SET public_status = 'needs_decision', phase = 'verify',
-                wait_reason = ?, fault_code = 'verification', next_action_at = NULL,
-                next_action_kind = NULL, outcome = NULL, updated_at = ? WHERE id = ?
-            """,
-            (
-                (
+        write_task_fields(
+            connection,
+            task["id"],
+            {
+                "public_status": "needs_decision",
+                "phase": "verify",
+                "wait_reason": (
                     "code task produced no required workspace delta"
                     if workspace_change_required and not workspace_changed
                     else (
@@ -1026,9 +1187,12 @@ def apply_checker_step(
                         or "independent checker contract did not prove every acceptance"
                     )
                 ),
-                now,
-                task["id"],
-            ),
+                "fault_code": "verification",
+                "next_action_at": None,
+                "next_action_kind": None,
+                "outcome": None,
+                "updated_at": now,
+            },
         )
     connection.execute(
         """
@@ -1040,12 +1204,164 @@ def apply_checker_step(
     return "verify"
 
 
+def _enqueue_checker_fallback(
+    connection: sqlite3.Connection,
+    task: sqlite3.Row,
+    failed_job: sqlite3.Row,
+    now: float,
+) -> str:
+    generation = connection.execute(
+        """
+        SELECT generation FROM session_generations
+        WHERE task_session_id = ? AND status = 'active'
+        ORDER BY generation DESC LIMIT 1
+        """,
+        (failed_job["task_session_id"],),
+    ).fetchone()
+    if not generation:
+        raise RuntimeError("Checker fallback has no active SessionGeneration")
+    sequence = connection.execute(
+        """
+        SELECT COALESCE(MAX(sequence), 0) + 1 AS value
+        FROM host_jobs WHERE task_id = ?
+        """,
+        (task["id"],),
+    ).fetchone()["value"]
+    dispatch = json.loads(
+        connection.execute(
+            "SELECT dispatch_json FROM host_jobs WHERE id = ?",
+            (failed_job["id"],),
+        ).fetchone()["dispatch_json"]
+    )
+    dispatch.pop("reconcile_failures", None)
+    dispatch["fallback_from_host_job_id"] = failed_job["id"]
+    retry_job_id = str(uuid4())
+    connection.execute(
+        """
+        INSERT INTO host_jobs(
+            id, task_id, task_session_id, session_generation,
+            spec_revision, sequence, purpose, status, started_at, dispatch_json
+        ) VALUES (?, ?, ?, ?, ?, ?, 'check', 'dispatching', ?, ?)
+        """,
+        (
+            retry_job_id,
+            task["id"],
+            failed_job["task_session_id"],
+            generation["generation"],
+            task["spec_revision"],
+            sequence,
+            now,
+            canonical_json(dispatch),
+        ),
+    )
+    return retry_job_id
+
+
+def _finalize_special_model_checker(
+    store: Store,
+    connection: sqlite3.Connection,
+    task: sqlite3.Row,
+    job: sqlite3.Row,
+    step: CheckerStep,
+    checker: dict[str, object],
+    subject: str,
+) -> str:
+    acceptance_id = (
+        "planner_contract"
+        if subject == "planner"
+        else "provider_minimal_probe"
+    )
+    checker_stdout = str(checker["stdout"])
+    verdict = _parse_checker_verdict(
+        provider_agent_text(checker_stdout),
+        [{"id": acceptance_id, "expected": f"{subject} result contract"}],
+        "Planner Artifact" if subject == "planner" else "Provider probe Evidence",
+    )
+    passed = bool(
+        checker["returncode"] == 0
+        and verdict["valid"]
+        and verdict["passed"]
+    )
+    now = time.time()
+    evidence = {
+        "subject": subject,
+        "source_task_id": task["id"],
+        "source_revision": task["spec_revision"],
+        "source_artifact": step.execution,
+        "checker_provider": step.provider_key,
+        "checker_returncode": checker["returncode"],
+        "checker_output_sha256": hashlib.sha256(
+            checker_stdout.encode()
+        ).hexdigest(),
+        "checker_contract_valid": verdict["valid"],
+        "checker_verdict": verdict["verdict"],
+        "acceptances": verdict["acceptances"],
+        "decision_reason": verdict["decision_reason"],
+        "passed": passed,
+        "status": "PASS" if passed else "CHANGES_REQUIRED",
+        "verified_at": now,
+    }
+    evidence_path = (
+        store.data_root
+        / "projects"
+        / task["project_id"]
+        / "tasks"
+        / task["id"]
+        / "artifacts"
+        / f"revision-{task['spec_revision']:06d}"
+        / f"check-{job['sequence']:06d}"
+        / "evidence"
+        / f"{subject}-checker-verdict.json"
+    )
+    _record_checker_evidence(
+        store,
+        connection,
+        task,
+        evidence_path,
+        evidence,
+        acceptance_id,
+        now,
+    )
+    connection.execute(
+        """
+        UPDATE host_jobs SET status = 'succeeded', ended_at = ?, returncode = 0,
+            output_ref = ?, failure_code = NULL WHERE id = ?
+        """,
+        (now, store.relative_data_path(evidence_path), job["id"]),
+    )
+    if passed:
+        return (
+            "planner_checker_pass"
+            if subject == "planner"
+            else "probe_checker_pass"
+        )
+    write_task_fields(
+        connection,
+        task["id"],
+        {
+            "public_status": "needs_decision",
+            "phase": "plan" if subject == "planner" else "verify",
+            "wait_reason": (
+                verdict["decision_reason"]
+                or f"independent Checker rejected the {subject} result"
+            ),
+            "fault_code": "verification",
+            "next_action_at": None,
+            "next_action_kind": None,
+            "updated_at": now,
+        },
+    )
+    return "needs_decision"
+
+
 def _execution_manifest(
     store: Store, connection: sqlite3.Connection, task: sqlite3.Row
 ) -> dict:
     artifact = connection.execute(
         """
-        SELECT path FROM artifacts
+        SELECT kind, path, sha256, bytes, acceptance_id, revision,
+               scope_json, source_task_id
+        FROM artifacts
         WHERE task_id = ? AND kind = 'output' AND revision = ?
           AND path LIKE '%/provider-execution.json'
         ORDER BY created_at DESC, rowid DESC LIMIT 1
@@ -1053,25 +1369,156 @@ def _execution_manifest(
         (task["id"], task["spec_revision"]),
     ).fetchone()
     if not artifact:
-        return {}
+        return {"manifest_error": "Provider execution manifest is missing"}
     try:
-        value = json.loads(store.resolve_data_path(artifact["path"]).read_text())
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return value if isinstance(value, dict) else {}
+        _entry, body = verified_artifact(
+            store,
+            artifact,
+            expected_source_task_id=task["id"],
+            expected_revision=task["spec_revision"],
+        )
+        value = json.loads(body)
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        return {
+            "manifest_error": (
+                f"Provider execution manifest failed verification: "
+                f"{type(error).__name__}"
+            )
+        }
+    if not isinstance(value, dict) or value.get("manifest_version") != 2:
+        return {"manifest_error": "Provider execution manifest version is invalid"}
+    if value.get("formal_result_error"):
+        return {"manifest_error": str(value["formal_result_error"])[:500]}
+    spec = json.loads(task["spec_json"])
+    expected_contract = spec.get("task_contract", {}).get("result", {})
+    if value.get("result_contract") != expected_contract:
+        return {"manifest_error": "formal result contract does not match TaskSpec"}
+    result_entries = value.get("result_artifacts")
+    if not isinstance(result_entries, list) or not result_entries:
+        return {"manifest_error": "formal result manifest is empty"}
+    for entry in result_entries:
+        if not isinstance(entry, dict):
+            return {"manifest_error": "formal result entry is invalid"}
+        row = connection.execute(
+            """
+            SELECT kind, path, sha256, bytes, acceptance_id, revision,
+                   scope_json, source_task_id
+            FROM artifacts
+            WHERE task_id = ? AND kind = ? AND path = ? AND revision = ?
+            ORDER BY rowid DESC LIMIT 1
+            """,
+            (
+                task["id"],
+                entry.get("kind"),
+                entry.get("path"),
+                task["spec_revision"],
+            ),
+        ).fetchone()
+        if not row:
+            return {"manifest_error": "formal result Artifact index is missing"}
+        try:
+            scope = json.loads(row["scope_json"])
+        except json.JSONDecodeError:
+            return {"manifest_error": "formal result Artifact scope is invalid"}
+        indexed = {
+            "kind": row["kind"],
+            "path": row["path"],
+            "sha256": row["sha256"],
+            "bytes": row["bytes"],
+            "acceptance_id": row["acceptance_id"],
+            "revision": row["revision"],
+            "scope": scope,
+            "source_task_id": row["source_task_id"],
+        }
+        if indexed != entry:
+            return {
+                "manifest_error": (
+                    "formal result Artifact path/hash/revision/scope/source mismatch"
+                )
+            }
+        if scope.get("kind") == "task_data":
+            try:
+                verified_artifact(
+                    store,
+                    row,
+                    expected_source_task_id=task["id"],
+                    expected_revision=task["spec_revision"],
+                )
+            except (OSError, ValueError):
+                return {
+                    "manifest_error": (
+                        "formal result Artifact content failed "
+                        "path/bytes/SHA-256 verification"
+                    )
+                }
+        elif scope.get("kind") == "workspace":
+            snapshot = workspace_snapshot(
+                str(scope["workspace_root"]), [str(row["path"])]
+            )
+            current = next(
+                (
+                    item
+                    for item in snapshot.get("requested", [])
+                    if isinstance(item, dict)
+                    and item.get("path") == row["path"]
+                ),
+                None,
+            )
+            if (
+                not isinstance(current, dict)
+                or current.get("sha256") != row["sha256"]
+                or current.get("bytes") != row["bytes"]
+            ):
+                return {
+                    "manifest_error": (
+                        "workspace Artifact changed after execution snapshot"
+                    )
+                }
+    return value
 
 
 def _provider_report(
-    store: Store, execution: dict
+    store: Store,
+    connection: sqlite3.Connection,
+    task: sqlite3.Row,
+    execution: dict,
 ) -> tuple[str, str | None]:
+    if execution.get("manifest_error"):
+        return "", str(execution["manifest_error"])
+    result_type = execution.get("result_contract", {}).get("type")
+    if result_type != "evidence":
+        return "", None
     report_ref = str(execution.get("provider_report_ref") or "")
     expected_sha256 = str(execution.get("provider_report_sha256") or "")
     if not report_ref or not expected_sha256:
+        if any(
+            isinstance(entry, dict)
+            and entry.get("acceptance_id") == "structured_result"
+            for entry in execution.get("result_artifacts", [])
+        ):
+            return "", None
         return "", "Provider report artifact is missing; Checker was not started"
     if execution.get("provider_report_truncated"):
         return "", "Provider report artifact exceeded its frozen bound"
+    artifact = connection.execute(
+        """
+        SELECT kind, path, sha256, bytes, acceptance_id, revision,
+               scope_json, source_task_id
+        FROM artifacts
+        WHERE task_id = ? AND kind = 'output' AND path = ? AND revision = ?
+        ORDER BY rowid DESC LIMIT 1
+        """,
+        (task["id"], report_ref, task["spec_revision"]),
+    ).fetchone()
+    if not artifact:
+        return "", "Provider report Artifact index is missing"
     try:
-        body = store.resolve_data_path(report_ref).read_bytes()
+        _entry, body = verified_artifact(
+            store,
+            artifact,
+            expected_source_task_id=task["id"],
+            expected_revision=task["spec_revision"],
+        )
     except (OSError, ValueError):
         return "", "Provider report artifact cannot be read; Checker was not started"
     if hashlib.sha256(body).hexdigest() != expected_sha256:
@@ -1111,6 +1558,7 @@ def _checker_result(
         "input_tokens": input_tokens,
         "cached_input_tokens": cached_tokens,
         "output_tokens": max(0, int(state.get("output_tokens") or 0)),
+        "usage_kind": str(state.get("usage_kind") or "cumulative"),
         "model": str(state.get("model") or step.provider_key),
     }
 
@@ -1145,17 +1593,20 @@ def _checker_prompt(
             else ""
         )
         +
-        "Persisted Provider report artifact "
-        f"{execution.get('provider_report_ref')} "
-        f"(sha256={execution.get('provider_report_sha256')}, "
-        f"bytes={execution.get('provider_report_bytes')}):\n"
-        f"{report}\n"
+        "Frozen formal result manifest (references only; never Worker chat): "
+        f"{canonical_json({'result_contract': execution.get('result_contract'), 'result_artifacts': execution.get('result_artifacts')})}\n"
+        "Open and verify every declared workspace Artifact/diff against its "
+        "path, SHA-256, revision, scope, source Task and coverage. For internal "
+        "Evidence, use only the verified manifest reference; independently "
+        "recheck the Task against the workspace and frozen TaskSpec.\n"
         f"Finish with one line beginning {CHECKER_RESULT_PREFIX!r} followed by one JSON object. "
         'Use {"verdict":"PASS|CHANGES_REQUIRED|NEEDS_DECISION",'
         '"acceptances":[{"acceptance_id":"...","passed":true,'
         '"actual_evidence":"bounded fact","recheck_command":"bounded command"}],'
         '"decision_reason":null}. Include every frozen acceptance_id exactly once. '
-        "Do not modify files, commit, deploy, send messages, or create external effects."
+        "Never ask the owner directly; use NEEDS_DECISION plus decision_reason as the "
+        "only structured blocker fact. Do not modify files, commit, deploy, send messages, "
+        "or create external effects."
     )
 
 
@@ -1246,22 +1697,19 @@ def _record_checker_evidence(
 ) -> None:
     body = json.dumps(evidence, ensure_ascii=False, sort_keys=True).encode()
     _write_atomic(path, body)
-    connection.execute(
-        """
-        INSERT INTO artifacts(
-            id, project_id, task_id, kind, path, sha256, bytes,
-            acceptance_id, revision, created_at
-        ) VALUES (?, ?, ?, 'evidence', ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            uuid4().hex,
-            task["project_id"],
-            task["id"],
-            store.relative_data_path(path),
-            hashlib.sha256(body).hexdigest(),
-            len(body),
-            acceptance_id,
-            task["spec_revision"],
-            now,
+    register_artifact(
+        store,
+        connection,
+        project_id=task["project_id"],
+        task_id=task["id"],
+        kind="evidence",
+        path=path,
+        stored_path=store.relative_data_path(path),
+        acceptance_id=acceptance_id,
+        revision=task["spec_revision"],
+        scope=task_data_scope(
+            result_coverage(json.loads(task["spec_json"]))
         ),
+        source_task_id=task["id"],
+        created_at=now,
     )

@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import sqlite3
 import time
 from uuid import uuid4
 
+from .artifact_contract import (
+    register_artifact,
+    task_data_scope,
+    verified_artifact,
+)
 from .butler import sync_conversation_files
 from .execution import (
     ProbeStep,
@@ -30,14 +36,21 @@ from .execution import (
     rotate_task_sessions,
 )
 from .intake import (
+    _artifact_matches_declared_path,
     canonical_json,
     declared_step_count,
     extract_git_publish_spec,
     normalize_instruction,
 )
+from .lifecycle_state import (
+    apply_model_budget_fact,
+    finalize_task_terminal,
+    lifecycle_write_scope,
+    write_task_fields,
+)
 from .planner import (
     PlannerStep,
-    classify_instruction,
+    instruction_facts,
     normalize_plan,
     parse_planner_result,
     perform_planner_step,
@@ -45,8 +58,10 @@ from .planner import (
 )
 from .provider import (
     ACTIVE_HOST_JOB_STATUSES,
-    model_budget_reached,
+    CHECKER_RESULT_PREFIX,
+    model_budget_fact,
     record_model_call,
+    selected_model,
 )
 from .store import Store, write_atomic as _write_atomic
 from .verification import (
@@ -65,6 +80,13 @@ class LeaseLost(RuntimeError):
 
 
 def advance_project(store: Store, project_id: str, lease_token: str, fence: int) -> str:
+    with lifecycle_write_scope("advance_project"):
+        return _advance_project_owned(store, project_id, lease_token, fence)
+
+
+def _advance_project_owned(
+    store: Store, project_id: str, lease_token: str, fence: int
+) -> str:
     result = _advance_project_transaction(store, project_id, lease_token, fence)
     if isinstance(result, (ProviderStep, ProbeStep, CheckerStep, PlannerStep)):
         with store.transaction() as connection:
@@ -100,6 +122,14 @@ def advance_project(store: Store, project_id: str, lease_token: str, fence: int)
                 outcome = apply_probe_step(store, connection, result, facts)
             elif isinstance(result, CheckerStep):
                 outcome = apply_checker_step(store, connection, result, facts)
+                if outcome == "planner_checker_pass":
+                    outcome = _consume_checked_planner(
+                        store, connection, result, time.time()
+                    )
+                elif outcome == "probe_checker_pass":
+                    outcome = _complete_checked_model_probe(
+                        store, connection, result, time.time()
+                    )
             elif isinstance(result, PlannerStep):
                 outcome = _apply_planner_step(store, connection, result, facts)
             else:
@@ -111,6 +141,51 @@ def advance_project(store: Store, project_id: str, lease_token: str, fence: int)
         _ensure_project_question(connection, project_id)
     sync_conversation_files(store, project_id)
     return outcome
+
+
+def record_checkpoint_failure(
+    store: Store, project_id: str, error: ValueError
+) -> None:
+    now = time.time()
+    with lifecycle_write_scope("advance_project"):
+        with store.transaction() as connection:
+            task = connection.execute(
+                """
+                SELECT id FROM tasks
+                WHERE project_id = ? AND outcome IS NULL
+                ORDER BY created_at, rowid LIMIT 1
+                """,
+                (project_id,),
+            ).fetchone()
+            if not task:
+                return
+            detail = str(error)[:500]
+            write_task_fields(
+                connection,
+                task["id"],
+                {
+                    "public_status": "needs_decision",
+                    "phase": "provider_recovery",
+                    "fault_code": "scope",
+                    "wait_reason": detail,
+                    "next_action_at": None,
+                    "next_action_kind": None,
+                    "updated_at": now,
+                },
+            )
+            connection.execute(
+                """
+                INSERT INTO task_events(
+                    project_id, task_id, kind, detail_json, created_at
+                ) VALUES (?, ?, 'checkpoint_failed', ?, ?)
+                """,
+                (
+                    project_id,
+                    task["id"],
+                    canonical_json({"error": detail}),
+                    now,
+                ),
+            )
 
 
 def _assert_lease(
@@ -151,6 +226,7 @@ def _advance_project_transaction(
                 "archive_project",
                 "set_project_setting",
                 "set_project_rule",
+                "promote_script",
                 "global_route",
             }:
                 return _apply_project_action(store, connection, action)
@@ -173,7 +249,7 @@ def _advance_project_transaction(
             if (
                 task["deadline_at"] is not None
                 and task["deadline_at"] <= time.time()
-                and task["phase"] != "stopping"
+                and task["phase"] not in {"timeout_reconcile", "stopping"}
             ):
                 return _handle_task_deadline(connection, task)
             if task["phase"] == "plan":
@@ -196,6 +272,13 @@ def _advance_project_transaction(
                 "probe_wait",
             }:
                 return pending_probe_step(connection, task)
+            if task["phase"] == "timeout_reconcile":
+                spec = json.loads(task["spec_json"])
+                return (
+                    pending_probe_step(connection, task)
+                    if spec["kind"] == "provider_probe"
+                    else pending_provider_step(connection, task)
+                )
             if task["phase"] == "stopping":
                 spec = json.loads(task["spec_json"])
                 return (
@@ -229,7 +312,7 @@ def _advance_project_transaction(
             (project_id,),
         ).fetchone()
         if message:
-            return _create_task(connection, message)
+            return _create_task(store, connection, message)
 
         broken = connection.execute(
             """
@@ -303,7 +386,9 @@ def _advance_project_transaction(
         return "idle"
 
 
-def _create_task(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
+def _create_task(
+    store: Store, connection: sqlite3.Connection, message: sqlite3.Row
+) -> str:
     now = time.time()
     connection.execute(
         "UPDATE projects SET archived_at = NULL WHERE id = ?",
@@ -312,62 +397,25 @@ def _create_task(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
     goal_id = uuid4().hex
     plan_id = uuid4().hex
     task_id = uuid4().hex
-    spec, acceptance = normalize_instruction(message["content"])
-    if spec["kind"] == "git_publish":
-        spec = {
-            **spec,
-            "authorization": {
-                "source_message_id": message["id"],
-                "project_id": message["project_id"],
-                "task_id": task_id,
-                "spec_revision": 1,
-                "action_kind": "git_publish",
-                "target_scope": (
-                    f"{spec['remote_ssh']}#refs/heads/{spec['branch']}"
-                ),
-                "expires_at": now + 900,
-            },
-        }
-    classification = classify_instruction(message["content"], str(spec["kind"]))
-    automatic_planning = classification["size"] == "large"
-    if automatic_planning:
-        project = connection.execute(
-            "SELECT host_path FROM projects WHERE id = ?", (message["project_id"],)
-        ).fetchone()
-        project_path = str((project["host_path"] if project else "") or "")
-        supported = bool(project_path)
-        spec = {
-            **spec,
-            "classification": classification,
-            "project_path": project_path,
-        }
-        role_key = "planner"
-        provider_key = _first_provider(connection, message["project_id"], role_key)
-        checker_role = "independent_checker"
-        checker_provider = _first_provider(
-            connection, message["project_id"], checker_role
-        )
-        reason = (
-            None
-            if supported
-            else "project workspace is not bound; set an absolute Host Bridge path"
-        )
-    else:
-        (
-            supported,
-            spec,
-            role_key,
-            provider_key,
-            checker_role,
-            checker_provider,
-            reason,
-        ) = _runtime_contract(connection, message["project_id"], spec)
-    public_status = "pending" if supported else "needs_decision"
-    phase = ("plan" if automatic_planning else "execute") if supported else "intake"
-    fault = None if supported else (
-        "credential" if spec["kind"] == "authorization_required" else "scope"
+    normalized_candidate, acceptance = normalize_instruction(message["content"])
+    facts = instruction_facts(
+        message["content"], str(normalized_candidate["kind"])
     )
-    outcome = None
+    project = connection.execute(
+        "SELECT host_path FROM projects WHERE id = ?", (message["project_id"],)
+    ).fetchone()
+    project_path = str((project["host_path"] if project else "") or "")
+    spec = {
+        "kind": "planner_intake",
+        "instruction": message["content"],
+        "normalized_candidate": normalized_candidate,
+        "input_facts": facts,
+        "planner_workspace_key": message["project_id"],
+        "project_path": project_path,
+    }
+    role_key = "planner"
+    provider_key = _first_provider(connection, message["project_id"], role_key)
+    checker_role = "independent_checker"
 
     connection.execute(
         """
@@ -384,9 +432,9 @@ def _create_task(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
             canonical_json(
                 {
                     "writes": (
-                        spec.get("project_path")
-                        if spec["kind"] in {"provider_task", "git_publish"}
-                        or automatic_planning
+                        project_path
+                        if normalized_candidate["kind"]
+                        in {"provider_task", "git_publish"}
                         else "task artifact directory only"
                     )
                 }
@@ -403,17 +451,11 @@ def _create_task(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
         (
             plan_id,
             goal_id,
-            0 if automatic_planning else 1,
+            0,
             canonical_json(
                 {
-                    "classification": classification,
-                    "status": (
-                        "planner_pending"
-                        if automatic_planning and supported
-                        else "direct"
-                        if supported
-                        else "needs_decision"
-                    ),
+                    "input_facts": facts,
+                    "status": "planner_pending",
                 }
             ),
             now,
@@ -434,48 +476,38 @@ def _create_task(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
             goal_id,
             canonical_json(spec),
             canonical_json(acceptance),
-            public_status,
-            phase,
-            reason,
-            fault,
-            now if supported else None,
-            outcome,
+            "pending",
+            "plan",
+            None,
+            None,
+            now,
+            None,
             now,
             now,
             plan_id,
             role_key,
             checker_role,
-            phase if supported else None,
+            "plan",
         ),
     )
-    if supported:
-        if automatic_planning:
-            create_task_session(
-                connection,
-                message["project_id"],
-                task_id,
-                now,
-                role_key,
-                provider_key,
-                False,
-            )
-        else:
-            create_task_sessions(
-                connection,
-                message["project_id"],
-                task_id,
-                now,
-                executor_role=role_key,
-                checker_role=checker_role,
-                executor_provider=provider_key,
-                checker_provider=checker_provider,
-                settings_overrides=(
-                    {role_key: {"retry_count": 0}}
-                    if spec.get("mode") == "minimal"
-                    or spec.get("kind") == "git_publish"
-                    else None
-                ),
-            )
+    create_task_session(
+        connection,
+        message["project_id"],
+        task_id,
+        now,
+        role_key,
+        provider_key,
+        False,
+    )
+    create_task_session(
+        connection,
+        message["project_id"],
+        task_id,
+        now,
+        checker_role,
+        _first_provider(connection, message["project_id"], checker_role),
+        True,
+    )
     connection.execute(
         "UPDATE messages SET action_json = ?, processed_at = ? WHERE id = ?",
         (canonical_json(spec), now, message["id"]),
@@ -488,30 +520,17 @@ def _create_task(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
         (
             message["project_id"],
             task_id,
-            "task_created" if supported else "needs_decision",
+            "task_created",
             canonical_json(
                 {
                     "source_message_id": message["id"],
                     "spec_revision": 1,
-                    "classification": classification,
+                    "input_facts": facts,
                 }
             ),
             now,
         ),
     )
-    if spec["kind"] == "git_publish" and supported:
-        connection.execute(
-            """
-            INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
-            VALUES (?, ?, 'authorization_granted', ?, ?)
-            """,
-            (
-                message["project_id"],
-                task_id,
-                canonical_json(spec["authorization"]),
-                now,
-            ),
-        )
     return "intake"
 
 
@@ -559,16 +578,9 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
                 """,
                 (now, job["id"]),
             )
-            connection.execute(
-                """
-                UPDATE tasks SET public_status = 'done', outcome = 'cancelled',
-                    phase = 'done', next_action_at = NULL, next_action_kind = NULL,
-                    wait_reason = NULL, fault_code = NULL, updated_at = ?
-                WHERE id = ?
-                """,
-                (now, task["id"]),
+            finalize_task_terminal(
+                connection, task["id"], "cancelled", now
             )
-            archive_task_sessions(connection, task["id"], now)
             event = "host_job_confirmed_not_executed"
             detail = {
                 "message_id": message["id"],
@@ -576,26 +588,27 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
                 "next": "submit a corrected TaskSpec",
             }
     elif kind == "cancel" and task["outcome"] is None:
-        spec = json.loads(task["spec_json"])
-        active_job = (
-            connection.execute(
-                """
-                SELECT id FROM host_jobs
-                WHERE task_id = ? AND status IN ('dispatching', 'running', 'cancelling')
-                ORDER BY sequence DESC LIMIT 1
-                """,
-                (task["id"],),
-            ).fetchone()
-            if spec.get("kind") == "provider_task"
-            else None
-        )
-        if active_job and task["phase"] != "execute_snapshot":
-            connection.execute(
-                """
-                UPDATE host_jobs SET status = 'cancelling' WHERE id = ?
-                """,
-                (active_job["id"],),
-            )
+        active_jobs = connection.execute(
+            """
+            SELECT id, dispatch_json FROM host_jobs
+            WHERE task_id = ?
+              AND status IN ('dispatching', 'running', 'cancelling')
+            ORDER BY sequence DESC
+            """,
+            (task["id"],),
+        ).fetchall()
+        if active_jobs:
+            for active_job in active_jobs:
+                dispatch = json.loads(active_job["dispatch_json"])
+                dispatch.setdefault("stop_requested_at", now)
+                dispatch["stop_reason"] = "owner_cancel"
+                connection.execute(
+                    """
+                    UPDATE host_jobs SET status = 'cancelling',
+                        dispatch_json = ? WHERE id = ?
+                    """,
+                    (canonical_json(dispatch), active_job["id"]),
+                )
             connection.execute(
                 """
                 UPDATE tasks SET public_status = 'in_progress', phase = 'stopping',
@@ -607,28 +620,12 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
             )
             event, detail = "cancel_requested", {
                 "message_id": message["id"],
-                "host_job_id": active_job["id"],
+                "host_job_ids": [job["id"] for job in active_jobs],
             }
         else:
-            if active_job:
-                connection.execute(
-                    """
-                    UPDATE host_jobs SET status = 'cancelled', ended_at = ?,
-                        returncode = -15, failure_code = 'process'
-                    WHERE id = ?
-                    """,
-                    (now, active_job["id"]),
-                )
-            connection.execute(
-                """
-                UPDATE tasks SET public_status = 'done', outcome = 'cancelled', phase = 'done',
-                    next_action_at = NULL, next_action_kind = NULL,
-                    wait_reason = NULL, fault_code = NULL,
-                    updated_at = ? WHERE id = ?
-                """,
-                (now, task["id"]),
+            finalize_task_terminal(
+                connection, task["id"], "cancelled", now
             )
-            archive_task_sessions(connection, task["id"], now)
             event, detail = "cancelled", {"message_id": message["id"]}
     elif kind == "rerun" and task["outcome"] == "cancelled":
         spec = json.loads(task["spec_json"])
@@ -667,6 +664,16 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
                 spec = dict(original["spec"])
                 acceptance = list(original["acceptance"])
                 spec_changed = True
+        for revoked_key in (
+            "authorization",
+            "secret_ref",
+            "secret_refs",
+            "credential_ref",
+            "credential_refs",
+        ):
+            if revoked_key in spec:
+                spec.pop(revoked_key, None)
+                spec_changed = True
         normalized_spec, _normalized_acceptance = normalize_instruction(
             str(spec.get("instruction") or "")
         )
@@ -681,15 +688,11 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
         spec_revision = task["spec_revision"] + (1 if spec_changed else 0)
         planner_rerun = bool(
             task["role_key"] == "planner"
-            and dict(spec.get("classification") or {}).get("size") == "large"
+            and spec.get("kind") == "planner_intake"
         )
         if planner_rerun:
-            supported = bool(spec.get("project_path"))
-            reason = (
-                None
-                if supported
-                else "project workspace is not bound; set an absolute Host Bridge path"
-            )
+            supported = True
+            reason = None
             role_key = "planner"
             provider_key = _first_provider(
                 connection, task["project_id"], role_key
@@ -752,6 +755,7 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
                 retry_count = 0, next_retry_at = NULL,
                 next_action_at = ?, next_action_kind = ?,
                 wait_reason = ?, fault_code = ?,
+                terminal_capabilities_revoked_at = NULL,
                 updated_at = ? WHERE id = ?
             """,
             (
@@ -1274,11 +1278,20 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
         )
         try:
             proposed = json.loads(proposal["summary_json"]) if proposal else None
+            proposed_plan = proposed["plan"]
+            normalized_plan = normalize_plan(
+                proposed_plan,
+                size=str(proposed_plan.get("size") or "large"),
+                requires_owner_choice=bool(
+                    proposed["classification"]["requires_owner_choice"]
+                ),
+            )
+            normalized_plan["classification"] = proposed["classification"]
             plan = _materialize_plan(
                 connection,
                 task["project_id"],
                 task["goal_id"],
-                normalize_plan(proposed["plan"]),
+                normalized_plan,
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
             connection.execute(
@@ -1308,11 +1321,20 @@ def _apply_action(connection: sqlite3.Connection, message: sqlite3.Row) -> str:
             return kind
     elif kind == "provide_plan" and task["public_status"] == "needs_decision":
         try:
+            provided_plan = action["plan"]
             plan = _materialize_plan(
                 connection,
                 task["project_id"],
                 task["goal_id"],
-                normalize_plan(action["plan"]),
+                normalize_plan(
+                    provided_plan,
+                    size=str(provided_plan.get("size") or "large"),
+                    requires_owner_choice=bool(
+                        isinstance(provided_plan.get("selection"), dict)
+                        and provided_plan["selection"].get("mode")
+                        == "owner_required"
+                    ),
+                ),
             )
         except ValueError as error:
             connection.execute(
@@ -1369,18 +1391,18 @@ def _apply_project_action(
         )
     elif kind == "set_project_setting":
         value = action["value"]
-        if action["setting_key"] == "provider_order":
+        if action["setting_key"] in {"provider_order", "provider_models"}:
             current = connection.execute(
                 """
                 SELECT value_json FROM settings
-                WHERE setting_key = 'provider_order'
+                WHERE setting_key = ?
                   AND (
                     (scope = 'project' AND project_id = ?)
                     OR (scope = 'global' AND project_id IS NULL)
                   )
                 ORDER BY CASE scope WHEN 'project' THEN 0 ELSE 1 END LIMIT 1
                 """,
-                (message["project_id"],),
+                (action["setting_key"], message["project_id"]),
             ).fetchone()
             value = {
                 **(json.loads(current["value_json"]) if current else {}),
@@ -1441,12 +1463,231 @@ def _apply_project_action(
                 now,
             ),
         )
+    elif kind == "promote_script":
+        task = connection.execute(
+            """
+            SELECT * FROM tasks
+            WHERE id = ? AND project_id = ?
+            """,
+            (action["task_id"], message["project_id"]),
+        ).fetchone()
+        if (
+            not task
+            or task["outcome"] != "done"
+            or task["public_status"] != "done"
+            or task["spec_revision"] != action["spec_revision"]
+        ):
+            raise ValueError("script source Task is no longer a verified terminal revision")
+        spec = json.loads(task["spec_json"])
+        result = spec.get("task_contract", {}).get("result", {})
+        script_contract = result.get("script_contract")
+        artifact_contract = result.get("artifact")
+        artifact = connection.execute(
+            """
+            SELECT * FROM artifacts
+            WHERE id = ? AND task_id = ? AND project_id = ?
+              AND kind = 'output' AND revision = ?
+            """,
+            (
+                action["artifact_id"],
+                task["id"],
+                task["project_id"],
+                task["spec_revision"],
+            ),
+        ).fetchone()
+        if (
+            not isinstance(script_contract, dict)
+            or not isinstance(artifact_contract, dict)
+            or not artifact
+            or not _artifact_matches_declared_path(
+                artifact["path"], artifact_contract.get("path")
+            )
+            or artifact["sha256"] != action["artifact_sha256"]
+        ):
+            raise ValueError("script Artifact no longer matches its frozen contract")
+        artifact_ref, body = verified_artifact(
+            store,
+            artifact,
+            expected_source_task_id=task["id"],
+            expected_revision=task["spec_revision"],
+        )
+        if not _has_passing_evidence(
+            store,
+            connection,
+            task,
+            set(script_contract["acceptance_ids"].values()),
+        ):
+            raise ValueError("script promotion requires complete current-revision Evidence")
+        _validate_promotable_python(body, script_contract)
+        revision = connection.execute(
+            """
+            SELECT COALESCE(MAX(revision), 0) + 1 AS value FROM library_items
+            WHERE scope = 'project' AND project_id = ?
+              AND kind = 'script' AND item_key = ?
+            """,
+            (message["project_id"], action["item_key"]),
+        ).fetchone()["value"]
+        path = (
+            store.data_root
+            / "projects"
+            / message["project_id"]
+            / "library"
+            / "scripts"
+            / f"{action['item_key']}.revision-{revision:06d}.py"
+        )
+        _write_atomic(path, body)
+        library_id = uuid4().hex
+        connection.execute(
+            """
+            INSERT INTO library_items(
+                id, scope, project_id, kind, item_key, revision,
+                path, sha256, source_task_id, source_artifact_id,
+                source_revision, created_at
+            ) VALUES (?, 'project', ?, 'script', ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                library_id,
+                message["project_id"],
+                action["item_key"],
+                revision,
+                store.relative_data_path(path),
+                artifact_ref["sha256"],
+                task["id"],
+                artifact["id"],
+                task["spec_revision"],
+                now,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO task_events(
+                project_id, task_id, kind, detail_json, created_at
+            ) VALUES (?, ?, 'script_promoted', ?, ?)
+            """,
+            (
+                task["project_id"],
+                task["id"],
+                canonical_json(
+                    {
+                        "library_item_id": library_id,
+                        "item_key": action["item_key"],
+                        "revision": revision,
+                        "path": store.relative_data_path(path),
+                        "sha256": artifact_ref["sha256"],
+                        "source_artifact_id": artifact["id"],
+                        "source_revision": task["spec_revision"],
+                    }
+                ),
+                now,
+            ),
+        )
     elif kind == "global_route":
         pass
     connection.execute(
         "UPDATE messages SET processed_at = ? WHERE id = ?", (now, message["id"])
     )
     return str(kind)
+
+
+def _has_passing_evidence(
+    store: Store,
+    connection: sqlite3.Connection,
+    task: sqlite3.Row,
+    expected_acceptance_ids: set[str],
+) -> bool:
+    rows = connection.execute(
+        """
+        SELECT * FROM artifacts
+        WHERE task_id = ? AND kind = 'evidence' AND revision = ?
+        ORDER BY created_at, rowid
+        """,
+        (task["id"], task["spec_revision"]),
+    ).fetchall()
+    if not rows:
+        return False
+    passed_ids: set[str] = set()
+    for row in rows:
+        _, body = verified_artifact(
+            store,
+            row,
+            expected_source_task_id=task["id"],
+            expected_revision=task["spec_revision"],
+        )
+        try:
+            evidence = json.loads(body)
+        except json.JSONDecodeError as error:
+            raise ValueError("script Evidence is not valid JSON") from error
+        if not isinstance(evidence, dict):
+            continue
+        if evidence.get("passed") is True and isinstance(
+            evidence.get("acceptance_id"), str
+        ):
+            passed_ids.add(evidence["acceptance_id"])
+        if evidence.get("verdict") == "PASS":
+            for acceptance in evidence.get("acceptances", []):
+                if (
+                    isinstance(acceptance, dict)
+                    and acceptance.get("passed") is True
+                    and isinstance(acceptance.get("acceptance_id"), str)
+                ):
+                    passed_ids.add(acceptance["acceptance_id"])
+    return expected_acceptance_ids <= passed_ids
+
+
+def _validate_promotable_python(body: bytes, contract: dict) -> None:
+    if len(body) > 1_048_576:
+        raise ValueError("promotable script exceeds 1 MiB")
+    try:
+        source = body.decode("utf-8")
+        tree = ast.parse(source)
+    except (UnicodeDecodeError, SyntaxError) as error:
+        raise ValueError("promotable script must be valid UTF-8 Python") from error
+    callable_name = contract.get("callable")
+    cli_entry = contract.get("cli_entry")
+    functions = {
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    if (
+        contract.get("language") != "python"
+        or not isinstance(callable_name, str)
+        or callable_name not in functions
+        or cli_entry != "main"
+        or cli_entry not in functions
+        or callable_name == cli_entry
+    ):
+        raise ValueError("script callable and CLI entry do not match TaskSpec")
+    main_guard = False
+    for node in tree.body:
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        if not (
+            isinstance(test, ast.Compare)
+            and isinstance(test.left, ast.Name)
+            and test.left.id == "__name__"
+            and len(test.ops) == 1
+            and isinstance(test.ops[0], ast.Eq)
+            and len(test.comparators) == 1
+            and isinstance(test.comparators[0], ast.Constant)
+            and test.comparators[0].value == "__main__"
+        ):
+            continue
+        for descendant in ast.walk(node):
+            if (
+                isinstance(descendant, ast.Call)
+                and isinstance(descendant.func, ast.Name)
+                and descendant.func.id == "SystemExit"
+                and descendant.args
+                and isinstance(descendant.args[0], ast.Call)
+                and isinstance(descendant.args[0].func, ast.Name)
+                and descendant.args[0].func.id == cli_entry
+            ):
+                main_guard = True
+                break
+    if not main_guard:
+        raise ValueError("script CLI must exit through SystemExit(main())")
 
 
 def _prepare_planner_step(
@@ -1500,9 +1741,11 @@ def _prepare_planner_step(
                             else spec.get("instruction") or ""
                         ),
                         task["project_id"],
-                        dict(spec.get("classification") or {}),
+                        dict(spec.get("input_facts") or {}),
                     ),
                     "access": "read",
+                    "workspace_kind": "planner",
+                    "workspace_key": str(spec["planner_workspace_key"]),
                 }
             ),
         ),
@@ -1528,11 +1771,11 @@ def _prepare_planner_step(
             started_at,
         ),
     )
-    classification = dict(spec.get("classification") or {})
+    input_facts = dict(spec.get("input_facts") or {})
     prompt = planner_prompt(
         str(goal["objective"] if goal else spec.get("instruction") or ""),
         task["project_id"],
-        classification,
+        input_facts,
     )
     return PlannerStep(
         "start",
@@ -1540,12 +1783,14 @@ def _prepare_planner_step(
         task["id"],
         job_id,
         generation["provider_key"],
-        str(spec["project_path"]),
+        str(spec.get("project_path") or ""),
+        str(spec["planner_workspace_key"]),
         prompt,
         generation["external_session_id"],
         int(settings.get("max_runtime_seconds", 600)),
-        classification,
+        input_facts,
         _context_policy(settings),
+        selected_model(settings, generation["provider_key"]),
     )
 
 
@@ -1577,19 +1822,21 @@ def _pending_planner_step(
     settings = json.loads(session["settings_json"]).get("values", {})
     spec = json.loads(task["spec_json"])
     dispatch = json.loads(job["dispatch_json"])
-    classification = dict(spec.get("classification") or {})
+    input_facts = dict(spec.get("input_facts") or {})
     return PlannerStep(
         "start" if job["status"] == "dispatching" else "poll",
         task["project_id"],
         task["id"],
         job["id"],
         generation["provider_key"],
-        str(spec["project_path"]),
+        str(spec.get("project_path") or ""),
+        str(spec["planner_workspace_key"]),
         str(dispatch["prompt"]),
         generation["external_session_id"],
         int(settings.get("max_runtime_seconds", 600)),
-        classification,
+        input_facts,
         _context_policy(settings),
+        selected_model(settings, generation["provider_key"]),
     )
 
 
@@ -1613,7 +1860,7 @@ def _apply_planner_step(
     if not facts.get("ok"):
         if step.kind == "start" and facts.get("failure_kind") == "rejected":
             return _reject_planner_start(
-                connection, task, job, step, facts, now
+                store, connection, task, job, step, facts, now
             )
         dispatch = json.loads(job["dispatch_json"])
         failures = int(dispatch.get("reconcile_failures") or 0) + 1
@@ -1708,6 +1955,7 @@ def _apply_planner_step(
             input_tokens, max(0, int(state.get("cached_input_tokens") or 0))
         ),
         "output_tokens": max(0, int(state.get("output_tokens") or 0)),
+        "usage_kind": str(state.get("usage_kind") or "cumulative"),
         "model": state.get("model") or step.provider_key,
     }
     if isinstance(result, dict):
@@ -1733,13 +1981,15 @@ def _apply_planner_step(
             job["task_session_id"],
             job["session_generation"],
             step.provider_key,
-            "single",
+            str(result.get("usage_kind") or "cumulative"),
             input_tokens,
             cached_tokens,
             max(0, int(result.get("output_tokens") or 0)),
             str(result.get("model") or step.provider_key),
         )
-        if model_budget_reached(connection, task["id"]):
+        budget_fact = model_budget_fact(connection, task["id"])
+        if budget_fact:
+            apply_model_budget_fact(connection, task["id"], budget_fact)
             connection.execute(
                 """
                 UPDATE host_jobs SET status = 'succeeded', ended_at = ?,
@@ -1751,9 +2001,6 @@ def _apply_planner_step(
     returncode = int(result.get("returncode") or 0) if isinstance(result, dict) else 1
     stdout = str(result.get("stdout") or "") if isinstance(result, dict) else ""
     if str(state.get("status")) != "completed" or returncode != 0:
-        fallback = _fallback_provider_generation(
-            connection, task, job, step.provider_key, now
-        )
         connection.execute(
             """
             UPDATE host_jobs SET status = 'failed', ended_at = ?, returncode = ?,
@@ -1765,6 +2012,9 @@ def _apply_planner_step(
                 "provider",
                 job["id"],
             ),
+        )
+        fallback = _fallback_provider_generation(
+            store, connection, task, job, step.provider_key, now
         )
         connection.execute(
             """
@@ -1800,9 +2050,10 @@ def _apply_planner_step(
 
     try:
         proposal = parse_planner_result(stdout)
-        proposal["plan"] = _materialize_plan(
-            connection, task["project_id"], task["goal_id"], proposal["plan"]
-        )
+        if proposal["plan"] is not None:
+            proposal["plan"] = _materialize_plan(
+                connection, task["project_id"], task["goal_id"], proposal["plan"]
+            )
     except ValueError as error:
         connection.execute(
             """
@@ -1845,23 +2096,19 @@ def _apply_planner_step(
     )
     _write_atomic(artifact_path, artifact_body)
     artifact_ref = store.relative_data_path(artifact_path)
-    connection.execute(
-        """
-        INSERT INTO artifacts(
-            id, project_id, task_id, kind, path, sha256, bytes,
-            acceptance_id, revision, created_at
-        ) VALUES (?, ?, ?, 'output', ?, ?, ?, 'planner_contract', ?, ?)
-        """,
-        (
-            uuid4().hex,
-            task["project_id"],
-            task["id"],
-            artifact_ref,
-            hashlib.sha256(artifact_body).hexdigest(),
-            len(artifact_body),
-            task["spec_revision"],
-            now,
-        ),
+    register_artifact(
+        store,
+        connection,
+        project_id=task["project_id"],
+        task_id=task["id"],
+        kind="output",
+        path=artifact_path,
+        stored_path=artifact_ref,
+        acceptance_id="planner_contract",
+        revision=task["spec_revision"],
+        scope=task_data_scope(["planner_classification", "plan_contract"]),
+        source_task_id=task["id"],
+        created_at=now,
     )
     connection.execute(
         """
@@ -1871,15 +2118,178 @@ def _apply_planner_step(
         (now, artifact_ref, job["id"]),
     )
     _archive_role_generation(connection, task["id"], "planner", now)
+    return _prepare_planner_checker(
+        connection,
+        task,
+        proposal,
+        artifact_ref,
+        hashlib.sha256(artifact_body).hexdigest(),
+        job["id"],
+        step.input_facts,
+        now,
+    )
+
+
+def _prepare_planner_checker(
+    connection: sqlite3.Connection,
+    task: sqlite3.Row,
+    proposal: dict,
+    artifact_ref: str,
+    artifact_sha256: str,
+    planner_job_id: str,
+    input_facts: dict[str, object],
+    now: float,
+) -> str:
+    task_session_id, session_generation = current_session(
+        connection, task["id"], "independent_checker"
+    )
+    generation = connection.execute(
+        """
+        SELECT provider_key, external_session_id
+        FROM session_generations
+        WHERE task_session_id = ? AND generation = ?
+        """,
+        (task_session_id, session_generation),
+    ).fetchone()
+    session = connection.execute(
+        "SELECT settings_json FROM task_sessions WHERE id = ?",
+        (task_session_id,),
+    ).fetchone()
+    settings = json.loads(session["settings_json"]).get("values", {})
+    sequence = connection.execute(
+        """
+        SELECT COALESCE(MAX(sequence), 0) + 1 AS value
+        FROM host_jobs WHERE task_id = ?
+        """,
+        (task["id"],),
+    ).fetchone()["value"]
+    checker_job_id = uuid4().hex
+    execution = {
+        "subject": "planner",
+        "artifact_ref": artifact_ref,
+        "artifact_sha256": artifact_sha256,
+        "artifact_revision": task["spec_revision"],
+        "source_task_id": task["id"],
+        "planner_job_id": planner_job_id,
+        "input_facts": input_facts,
+    }
+    prompt = (
+        "Independently check this parsed Planner Artifact. Do not read or trust "
+        "Planner chat. Verify semantic sizing reasons, workflow gate, complete "
+        "Plan alternatives, objective selection, atomic DAG, TaskSpec result/"
+        "acceptance/dependency/runtime/authorization contracts, and that no "
+        "scope was invented.\n"
+        f"Task ID: {task['id']} · revision {task['spec_revision']}\n"
+        f"Artifact: {artifact_ref} sha256={artifact_sha256}\n"
+        f"Complete parsed Artifact:\n{canonical_json(proposal)}\n"
+        f"Finish with {CHECKER_RESULT_PREFIX!r} followed by "
+        '{"verdict":"PASS|CHANGES_REQUIRED|NEEDS_DECISION",'
+        '"acceptances":[{"acceptance_id":"planner_contract",'
+        '"passed":true,"actual_evidence":"bounded independent fact",'
+        '"recheck_command":"bounded recheck"}],"decision_reason":null}. '
+        "Do not modify files or create external effects."
+    )
+    connection.execute(
+        """
+        INSERT INTO host_jobs(
+            id, task_id, task_session_id, session_generation,
+            spec_revision, sequence, purpose, status, started_at, dispatch_json
+        ) VALUES (?, ?, ?, ?, ?, ?, 'check', 'dispatching', ?, ?)
+        """,
+        (
+            checker_job_id,
+            task["id"],
+            task_session_id,
+            session_generation,
+            task["spec_revision"],
+            sequence,
+            now,
+            canonical_json(
+                {
+                    "prompt": prompt,
+                    "access": "read",
+                    "workspace_kind": "planner",
+                    "workspace_key": json.loads(task["spec_json"])[
+                        "planner_workspace_key"
+                    ],
+                    "check_subject": "planner",
+                    "execution": execution,
+                }
+            ),
+        ),
+    )
+    write_task_fields(
+        connection,
+        task["id"],
+        {
+            "public_status": "in_progress",
+            "phase": "check_call",
+            "wait_reason": None,
+            "fault_code": None,
+            "next_action_at": now,
+            "next_action_kind": "plan_check",
+            "updated_at": now,
+        },
+    )
+    _record_event(
+        connection,
+        task,
+        "planner_checker_prepared",
+        {
+            "host_job_id": checker_job_id,
+            "planner_job_id": planner_job_id,
+            "artifact_ref": artifact_ref,
+            "artifact_sha256": artifact_sha256,
+        },
+        now,
+    )
+    return "planner_check"
+
+
+def _apply_checked_planner_proposal(
+    connection: sqlite3.Connection,
+    task: sqlite3.Row,
+    proposal: dict,
+    planner_job_id: str,
+    input_facts: dict[str, object],
+    now: float,
+) -> str:
+    if proposal["plan"] is None:
+        write_task_fields(
+            connection,
+            task["id"],
+            {
+                "public_status": "needs_decision",
+                "phase": "plan",
+                "wait_reason": proposal["blocking_reason"],
+                "fault_code": "scope",
+                "next_action_at": None,
+                "next_action_kind": None,
+                "updated_at": now,
+            },
+        )
+        _record_event(
+            connection,
+            task,
+            "planner_needs_information",
+            {
+                "host_job_id": planner_job_id,
+                "classification": proposal["classification"],
+                "blocking_reason": proposal["blocking_reason"],
+            },
+            now,
+        )
+        return "needs_decision"
     auto_select = bool(
         proposal["confidence"] >= 0.95
-        and not step.classification.get("authorization_required")
+        and not proposal["classification"]["requires_owner_choice"]
+        and not input_facts.get("possible_high_risk_terms")
     )
     if auto_select:
         _install_plan(
             connection,
             task,
-            f"planner:{job['id']}",
+            f"planner:{planner_job_id}",
             proposal["plan"],
             now,
         )
@@ -1906,7 +2316,10 @@ def _apply_planner_step(
     question = (
         f"Planner 建议“{selected['name']}”，置信度 {proposal['confidence']:.2f}；"
         "这是高风险操作，是否批准该方案？"
-        if step.classification.get("authorization_required")
+        if (
+            proposal["classification"]["requires_owner_choice"]
+            or input_facts.get("possible_high_risk_terms")
+        )
         else (
             f"Planner 建议“{selected['name']}”，但置信度只有 "
             f"{proposal['confidence']:.2f}；是否按该方案继续？"
@@ -1926,7 +2339,7 @@ def _apply_planner_step(
         task,
         "planner_needs_decision",
         {
-            "host_job_id": job["id"],
+            "host_job_id": planner_job_id,
             "plan_revision": revision,
             "confidence": proposal["confidence"],
         },
@@ -1935,7 +2348,172 @@ def _apply_planner_step(
     return "needs_decision"
 
 
+def _complete_checked_model_probe(
+    store: Store,
+    connection: sqlite3.Connection,
+    step: CheckerStep,
+    now: float,
+) -> str:
+    task = connection.execute(
+        "SELECT * FROM tasks WHERE id = ?",
+        (step.task_id,),
+    ).fetchone()
+    if not task:
+        raise RuntimeError("checked model probe Task disappeared")
+    spec = json.loads(task["spec_json"])
+    source = step.execution
+    output = connection.execute(
+        """
+        SELECT * FROM artifacts
+        WHERE task_id = ? AND kind = 'output'
+          AND acceptance_id = 'provider_minimal_probe'
+          AND revision = ?
+        ORDER BY created_at DESC, rowid DESC LIMIT 1
+        """,
+        (task["id"], task["spec_revision"]),
+    ).fetchone()
+    checker_evidence = connection.execute(
+        """
+        SELECT * FROM artifacts
+        WHERE task_id = ? AND kind = 'evidence'
+          AND acceptance_id = 'provider_minimal_probe'
+          AND revision = ?
+        ORDER BY created_at DESC, rowid DESC LIMIT 1
+        """,
+        (task["id"], task["spec_revision"]),
+    ).fetchone()
+    try:
+        if (
+            spec.get("kind") != "provider_probe"
+            or spec.get("mode") != "minimal"
+            or not output
+            or not checker_evidence
+        ):
+            raise ValueError("minimal probe result or Checker Evidence is missing")
+        output_ref, output_body = verified_artifact(
+            store,
+            output,
+            expected_source_task_id=task["id"],
+            expected_revision=task["spec_revision"],
+        )
+        evidence_ref, evidence_body = verified_artifact(
+            store,
+            checker_evidence,
+            expected_source_task_id=task["id"],
+            expected_revision=task["spec_revision"],
+        )
+        probe_result = json.loads(output_body)
+        evidence = json.loads(evidence_body)
+        if (
+            source.get("subject") != "model_probe"
+            or source.get("source_task_id") != task["id"]
+            or int(source.get("source_revision") or -1)
+            != task["spec_revision"]
+            or source.get("artifact_ref") != output_ref
+            or source.get("probe_result") != probe_result
+            or evidence.get("subject") != "model_probe"
+            or evidence.get("source_artifact") != source
+            or evidence.get("passed") is not True
+            or evidence.get("status") != "PASS"
+        ):
+            raise ValueError(
+                "minimal probe and independent Checker lineage do not match"
+            )
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        write_task_fields(
+            connection,
+            task["id"],
+            {
+                "public_status": "needs_decision",
+                "phase": "verify",
+                "wait_reason": str(error),
+                "fault_code": "verification",
+                "next_action_at": None,
+                "next_action_kind": None,
+                "updated_at": now,
+            },
+        )
+        _record_event(
+            connection,
+            task,
+            "model_probe_checker_lineage_failed",
+            {"reason": str(error)},
+            now,
+        )
+        return "needs_decision"
+    finalize_task_terminal(connection, task["id"], "done", now)
+    _record_event(
+        connection,
+        task,
+        "verified",
+        {
+            "acceptance_id": "provider_minimal_probe",
+            "source_artifact": output_ref,
+            "checker_evidence": evidence_ref,
+            "passed": True,
+        },
+        now,
+    )
+    return "verify"
+
+
+def _consume_checked_planner(
+    store: Store,
+    connection: sqlite3.Connection,
+    step: CheckerStep,
+    now: float,
+) -> str:
+    execution = step.execution
+    artifact = connection.execute(
+        """
+        SELECT kind, path, sha256, bytes, acceptance_id, revision,
+               scope_json, source_task_id
+        FROM artifacts
+        WHERE task_id = ? AND kind = 'output' AND path = ? AND revision = ?
+          AND acceptance_id = 'planner_contract'
+        ORDER BY rowid DESC LIMIT 1
+        """,
+        (
+            step.task_id,
+            execution.get("artifact_ref"),
+            execution.get("artifact_revision"),
+        ),
+    ).fetchone()
+    task = connection.execute(
+        "SELECT * FROM tasks WHERE id = ? AND project_id = ?",
+        (step.task_id, step.project_id),
+    ).fetchone()
+    if not task or not artifact:
+        raise RuntimeError("checked Planner Artifact is missing")
+    entry, body = verified_artifact(
+        store,
+        artifact,
+        expected_source_task_id=task["id"],
+        expected_revision=task["spec_revision"],
+    )
+    if (
+        entry["sha256"] != execution.get("artifact_sha256")
+        or entry["revision"] != execution.get("artifact_revision")
+    ):
+        raise ValueError("checked Planner Artifact lineage changed")
+    try:
+        proposal = json.loads(body)
+    except json.JSONDecodeError as error:
+        raise ValueError("checked Planner Artifact is invalid JSON") from error
+    if not isinstance(proposal, dict):
+        raise ValueError("checked Planner Artifact is not an object")
+    return _apply_checked_planner_proposal(
+        connection,
+        task,
+        proposal,
+        str(execution["planner_job_id"]),
+        dict(execution.get("input_facts") or {}),
+        now,
+    )
+
+
 def _reject_planner_start(
+    store: Store,
     connection: sqlite3.Connection,
     task: sqlite3.Row,
     job: sqlite3.Row,
@@ -1956,7 +2534,7 @@ def _reject_planner_start(
         (now, canonical_json(dispatch), job["id"]),
     )
     fallback = _fallback_provider_generation(
-        connection, task, job, step.provider_key, now
+        store, connection, task, job, step.provider_key, now
     )
     connection.execute(
         """
@@ -2046,6 +2624,16 @@ def _materialize_plan(
         if not supported:
             raise ValueError(f"task {item['key']} cannot run: {reason}")
         settings = item["settings"]
+        if spec.get("butler_semantic_query"):
+            settings = {
+                role: dict(values) for role, values in settings.items()
+            }
+            settings.setdefault(role_key, {})["provider_order"] = (
+                _read_model_order(connection, project_id, role_key)
+            )
+            settings.setdefault(checker_role, {})["provider_order"] = (
+                _read_model_order(connection, project_id, checker_role)
+            )
         executor_order = settings.get(role_key, {}).get("provider_order")
         checker_order = settings.get(checker_role, {}).get("provider_order")
         tasks.append(
@@ -2374,27 +2962,28 @@ def _handle_task_deadline(
     ).fetchone()
     if active:
         dispatch = json.loads(active["dispatch_json"])
-        dispatch.setdefault("stop_requested_at", now)
-        dispatch["stop_reason"] = "deadline"
+        dispatch.setdefault("deadline_detected_at", now)
+        dispatch["timeout_stage"] = "reconcile"
         connection.execute(
             """
-            UPDATE host_jobs SET status = 'cancelling', dispatch_json = ?
+            UPDATE host_jobs SET dispatch_json = ?
             WHERE id = ?
             """,
             (canonical_json(dispatch), active["id"]),
         )
         connection.execute(
             """
-            UPDATE tasks SET public_status = 'in_progress', phase = 'stopping',
-                wait_reason = '[deadline] graceful stop requested after reconcile',
+            UPDATE tasks SET public_status = 'in_progress',
+                phase = 'timeout_reconcile',
+                wait_reason = '[deadline] reconcile and checkpoint required before stop',
                 fault_code = 'process', next_action_at = ?,
-                next_action_kind = 'cancel', updated_at = ? WHERE id = ?
+                next_action_kind = 'reconcile_stop', updated_at = ? WHERE id = ?
             """,
             (now, now, task["id"]),
         )
-        event = "deadline_stop_requested"
+        event = "deadline_reconcile_requested"
         detail = {"host_job_id": active["id"], "deadline_at": task["deadline_at"]}
-        result = "deadline_stop"
+        result = "deadline_reconcile"
     else:
         connection.execute(
             """
@@ -2429,15 +3018,68 @@ def _stop_unknown_phase(connection: sqlite3.Connection, task: sqlite3.Row) -> st
 def _ensure_project_question(
     connection: sqlite3.Connection, project_id: str
 ) -> None:
+    del project_id
+    now = time.time()
+    question_rows = connection.execute(
+        """
+        SELECT message.id, message.action_json, message.created_at,
+               task.id AS task_id, task.outcome AS task_outcome,
+               task.public_status AS task_public_status
+        FROM messages message
+        JOIN tasks task
+          ON task.id = json_extract(message.action_json, '$.task_id')
+        WHERE message.role = 'butler'
+          AND json_extract(message.action_json, '$.kind') = 'question'
+        ORDER BY message.created_at, message.rowid
+        """
+    ).fetchall()
+    active_questions = []
+    for row in question_rows:
+        action = json.loads(row["action_json"])
+        if (
+            row["task_outcome"] is None
+            and row["task_public_status"] == "needs_decision"
+        ):
+            active_questions.append(row)
+        elif action.get("waiting", True) is not False:
+            action["waiting"] = False
+            action["resolved_at"] = now
+            connection.execute(
+                "UPDATE messages SET action_json = ? WHERE id = ?",
+                (canonical_json(action), row["id"]),
+            )
+    waiting = []
+    queued = []
+    for row in active_questions:
+        action = json.loads(row["action_json"])
+        (waiting if action.get("waiting", True) is not False else queued).append(
+            (row, action)
+        )
+    if waiting:
+        for row, action in waiting[1:]:
+            action["waiting"] = False
+            action["queued_behind_task_id"] = waiting[0][0]["task_id"]
+            connection.execute(
+                "UPDATE messages SET action_json = ? WHERE id = ?",
+                (canonical_json(action), row["id"]),
+            )
+        return
+    if queued:
+        row, action = queued[0]
+        action["waiting"] = True
+        action.pop("queued_behind_task_id", None)
+        connection.execute(
+            "UPDATE messages SET action_json = ? WHERE id = ?",
+            (canonical_json(action), row["id"]),
+        )
+        return
     task = connection.execute(
         """
-        SELECT id, spec_revision, phase, fault_code, wait_reason
+        SELECT id, project_id, spec_revision, phase, fault_code, wait_reason
         FROM tasks
-        WHERE project_id = ? AND outcome IS NULL
-          AND public_status = 'needs_decision'
-        ORDER BY updated_at DESC, rowid DESC LIMIT 1
-        """,
-        (project_id,),
+        WHERE outcome IS NULL AND public_status = 'needs_decision'
+        ORDER BY updated_at, rowid LIMIT 1
+        """
     ).fetchone()
     if not task:
         return
@@ -2445,7 +3087,6 @@ def _ensure_project_question(
     fingerprint = hashlib.sha256(
         f"{task['spec_revision']}:{task['phase']}:{task['fault_code']}:{reason}".encode()
     ).hexdigest()[:16]
-    now = time.time()
     connection.execute(
         """
         INSERT OR IGNORE INTO messages(
@@ -2455,13 +3096,14 @@ def _ensure_project_question(
         """,
         (
             uuid4().hex,
-            project_id,
+            task["project_id"],
             f"我现在只需要你决定一件事：{reason}",
             canonical_json(
                 {
                     "kind": "question",
                     "task_id": task["id"],
                     "spec_revision": task["spec_revision"],
+                    "waiting": True,
                 }
             ),
             f"question:{task['id']}:{fingerprint}",
@@ -2489,16 +3131,56 @@ def _runtime_contract(
         )
     if kind == "provider_probe":
         provider = str(spec["provider_key"])
+        checker_role = (
+            "independent_checker"
+            if spec["mode"] == "minimal"
+            else "deterministic_checker"
+        )
+        checker_provider = (
+            _first_provider(connection, project_id, checker_role)
+            if checker_role == "independent_checker"
+            else "local"
+        )
         return (
             True,
             spec,
             "provider_probe",
             provider,
-            "deterministic_checker",
-            "local",
+            checker_role,
+            checker_provider,
             None,
         )
     if kind == "provider_task":
+        if spec.get("butler_semantic_query"):
+            worker_order = _read_model_order(
+                connection, project_id, "fullstack"
+            )
+            requested = spec.get("provider_key")
+            provider = (
+                str(requested)
+                if requested in worker_order
+                else worker_order[0]
+            )
+            checker_provider = _read_model_order(
+                connection, project_id, "independent_checker"
+            )[0]
+            workspace_key = "butler-" + hashlib.sha256(
+                canonical_json(spec["butler_semantic_query"]).encode()
+            ).hexdigest()[:48]
+            return (
+                True,
+                {
+                    **spec,
+                    "project_path": "",
+                    "provider_key": provider,
+                    "butler_workspace_key": workspace_key,
+                },
+                "fullstack",
+                provider,
+                "independent_checker",
+                checker_provider,
+                None,
+            )
         project = connection.execute(
             "SELECT host_path FROM projects WHERE id = ?", (project_id,)
         ).fetchone()
@@ -2562,8 +3244,28 @@ def _runtime_contract(
             else "git_publish"
         )
         expected_remote_head = spec.get("expected_remote_head")
+        authorization_task = (
+            connection.execute(
+                """
+                SELECT terminal_capabilities_revoked_at FROM tasks
+                WHERE id = ? AND project_id = ?
+                """,
+                (
+                    authorization.get("task_id"),
+                    project_id,
+                ),
+            ).fetchone()
+            if isinstance(authorization, dict)
+            and isinstance(authorization.get("task_id"), str)
+            else None
+        )
         authorized = bool(
             isinstance(authorization, dict)
+            and authorization_task
+            and authorization_task[
+                "terminal_capabilities_revoked_at"
+            ]
+            is None
             and authorization.get("project_id") == project_id
             and authorization.get("action_kind") == expected_action
             and authorization.get("target_scope") == expected_scope
@@ -2640,3 +3342,23 @@ def _first_provider(
     if not order:
         raise ValueError(f"Provider order is empty for role {role_key}")
     return str(order[0])
+
+
+def _read_model_order(
+    connection: sqlite3.Connection, project_id: str, role_key: str
+) -> list[str]:
+    configured = (
+        effective_settings(connection, project_id, {})["values"]
+        .get("provider_order", {})
+        .get(role_key, [])
+    )
+    order = [
+        str(provider)
+        for provider in configured
+        if provider in {"codex_cli", "cursor_cli"}
+    ]
+    if not order:
+        raise ValueError(
+            f"read-only semantic summary has no eligible Provider for {role_key}"
+        )
+    return order

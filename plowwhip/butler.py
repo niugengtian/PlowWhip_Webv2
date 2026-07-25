@@ -6,7 +6,13 @@ import time
 from pathlib import Path
 from uuid import uuid4
 
-from .intake import PROJECT_ID, canonical_json, submit_message
+from .intake import (
+    BUTLER_SEMANTIC_PREFIX,
+    PROJECT_ID,
+    canonical_json,
+    submit_message,
+)
+from .secret_policy import require_secret_safe
 from .store import Store, write_atomic as _write_atomic
 
 
@@ -21,6 +27,7 @@ def search(db_path: str | Path, data_root: str | Path, query: str) -> dict:
     query = query.strip()
     if not query or len(query) > 128:
         raise ValueError("search query must contain 1-128 characters")
+    require_secret_safe(query, "search query")
     escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     pattern = f"%{escaped}%"
     store = Store(db_path, data_root)
@@ -81,6 +88,132 @@ def conversation(
         connection.close()
 
 
+def semantic_search(
+    store: Store,
+    query: str,
+    project_id: str,
+    idempotency_key: str,
+) -> dict[str, object]:
+    """Use exact indexes first; queue a checked read-only summary only if empty."""
+    if not PROJECT_ID.fullmatch(project_id):
+        raise ValueError("semantic search requires one exact active project_id")
+    if not query.strip() or len(query.strip()) > 128:
+        raise ValueError("semantic search query must contain 1-128 characters")
+    if not idempotency_key or len(idempotency_key) > 128:
+        raise ValueError("idempotency_key must contain 1-128 characters")
+    require_secret_safe(
+        {
+            "query": query,
+            "project_id": project_id,
+            "idempotency_key": idempotency_key,
+        },
+        "semantic search",
+    )
+    exact = search(store.db_path, store.data_root, query)
+    matching = [
+        item for item in exact["results"] if item["project_id"] == project_id
+    ]
+    if matching:
+        return {
+            "message_id": _submit_global_route_reference(
+                store,
+                project_id,
+                f"语义查询命中精确索引：{query}",
+                idempotency_key,
+            ),
+            "project_id": project_id,
+            "routed_only": True,
+            "model_queued": False,
+            "results": matching,
+        }
+    sources = _semantic_sources(store, project_id)
+    if not sources:
+        raise ValueError("project has no canonical sources to summarize")
+    instruction = BUTLER_SEMANTIC_PREFIX + canonical_json(
+        {"query": query.strip(), "sources": sources}
+    )
+    return {
+        "message_id": submit_message(
+            store, project_id, instruction, idempotency_key
+        ),
+        "project_id": project_id,
+        "routed_only": False,
+        "model_queued": True,
+        "source_count": len(sources),
+    }
+
+
+def _semantic_sources(store: Store, project_id: str) -> list[dict[str, str]]:
+    connection = store.connect_readonly()
+    try:
+        project = connection.execute(
+            "SELECT 1 FROM projects WHERE id = ? AND archived_at IS NULL",
+            (project_id,),
+        ).fetchone()
+        if not project:
+            raise ValueError("active project not found")
+        sources: list[dict[str, str]] = []
+        for row in connection.execute(
+            """
+            SELECT id, objective FROM goals
+            WHERE project_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 15
+            """,
+            (project_id,),
+        ):
+            sources.append(
+                {
+                    "kind": "goal",
+                    "ref": row["id"],
+                    "detail": str(row["objective"])[:512],
+                }
+            )
+        for row in connection.execute(
+            """
+            SELECT id, public_status, phase FROM tasks
+            WHERE project_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 15
+            """,
+            (project_id,),
+        ):
+            sources.append(
+                {
+                    "kind": "task",
+                    "ref": row["id"],
+                    "detail": f"{row['public_status']} / {row['phase']}",
+                }
+            )
+        for row in connection.execute(
+            """
+            SELECT id, substr(content, 1, 256) AS detail FROM messages
+            WHERE project_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 10
+            """,
+            (project_id,),
+        ):
+            sources.append(
+                {
+                    "kind": "message",
+                    "ref": row["id"],
+                    "detail": str(row["detail"]),
+                }
+            )
+        for row in connection.execute(
+            """
+            SELECT id, kind, path FROM artifacts
+            WHERE project_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 10
+            """,
+            (project_id,),
+        ):
+            sources.append(
+                {
+                    "kind": f"artifact:{row['kind']}",
+                    "ref": row["id"],
+                    "detail": str(row["path"])[:512],
+                }
+            )
+        return sources[:50]
+    finally:
+        connection.close()
+
+
 def route_global_message(
     store: Store,
     content: str,
@@ -91,6 +224,10 @@ def route_global_message(
         raise ValueError("message must contain 1-65536 UTF-8 bytes")
     if not idempotency_key or len(idempotency_key) > 128:
         raise ValueError("idempotency_key must contain 1-128 characters")
+    require_secret_safe(
+        {"content": content, "idempotency_key": idempotency_key},
+        "global message",
+    )
     connection = store.connect_readonly()
     try:
         duplicate = connection.execute(

@@ -6,7 +6,13 @@ import sqlite3
 import time
 from uuid import uuid4
 
+from .artifact_contract import (
+    register_artifact,
+    task_data_scope,
+    verified_artifact,
+)
 from .intake import canonical_json
+from .provider import workspace_snapshot
 from .store import Store, write_atomic as _write_atomic
 
 
@@ -35,6 +41,55 @@ def checkpoint_project(store: Store, project_id: str) -> None:
             _checkpoint_session(store, connection, project_id, session)
 
 
+def checkpoint_task_session(
+    store: Store,
+    connection: sqlite3.Connection,
+    task_session_id: str,
+) -> dict[str, object]:
+    """Persist and verify the latest Warm/Cold boundary before replacement."""
+    session = connection.execute(
+        """
+        SELECT session.id, session.task_id, session.role_key, session.settings_json,
+               task.project_id, task.spec_revision, task.public_status, task.phase,
+               task.wait_reason, task.fault_code, task.outcome,
+               generation.id AS generation_id, generation.generation
+        FROM task_sessions session
+        JOIN tasks task ON task.id = session.task_id
+        JOIN session_generations generation
+          ON generation.task_session_id = session.id
+        WHERE session.id = ? AND generation.status = 'active'
+        ORDER BY generation.generation DESC LIMIT 1
+        """,
+        (task_session_id,),
+    ).fetchone()
+    if not session:
+        raise ValueError("active TaskSession generation is missing")
+    _segment_session(store, connection, session["project_id"], session)
+    _checkpoint_session(store, connection, session["project_id"], session)
+    handoff = connection.execute(
+        """
+        SELECT kind, path, sha256, bytes, acceptance_id, revision,
+               scope_json, source_task_id
+        FROM artifacts
+        WHERE task_id = ? AND kind = 'handoff' AND acceptance_id = ?
+        ORDER BY revision DESC, rowid DESC LIMIT 1
+        """,
+        (session["task_id"], f"handoff:{session['role_key']}"),
+    ).fetchone()
+    if not handoff:
+        raise ValueError("replacement requires a valid Warm handoff")
+    entry, _ = verified_artifact(
+        store,
+        handoff,
+        expected_source_task_id=session["task_id"],
+    )
+    connection.execute(
+        "UPDATE session_generations SET handoff_ref = ? WHERE id = ?",
+        (entry["path"], session["generation_id"]),
+    )
+    return entry
+
+
 def compile_hot_context(
     store: Store,
     connection: sqlite3.Connection,
@@ -57,7 +112,9 @@ def compile_hot_context(
     ).fetchone()
     artifacts = connection.execute(
         """
-        SELECT kind, path, sha256, acceptance_id, revision FROM artifacts
+        SELECT kind, path, sha256, bytes, acceptance_id, revision,
+               scope_json, source_task_id
+        FROM artifacts
         WHERE task_id = ? AND kind IN ('output', 'evidence')
         ORDER BY created_at DESC, rowid DESC LIMIT 8
         """,
@@ -103,7 +160,9 @@ def compile_hot_context(
         },
         "warm_handoff": warm,
         "dependency_results": dependency_results,
-        "recent_evidence_and_artifacts": [dict(row) for row in reversed(artifacts)],
+        "recent_evidence_and_artifacts": [
+            _artifact_reference(row) for row in reversed(artifacts)
+        ],
     }
     body = canonical_json(capsule)
     if len(body.encode()) > cap:
@@ -117,10 +176,7 @@ def compile_hot_context(
         )
         capsule["recent_evidence_and_artifacts"] = [
             {
-                "kind": row["kind"],
-                "path": row["path"],
-                "sha256": row["sha256"],
-                "acceptance_id": row["acceptance_id"],
+                **_artifact_reference(row),
             }
             for row in artifacts[:2]
         ]
@@ -133,86 +189,151 @@ def compile_hot_context(
     return body
 
 
+def _artifact_reference(row: sqlite3.Row) -> dict[str, object]:
+    try:
+        scope = json.loads(row["scope_json"])
+    except json.JSONDecodeError as error:
+        raise ValueError("Artifact scope is invalid") from error
+    return {
+        "kind": row["kind"],
+        "path": row["path"],
+        "sha256": row["sha256"],
+        "bytes": row["bytes"],
+        "acceptance_id": row["acceptance_id"],
+        "revision": row["revision"],
+        "scope": scope,
+        "source_task_id": row["source_task_id"],
+    }
+
+
 def _dependency_results(
     store: Store, connection: sqlite3.Connection, task_id: str
 ) -> list[dict[str, object]]:
-    rows = connection.execute(
+    dependencies = connection.execute(
         """
-        SELECT dependency.depends_on_task_id AS task_id, artifact.path, artifact.sha256
+        SELECT dependency.depends_on_task_id AS task_id,
+               task.spec_revision, task.outcome
         FROM task_dependencies dependency
-        JOIN artifacts artifact ON artifact.task_id = dependency.depends_on_task_id
-        WHERE dependency.task_id = ? AND artifact.kind = 'evidence'
-          AND artifact.acceptance_id IS NULL
-        ORDER BY artifact.created_at DESC, artifact.rowid DESC
+        JOIN tasks task ON task.id = dependency.depends_on_task_id
+        WHERE dependency.task_id = ?
+        ORDER BY dependency.rowid
         """,
         (task_id,),
     ).fetchall()
     results = []
-    seen = set()
-    for row in rows:
-        if row["task_id"] in seen or len(results) >= 2:
-            continue
-        seen.add(row["task_id"])
-        try:
-            path = store.resolve_data_path(row["path"])
-            with path.open("rb") as handle:
-                body = handle.read(65_537)
-            if len(body) > 65_536:
-                raise ValueError("dependency verdict exceeds bound")
-            verdict = json.loads(body)
-            if not isinstance(verdict, dict):
-                raise ValueError("dependency verdict must be an object")
-            acceptances = [
-                {
-                    "acceptance_id": str(item.get("acceptance_id") or ""),
-                    "actual_evidence": str(item.get("actual_evidence") or "")[:500],
-                    "recheck_command": str(item.get("recheck_command") or "")[:800],
-                }
-                for item in verdict.get("acceptances", [])[:8]
-                if isinstance(item, dict)
-            ]
-        except (OSError, ValueError, json.JSONDecodeError):
-            acceptances = []
-            verdict = {}
-        report_row = connection.execute(
+    for dependency in dependencies:
+        if dependency["outcome"] != "done":
+            raise ValueError(
+                f"dependency {dependency['task_id']} has no terminal result"
+            )
+        rows = connection.execute(
             """
-            SELECT path, sha256, bytes FROM artifacts
-            WHERE task_id = ? AND kind = 'output'
-              AND acceptance_id = 'provider_report'
-            ORDER BY created_at DESC, rowid DESC LIMIT 1
+            SELECT kind, path, sha256, bytes, acceptance_id, revision,
+                   scope_json, source_task_id
+            FROM artifacts
+            WHERE task_id = ? AND revision = ?
+              AND (
+                (kind = 'output' AND acceptance_id IN (
+                    'task_result_artifact', 'provider_report',
+                    'artifact_content_sha256'
+                ))
+                OR kind = 'evidence'
+              )
+            ORDER BY CASE kind WHEN 'output' THEN 0 ELSE 1 END,
+                     created_at, rowid
             """,
-            (row["task_id"],),
-        ).fetchone()
-        report = None
-        if report_row:
+            (dependency["task_id"], dependency["spec_revision"]),
+        ).fetchall()
+        manifests = []
+        evidence = []
+        for row in rows:
             try:
-                report_body = store.resolve_data_path(report_row["path"]).read_bytes()
+                scope = json.loads(row["scope_json"])
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    f"dependency {dependency['task_id']} has invalid Artifact scope"
+                ) from error
+            entry = {
+                "kind": row["kind"],
+                "path": row["path"],
+                "sha256": row["sha256"],
+                "bytes": row["bytes"],
+                "acceptance_id": row["acceptance_id"],
+                "revision": row["revision"],
+                "scope": scope,
+                "source_task_id": row["source_task_id"],
+            }
+            if (
+                row["source_task_id"] != dependency["task_id"]
+                or row["revision"] != dependency["spec_revision"]
+            ):
+                raise ValueError(
+                    f"dependency {dependency['task_id']} Artifact lineage mismatch"
+                )
+            manifests.append(entry)
+            if row["kind"] == "evidence":
+                _verified, body = verified_artifact(
+                    store,
+                    row,
+                    expected_source_task_id=dependency["task_id"],
+                    expected_revision=dependency["spec_revision"],
+                )
+                try:
+                    structured = json.loads(body)
+                except json.JSONDecodeError as error:
+                    raise ValueError(
+                        f"dependency {dependency['task_id']} Evidence is invalid"
+                    ) from error
+                if not isinstance(structured, dict):
+                    raise ValueError(
+                        f"dependency {dependency['task_id']} Evidence is not structured"
+                    )
+                evidence.append(
+                    {
+                        "manifest": entry,
+                        "content": structured,
+                    }
+                )
+            elif scope.get("kind") == "task_data":
+                verified_artifact(
+                    store,
+                    row,
+                    expected_source_task_id=dependency["task_id"],
+                    expected_revision=dependency["spec_revision"],
+                )
+            elif scope.get("kind") == "workspace":
+                snapshot = workspace_snapshot(
+                    str(scope["workspace_root"]), [str(row["path"])]
+                )
+                requested = snapshot.get("requested", [])
+                current = next(
+                    (
+                        item
+                        for item in requested
+                        if isinstance(item, dict)
+                        and item.get("path") == row["path"]
+                    ),
+                    None,
+                )
                 if (
-                    len(report_body) > 32_768
-                    or len(report_body) != int(report_row["bytes"])
-                    or hashlib.sha256(report_body).hexdigest()
-                    != report_row["sha256"]
+                    not isinstance(current, dict)
+                    or current.get("sha256") != row["sha256"]
+                    or current.get("bytes") != row["bytes"]
                 ):
-                    raise ValueError("dependency report contract failed")
-                report = {
-                    "path": report_row["path"],
-                    "sha256": report_row["sha256"],
-                    "content": report_body.decode(errors="replace"),
-                }
-            except (OSError, ValueError):
-                report = None
-        if report:
-            acceptances = [
-                {"acceptance_id": item["acceptance_id"]}
-                for item in acceptances
-            ]
+                    raise ValueError(
+                        f"dependency {dependency['task_id']} workspace "
+                        "Artifact path/hash changed after verification"
+                    )
+        if not manifests or not evidence:
+            raise ValueError(
+                f"dependency {dependency['task_id']} lacks complete Artifact/Evidence"
+            )
         results.append(
             {
-                "task_id": row["task_id"],
-                "verdict": verdict.get("checker_verdict"),
-                "evidence": {"path": row["path"], "sha256": row["sha256"]},
-                "provider_report": report,
-                "acceptances": acceptances,
+                "task_id": dependency["task_id"],
+                "revision": dependency["spec_revision"],
+                "artifacts": manifests,
+                "evidence": evidence,
             }
         )
     return results
@@ -291,24 +412,19 @@ def _segment_session(
             / f"segment-{revision:06d}.json"
         )
         _write_atomic(path, body)
-        connection.execute(
-            """
-            INSERT INTO artifacts(
-                id, project_id, task_id, kind, path, sha256, bytes,
-                acceptance_id, revision, created_at
-            ) VALUES (?, ?, ?, 'log', ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                uuid4().hex,
-                project_id,
-                session["task_id"],
-                store.relative_data_path(path),
-                hashlib.sha256(body).hexdigest(),
-                len(body),
-                acceptance_id,
-                revision,
-                time.time(),
-            ),
+        register_artifact(
+            store,
+            connection,
+            project_id=project_id,
+            task_id=session["task_id"],
+            kind="log",
+            path=path,
+            stored_path=store.relative_data_path(path),
+            acceptance_id=acceptance_id,
+            revision=revision,
+            scope=task_data_scope([]),
+            source_task_id=session["task_id"],
+            created_at=time.time(),
         )
         revision += 1
 
@@ -334,7 +450,9 @@ def _checkpoint_session(
 ) -> None:
     artifacts = connection.execute(
         """
-        SELECT kind, path, sha256, acceptance_id, revision FROM artifacts
+        SELECT kind, path, sha256, bytes, acceptance_id, revision,
+               scope_json, source_task_id
+        FROM artifacts
         WHERE task_id = ? AND kind IN ('output', 'evidence')
         ORDER BY created_at DESC, rowid DESC LIMIT 8
         """,
@@ -357,11 +475,7 @@ def _checkpoint_session(
         None,
     )
     evidence = [
-        {
-            "acceptance_id": row["acceptance_id"],
-            "path": row["path"],
-            "sha256": row["sha256"],
-        }
+        _artifact_reference(row)
         for row in artifacts
         if row["kind"] == "evidence"
     ]
@@ -382,7 +496,9 @@ def _checkpoint_session(
         },
         "confirmed_evidence": evidence,
         "artifacts": [
-            dict(row) for row in reversed(artifacts) if row["kind"] == "output"
+            _artifact_reference(row)
+            for row in reversed(artifacts)
+            if row["kind"] == "output"
         ],
         "latest_owner_decision": _decision_ref(latest_decision),
         "next_smallest_action": _next_action(session),
@@ -429,24 +545,19 @@ def _checkpoint_session(
     _write_atomic(archived, body)
     _write_atomic(base / "current.json", body)
     relative = store.relative_data_path(archived)
-    connection.execute(
-        """
-        INSERT INTO artifacts(
-            id, project_id, task_id, kind, path, sha256, bytes,
-            acceptance_id, revision, created_at
-        ) VALUES (?, ?, ?, 'handoff', ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            uuid4().hex,
-            project_id,
-            session["task_id"],
-            relative,
-            digest,
-            len(body),
-            acceptance_id,
-            revision,
-            time.time(),
-        ),
+    register_artifact(
+        store,
+        connection,
+        project_id=project_id,
+        task_id=session["task_id"],
+        kind="handoff",
+        path=archived,
+        stored_path=relative,
+        acceptance_id=acceptance_id,
+        revision=revision,
+        scope=task_data_scope([]),
+        source_task_id=session["task_id"],
+        created_at=time.time(),
     )
     connection.execute(
         "UPDATE session_generations SET handoff_ref = ? WHERE id = ?",

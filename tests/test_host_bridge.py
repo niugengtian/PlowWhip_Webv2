@@ -18,8 +18,10 @@ from plowwhip.host_bridge import (
     _parse_usage,
     _resolve_executable,
     _safe_environment,
+    _validated_capability,
     make_server,
 )
+from plowwhip.provider import provider_job_output
 
 
 class HostBridgeTest(unittest.TestCase):
@@ -48,6 +50,12 @@ with (project / "invocations.txt").open("a") as output:
     output.write("1\\n")
 if "SLEEP" in prompt:
     time.sleep(30)
+elif "DELETE" in prompt:
+    (project / "delete-me.txt").unlink()
+    (project / "after-delete.txt").write_text("applied")
+elif "BIG" in prompt:
+    sys.stdout.write("A" * (1024 * 1024 + 321))
+    print("\\nBIG-RESULT-END")
 else:
     (project / "result.txt").write_text("done")
     for index in range(25):
@@ -91,6 +99,24 @@ else:
         *,
         token: str | None = None,
     ) -> tuple[int, dict[str, object]]:
+        body = dict(body)
+        if path == "/v1/jobs/start" and "capability" not in body:
+            body["capability"] = {
+                "tier": (
+                    "read_only"
+                    if body.get("access") == "read"
+                    else "recoverable_workspace_write"
+                ),
+                "project_id": "test",
+                "task_id": "test",
+                "spec_revision": 1,
+                "allowed_actions": (
+                    ["read_workspace"]
+                    if body.get("access") == "read"
+                    else ["write_workspace", "run_checks"]
+                ),
+                "target_scope": "project_workspace",
+            }
         request = Request(
             f"{self.url}{path}",
             data=json.dumps(body).encode(),
@@ -133,6 +159,35 @@ else:
         )
         self.assertEqual(status, 200)
         self.assertTrue(probe["available"])
+        with self.assertRaisesRegex(ValueError, "structured capability"):
+            self.server.manager.start(  # type: ignore[attr-defined]
+                {
+                    "job_id": uuid4().hex,
+                    "adapter": "json-worker",
+                    "executable": str(self.worker),
+                    "project_path": str(self.project),
+                    "prompt": "missing capability",
+                    "timeout_seconds": 10,
+                    "access": "write",
+                    "context_policy": {},
+                }
+            )
+
+        status, rejected = self._post(
+            "/v1/jobs/start",
+            {
+                "job_id": uuid4().hex,
+                "adapter": "json-worker",
+                "executable": str(self.worker),
+                "project_path": str(self.project),
+                "prompt": "api_key=abcdefghijklmnop",
+                "timeout_seconds": 10,
+                "access": "write",
+                "context_policy": {},
+            },
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("plaintext Secret", rejected["detail"])
 
         _, before = self._post(
             "/v1/evidence/snapshot", {"project_path": str(self.project), "paths": []}
@@ -147,6 +202,7 @@ else:
             "timeout_seconds": 10,
             "access": "write",
             "context_policy": {},
+            "model": "fixture-model",
         }
         self.assertEqual(self._post("/v1/jobs/start", payload)[0], 202)
         self.assertEqual(self._post("/v1/jobs/start", payload)[0], 202)
@@ -157,6 +213,7 @@ else:
         self.assertEqual(terminal["cached_input_tokens"], 3)
         self.assertEqual(terminal["output_tokens"], 2)
         self.assertEqual(terminal["model"], "fake-model")
+        self.assertEqual(terminal["requested_model"], "fixture-model")
         self.assertEqual(
             (self.project / "invocations.txt").read_text().splitlines(),
             ["1"],
@@ -195,6 +252,144 @@ else:
         self.assertEqual(recovered["status"], "completed")
         self.assertEqual(recovered["returncode"], 0)
 
+    def test_complete_output_is_chunked_to_eof_and_never_tail_overwritten(self):
+        job_id = uuid4().hex
+        payload = {
+            "job_id": job_id,
+            "adapter": "json-worker",
+            "executable": str(self.worker),
+            "project_path": str(self.project),
+            "prompt": "BIG",
+            "timeout_seconds": 10,
+            "access": "write",
+            "context_policy": {},
+        }
+        self.assertEqual(self._post("/v1/jobs/start", payload)[0], 202)
+        terminal = self._wait_terminal(job_id)
+        self.assertEqual(terminal["status"], "completed")
+
+        offsets = {"stdout": 0, "stderr": 0}
+        bodies = {"stdout": [], "stderr": []}
+        while True:
+            _, output = self._post(
+                "/v1/jobs/output",
+                {
+                    "job_id": job_id,
+                    "stdout_offset": offsets["stdout"],
+                    "stderr_offset": offsets["stderr"],
+                    "limit": 65_536,
+                    "tail_lines": 20,
+                },
+            )
+            for chunk in output["chunks"]:
+                bodies[chunk["stream"]].append(chunk["text"])
+            offsets = output["next_offsets"]
+            if not output["has_more"]:
+                break
+        stdout = "".join(bodies["stdout"])
+        self.assertGreater(len(stdout.encode()), 1024 * 1024)
+        self.assertTrue(stdout.endswith("BIG-RESULT-END\n"))
+        stream_ref = output["stream_refs"]["stdout"]
+        self.assertEqual(stream_ref["bytes"], offsets["stdout"])
+        self.assertTrue(stream_ref["complete"])
+        persisted = self.state / job_id / "stdout.segment-000001.log"
+        self.assertEqual(persisted.stat().st_size, stream_ref["bytes"])
+        self.assertEqual(
+            __import__("hashlib").sha256(persisted.read_bytes()).hexdigest(),
+            stream_ref["sha256"],
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "PLOW_WHIP_BRIDGE_URL": self.url,
+                "PLOW_WHIP_BRIDGE_TOKEN": self.token,
+            },
+        ):
+            complete = provider_job_output(job_id, complete=True)
+        complete_stdout = "".join(
+            chunk["text"]
+            for chunk in complete["chunks"]
+            if chunk["stream"] == "stdout"
+        )
+        self.assertEqual(complete_stdout, stdout)
+        self.assertTrue(complete["complete"])
+
+    def test_recoverable_workspace_capability_renames_deletions(self):
+        original = self.project / "delete-me.txt"
+        original.write_text("preserve me")
+        job_id = uuid4().hex
+        status, _ = self._post(
+            "/v1/jobs/start",
+            {
+                "job_id": job_id,
+                "adapter": "json-worker",
+                "executable": str(self.worker),
+                "project_path": str(self.project),
+                "prompt": "DELETE",
+                "timeout_seconds": 10,
+                "access": "write",
+                "context_policy": {},
+            },
+        )
+        self.assertEqual(status, 202)
+        terminal = self._wait_terminal(job_id)
+        self.assertEqual(terminal["returncode"], 0)
+        self.assertTrue(terminal["workspace_apply"]["applied"])
+        self.assertFalse(original.exists())
+        recoverable = list(self.project.glob("delete-me.txt.rm.*"))
+        self.assertEqual(len(recoverable), 1)
+        self.assertRegex(
+            recoverable[0].name,
+            r"^delete-me\.txt\.rm\.\d{14}$",
+        )
+        self.assertEqual(recoverable[0].read_text(), "preserve me")
+        self.assertEqual(
+            (self.project / "after-delete.txt").read_text(), "applied"
+        )
+
+    def test_external_effect_capability_requires_scoped_live_authorization(self):
+        base = {
+            "tier": "authorized_external_effect",
+            "project_id": "project",
+            "task_id": "task",
+            "spec_revision": 3,
+        }
+        authorization = {
+            "project_id": "project",
+            "task_id": "task",
+            "spec_revision": 3,
+            "action_kind": "git_publish",
+            "target_scope": "git@example.invalid:repo.git#refs/heads/main",
+            "expires_at": time.time() + 60,
+        }
+        validated = _validated_capability(
+            {**base, "authorization": authorization},
+            "git-publish",
+            "write",
+        )
+        self.assertEqual(
+            validated["authorization"]["target_scope"],
+            authorization["target_scope"],
+        )
+        with self.assertRaisesRegex(ValueError, "stale or out of scope"):
+            _validated_capability(
+                {
+                    **base,
+                    "authorization": {
+                        **authorization,
+                        "expires_at": time.time() - 1,
+                    },
+                },
+                "git-publish",
+                "write",
+            )
+        with self.assertRaisesRegex(ValueError, "capability tier"):
+            _validated_capability(
+                {"tier": "recoverable_workspace_write"},
+                "git-publish",
+                "write",
+            )
+
     def test_scope_executable_loopback_and_cancel_guards(self):
         private_env = self.root / "bridge.env"
         private_env.write_text("PLOW_WHIP_BRIDGE_TOKEN=file-token-is-long-enough-123\n")
@@ -208,6 +403,9 @@ else:
                 __import__("os").environ["PLOW_WHIP_BRIDGE_TOKEN"],
                 "file-token-is-long-enough-123",
             )
+        private_env.write_text("DEEPSEEK_MODEL=must-not-be-env\n")
+        with self.assertRaisesRegex(SystemExit, "unsupported private environment"):
+            _load_private_env(private_env)
 
         outside = self.root.parent
         status, _ = self._post(
@@ -329,9 +527,15 @@ else:
             "implement",
             "write",
             context,
+            model="cursor-test-model",
         )
         self.assertIn("--force", write_argv)
         self.assertNotIn("--mode", write_argv)
+        self.assertIn("--model", write_argv)
+        self.assertEqual(
+            write_argv[write_argv.index("--model") + 1],
+            "cursor-test-model",
+        )
 
         usage = _parse_usage(
             "\n".join(
@@ -446,6 +650,62 @@ print(json.dumps({
             "workspace-write",
         )
 
+    def test_planner_job_uses_private_read_only_bridge_workspace(self):
+        codex = self.root / "codex"
+        codex.write_text(
+            """#!/usr/bin/env python3
+import json
+import pathlib
+
+pathlib.Path("provider-write.txt").write_text("isolated", encoding="utf-8")
+print(json.dumps({"cwd": str(pathlib.Path.cwd())}))
+""",
+            encoding="utf-8",
+        )
+        codex.chmod(0o700)
+        workspace_key = "project-a-planner"
+        job_id = uuid4().hex
+        status, _ = self._post(
+            "/v1/jobs/start",
+            {
+                "job_id": job_id,
+                "adapter": "codex",
+                "executable": "codex",
+                "project_path": "",
+                "workspace_kind": "planner",
+                "workspace_key": workspace_key,
+                "prompt": "classify one immutable instruction",
+                "timeout_seconds": 10,
+                "access": "read",
+                "context_policy": {},
+            },
+        )
+        self.assertEqual(status, 202)
+        terminal = self._wait_terminal(job_id)
+        self.assertEqual(terminal["status"], "completed")
+        self.assertTrue(terminal["isolated_workspace"])
+        planner_workspace = self.state / "planner-workspaces" / workspace_key
+        self.assertTrue(planner_workspace.is_dir())
+        self.assertFalse((planner_workspace / "provider-write.txt").exists())
+
+        invalid = {
+            "job_id": uuid4().hex,
+            "adapter": "codex",
+            "executable": "codex",
+            "project_path": "",
+            "workspace_kind": "planner",
+            "workspace_key": "../escape",
+            "prompt": "invalid",
+            "timeout_seconds": 10,
+            "access": "read",
+            "context_policy": {},
+        }
+        self.assertEqual(self._post("/v1/jobs/start", invalid)[0], 400)
+        invalid["job_id"] = uuid4().hex
+        invalid["workspace_key"] = "project-a-write"
+        invalid["access"] = "write"
+        self.assertEqual(self._post("/v1/jobs/start", invalid)[0], 400)
+
     def test_cursor_first_job_bootstraps_one_session(self):
         cursor = self.root / "cursor"
         cursor.write_text(
@@ -557,6 +817,8 @@ else:
                 "PLOW_WHIP_GIT_SSH_IDENTITY_FILE": (
                     "/Users/test/.ssh/id_ed25519"
                 ),
+                "DEEPSEEK_MODEL": "must-not-pass",
+                "KIMI_MODEL": "must-not-pass",
                 "UNRELATED_SECRET": "must-not-pass",
             },
             clear=True,
@@ -570,6 +832,8 @@ else:
             "/Users/test/.ssh/id_ed25519",
         )
         self.assertNotIn("UNRELATED_SECRET", environment)
+        self.assertNotIn("DEEPSEEK_MODEL", environment)
+        self.assertNotIn("KIMI_MODEL", environment)
 
 
 if __name__ == "__main__":
