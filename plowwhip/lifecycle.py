@@ -250,45 +250,33 @@ def record_checkpoint_failure(
     store: Store, project_id: str, error: ValueError
 ) -> None:
     now = time.time()
-    with lifecycle_write_scope("advance_project"):
-        with store.transaction() as connection:
-            task = connection.execute(
-                """
-                SELECT id FROM tasks
-                WHERE project_id = ? AND outcome IS NULL
-                ORDER BY created_at, rowid LIMIT 1
-                """,
-                (project_id,),
-            ).fetchone()
-            if not task:
-                return
-            detail = str(error)[:500]
-            write_task_fields(
-                connection,
+    with store.transaction() as connection:
+        task = connection.execute(
+            """
+            SELECT id FROM tasks
+            WHERE project_id = ? AND outcome IS NULL
+            ORDER BY created_at, rowid LIMIT 1
+            """,
+            (project_id,),
+        ).fetchone()
+        if not task:
+            return
+        # A checkpoint is an observer, not a second lifecycle driver.  It records
+        # immutable facts only; advance_project consumes the fact on a later tick.
+        detail = str(error)[:500]
+        connection.execute(
+            """
+            INSERT INTO task_events(
+                project_id, task_id, kind, detail_json, created_at
+            ) VALUES (?, ?, 'checkpoint_failed', ?, ?)
+            """,
+            (
+                project_id,
                 task["id"],
-                {
-                    "public_status": "needs_decision",
-                    "phase": "provider_recovery",
-                    "fault_code": "scope",
-                    "wait_reason": detail,
-                    "next_action_at": None,
-                    "next_action_kind": None,
-                    "updated_at": now,
-                },
-            )
-            connection.execute(
-                """
-                INSERT INTO task_events(
-                    project_id, task_id, kind, detail_json, created_at
-                ) VALUES (?, ?, 'checkpoint_failed', ?, ?)
-                """,
-                (
-                    project_id,
-                    task["id"],
-                    canonical_json({"error": detail}),
-                    now,
-                ),
-            )
+                canonical_json({"error": detail}),
+                now,
+            ),
+        )
 
 
 def _assert_lease(
@@ -311,6 +299,63 @@ def _advance_project_transaction(
     """Perform exactly one lifecycle action. Cronner is the only caller with a lease."""
     with store.transaction() as connection:
         _assert_lease(connection, project_id, lease_token, fence)
+
+        checkpoint_failure = connection.execute(
+            """
+            SELECT task.* , event.id AS checkpoint_event_id, event.detail_json
+            FROM task_events event
+            JOIN tasks task ON task.id = event.task_id
+            WHERE event.project_id = ? AND event.kind = 'checkpoint_failed'
+              AND task.outcome IS NULL
+              AND task.public_status IN ('pending', 'in_progress')
+              AND NOT EXISTS (
+                  SELECT 1 FROM task_events consumed
+                  WHERE consumed.task_id = task.id
+                    AND consumed.kind = 'checkpoint_failure_escalated'
+                    AND json_extract(consumed.detail_json, '$.source_event_id')
+                        = event.id
+              )
+            ORDER BY event.created_at, event.rowid LIMIT 1
+            """,
+            (project_id,),
+        ).fetchone()
+        if checkpoint_failure:
+            detail = json.loads(checkpoint_failure["detail_json"]).get("error", "")
+            now = time.time()
+            write_task_fields(
+                connection,
+                checkpoint_failure["id"],
+                {
+                    "public_status": "needs_decision",
+                    "phase": "provider_recovery",
+                    "fault_code": "scope",
+                    "wait_reason": str(detail)[:500],
+                    "next_action_at": None,
+                    "next_action_kind": None,
+                    "updated_at": now,
+                },
+            )
+            connection.execute(
+                """
+                INSERT INTO task_events(
+                    project_id, task_id, kind, detail_json, created_at
+                ) VALUES (?, ?, 'checkpoint_failure_escalated', ?, ?)
+                """,
+                (
+                    project_id,
+                    checkpoint_failure["id"],
+                    canonical_json(
+                        {
+                            "source": "checkpoint_failed",
+                            "source_event_id": checkpoint_failure[
+                                "checkpoint_event_id"
+                            ],
+                        }
+                    ),
+                    now,
+                ),
+            )
+            return "checkpoint_needs_decision"
 
         action = connection.execute(
             """
@@ -511,11 +556,37 @@ def _create_task(
     facts = instruction_facts(
         message["content"], str(normalized_candidate["kind"])
     )
-    from .script_library import list_project_scripts
+    from .script_library import list_project_scripts, search_script_library
 
-    facts["script_library"] = list_project_scripts(
-        connection, store, message["project_id"], limit=20
+    script_goal = (
+        str(normalized_candidate["kind"]) == "local_script"
+        or "script" in message["content"].lower()
+        or "脚本" in message["content"]
     )
+    declared_script = (
+        normalized_candidate.get("script")
+        if isinstance(normalized_candidate.get("script"), dict)
+        else {}
+    )
+    script_query = str(
+        declared_script.get("item_key") or message["content"][:128]
+    )
+    script_search = (
+        search_script_library(
+            connection, store, script_query, project_id=message["project_id"]
+        )
+        if script_goal
+        else []
+    )
+    if script_goal:
+        facts["script_library"] = list_project_scripts(
+            connection, store, message["project_id"], limit=20
+        )
+        facts["script_library_search"] = {
+            "query": script_query,
+            "hit_count": len(script_search),
+            "hits": script_search,
+        }
     project = connection.execute(
         "SELECT host_path FROM projects WHERE id = ?", (message["project_id"],)
     ).fetchone()
@@ -623,6 +694,20 @@ def _create_task(
         _first_provider(connection, message["project_id"], checker_role),
         True,
     )
+    if script_goal:
+        connection.execute(
+            """
+            INSERT INTO task_events(
+                project_id, task_id, kind, detail_json, created_at
+            ) VALUES (?, ?, 'script_library_search', ?, ?)
+            """,
+            (
+                message["project_id"],
+                task_id,
+                canonical_json(facts["script_library_search"]),
+                now,
+            ),
+        )
     connection.execute(
         "UPDATE messages SET action_json = ?, processed_at = ? WHERE id = ?",
         (canonical_json(spec), now, message["id"]),

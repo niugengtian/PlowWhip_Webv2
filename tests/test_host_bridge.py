@@ -57,6 +57,14 @@ elif "DELETE" in prompt:
 elif "BIG" in prompt:
     sys.stdout.write("A" * (1024 * 1024 + 321))
     print("\\nBIG-RESULT-END")
+elif "TURN_LIMIT" in prompt:
+    print(json.dumps({"type": "model.request_started", "ts": time.time()}))
+    print(json.dumps({
+        "type": "worker.error",
+        "failure_class": "internal_tool_no_progress",
+        "ts": time.time(),
+    }))
+    raise SystemExit(1)
 else:
     (project / "result.txt").write_text("done")
     for index in range(25):
@@ -518,6 +526,46 @@ else:
             time.sleep(0.02)
         else:
             self.fail("restarted Bridge did not reconcile cancellation")
+        self.assertEqual(terminal["returncode"], 130)
+
+    def test_active_model_turn_limit_is_recorded_as_advisory(self):
+        job_id = uuid4().hex
+        status, _ = self._post(
+            "/v1/jobs/start",
+            {
+                "job_id": job_id,
+                "adapter": "json-worker",
+                "executable": str(self.worker),
+                "project_path": str(self.project),
+                "prompt": "TURN_LIMIT",
+                "timeout_seconds": 10,
+                "access": "write",
+                "context_policy": {},
+            },
+        )
+        self.assertEqual(status, 202)
+        terminal = self._wait_terminal(job_id)
+        self.assertEqual(terminal["failure_class"], "internal_tool_no_progress")
+        self.assertTrue(terminal["turn_limit_advisory"])
+
+    def test_force_cancel_converges_when_host_remains_active(self):
+        job_id = uuid4().hex
+        manager = HostJobManager(self.root / "force-state", (self.root.resolve(),))
+        manager._write(  # type: ignore[attr-defined]
+            {
+                "job_id": job_id,
+                "status": "cancelling",
+                "force_cancel_requested": True,
+                "started_at": time.time(),
+                "project_path": str(self.project),
+                "adapter": "json-worker",
+                "isolated_workspace": False,
+            }
+        )
+        with patch("plowwhip.host_bridge.time.sleep"):
+            manager._force_cancel_deadline(job_id)  # type: ignore[attr-defined]
+        terminal = manager.status(job_id)
+        self.assertEqual(terminal["status"], "cancelled")
         self.assertEqual(terminal["returncode"], 130)
 
     def test_cursor_read_mode_and_cumulative_token_normalization(self):

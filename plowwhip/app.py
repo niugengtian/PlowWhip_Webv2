@@ -29,6 +29,7 @@ from .monitor import (
     task_snapshot,
     token_snapshot,
 )
+from .provider import bridge_health
 from .store import Store
 from .ui import HTML
 
@@ -63,6 +64,9 @@ class Handler(BaseHTTPRequestHandler):
                         if getattr(self.server, "cronner_enabled", False)
                         else "disabled"
                     ),
+                    # Backward-compatible additive status.  A reachable Bridge
+                    # may still reject a particular job; job APIs classify that.
+                    "bridge": bridge_health(),
                 },
             )
             return

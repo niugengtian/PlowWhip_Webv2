@@ -4,10 +4,16 @@ Planner/control-plane set per-Task budgets. Soft timeout reports to the
 project butler, doubles the budget up to MAX_SOFT_TIMEOUTS, and records a
 ledger note that the Task timeout estimate was wrong. Hard idle never
 doubles — fail-closed to stop token burn.
+
+T-14: the 2nd and 3rd soft extensions also require effective increment
+(new Artifact/Evidence/acceptance progress, or exploration frontier growth);
+active I/O alone is not enough after the first soft.
 """
 
 from __future__ import annotations
 
+import json
+import sqlite3
 from pathlib import Path
 from typing import Literal
 
@@ -35,6 +41,18 @@ ACTIVE_IO_PHASES = frozenset(
         "model_response",
         "tool",
         "compacting",
+    }
+)
+
+PROGRESS_EVENT_KINDS = frozenset(
+    {
+        "artifact_registered",
+        "artifact_indexed",
+        "evidence_recorded",
+        "acceptance_progress",
+        "workspace_revision",
+        "exploration_frontier",
+        "formal_result_manifest",
     }
 )
 
@@ -83,6 +101,68 @@ def classify_timeout(
 
 def soft_timeout_allowed(count: int) -> bool:
     return 0 <= int(count) < MAX_SOFT_TIMEOUTS
+
+
+def effective_increment_since(
+    connection: sqlite3.Connection,
+    task_id: str,
+    *,
+    since: float | None,
+    dispatch: dict | None = None,
+) -> bool:
+    """T-14: true when Artifact/Evidence/frontier progressed after *since*."""
+    since_at = float(since or 0.0)
+    rows = connection.execute(
+        """
+        SELECT kind, detail_json, created_at FROM task_events
+        WHERE task_id = ? AND created_at > ?
+        ORDER BY created_at DESC, rowid DESC
+        LIMIT 80
+        """,
+        (task_id, since_at),
+    ).fetchall()
+    for row in rows:
+        kind = str(row["kind"] or "")
+        if kind in PROGRESS_EVENT_KINDS or kind.startswith("artifact_"):
+            return True
+        if "evidence" in kind or "acceptance" in kind:
+            return True
+        try:
+            detail = json.loads(row["detail_json"] or "{}")
+        except json.JSONDecodeError:
+            detail = {}
+        if not isinstance(detail, dict):
+            continue
+        if detail.get("effective_increment") is True:
+            return True
+        if detail.get("new_artifact") or detail.get("artifact_path"):
+            return True
+        frontier = detail.get("exploration_frontier")
+        if isinstance(frontier, (int, float)) and frontier > 0:
+            return True
+
+    payload = dispatch if isinstance(dispatch, dict) else {}
+    baseline = payload.get("soft_progress_baseline")
+    current = payload.get("soft_progress_marker")
+    if baseline is not None and current is not None and current != baseline:
+        return True
+    artifact_count = payload.get("result_artifact_count")
+    baseline_count = payload.get("soft_artifact_count_baseline")
+    try:
+        if (
+            artifact_count is not None
+            and baseline_count is not None
+            and int(artifact_count) > int(baseline_count)
+        ):
+            return True
+    except (TypeError, ValueError):
+        pass
+    return False
+
+
+def soft_extension_requires_increment(soft_count: int) -> bool:
+    """After the first soft extension, further doubles need T-14 increment."""
+    return int(soft_count) >= 1
 
 
 def ledger_timeout_note(

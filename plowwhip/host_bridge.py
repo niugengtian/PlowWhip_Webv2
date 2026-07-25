@@ -688,7 +688,36 @@ class HostJobManager:
             pid,
             signal.SIGKILL if force else signal.SIGTERM,
         )
+        if force:
+            # SIGKILL can be ignored by an uninterruptible host process.  Do not
+            # let that leave the control-plane slot occupied forever.
+            threading.Thread(
+                target=self._force_cancel_deadline,
+                args=(job_id,),
+                name=f"plowwhip-force-cancel-{job_id[:8]}",
+                daemon=True,
+            ).start()
         return dict(record)
+
+    def _force_cancel_deadline(self, job_id: str) -> None:
+        """Bound force-cancel convergence even when the host never reaps."""
+        time.sleep(3)
+        with self._lock:
+            record = self._read(job_id, required=False)
+            if not record or record.get("status") not in ACTIVE_STATUSES:
+                return
+            if not record.get("force_cancel_requested"):
+                return
+            record.update(
+                {
+                    "status": "cancelled",
+                    "returncode": 130,
+                    "failure_class": "cancelled",
+                    "force_cancel_converged_at": time.time(),
+                }
+            )
+            self._finish(record)
+            self._write(record)
 
     def _wait(
         self,
@@ -961,6 +990,23 @@ class HostJobManager:
             "process",
         }:
             record["failure_class"] = derived["failure_class"]
+        if (
+            record.get("failure_class")
+            in {"internal_tool_no_progress", "tool_no_progress_limit_exceeded"}
+            and any(
+                marker in stdout
+                for marker in (
+                    '"type": "model.request_started"',
+                    '"type":"model.request_started"',
+                    '"type": "model.response_started"',
+                    '"type":"model.response_started"',
+                )
+            )
+        ):
+            # A worker-reported turn/tool ceiling during model I/O is advisory:
+            # preserve it for diagnosis but never reinterpret it as a Bridge
+            # transport or process failure.
+            record["turn_limit_advisory"] = True
         record["ended_at"] = record.get("ended_at") or time.time()
         record["duration_ms"] = max(
             0, int((record["ended_at"] - record["started_at"]) * 1_000)

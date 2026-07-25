@@ -13,7 +13,9 @@ from plowwhip.host_bridge import (
 from plowwhip.intake import (
     extract_local_script_spec,
     set_project_setting,
+    submit_message,
 )
+from plowwhip.cronner import tick
 from plowwhip.local_script_worker import run_local_script
 from plowwhip.provider_policy import (
     first_eligible_provider,
@@ -131,6 +133,54 @@ if __name__ == "__main__":
         self.assertEqual(listed[0]["item_key"], "normalize_csv")
         result = search(self.store.db_path, self.store.data_root, "normalize")
         self.assertTrue(any(item["kind"] == "script" for item in result["results"]))
+
+    def test_script_goal_records_library_hit_or_miss_before_planning(self):
+        body = '"""summary: normalize records"""\n'
+        with self.store.transaction() as connection:
+            for project_id in ("script-hit", "script-miss"):
+                connection.execute(
+                    "INSERT INTO projects(id, display_name, created_at) VALUES (?, ?, 1)",
+                    (project_id, project_id),
+                )
+            path = self.store.data_root / "scripts" / "normalize.revision-000001.py"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(body, encoding="utf-8")
+            connection.execute(
+                """
+                INSERT INTO library_items(
+                    id, scope, project_id, kind, item_key, revision, path, sha256, created_at
+                ) VALUES ('b123456789012345678901234567890', 'project', 'script-hit',
+                          'script', 'normalize', 1, ?, 'sha', 1)
+                """,
+                (self.store.relative_data_path(path),),
+            )
+        submit_message(
+            self.store,
+            "script-hit",
+            "run local script library:normalize",
+            "script-hit-message",
+        )
+        submit_message(
+            self.store,
+            "script-miss",
+            "run local script library:missing",
+            "script-miss-message",
+        )
+        tick(self.store, limit=2)
+        connection = self.store.connect_readonly()
+        try:
+            rows = connection.execute(
+                """
+                SELECT project_id, detail_json FROM task_events
+                WHERE kind = 'script_library_search' ORDER BY project_id
+                """
+            ).fetchall()
+        finally:
+            connection.close()
+        results = {row["project_id"]: json.loads(row["detail_json"]) for row in rows}
+        self.assertEqual(results["script-hit"]["hit_count"], 1)
+        self.assertEqual(results["script-hit"]["hits"][0]["item_key"], "normalize")
+        self.assertEqual(results["script-miss"]["hit_count"], 0)
 
     def test_local_script_instruction_and_worker(self):
         spec = extract_local_script_spec(

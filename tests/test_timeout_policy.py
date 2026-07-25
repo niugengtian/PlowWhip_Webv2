@@ -15,7 +15,9 @@ from plowwhip.timeout_policy import (
     classify_timeout,
     clamp_timeout_seconds,
     default_timeout_seconds,
+    effective_increment_since,
     next_soft_timeout_seconds,
+    soft_extension_requires_increment,
 )
 
 
@@ -222,6 +224,121 @@ class TimeoutPolicyTest(unittest.TestCase):
             )
         self.assertEqual(outcome, "hard_idle")
         extend.assert_not_called()
+
+    def test_t14_second_soft_requires_effective_increment(self):
+        self.assertFalse(soft_extension_requires_increment(0))
+        self.assertTrue(soft_extension_requires_increment(1))
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.executescript(
+            """
+            CREATE TABLE tasks(
+                id TEXT PRIMARY KEY, project_id TEXT, deadline_at REAL,
+                public_status TEXT, phase TEXT, wait_reason TEXT,
+                fault_code TEXT, next_action_at REAL, next_action_kind TEXT,
+                updated_at REAL, spec_revision INTEGER DEFAULT 1
+            );
+            CREATE TABLE host_jobs(
+                id TEXT PRIMARY KEY, task_id TEXT, status TEXT, dispatch_json TEXT
+            );
+            CREATE TABLE messages(
+                id TEXT PRIMARY KEY, project_id TEXT, role TEXT, content TEXT,
+                action_json TEXT, idempotency_key TEXT UNIQUE,
+                created_at REAL, processed_at REAL
+            );
+            CREATE TABLE task_events(
+                project_id TEXT, task_id TEXT, kind TEXT,
+                detail_json TEXT, created_at REAL
+            );
+            """
+        )
+        now = time.time()
+        connection.execute(
+            """
+            INSERT INTO tasks VALUES (
+                'task3', 'proj', ?, 'in_progress', 'execute_wait', NULL,
+                NULL, ?, 'poll', ?, 1
+            )
+            """,
+            (now - 1, now + 1, now),
+        )
+        connection.execute(
+            """
+            INSERT INTO host_jobs VALUES (
+                'job3', 'task3', 'running', ?
+            )
+            """,
+            (
+                json.dumps(
+                    {
+                        "timeout_seconds": 1200,
+                        "soft_timeout_count": 1,
+                        "last_soft_timeout_at": now - 60,
+                    }
+                ),
+            ),
+        )
+        task = connection.execute("SELECT * FROM tasks").fetchone()
+        job = connection.execute("SELECT * FROM host_jobs").fetchone()
+        state = {
+            "status": "running",
+            "deadline_reached_at": now,
+            "timeout_seconds": 1200,
+            "io_phase": "awaiting_model",
+            "last_io_at": now,
+        }
+        from plowwhip.lifecycle_state import lifecycle_write_scope
+
+        with lifecycle_write_scope("advance_project"), patch(
+            "plowwhip.soft_timeout.extend_provider_job_timeout"
+        ) as extend:
+            stalled = try_soft_timeout_extension(
+                connection,
+                task,
+                job,
+                state,
+                now=now,
+                repo_root=Path(tempfile.mkdtemp()),
+            )
+        self.assertEqual(stalled, "stall_no_increment")
+        extend.assert_not_called()
+
+        connection.execute(
+            """
+            INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
+            VALUES ('proj', 'task3', 'artifact_registered', '{}', ?)
+            """,
+            (now - 10,),
+        )
+        self.assertTrue(
+            effective_increment_since(
+                connection, "task3", since=now - 60, dispatch={}
+            )
+        )
+        job = connection.execute("SELECT * FROM host_jobs").fetchone()
+        with lifecycle_write_scope("advance_project"), patch(
+            "plowwhip.soft_timeout.extend_provider_job_timeout",
+            return_value={"timeout_seconds": 2400},
+        ) as extend:
+            extended = try_soft_timeout_extension(
+                connection,
+                task,
+                job,
+                state,
+                now=now,
+                repo_root=Path(tempfile.mkdtemp()),
+            )
+        self.assertEqual(extended, "extended")
+        extend.assert_called_once()
+        event = connection.execute(
+            """
+            SELECT detail_json FROM task_events
+            WHERE kind = 'task_timeout_soft_extended'
+            ORDER BY rowid DESC LIMIT 1
+            """
+        ).fetchone()
+        detail = json.loads(event["detail_json"])
+        self.assertTrue(detail.get("effective_increment"))
 
 
 if __name__ == "__main__":

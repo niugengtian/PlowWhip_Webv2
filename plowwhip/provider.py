@@ -167,14 +167,46 @@ def provider_agent_text(output: str) -> str:
 
 
 class HostBridgeError(RuntimeError):
-    def __init__(self, message: str, *, status: int | None = None, detail: str = ""):
+    """A Bridge failure with a stable control-plane classification."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int | None = None,
+        detail: str = "",
+        failure_kind: str = "transient",
+    ):
         super().__init__(message)
         self.status = status
         self.detail = detail
+        self.failure_kind = failure_kind
 
     @property
     def rejected(self) -> bool:
         return self.status is not None and 400 <= self.status < 500
+
+
+def bridge_health() -> str:
+    """Return disabled, ok, or unreachable without exposing Bridge credentials."""
+    try:
+        base_url, token = _bridge_configuration()
+    except HostBridgeError:
+        return "disabled"
+    try:
+        # Probe is read-only and validates only the Bridge process/credential.
+        _bridge_post(
+            base_url,
+            token,
+            "/v1/probe",
+            {"adapter": "local-script", "executable": "local-script"},
+            2,
+        )
+    except HostBridgeError as error:
+        return "unreachable" if error.failure_kind == "unreachable" else "ok"
+    except RuntimeError:
+        return "ok"
+    return "ok"
 
 
 PROVIDER_ORDERS = {
@@ -599,7 +631,11 @@ def _contains_context_compaction(value: object) -> bool:
 def _bridge_configuration() -> tuple[str, str]:
     token = os.environ.get("PLOW_WHIP_BRIDGE_TOKEN")
     if not token:
-        raise RuntimeError("Host Bridge token is not configured")
+        raise HostBridgeError(
+            "Host Bridge is not configured",
+            detail="PLOW_WHIP_BRIDGE_TOKEN is not configured",
+            failure_kind="not_configured",
+        )
     return (
         os.environ.get(
             "PLOW_WHIP_BRIDGE_URL", "http://host.docker.internal:8765"
@@ -686,10 +722,20 @@ def _bridge_post(
         message = f"Host Bridge rejected request: HTTP {error.code}"
         if detail:
             message += f" ({detail})"
-        raise HostBridgeError(message, status=error.code, detail=detail) from error
+        raise HostBridgeError(
+            message,
+            status=error.code,
+            detail=detail,
+            failure_kind=(
+                "task_missing"
+                if error.code == 404 and "/v1/jobs/" in path
+                else "transient"
+            ),
+        ) from error
     except (URLError, TimeoutError, OSError) as error:
         raise HostBridgeError(
-            f"Host Bridge is unreachable: {type(error).__name__}"
+            f"Host Bridge is unreachable: {type(error).__name__}",
+            failure_kind="unreachable",
         ) from error
     if len(body) > max_bytes:
         raise RuntimeError("Host Bridge response is too large")

@@ -934,8 +934,13 @@ def pending_provider_step(
     settings = json.loads(session["settings_json"])["values"]
     if task["phase"] == "stopping":
         cancel_sent_at = dispatch.get("cancel_sent_at")
+        force_sent_at = dispatch.get("force_cancel_sent_at")
         if cancel_sent_at is None:
             kind = "cancel"
+        elif force_sent_at is not None:
+            # Force was already issued. Poll the Bridge; it owns process truth
+            # and has its own bounded force-cancel convergence watchdog.
+            kind = "poll"
         elif time.time() >= float(cancel_sent_at) + int(
             settings.get("stop_grace_seconds", 10)
         ):
@@ -1107,7 +1112,7 @@ def perform_provider_step(step: ProviderStep) -> dict[str, object]:
             "failure_kind": (
                 "rejected"
                 if step.kind == "start" and stage == "start" and error.rejected
-                else "transport"
+                else error.failure_kind
             ),
             "failure_stage": stage,
             "error_status": error.status,
@@ -1142,6 +1147,7 @@ def apply_provider_step(
         dispatch = json.loads(job["dispatch_json"])
         failures = int(dispatch.get("reconcile_failures") or 0) + 1
         dispatch["reconcile_failures"] = failures
+        bridge_failure = str(facts.get("failure_kind") or "transient")
         settings = connection.execute(
             "SELECT settings_json FROM task_sessions WHERE id = ?",
             (job["task_session_id"],),
@@ -1180,13 +1186,22 @@ def apply_provider_step(
                         if exhausted and step.kind == "recover"
                         else f"Host Bridge snapshot unavailable after {failures} attempts"
                         if exhausted
-                        else f"Host Bridge {step.kind} unavailable; idempotent reconcile scheduled"
+                        else (
+                            f"Host Bridge {bridge_failure} during {step.kind}; "
+                            "idempotent reconcile scheduled"
+                        )
                     )
                 ),
                 "fault_code": (
                     "unsafe_unknown"
                     if exhausted and not safe_reconcile
-                    else "transport"
+                    else (
+                        "credential"
+                        if bridge_failure == "not_configured"
+                        else "scope"
+                        if bridge_failure == "task_missing"
+                        else "transport"
+                    )
                 ),
                 "next_action_at": (
                     None
@@ -1205,7 +1220,13 @@ def apply_provider_step(
             (
                 task["project_id"],
                 task["id"],
-                canonical_json({"host_job_id": job["id"], "step": step.kind}),
+                canonical_json(
+                    {
+                        "host_job_id": job["id"],
+                        "step": step.kind,
+                        "failure_kind": bridge_failure,
+                    }
+                ),
                 now,
             ),
         )

@@ -1,3 +1,10 @@
+"""Task lifecycle state writers.
+
+Only the leased ``advance_project`` lifecycle path may mutate Task lifecycle
+fields.  Execution, verification, timeout and checkpoint code supply facts;
+they must never create their own write scope.
+"""
+
 from __future__ import annotations
 
 import json

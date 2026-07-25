@@ -4101,10 +4101,20 @@ class VerticalSliceTest(unittest.TestCase):
             result = tick(self.store)[0]
         self.assertEqual(result["action"], "checkpoint_needs_decision")
         state = snapshot(self.db, self.data, "checkpoint-overflow")
+        # Checkpoint is an observer: it records a fact but cannot advance Task
+        # state itself.  The next leased advance consumes the fact.
+        self.assertEqual(state["task"]["public_status"], "pending")
+        self.assertIn(
+            "checkpoint_failed", {event["kind"] for event in state["events"]}
+        )
+        result = tick(self.store)[0]
+        self.assertEqual(result["action"], "checkpoint_needs_decision")
+        state = snapshot(self.db, self.data, "checkpoint-overflow")
         self.assertEqual(state["task"]["public_status"], "needs_decision")
         self.assertEqual(state["task"]["fault_code"], "scope")
         self.assertIn(
-            "checkpoint_failed", {event["kind"] for event in state["events"]}
+            "checkpoint_failure_escalated",
+            {event["kind"] for event in state["events"]},
         )
 
     def test_deadline_reconciles_and_gracefully_stops_active_host_job(self):
@@ -6491,7 +6501,7 @@ class VerticalSliceTest(unittest.TestCase):
         ):
             facts = perform_provider_step(step)
         self.assertFalse(facts["ok"])
-        self.assertEqual(facts["failure_kind"], "transport")
+        self.assertEqual(facts["failure_kind"], "transient")
         self.assertEqual(facts["failure_stage"], "snapshot_after")
 
     def _row_counts(self):

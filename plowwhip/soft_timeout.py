@@ -16,8 +16,10 @@ from .timeout_policy import (
     MAX_SOFT_TIMEOUTS,
     append_timeout_ledger,
     classify_timeout,
+    effective_increment_since,
     ledger_timeout_note,
     next_soft_timeout_seconds,
+    soft_extension_requires_increment,
     soft_timeout_allowed,
 )
 
@@ -25,6 +27,7 @@ SoftTimeoutResult = Literal[
     "extended",
     "hard_idle",
     "soft_cap_reached",
+    "stall_no_increment",
     "skipped",
     "extend_failed",
 ]
@@ -169,6 +172,77 @@ def try_soft_timeout_extension(
         )
         return "soft_cap_reached"
 
+    # T-14: 2nd/3rd soft requires effective increment beyond active I/O.
+    since = dispatch.get("last_soft_timeout_at")
+    has_increment = effective_increment_since(
+        connection,
+        str(task["id"]),
+        since=float(since) if since is not None else None,
+        dispatch=dispatch,
+    )
+    if soft_extension_requires_increment(soft_count) and not has_increment:
+        _record_butler_notice(
+            connection,
+            task,
+            current,
+            (
+                f"[超时-stall] Task {task['id'][:8]}… soft#{soft_count + 1} "
+                f"无有效增量（Artifact/Evidence/前沿），停止翻倍。"
+            ),
+            {
+                "kind": "timeout_notice",
+                "timeout_class": "soft_stall",
+                "task_id": task["id"],
+                "waiting": False,
+            },
+        )
+        _append_ledger(
+            repo_root,
+            task,
+            attempt=soft_count + 1,
+            previous_seconds=previous,
+            next_seconds=None,
+            timeout_class="soft",
+            io_phase=io_phase,
+            reason="T-14 无有效增量，受控 stall",
+        )
+        connection.execute(
+            """
+            INSERT INTO task_events(project_id, task_id, kind, detail_json, created_at)
+            VALUES (?, ?, 'task_timeout_soft_stall', ?, ?)
+            """,
+            (
+                task["project_id"],
+                task["id"],
+                canonical_json(
+                    {
+                        "host_job_id": job["id"],
+                        "soft_timeout_count": soft_count,
+                        "timeout_seconds": previous,
+                        "effective_increment": False,
+                        "io_phase": io_phase,
+                    }
+                ),
+                current,
+            ),
+        )
+        # Called only by execution while advance_project owns the lifecycle scope.
+        write_task_fields(
+            connection,
+            task["id"],
+            {
+                "wait_reason": (
+                    f"[超时-stall] soft#{soft_count + 1} 无有效增量；"
+                    "已 checkpoint，请换策略或缩 Goal（不再自动翻倍）"
+                ),
+                "fault_code": "scope",
+                "next_action_at": current + 1,
+                "next_action_kind": "reconcile",
+                "updated_at": current,
+            },
+        )
+        return "stall_no_increment"
+
     next_budget = next_soft_timeout_seconds(previous, size)
     try:
         extend_provider_job_timeout(job["id"], next_budget)
@@ -184,6 +258,7 @@ def try_soft_timeout_extension(
         "UPDATE host_jobs SET dispatch_json = ? WHERE id = ?",
         (canonical_json(dispatch), job["id"]),
     )
+    # Called only by execution while advance_project owns the lifecycle scope.
     write_task_fields(
         connection,
         task["id"],
@@ -215,6 +290,7 @@ def try_soft_timeout_extension(
                     "previous_seconds": previous,
                     "next_seconds": next_budget,
                     "io_phase": io_phase,
+                    "effective_increment": has_increment if soft_count > 1 else True,
                 }
             ),
             current,
@@ -236,6 +312,7 @@ def try_soft_timeout_extension(
             "attempt": soft_count,
             "previous_seconds": previous,
             "next_seconds": next_budget,
+            "effective_increment": has_increment if soft_count > 1 else True,
             "waiting": False,
         },
     )
